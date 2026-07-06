@@ -5,7 +5,8 @@ use crate::r#match::player::strategies::common::players::ops::forward_shot_decis
 };
 use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
-    ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
+    ConditionContext, PlayerSide, StateChangeResult, StateProcessingContext,
+    StateProcessingHandler,
 };
 use nalgebra::Vector3;
 
@@ -84,11 +85,36 @@ impl StateProcessingHandler for ForwardRunningInBehindState {
         // assigned lateral channel. A winger with start_y near the touchline runs
         // into their flank corridor (where CrossingState takes over at the byline);
         // a central striker with start_y near 272 runs toward goal centre as before.
-        let run_target = Vector3::new(
+        let mut run_target = Vector3::new(
             opponent_goal.x,
             ctx.player.start_position.y,
             0.0,
         );
+
+        // Offside discipline: while a teammate is still ON the ball (the
+        // through-pass hasn't been released), hold the run at the shoulder
+        // of the last defender instead of sprinting to the goal line. The
+        // moment the ball is released (in flight or loose) the clamp lifts
+        // and the sprint beats the line legally. Without this, forwards
+        // camped 40u+ beyond the line during buildup and every delivery
+        // arrived offside (~25 whistles / 10-min match, killing most
+        // attacking moves and dragging goals/match from ~2.5 to ~0.8).
+        let teammate_on_ball = !ctx.ball().is_in_flight()
+            && ctx
+                .ball()
+                .owner_id()
+                .and_then(|id| ctx.context.players.by_id(id))
+                .map_or(false, |o| o.team_id == ctx.player.team_id && o.id != ctx.player.id);
+        if teammate_on_ball {
+            const ONSIDE_HOLD: f32 = 6.0;
+            let line = ctx.player().defensive().find_defensive_line();
+            match ctx.player.side {
+                Some(PlayerSide::Left) => run_target.x = run_target.x.min(line - ONSIDE_HOLD),
+                Some(PlayerSide::Right) => run_target.x = run_target.x.max(line + ONSIDE_HOLD),
+                None => {}
+            }
+        }
+
         let direction = (run_target - current_position).normalize();
 
         let ownership_duration = ctx.tick_context.ball.ownership_duration;

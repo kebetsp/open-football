@@ -3042,6 +3042,7 @@ impl PlayerEventDispatcher {
                     goal_line_z,
                     defending_side,
                     deflected,
+                    physics_save_rolled: false,
                 });
             } else {
                 field.ball.cached_shot_target = None;

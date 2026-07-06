@@ -536,6 +536,14 @@ impl Ball {
         if self.current_owner.is_some() || self.flags.in_flight_state == 0 {
             return;
         }
+        // One roll per shot. This check runs every tick the ball is near
+        // the goal line; unlatched it compounded with itself AND the GK
+        // state machine's per-tick rolls (measured: disabling this layer
+        // entirely moved goals/match 0.83 → 4.0, i.e. it was converting
+        // ~80% of would-be goals into saves).
+        if shot_target.physics_save_rolled {
+            return;
+        }
 
         // Ball well over the bar — not a save situation.
         if self.position.z > 2.8 {
@@ -701,6 +709,11 @@ impl Ball {
         #[cfg(feature = "match-logs")]
         save_accounting_stats::SAVE_PHYSICS_FIRED.fetch_add(1, Ordering::Relaxed);
 
+        // Latch before rolling — win or lose, the physics layer gets
+        // exactly one attempt at this shot.
+        if let Some(t) = self.cached_shot_target.as_mut() {
+            t.physics_save_rolled = true;
+        }
         if context.rng.unit_f32() >= save_prob {
             return; // Keeper beaten — shot goes on.
         }

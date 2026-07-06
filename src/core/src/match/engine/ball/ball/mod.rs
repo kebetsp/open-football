@@ -348,6 +348,12 @@ pub struct ShotTarget {
     /// was set for the original trajectory and the redirected ball is
     /// arriving on a new line they haven't committed to.
     pub deflected: bool,
+    /// Latch: the physics-layer save (`try_save_shot`) has taken its
+    /// one roll for this shot. That check runs every tick the ball is
+    /// near the goal line; without the latch it compounded 2-3 rolls
+    /// of up to 0.55 per shot ON TOP of the GK state machine's own
+    /// per-tick rolls, driving per-shot conversion to ~2% (real ~12%).
+    pub physics_save_rolled: bool,
 }
 
 #[derive(Default, Clone)]
