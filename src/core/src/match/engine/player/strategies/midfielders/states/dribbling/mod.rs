@@ -1,3 +1,4 @@
+use crate::club::player::traits::BehavioralDirective;
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
 use crate::r#match::player::strategies::common::players::ops::forward_shot_decision::{
@@ -20,6 +21,30 @@ impl StateProcessingHandler for MidfielderDribblingState {
             return Some(StateChangeResult::with_midfielder_state(
                 MidfielderState::Running,
             ));
+        }
+
+        // Behavioural directive: byline_and_cross. While wide, commit to
+        // the touchline carry — cross on reaching the byline, bail out
+        // only under a genuine two-man press. Skips the carry-budget
+        // timeout and mid-dribble pass-outs below, which would otherwise
+        // cancel the run before the byline.
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+            let field_h = ctx.context.field_size.height as f32;
+            let y = ctx.player.position.y;
+            if y < field_h * 0.26 || y > field_h * 0.74 {
+                let goal_x = ctx.player().opponent_goal_position().x;
+                if (goal_x - ctx.player.position.x).abs() < 40.0 {
+                    return Some(StateChangeResult::with_midfielder_state(
+                        MidfielderState::Crossing,
+                    ));
+                }
+                if ctx.players().opponents().nearby(8.0).count() >= 2 {
+                    return Some(StateChangeResult::with_midfielder_state(
+                        MidfielderState::Passing,
+                    ));
+                }
+                return None; // keep carrying; velocity() steers to the byline
+            }
         }
 
         let mid_profile = MidfielderSkillProfile::from_ctx(ctx);
@@ -121,7 +146,23 @@ impl StateProcessingHandler for MidfielderDribblingState {
             return Some(direction * ctx.player.skills.physical.pace * 0.3);
         }
 
-        let goal_pos = ctx.player().opponent_goal_position();
+        let mut goal_pos = ctx.player().opponent_goal_position();
+        // Behavioural directive: byline_and_cross — dribble target is the
+        // byline at the player's own channel, not the goal centre. The
+        // evasion blending below then dodges defenders while still
+        // tracking the touchline route.
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+            let field_h = ctx.context.field_size.height as f32;
+            let y = ctx.player.position.y;
+            if y < field_h * 0.26 || y > field_h * 0.74 {
+                let start_y = ctx.player.start_position.y;
+                goal_pos.y = if start_y < field_h * 0.30 || start_y > field_h * 0.70 {
+                    start_y
+                } else {
+                    y
+                };
+            }
+        }
         let player_pos = ctx.player.position;
         let to_goal = (goal_pos - player_pos).normalize();
 

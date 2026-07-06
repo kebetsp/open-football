@@ -703,8 +703,11 @@ impl Ball {
         // sets feet under a regular shot).
         let env_mod = context.environment.modifiers();
         let env_handling_delta = env_mod.goalkeeper_handling;
+        // Cap trimmed 0.55 → 0.45 after the single-roll latch landed:
+        // batch mean sat at ~1.7 goals/match (band ~2-3) with the roll
+        // now firing once per shot instead of compounding.
         let save_prob =
-            ((base - speed_penalty) * skill_mult + env_handling_delta).clamp(0.05, 0.55);
+            ((base - speed_penalty) * skill_mult + env_handling_delta).clamp(0.05, 0.45);
 
         #[cfg(feature = "match-logs")]
         save_accounting_stats::SAVE_PHYSICS_FIRED.fetch_add(1, Ordering::Relaxed);

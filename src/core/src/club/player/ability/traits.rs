@@ -50,6 +50,22 @@ pub enum PlayerTrait {
     OneClubPlayer,
 }
 
+/// Manager-issued movement directive for one match. Unlike a
+/// `PlayerTrait` (a permanent signature behaviour), a behavioural
+/// directive is a per-match tactical instruction injected through the
+/// match API and checked by the relevant strategy state at its decision
+/// point. Typed enum on purpose: a mistyped directive string must fail
+/// at the parse boundary (mapped to `None` + a warning), never reach a
+/// state machine as a silent no-op. At most one movement directive per
+/// player per match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BehavioralDirective {
+    /// Stay wide, carry the ball along the touchline to the byline at
+    /// the player's own channel, and deliver a cross from there —
+    /// instead of the default cut-inside-and-pass-centrally pattern.
+    BylineAndCross,
+}
+
 impl PlayerTrait {
     pub fn as_str(&self) -> &'static str {
         match self {

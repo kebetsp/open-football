@@ -1,4 +1,5 @@
 use crate::IntegerUtils;
+use crate::club::player::traits::BehavioralDirective;
 use crate::r#match::events::Event;
 use crate::r#match::forwarders::states::ForwardState;
 use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondition};
@@ -221,6 +222,29 @@ impl StateProcessingHandler for ForwardRunningState {
                 return Some(StateChangeResult::with_forward_state(
                     ForwardState::Crossing,
                 ));
+            }
+
+            // Behavioural directive: byline_and_cross. In the wide band,
+            // bypass the entire shot/pass decision tree — carry to the
+            // byline (Dribbling's velocity steers the route) and deliver
+            // a cross on arrival. This is the route change the directive
+            // exists for; without the bypass the pass-EV branches below
+            // lay the ball off centrally on almost every possession.
+            if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+                let field_h = ctx.context.field_size.height as f32;
+                let y = ctx.player.position.y;
+                let is_wide = y < field_h * 0.26 || y > field_h * 0.74;
+                if is_wide {
+                    let goal_x = ctx.player().opponent_goal_position().x;
+                    if (goal_x - ctx.player.position.x).abs() < 40.0 {
+                        return Some(StateChangeResult::with_forward_state(
+                            ForwardState::Crossing,
+                        ));
+                    }
+                    return Some(StateChangeResult::with_forward_state(
+                        ForwardState::Dribbling,
+                    ));
+                }
             }
 
             let distance_to_goal = ctx.ball().distance_to_opponent_goal();

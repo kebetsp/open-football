@@ -1,4 +1,5 @@
 use crate::PlayerFieldPositionGroup;
+use crate::club::player::traits::BehavioralDirective;
 use crate::r#match::events::Event;
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
@@ -88,6 +89,33 @@ impl StateProcessingHandler for MidfielderRunningState {
                 return Some(StateChangeResult::with_midfielder_state(
                     MidfielderState::Crossing,
                 ));
+            }
+
+            // Behavioural directive: byline_and_cross. A wide midfielder
+            // (the 4-4-2 winger) with this directive bypasses the entire
+            // pass/shot decision tree while in the wide band of the
+            // attacking half: carry to the byline (Dribbling velocity
+            // steers the route), cross on arrival. Mirrors the forward-
+            // state implementation; wingers in this formation are
+            // midfielders, so the directive must live here too.
+            if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+                let field_h = ctx.context.field_size.height as f32;
+                let field_w = ctx.context.field_size.width as f32;
+                let y = ctx.player.position.y;
+                let is_wide = y < field_h * 0.26 || y > field_h * 0.74;
+                let in_attacking_zone =
+                    ctx.ball().distance_to_opponent_goal() < field_w * 0.70;
+                if is_wide && in_attacking_zone {
+                    let goal_x = ctx.player().opponent_goal_position().x;
+                    if (goal_x - ctx.player.position.x).abs() < 40.0 {
+                        return Some(StateChangeResult::with_midfielder_state(
+                            MidfielderState::Crossing,
+                        ));
+                    }
+                    return Some(StateChangeResult::with_midfielder_state(
+                        MidfielderState::Dribbling,
+                    ));
+                }
             }
 
             let distance_to_goal = ctx.ball().distance_to_opponent_goal();

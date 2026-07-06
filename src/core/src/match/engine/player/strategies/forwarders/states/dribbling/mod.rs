@@ -1,3 +1,4 @@
+use crate::club::player::traits::BehavioralDirective;
 use crate::r#match::forwarders::states::ForwardState;
 use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondition};
 use crate::r#match::player::strategies::common::players::ops::forward_shot_decision::{
@@ -16,6 +17,28 @@ impl StateProcessingHandler for ForwardDribblingState {
     fn process(&self, ctx: &StateProcessingContext) -> Option<StateChangeResult> {
         if !ctx.player.has_ball(ctx) {
             return Some(StateChangeResult::with_forward_state(ForwardState::Running));
+        }
+
+        // Behavioural directive: byline_and_cross. While wide, commit to
+        // the touchline carry: cross on reaching the byline, bail out only
+        // under a genuine two-man press. The generic exits below (no-
+        // opponent bail, dribble timeout, single-chaser pass-out) would
+        // otherwise cancel the run on almost every touchline duel.
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+            let field_h = ctx.context.field_size.height as f32;
+            let y = ctx.player.position.y;
+            if y < field_h * 0.26 || y > field_h * 0.74 {
+                let goal_x = ctx.player().opponent_goal_position().x;
+                if (goal_x - ctx.player.position.x).abs() < 40.0 {
+                    return Some(StateChangeResult::with_forward_state(
+                        ForwardState::Crossing,
+                    ));
+                }
+                if ctx.players().opponents().nearby(8.0).count() >= 2 {
+                    return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
+                }
+                return None; // keep carrying; velocity() steers to the byline
+            }
         }
 
         // No opponents nearby — just run, dribbling is for beating defenders
@@ -99,6 +122,32 @@ impl StateProcessingHandler for ForwardDribblingState {
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         let goal = ctx.player().opponent_goal_position();
+
+        // Behavioural directive: byline_and_cross — steer along the
+        // touchline to the byline at the player's own channel instead of
+        // angling in toward goal centre. Uses start_position.y as the
+        // channel when the player's slot is a wide one; otherwise holds
+        // the current wide lane.
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+            let field_h = ctx.context.field_size.height as f32;
+            let y = ctx.player.position.y;
+            if y < field_h * 0.26 || y > field_h * 0.74 {
+                let start_y = ctx.player.start_position.y;
+                let channel_y = if start_y < field_h * 0.30 || start_y > field_h * 0.70 {
+                    start_y
+                } else {
+                    y
+                };
+                return Some(
+                    SteeringBehavior::Arrive {
+                        target: Vector3::new(goal.x, channel_y, 0.0),
+                        slowing_distance: 30.0,
+                    }
+                    .calculate(ctx.player)
+                    .velocity,
+                );
+            }
+        }
 
         // GK-avoidance: when the keeper is in close range, sidestep to
         // create a shooting angle rather than running straight into them.

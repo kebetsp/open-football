@@ -1,5 +1,5 @@
 use crate::club::player::events::PositionLoad;
-use crate::club::player::traits::PlayerTrait;
+use crate::club::player::traits::{BehavioralDirective, PlayerTrait};
 use crate::r#match::PlayerMatchEndStats;
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::engine::result::PlayerMatchPhysicalSnapshot;
@@ -75,6 +75,10 @@ pub struct MatchPlayer {
     /// per-match shot-reason log shows which code path fired the shot.
     /// Cleared after consumption.
     pub pending_shot_reason: Option<&'static str>,
+    /// Manager-issued per-match movement directive (at most one).
+    /// Injected via the match API; checked by strategy states at their
+    /// decision points. See `BehavioralDirective` in club/player/ability.
+    pub behavioral_directive: Option<BehavioralDirective>,
 
     /// Manager flag protecting this player from fatigue / development subs.
     /// Mirrored from `Player::is_force_match_selection` at squad-build time.
@@ -246,6 +250,7 @@ impl MatchPlayer {
             is_sent_off: false,
             tackle_cooldown: 0,
             pending_shot_reason: None,
+            behavioral_directive: None,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
             entry_match_time_ms: 0,
@@ -306,6 +311,7 @@ impl MatchPlayer {
             is_sent_off: false,
             tackle_cooldown: 0,
             pending_shot_reason: None,
+            behavioral_directive: None,
             is_force_match_selection,
             birth_date,
             entry_match_time_ms: 0,

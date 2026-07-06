@@ -1,3 +1,4 @@
+use crate::club::player::traits::BehavioralDirective;
 use crate::r#match::events::Event;
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
@@ -31,6 +32,26 @@ impl StateProcessingHandler for MidfielderCrossingState {
             && ctx.in_state_time < CORNER_SETUP_MAX
         {
             return None;
+        }
+
+        // BYLINE-DIRECTIVE HOLD: a byline_and_cross winger often beats
+        // their own runners to the byline. Shield the ball briefly until
+        // a teammate arrives within crossing range, instead of falling
+        // through to a target-less delivery that degrades into a plain
+        // pass-out (which erases the instructed pattern).
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross)
+            && !ctx.ball().is_team_attacking_corner()
+            && ctx.in_state_time < 60
+        {
+            let goal_pos = ctx.player().opponent_goal_position();
+            let target_ready = ctx
+                .players()
+                .teammates()
+                .all()
+                .any(|t| t.id != ctx.player.id && (t.position - goal_pos).magnitude() < 150.0);
+            if !target_ready {
+                return None;
+            }
         }
 
         // After windup time, deliver the cross
@@ -115,10 +136,13 @@ impl MidfielderCrossingState {
                 continue;
             }
 
-            // Must have a clear passing lane — EXCEPT on a corner, where the
-            // delivery is a lofted ball over the packed defenders, so a
-            // blocked ground lane doesn't disqualify a central target.
-            if !ctx.ball().is_team_attacking_corner() && !ctx.player().has_clear_pass(teammate.id) {
+            // Must have a clear passing lane — EXCEPT on a corner or a
+            // byline-directive delivery, where the ball is lofted over the
+            // packed defenders, so a blocked ground lane doesn't
+            // disqualify a central target.
+            let lofted_delivery = ctx.ball().is_team_attacking_corner()
+                || ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross);
+            if !lofted_delivery && !ctx.player().has_clear_pass(teammate.id) {
                 continue;
             }
 
@@ -144,10 +168,11 @@ impl MidfielderCrossingState {
                 .count();
 
             // Skip crosses with 2+ opponents directly in the path.
-            // Exception: on a corner the delivery is lofted over them — the aerial
-            // ball rises above the 2.5u interception gate in interactions.rs, so
-            // ground-lane crowding is irrelevant for set-piece deliveries.
-            if opponents_in_path >= 2 && !ctx.ball().is_team_attacking_corner() {
+            // Exception: on a corner or byline-directive delivery the ball is
+            // lofted over them — the aerial ball rises above the 2.5u
+            // interception gate in interactions.rs, so ground-lane crowding
+            // is irrelevant for those deliveries.
+            if opponents_in_path >= 2 && !lofted_delivery {
                 continue;
             }
 
