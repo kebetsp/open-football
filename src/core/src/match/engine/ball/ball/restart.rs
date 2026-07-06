@@ -24,7 +24,7 @@ impl Ball {
     /// the engine can place the thrower onto the ball after the tick.
     pub(super) fn check_throw_in(
         &mut self,
-        context: &MatchContext,
+        context: &mut MatchContext,
         players: &[MatchPlayer],
         events: &mut EventCollection,
     ) {
@@ -87,6 +87,7 @@ impl Ball {
             .unwrap_or(0);
         self.record_touch(thrower_id, team_id, context.current_tick(), true);
 
+        context.dead_ball_until_ms = context.total_match_time + context.rng.range_u64(1, 3) * 1000;
         self.pending_set_piece_teleport = Some((thrower_id, throw_pos));
         events.add_ball_event(BallEvent::Claimed(thrower_id));
     }

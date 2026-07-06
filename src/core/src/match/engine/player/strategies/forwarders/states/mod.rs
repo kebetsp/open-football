@@ -1,5 +1,6 @@
 pub mod assisting;
 pub mod common;
+pub mod corner_run;
 pub mod creating_space;
 pub mod cross_receiving;
 pub mod crossing;
@@ -21,6 +22,7 @@ pub mod takeball;
 pub mod walking;
 
 pub use assisting::*;
+pub use corner_run::*;
 pub use creating_space::*;
 pub use cross_receiving::*;
 pub use crossing::*;

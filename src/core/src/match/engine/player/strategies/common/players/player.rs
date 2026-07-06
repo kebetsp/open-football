@@ -504,7 +504,13 @@ impl<'p> PlayerOperationsImpl<'p> {
         //    perpendicular distance to the shot line and their
         //    longitudinal proximity to the shooter (defenders right
         //    next to the shooter block more than ones near the goal).
-        let check_distance = distance_to_goal * 0.80;
+        // Cap at 60u: defenders more than 60u ahead of the shooter are near
+        // the goal mouth, not blocking the shot trajectory. Without this cap,
+        // the entire defensive shape is scanned from long range, making
+        // corridor_blockage near-certain and has_clear_shot() always false
+        // beyond ~90u — forcing forwards to run all the way inside before
+        // the engine considers shooting.
+        let check_distance = (distance_to_goal * 0.80).min(60.0);
         let mut corridor_blockage: f32 = 0.0;
         for opp in self.ctx.players().opponents().all() {
             if opp.tactical_positions.is_goalkeeper() {
@@ -570,11 +576,16 @@ impl<'p> PlayerOperationsImpl<'p> {
         let clarity = self.shot_clarity();
         let finishing = self.ctx.player.skills.technical.finishing / 20.0;
         let composure = self.ctx.player.skills.mental.composure / 20.0;
-        // Threshold: 0.32 baseline, drops to 0.18 for elite players.
-        // An 18-finishing striker shoots through clarity ≥ 0.18 (heavy
-        // traffic but a sliver of angle). Average 10-finishing needs
-        // ≥ 0.27. Below ~0.18 the shot is hopeless even for elite.
-        let threshold = (0.36 - finishing * 0.15 - composure * 0.03).clamp(0.18, 0.36);
+        // Progressive proximity term: the closer to goal, the lower the
+        // bar for "clear enough to shoot." A striker at 5 yards shoots
+        // through traffic; the same striker at 45 yards waits for a lane.
+        // proximity = 0 at ≥90u, 1 at 0u — contributes up to 0.15 of
+        // threshold reduction. Clamp floor drops to 0.05 so the reduction
+        // is meaningful even for elite players at point-blank range.
+        let distance = (self.opponent_goal_position() - self.ctx.player.position).norm();
+        let proximity = (1.0 - (distance / 90.0)).clamp(0.0, 1.0) * 0.15;
+        let threshold = (0.36 - finishing * 0.15 - composure * 0.03 - proximity)
+            .clamp(0.05, 0.36);
         clarity >= threshold
     }
 

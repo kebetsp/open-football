@@ -52,10 +52,17 @@ impl StateProcessingHandler for MidfielderAttackSupportingState {
                 return None;
             }
 
-            // Guard unmarked attackers on our side
+            // Ball in our own half — guard if opponents are nearby, otherwise
+            // drop straight back rather than looping through Guarding with no target.
             if ctx.ball().on_own_side() {
+                let has_nearby_opponent = ctx.players().opponents().nearby(100.0).next().is_some();
+                if has_nearby_opponent {
+                    return Some(StateChangeResult::with_midfielder_state(
+                        MidfielderState::Guarding,
+                    ));
+                }
                 return Some(StateChangeResult::with_midfielder_state(
-                    MidfielderState::Guarding,
+                    MidfielderState::Returning,
                 ));
             }
 
@@ -113,10 +120,129 @@ impl StateProcessingHandler for MidfielderAttackSupportingState {
         if let Some(ball_owner_id) = ctx.ball().owner_id() {
             if let Some(ball_owner) = ctx.context.players.by_id(ball_owner_id) {
                 if ball_owner.team_id == ctx.player.team_id {
-                    // Teammate has ball - make attacking run instead of clustering
-                    let target_position = self.calculate_attacking_run_position(ctx);
+                    let field_width = ctx.context.field_size.width as f32;
+                    let field_height = ctx.context.field_size.height as f32;
+                    let goal = ctx.player().opponent_goal_position();
+                    let center_y = field_height / 2.0;
+                    let attacking_dir: f32 = match ctx.player.side {
+                        Some(PlayerSide::Left) => 1.0,
+                        Some(PlayerSide::Right) => -1.0,
+                        None => 0.0,
+                    };
 
-                    // Vary speed based on situation
+                    // When 3+ teammates are already near goal, don't pile in —
+                    // hold a wide recycling position at the edge of the attack
+                    // to provide an outlet and keep the channel from flooding.
+                    let close_count = ctx.players().teammates().all()
+                        .filter(|t| (goal - t.position).magnitude() < 200.0)
+                        .count();
+                    if close_count >= 3 {
+                        let (left_n, right_n) = ctx
+                            .players()
+                            .teammates()
+                            .all()
+                            .filter(|t| (goal - t.position).magnitude() < 200.0)
+                            .fold((0u32, 0u32), |(l, r), t| {
+                                if t.position.y < center_y { (l + 1, r) } else { (l, r + 1) }
+                            });
+                        let wide_y = if left_n <= right_n {
+                            (center_y - 110.0).max(20.0)
+                        } else {
+                            (center_y + 110.0).min(field_height - 20.0)
+                        };
+                        let edge_x = (goal.x - attacking_dir * 160.0)
+                            .clamp(20.0, field_width - 20.0);
+                        let recycle_pos = Vector3::new(edge_x, wide_y, 0.0);
+                        let dist = (recycle_pos - ctx.player.position).magnitude();
+                        if dist > 8.0 {
+                            return Some(
+                                SteeringBehavior::Arrive {
+                                    target: recycle_pos,
+                                    slowing_distance: 30.0,
+                                }
+                                .calculate(ctx.player)
+                                .velocity,
+                            );
+                        }
+                        return Some(Vector3::zeros());
+                    }
+
+                    // Slot coverage: if a forward is absent from the attack and
+                    // this midfielder is the nearest eligible fill, shadow the
+                    // missing forward's role. The "nearer mid exists" check
+                    // prevents two midfielders competing for the same slot.
+                    let fwd_total = ctx
+                        .players()
+                        .teammates()
+                        .all()
+                        .filter(|t| t.tactical_positions.is_forward())
+                        .count();
+                    let fwd_near_goal: Vec<Vector3<f32>> = ctx
+                        .players()
+                        .teammates()
+                        .all()
+                        .filter(|t| {
+                            t.tactical_positions.is_forward()
+                                && (goal - t.position).magnitude() < 220.0
+                        })
+                        .map(|t| t.position)
+                        .collect();
+
+                    if fwd_near_goal.len() < fwd_total {
+                        let my_goal_dist = (goal - ctx.player.position).magnitude();
+                        let closer_mid = ctx
+                            .players()
+                            .teammates()
+                            .all()
+                            .filter(|t| {
+                                t.tactical_positions.is_midfielder()
+                                    && t.id != ctx.player.id
+                            })
+                            .any(|t| (goal - t.position).magnitude() < my_goal_dist - 15.0);
+
+                        if !closer_mid {
+                            let fill_pos = if let Some(&fwd_pos) = fwd_near_goal.first() {
+                                // Mirror: same depth as existing forward, opposite side
+                                let mirror_y = if fwd_pos.y < center_y {
+                                    (center_y + 100.0).min(field_height - 20.0)
+                                } else {
+                                    (center_y - 100.0).max(20.0)
+                                };
+                                Vector3::new(fwd_pos.x, mirror_y, 0.0)
+                            } else {
+                                // No forwards near goal — take the primary forward slot
+                                Vector3::new(
+                                    (goal.x - attacking_dir * 120.0)
+                                        .clamp(20.0, field_width - 20.0),
+                                    center_y,
+                                    0.0,
+                                )
+                            };
+                            let dist = (fill_pos - ctx.player.position).magnitude();
+                            if dist > 8.0 {
+                                return Some(
+                                    SteeringBehavior::Arrive {
+                                        target: fill_pos,
+                                        slowing_distance: 20.0,
+                                    }
+                                    .calculate(ctx.player)
+                                    .velocity,
+                                );
+                            }
+                        }
+                    }
+
+                    // Make attacking run, but bias the y-target toward this
+                    // player's home y-lane so each midfielder naturally occupies
+                    // a different corridor rather than converging on the ball.
+                    let raw_target = self.calculate_attacking_run_position(ctx);
+                    let target_position = Vector3::new(
+                        raw_target.x,
+                        raw_target.y * 0.40 + ctx.player.start_position.y * 0.60,
+                        0.0,
+                    )
+                    .clamp_to_field(field_width, field_height);
+
                     let urgency_factor = self.calculate_urgency_factor(ctx);
                     let slowing_distance = 20.0 * (1.0 - urgency_factor * 0.3);
 
@@ -728,8 +854,9 @@ impl MidfielderAttackSupportingState {
                 0.0
             };
 
-            return Vector3::new(target_x + curve_factor, target_y, 0.0)
+            let pos = Vector3::new(target_x + curve_factor, target_y, 0.0)
                 .clamp_to_field(field_width, field_height);
+            return self.apply_teammate_spacing(ctx, pos);
         }
 
         // Default: Edge of the box for cutback opportunities
@@ -740,7 +867,8 @@ impl MidfielderAttackSupportingState {
             goal_position.y + 100.0
         };
 
-        Vector3::new(box_edge_x, box_edge_y, 0.0).clamp_to_field(field_width, field_height)
+        let pos = Vector3::new(box_edge_x, box_edge_y, 0.0).clamp_to_field(field_width, field_height);
+        self.apply_teammate_spacing(ctx, pos)
     }
 
     /// Calculate support position in middle third
@@ -756,7 +884,6 @@ impl MidfielderAttackSupportingState {
 
         // Create triangles with ball carrier and forwards
         if let Some(ball_holder) = self.find_ball_holder(ctx) {
-            // Position to create a passing triangle
             let triangle_position = self.create_passing_triangle(
                 ctx,
                 &ball_holder,
@@ -765,19 +892,22 @@ impl MidfielderAttackSupportingState {
             );
 
             if self.is_position_valuable(ctx, triangle_position) {
-                return triangle_position.clamp_to_field(field_width, field_height);
+                let pos = triangle_position.clamp_to_field(field_width, field_height);
+                return self.apply_teammate_spacing(ctx, pos);
             }
         }
 
         // Support wide if center is congested
         if self.is_center_congested(ctx) {
-            let wide_position = self.calculate_wide_support(ctx, attacking_direction);
-            return wide_position.clamp_to_field(field_width, field_height);
+            let pos = self.calculate_wide_support(ctx, attacking_direction)
+                .clamp_to_field(field_width, field_height);
+            return self.apply_teammate_spacing(ctx, pos);
         }
 
         // Default: Position between lines
-        self.position_between_lines(ctx, attacking_direction)
-            .clamp_to_field(field_width, field_height)
+        let pos = self.position_between_lines(ctx, attacking_direction)
+            .clamp_to_field(field_width, field_height);
+        self.apply_teammate_spacing(ctx, pos)
     }
 
     /// Calculate support position during build-up
@@ -797,8 +927,7 @@ impl MidfielderAttackSupportingState {
             0.0,
         );
 
-        // Ensure we're not too close to other midfielders
-        let adjusted_position = self.avoid_midfielder_clustering(ctx, progressive_position);
+        let adjusted_position = self.apply_teammate_spacing(ctx, progressive_position);
 
         adjusted_position.clamp_to_field(field_width, field_height)
     }
@@ -1083,27 +1212,32 @@ impl MidfielderAttackSupportingState {
         }
     }
 
-    /// Avoid clustering with other midfielders
-    fn avoid_midfielder_clustering(
+    /// Push the computed target position away from ALL nearby teammates —
+    /// not just midfielders. Crowding any teammate wastes space.
+    /// Applied as a post-process on every computed support position so
+    /// midfielders arriving at similar raw targets still spread out.
+    fn apply_teammate_spacing(
         &self,
         ctx: &StateProcessingContext,
         target: Vector3<f32>,
     ) -> Vector3<f32> {
         let mut adjusted = target;
+        let field_width = ctx.context.field_size.width as f32;
+        let field_height = ctx.context.field_size.height as f32;
 
-        // Only check nearby teammates — no need to scan all
-        for midfielder in ctx.players().teammates().nearby(50.0) {
-            if midfielder.id == ctx.player.id || !midfielder.tactical_positions.is_midfielder() {
+        for teammate in ctx.players().teammates().all() {
+            if teammate.id == ctx.player.id {
                 continue;
             }
-            let distance = (midfielder.position - adjusted).magnitude();
-            if distance < 25.0 {
-                let away = (adjusted - midfielder.position).normalize();
-                adjusted += away * (25.0 - distance);
+            let diff = adjusted - teammate.position;
+            let distance = diff.magnitude();
+            if distance < 80.0 && distance > 0.01 {
+                let strength = (80.0 - distance) / 80.0;
+                adjusted += diff.normalize() * strength * 35.0;
             }
         }
 
-        adjusted
+        adjusted.clamp_to_field(field_width, field_height)
     }
 
     /// Calculate urgency factor for movement

@@ -202,6 +202,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
 
         context.fill_details();
 
+        result.second_half_start_ms = context.second_half_start_ms;
         result.additional_time_ms = context.additional_time_ms;
         result.penalty_shootout = context.penalty_shootout_kicks.clone();
         result.score = Some(context.score.clone());

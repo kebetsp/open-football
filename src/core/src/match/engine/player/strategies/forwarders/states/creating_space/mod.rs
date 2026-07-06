@@ -20,7 +20,6 @@ enum ForwardMovementPattern {
 }
 
 use nalgebra::Vector3;
-use std::cmp::Ordering;
 
 const MAX_DISTANCE_FROM_BALL: f32 = 80.0;
 const MIN_DISTANCE_FROM_BALL: f32 = 30.0;
@@ -79,102 +78,13 @@ impl StateProcessingHandler for ForwardCreatingSpaceState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
-        let field_width = ctx.context.field_size.width as f32;
-        let field_height = ctx.context.field_size.height as f32;
-        let ball_pos = ctx.tick_context.positions.ball.position;
-
-        let attacking_direction = match ctx.player.side {
-            Some(PlayerSide::Left) => 1.0,
-            Some(PlayerSide::Right) => -1.0,
-            None => 1.0,
-        };
-
-        let goal_pos = ctx.player().opponent_goal_position();
-
-        // Forwards must always push TOWARD the opponent goal, never drop back.
-        // Target X: between the ball and the goal, biased heavily toward goal.
-        let forward_x = goal_pos.x * 0.6 + ball_pos.x * 0.4;
-        // Never behind the ball — always ahead
-        let (raw_min, raw_max) = if attacking_direction > 0.0 {
-            (ball_pos.x.max(field_width * 0.4), field_width - 30.0)
-        } else {
-            (30.0, ball_pos.x.min(field_width * 0.6))
-        };
-        // Safety: ensure min <= max when ball is near the edge
-        let min_x = raw_min.min(raw_max);
-        let target_x = forward_x.clamp(min_x, raw_max);
-
-        // Find gaps between defenders in the attacking zone — and
-        // assign a DIFFERENT gap to each of our forwards so they run
-        // into separate channels, not all into the single widest gap.
-        // Previously every forward aimed at `best_gap_y` which meant
-        // 3 forwards ran toward the same spot synchronously, visibly
-        // bunched and making the whole "creating space" movement
-        // useless.
-        // Inline buffer: at most 11 opponents + 2 virtual touchline
-        // defenders = 13 ys. Cap at 16 with a generous margin.
-        const MAX_DEFENDER_YS: usize = 16;
-        let mut opp_ys: [f32; MAX_DEFENDER_YS] = [0.0; MAX_DEFENDER_YS];
-        let mut opp_ys_len: usize = 0;
-        for opp in ctx.players().opponents().all() {
-            let opp_x_ok = if attacking_direction > 0.0 {
-                opp.position.x > ball_pos.x - 20.0
-            } else {
-                opp.position.x < ball_pos.x + 20.0
-            };
-            if !opp_x_ok {
-                continue;
-            }
-            if opp_ys_len >= MAX_DEFENDER_YS - 2 {
-                break;
-            }
-            opp_ys[opp_ys_len] = opp.position.y;
-            opp_ys_len += 1;
-        }
-        // Virtual defenders at the touchlines so gaps near the wings exist.
-        opp_ys[opp_ys_len] = 0.0;
-        opp_ys_len += 1;
-        opp_ys[opp_ys_len] = field_height;
-        opp_ys_len += 1;
-        opp_ys[..opp_ys_len].sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-
-        // Build (gap_width, gap_center_y) list in a fixed-size array
-        // and track the widest gap inline so we don't have to sort.
-        const MAX_GAPS: usize = MAX_DEFENDER_YS;
-        let mut gaps: [(f32, f32); MAX_GAPS] = [(0.0, 0.0); MAX_GAPS];
-        let mut gaps_len: usize = 0;
-        for i in 0..opp_ys_len.saturating_sub(1) {
-            let width = opp_ys[i + 1] - opp_ys[i];
-            let center = (opp_ys[i] + opp_ys[i + 1]) * 0.5;
-            gaps[gaps_len] = (width, center);
-            gaps_len += 1;
-        }
-        gaps[..gaps_len].sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-
-        // Rank THIS forward among our forwards by id so each one picks
-        // a distinct gap (id-based so the assignment is stable tick
-        // to tick — forwards don't swap targets and swap back).
-        let my_id = ctx.player.id;
-        let slot_index = ctx
-            .players()
-            .teammates()
-            .all()
-            .filter(|t| t.tactical_positions.is_forward() && t.id < my_id)
-            .count();
-
-        // Pick the gap matching my slot; fall back to the widest if
-        // there are fewer gaps than forwards. Also skew slightly
-        // toward a different gap than the nearest teammate would have
-        // picked (nearest forward might still be in my slot range).
-        let gap_idx = slot_index.min(gaps_len.saturating_sub(1));
-        let target_y = if gaps_len == 0 {
-            field_height / 2.0
-        } else {
-            gaps[gap_idx].1
-        }
-        .clamp(40.0, field_height - 40.0);
-
-        let target = Vector3::new(target_x, target_y, 0.0);
+        // Scoring-based zone finder: evaluates passing lane quality, goal angle,
+        // offside avoidance, and ball-holder distance across ~40 candidates.
+        // Works during build-up and final third alike — the scoring naturally
+        // trades off goal threat vs. availability to receive. Tactical style
+        // adjustment (Possession → come shorter, Attacking → push higher,
+        // WidePlay → wider) is applied inside find_optimal_free_zone.
+        let target = self.find_optimal_free_zone(ctx);
         let dist = (target - ctx.player.position).magnitude();
 
         if dist < 8.0 {
@@ -456,6 +366,33 @@ impl ForwardCreatingSpaceState {
                 score += PASSING_LANE_IMPORTANCE;
             } else {
                 score -= 10.0;
+            }
+        }
+
+        // Universal teammate repulsion — crowding any teammate is wasteful
+        // regardless of role. At 90u radius with a linear penalty, a player
+        // 45u away costs ~25 pts; within 10u it costs ~44 pts.
+        let teammate_crowd_penalty: f32 = ctx
+            .players()
+            .teammates()
+            .all()
+            .map(|t| (t.position - position).magnitude())
+            .filter(|&d| d < 90.0)
+            .map(|d| (90.0 - d) / 90.0)
+            .sum::<f32>();
+        score -= teammate_crowd_penalty * 50.0;
+
+        // GK proximity penalty — the keeper physically dominates the
+        // 6-yard area. Standing next to them without the ball is not
+        // a useful attacking position. Strong enough to overcome the
+        // goal-threat and box-area bonuses that otherwise pull forwards
+        // toward the goal mouth (and the keeper standing in it).
+        if let Some(gk) = ctx.players().opponents().goalkeeper().next() {
+            let gk_dist = (gk.position - position).magnitude();
+            if gk_dist < 12.0 {
+                score -= 100.0 + (12.0 - gk_dist) * 6.0; // −100 to −172
+            } else if gk_dist < 25.0 {
+                score -= (25.0 - gk_dist) * 3.0; // 0 to −39
             }
         }
 

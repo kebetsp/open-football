@@ -77,39 +77,25 @@ impl StateProcessingHandler for ForwardRunningInBehindState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
-        // Forward should sprint toward goal, behind the defensive line
         let opponent_goal = ctx.ball().direction_to_opponent_goal();
         let current_position = ctx.player.position;
 
-        // Calculate target position: run toward goal, slightly angled to stay in passing lane
-        let to_goal = (opponent_goal - current_position).normalize();
+        // Channel-aware target: advance to the goal line but stay in the player's
+        // assigned lateral channel. A winger with start_y near the touchline runs
+        // into their flank corridor (where CrossingState takes over at the byline);
+        // a central striker with start_y near 272 runs toward goal centre as before.
+        let run_target = Vector3::new(
+            opponent_goal.x,
+            ctx.player.start_position.y,
+            0.0,
+        );
+        let direction = (run_target - current_position).normalize();
 
-        // CURVED RUN: Stay level with last defender, then accelerate past when ball is played
-        let ball_coming = ctx.ball().is_towards_player();
         let ownership_duration = ctx.tick_context.ball.ownership_duration;
         let is_counter = ownership_duration < 15;
 
-        let lateral_offset = if ball_coming {
-            // Ball is being played — sprint straight toward goal
-            Vector3::new(0.0, 0.0, 0.0)
-        } else {
-            // Ball not played yet — curve run to stay onside
-            // Use sinusoidal curve to drift laterally while maintaining forward momentum
-            let phase = (ctx.in_state_time as f32) * std::f32::consts::TAU / 80.0;
-            let lateral_sway = phase.sin() * 0.3;
-            if current_position.y > ctx.context.field_size.height as f32 / 2.0 {
-                Vector3::new(0.0, -0.2 + lateral_sway, 0.0) // Drift inward with curve
-            } else {
-                Vector3::new(0.0, 0.2 - lateral_sway, 0.0)
-            }
-        };
-
-        let direction = (to_goal + lateral_offset).normalize();
-
-        // Sprint at maximum pace with acceleration bonus
         let pace = ctx.player.skills.physical.pace;
         let acceleration = ctx.player.skills.physical.acceleration / 20.0;
-        // Counter-attack: extra burst of speed
         let counter_bonus = if is_counter { 0.3 } else { 0.0 };
         let sprint_speed = pace * (1.5 + acceleration * 0.5 + counter_bonus);
 

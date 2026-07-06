@@ -33,6 +33,12 @@ impl StateProcessingHandler for ForwardDribblingState {
                 if let Some(result) = dispatch_shot(ctx, "FWD_DRIB_NEAR_GK") {
                     return Some(result);
                 }
+                // dispatch_shot returned None (Hold). In the penalty zone
+                // (<12u) the keeper can physically grab or block — pass to
+                // a teammate rather than keep running into them.
+                if distance_to_gk < 12.0 {
+                    return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
+                }
             }
         }
 
@@ -92,9 +98,40 @@ impl StateProcessingHandler for ForwardDribblingState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let goal = ctx.player().opponent_goal_position();
+
+        // GK-avoidance: when the keeper is in close range, sidestep to
+        // create a shooting angle rather than running straight into them.
+        // "Round the keeper" — the forward angles laterally away from
+        // the pitch centre to open up a gap.
+        if let Some(gk) = ctx.players().opponents().goalkeeper().next() {
+            let gk_dist = (gk.position - ctx.player.position).magnitude();
+            let goal_dist = ctx.ball().distance_to_opponent_goal();
+            if gk_dist < 20.0 && goal_dist < 80.0 {
+                let to_goal = (goal - ctx.player.position).normalize();
+                let lateral = Vector3::new(-to_goal.y, to_goal.x, 0.0);
+                let center_y = ctx.context.field_size.height as f32 / 2.0;
+                let side = if ctx.player.position.y > center_y { -1.0 } else { 1.0 };
+                let target = ctx.player.position + lateral * side * 18.0;
+                let clamped = Vector3::new(
+                    target.x.clamp(15.0, ctx.context.field_size.width as f32 - 15.0),
+                    target.y.clamp(15.0, ctx.context.field_size.height as f32 - 15.0),
+                    0.0,
+                );
+                return Some(
+                    SteeringBehavior::Arrive {
+                        target: clamped,
+                        slowing_distance: 10.0,
+                    }
+                    .calculate(ctx.player)
+                    .velocity,
+                );
+            }
+        }
+
         Some(
             SteeringBehavior::Arrive {
-                target: ctx.player().opponent_goal_position(),
+                target: goal,
                 slowing_distance: 150.0,
             }
             .calculate(ctx.player)

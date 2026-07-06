@@ -2,7 +2,7 @@ use crate::r#match::events::Event;
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
 use crate::r#match::player::events::{PassingEventContext, PlayerEvent};
-use crate::r#match::player::strategies::common::passing::box_loaded_for_corner;
+use crate::r#match::player::strategies::common::set_pieces::{corner_box_loaded, pick_corner_delivery};
 use crate::r#match::{
     ConditionContext, MatchPlayerLite, StateChangeResult, StateProcessingContext,
     StateProcessingHandler,
@@ -10,8 +10,6 @@ use crate::r#match::{
 use nalgebra::Vector3;
 
 const CROSS_EXECUTION_TIME: u64 = 5;
-/// Max ticks the taker holds an attacking corner waiting for the box to
-/// load before delivering anyway (the dead-ball set-up window).
 const CORNER_SETUP_MAX: u64 = 200;
 
 #[derive(Default, Clone)]
@@ -26,12 +24,10 @@ impl StateProcessingHandler for MidfielderCrossingState {
             ));
         }
 
-        // CORNER SET-UP HOLD: on our corner, hold the delivery until the
-        // box is loaded (centre-backs need ~1-2s to sprint up) or the
-        // set-up window expires — otherwise the cross goes in 5 ticks,
-        // before any CB can arrive to attack it.
+        // CORNER SET-UP HOLD: wait until ≥2 runners have reached their zones
+        // (or the setup window expires) so the delivery has a live target.
         if ctx.ball().is_team_attacking_corner()
-            && !box_loaded_for_corner(ctx)
+            && !corner_box_loaded(ctx)
             && ctx.in_state_time < CORNER_SETUP_MAX
         {
             return None;
@@ -39,17 +35,35 @@ impl StateProcessingHandler for MidfielderCrossingState {
 
         // After windup time, deliver the cross
         if ctx.in_state_time > CROSS_EXECUTION_TIME {
-            // Find a target in the box
-            if let Some(target) = self.find_cross_target(ctx) {
-                #[cfg(feature = "match-logs")]
-                if ctx.ball().is_team_attacking_corner() {
-                    use std::sync::atomic::Ordering;
-                    use crate::r#match::player::strategies::common::players::ops::forward_shot_decision::mid_run_diag;
-                    mid_run_diag::CORNER_CROSS_SENT.fetch_add(1, Ordering::Relaxed);
-                    if target.tactical_positions.is_central_defender() {
-                        mid_run_diag::CORNER_CROSS_TO_CB.fetch_add(1, Ordering::Relaxed);
+            if ctx.ball().is_team_attacking_corner() {
+                // Zone-based corner delivery: ball goes to the zone centre.
+                let zone_rotation = ((ctx.context.total_match_time / 2000) % 3) as u8;
+                if let Some((receiver_id, zone_target)) = pick_corner_delivery(ctx, zone_rotation) {
+                    #[cfg(feature = "match-logs")]
+                    {
+                        use std::sync::atomic::Ordering;
+                        use crate::r#match::player::strategies::common::players::ops::forward_shot_decision::mid_run_diag;
+                        mid_run_diag::CORNER_CROSS_SENT.fetch_add(1, Ordering::Relaxed);
                     }
+                    return Some(StateChangeResult::with_midfielder_state_and_event(
+                        MidfielderState::Running,
+                        Event::PlayerEvent(PlayerEvent::PassTo(
+                            PassingEventContext::new()
+                                .with_from_player_id(ctx.player.id)
+                                .with_to_player_id(receiver_id)
+                                .with_pass_target(zone_target)
+                                .with_reason("MID_CORNER")
+                                .build(ctx),
+                        )),
+                    ));
                 }
+                return Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::Passing,
+                ));
+            }
+
+            // Open-play cross: use the original target-selection logic.
+            if let Some(target) = self.find_cross_target(ctx) {
                 return Some(StateChangeResult::with_midfielder_state_and_event(
                     MidfielderState::Running,
                     Event::PlayerEvent(PlayerEvent::PassTo(
@@ -62,7 +76,6 @@ impl StateProcessingHandler for MidfielderCrossingState {
                 ));
             }
 
-            // No target found — fall back to generic passing
             return Some(StateChangeResult::with_midfielder_state(
                 MidfielderState::Passing,
             ));
@@ -130,8 +143,11 @@ impl MidfielderCrossingState {
                 })
                 .count();
 
-            // Skip crosses with 2+ opponents directly in the path
-            if opponents_in_path >= 2 {
+            // Skip crosses with 2+ opponents directly in the path.
+            // Exception: on a corner the delivery is lofted over them — the aerial
+            // ball rises above the 2.5u interception gate in interactions.rs, so
+            // ground-lane crowding is irrelevant for set-piece deliveries.
+            if opponents_in_path >= 2 && !ctx.ball().is_team_attacking_corner() {
                 continue;
             }
 

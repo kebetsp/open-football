@@ -188,6 +188,7 @@ pub struct MatchResultRaw {
     pub right_team_players: FieldSquad,
 
     pub match_time_ms: u64,
+    pub second_half_start_ms: u64,
     pub additional_time_ms: u64,
 
     pub player_stats: HashMap<u32, PlayerMatchEndStats>,
@@ -239,6 +240,7 @@ impl Clone for MatchResultRaw {
             left_team_players: self.left_team_players.clone(),
             right_team_players: self.right_team_players.clone(),
             match_time_ms: self.match_time_ms,
+            second_half_start_ms: self.second_half_start_ms,
             additional_time_ms: self.additional_time_ms,
             player_stats: self.player_stats.clone(),
             substitutions: self.substitutions.clone(),
@@ -262,6 +264,7 @@ impl MatchResultRaw {
             left_team_players: FieldSquad::new(),
             right_team_players: FieldSquad::new(),
             match_time_ms,
+            second_half_start_ms: 0,
             additional_time_ms: 0,
             player_stats: HashMap::new(),
             substitutions: Vec::new(),
@@ -283,6 +286,7 @@ impl MatchResultRaw {
             left_team_players: self.left_team_players.clone(),
             right_team_players: self.right_team_players.clone(),
             match_time_ms: self.match_time_ms,
+            second_half_start_ms: self.second_half_start_ms,
             additional_time_ms: self.additional_time_ms,
             player_stats: self.player_stats.clone(),
             substitutions: self.substitutions.clone(),

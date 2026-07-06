@@ -136,8 +136,12 @@ pub fn handle_goal_reset(field: &mut MatchField, context: &mut MatchContext) {
     // against a fully SET defense, which is the realism point: the
     // engine's freshly-reset formations were measurably easy to attack
     // and goals begat goals through that window.
+    // The replay frontend snaps players to formation instantly on the
+    // large time gap, so the dead ball only needs to be long enough to
+    // let the engine settle formations before play resumes. 3–5 s gives
+    // a natural 1–2 real-second pause at replay speed before kickoff.
     context.dead_ball_until_ms =
-        context.total_match_time + context.rng.range_u64(45, 75) * 1000;
+        context.total_match_time + context.rng.range_u64(3, 6) * 1000;
     // The side kicking off after a goal IS the side that just conceded.
     // Mark them so the forward shot-decision dampens willingness in the
     // ~1-minute post-concede window — breaks the equalizer cascade that

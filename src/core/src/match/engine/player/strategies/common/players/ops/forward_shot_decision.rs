@@ -318,16 +318,17 @@ pub fn evaluate_forward_shot_decision(
     }
 
     let distance = ctx.ball().distance_to_opponent_goal();
-    // Anything beyond the absolute long-range cap is hopeless even
-    // for elite long-shooters — keep the ball.
-    if distance > 110.0 {
+    // Absolute long-range cap — must match the calling states' max_shot_distance (160u).
+    // Raised from 160u: xG floor (min_xg ~0.032–0.050) naturally suppresses most
+    // attempts beyond ~15m; hard cap only prevents truly unrealistic open-play shots.
+    if distance > 220.0 {
         #[cfg(feature = "match-logs")]
         helper_diag::HOLD_FAR.fetch_add(1, Ordering::Relaxed);
         return ShotDecision::Hold;
     }
 
     let skills = &ctx.player.skills;
-    let minute = sc::minute_from_ms(ctx.context.total_match_time);
+    let _minute = sc::minute_from_ms(ctx.context.total_match_time);
     // Unified shot profile — single source of truth for execution_skill,
     // selection_skill, body_control, poor_penalty, etc. The
     // `shooting().shot_profile()` helper builds this from the same
@@ -337,23 +338,10 @@ pub fn evaluate_forward_shot_decision(
     let profile = shooting_ops.shot_profile();
     let selection = profile.selection_skill;
     let execution_skill = profile.execution_skill;
-    let composure_skill = profile.composure_skill;
-    let body_control = profile.body_control;
     let _poor_penalty = profile.poor_penalty;
     let pressure_penalty = profile.pressure_penalty;
     let low_condition_penalty = profile.low_condition_penalty;
 
-    let tech = sc::EffActionContext::technical(minute);
-    let mental = sc::EffActionContext::mental(minute);
-    // A few raw-band reads still drive 1v1 cool-headedness; routed
-    // through effective_skill so fatigue applies.
-    let _finishing = sc::n(sc::eff(ctx.player, tech, |p| p.skills.technical.finishing));
-    let composure = sc::n(sc::eff(ctx.player, mental, |p| p.skills.mental.composure));
-    let _technique = (skills.technical.technique / 20.0).clamp(0.0, 1.0);
-    let first_touch = sc::n(sc::eff(ctx.player, tech, |p| {
-        p.skills.technical.first_touch
-    }));
-    let decisions = sc::n(sc::eff(ctx.player, mental, |p| p.skills.mental.decisions));
 
     // ── xG quality ────────────────────────────────────────────────────
     // Pre-shot xG (matches `handle_shoot_event`'s formula). Low-xG
@@ -433,6 +421,14 @@ pub fn evaluate_forward_shot_decision(
     if !inside_six && xg < min_xg {
         #[cfg(feature = "match-logs")]
         helper_diag::HOLD_XG.fetch_add(1, Ordering::Relaxed);
+        // Inside the penalty area, the forward should lay off rather than
+        // keep running toward the keeper — that's what causes the
+        // "sprint straight into GK" bug. Pass lets the Passing state pick
+        // the best outlet; outside the box, Hold is still correct (the
+        // player can still find a shooting lane by running wider).
+        if distance <= 36.0 {
+            return ShotDecision::Pass;
+        }
         return ShotDecision::Hold;
     }
     if inside_six && xg < (inside_six_floor.min(min_xg)) {
@@ -442,47 +438,17 @@ pub fn evaluate_forward_shot_decision(
     }
 
     // ── Clear shot ────────────────────────────────────────────────────
-    let clarity = ctx.player().shot_clarity();
-    if !ctx.player().has_clear_shot() && !inside_six {
+    // Inside the penalty area (≤36u) we shoot even without a clear lane —
+    // a charging GK IS in the shot lane at close range but that is exactly
+    // when you must fire, not hold. The clear-shot gate is only meaningful
+    // for longer-range attempts where a defender blocking the angle matters.
+    let _clarity = ctx.player().shot_clarity();
+    if !ctx.player().has_clear_shot() && distance > 36.0 {
         #[cfg(feature = "match-logs")]
         helper_diag::HOLD_NO_CLEAR.fetch_add(1, Ordering::Relaxed);
         return ShotDecision::Hold;
     }
 
-    // ── Sprint / balance penalty ──────────────────────────────────────
-    // Approximates body control after a sprint. After
-    // `RunningInBehind`, `in_state_time` reflects how many ticks the
-    // forward has been at full pace; physical attributes plus
-    // first-touch / composure / agility approximate body balance.
-    let physical_balance = (skills.physical.strength / 20.0
-        + skills.physical.agility / 20.0
-        + first_touch
-        + composure)
-        / 4.0;
-    let in_state = ctx.in_state_time as f32;
-    let sprinting = in_state.min(120.0) / 120.0; // 0..1 over a long sprint
-    // Low-balance sprinters lose up to 35% of willingness; well-balanced
-    // forwards lose <5%.
-    let balance_factor = (1.0 - sprinting * (0.45 - physical_balance * 0.40)).clamp(0.55, 1.0);
-
-    // ── GK / 1v1 context ──────────────────────────────────────────────
-    // 1v1: keeper close means GREAT chance, but composure + first touch
-    // matter more. A panicked Composure-8 striker against a closing
-    // keeper still squanders most 1v1s in real football.
-    let gk_proximity = if let Some(gk) = ctx.players().opponents().goalkeeper().next() {
-        let d = (gk.position - ctx.player.position).magnitude();
-        if d < 25.0 && distance < 70.0 {
-            // 1v1 — apply skill-graded conversion bias rather than a
-            // flat bonus. (Composure + first touch + decisions) governs
-            // whether the striker keeps cool.
-            let cool = (composure + first_touch + decisions) / 3.0;
-            (0.55 + cool * 0.55).clamp(0.55, 1.10)
-        } else {
-            1.0
-        }
-    } else {
-        1.10
-    };
 
     // ── Pass-vs-shot EV ───────────────────────────────────────────────
     // Cheap version of the comparison done in Running's full decision
@@ -539,11 +505,35 @@ pub fn evaluate_forward_shot_decision(
     let margin = SkillCurve::new(skills.mental.teamwork, 12.0, 0.6).lerp(0.10, 0.02);
     // Cap pass EV so a fantasy cutback doesn't talk us out of a real shot.
     let capped_pass_ev = best_pass_ev.min(0.55);
+    // True tap-in range (≤24u): bypass pass-EV entirely — the forward
+    // should almost always shoot from here regardless of nearby teammates.
     let point_blank = distance < 24.0 && xg >= 0.18;
-    if !point_blank && capped_pass_ev > xg + margin {
-        #[cfg(feature = "match-logs")]
-        helper_diag::PASS_DEFERRAL.fetch_add(1, Ordering::Relaxed);
-        return ShotDecision::Pass;
+    if !point_blank {
+        let ev_advantage = capped_pass_ev - (xg + margin);
+        if ev_advantage > 0.0 {
+            // Probabilistic pass: probability scales with how much better
+            // the teammate's chance is relative to our own shot.
+            // Inside the penalty area (< 36u) a shooting instinct caps
+            // the probability — even a clearly better nearby option
+            // doesn't guarantee a lay-off; the forward still shoots most
+            // of the time unless the advantage is large.
+            // Outside the box, decision-making is more rational.
+            //
+            // Examples (inside box, ev_advantage / 0.25, capped 0.65):
+            //   teammate marginally better (+0.04) → ~16% pass, 84% shoot
+            //   teammate clearly better   (+0.12) → ~48% pass, 52% shoot
+            //   teammate much better      (+0.25) → 65% pass, 35% shoot
+            let pass_prob = if distance < 36.0 {
+                (ev_advantage / 0.25).clamp(0.0, 0.65)
+            } else {
+                (ev_advantage / 0.20).clamp(0.0, 0.85)
+            };
+            if ctx.context.rng.unit_f32() < pass_prob {
+                #[cfg(feature = "match-logs")]
+                helper_diag::PASS_DEFERRAL.fetch_add(1, Ordering::Relaxed);
+                return ShotDecision::Pass;
+            }
+        }
     }
 
     // ── Anti-monopoly LAY-OFF ─────────────────────────────────────────
@@ -578,97 +568,31 @@ pub fn evaluate_forward_shot_decision(
         }
     }
 
-    // ── Willingness roll ──────────────────────────────────────────────
-    // Skill-curved willingness — weighted heavily on `selection` so a
-    // smart forward pulls the trigger on the right chance, not just any
-    // chance. Composure and execution add some lift; the rest comes
-    // from chance quality (xg_boost, clarity, body control, GK).
+    // ── Willingness: three-factor timing model ───────────────────────
+    // Willingness answers "when to fire", not "how well".
+    // Execution quality (accuracy, power) is handled by the shot event.
+    // Three factors:
+    //   matchup  — forward skill vs the specific defenders/GK in this
+    //              episode (better than them → more confident to shoot)
+    //   window   — parabolic GK-proximity curve; peaks at the 1v1 sweet
+    //              spot (~25–40u from GK) where the keeper is committed
+    //              but hasn't smothered the angle yet
+    //   closing  — urgency from outfield defenders converging on the
+    //              carrier (window is physically closing, shoot now)
     //
-    // Calibration target: ~13 shots/team/match (real PL average is
-    // 12-14/team, top sides 16-18). Earlier slopes (0.22 / 0.10 / 0.12
-    // + 0.06 base) produced mean willingness ~0.06 across the skill
-    // distribution — strong teams logged 39 shots/match (~3× target)
-    // and equal-skill matches 27/team (~2×). The trim flattens the
-    // skill slope (so strong shooters are less aggressive per chance)
-    // while bumping the base constant so weak shooters keep firing on
-    // tap-in floors. Net per-shot conversion is preserved (xg_boost /
-    // clarity / body_control still scale willingness); only the
-    // per-tick fire rate drops, cutting shot volume to ~17/team at
-    // equal skill and ~22/team for strong sides — matching real PL.
-    // Calibration target: shots/team ~17 (engine-realistic, real PL ~13).
-    // The engine has multiple shot paths (helper + corner headers +
-    // midfielder cutbacks); the helper handles ~80% of shots. The
-    // interception noise gate must stay in place (see
-    // [[interception-load-bearing]]) — over-cutting interceptions
-    // explodes goals via 28→62% on-target.
-    //
-    // Lever: BASE cut applies to every helper call regardless of xG
-    // (line-balance neutral). xg_boost floor preferentially cuts
-    // speculative shots — too aggressive on the floor hits FWDs more
-    // than MIDs and breaks the 58/32/10 line ratio (FWDs take more
-    // speculative shots). Iteration history (2026-06-05):
-    //   G (base 0.012, xg_boost floor 0.20): goals 2.91, line 47/40/13
-    //   H (base 0.018, xg_boost floor 0.42): goals 3.28, line 52/36/12
-    //   I (base 0.012, xg_boost floor 0.30): aiming goals ~2.6, line 55/33/12
-    // Halved across the board (0.013/0.045/0.020/0.025 → below) as the
-    // volume half of the fatigue-normalization rebalance (2026-06-11).
-    // FATIGUE_RATE_MULTIPLIER's order-of-magnitude correction stopped
-    // outfielders from flatlining at the 15% condition floor by minute
-    // 20 — which un-suppressed shot volume for the remaining 70 minutes
-    // and pushed goals/match from 3.3 to 5.3. The willingness trim is
-    // the memory-approved lever for shot volume (NOT the intercept
-    // gate); halving restores ~18 shots/team while keeping the now-flat
-    // xG/shot and goal-timing profile the fatigue fix bought.
-    // Second trim pass (×0.78) after the condition-slope softening and
-    // settle-window extension put goals at 3.41, then a final ×0.9 once
-    // the 600-match validation read 2.97 — lands the total in the
-    // 2.6-2.8 real band at ~18 shots/team.
-    // Third trim (×0.85, 2026-06 regime-neutralization round): gating
-    // score-reactive behavior to the final ~28 minutes un-suppressed
-    // the first hour of play and lifted totals to 3.48 — this rebases
-    // to ~2.9-3.0 at the new flat game-state profile.
-    let base_willingness =
-        0.0038 + selection * 0.0134 + composure_skill * 0.0061 + execution_skill * 0.0077;
-    // xg_boost — floor 0.30 (vs prior 0.50). Mid-range chance with
-    // xG=0.06 gets 0.30 boost (was 0.50 — ~40% reduction). Clear-shot
-    // xG=0.10 gets 0.50 (was 0.50 — no change). High-xG xG≥0.28 gets
-    // 1.40 (cap unchanged). Net effect: speculative low-xG shots cut
-    // ~40%, high-xG kept intact — preserves line balance better than
-    // a deep floor cut.
-    let xg_boost = (xg / 0.20).clamp(0.30, 1.40);
-    let clarity_mult = 0.50 + clarity * 0.50;
-    let body_control_mult = (0.65 + body_control * 0.40).clamp(0.60, 1.05);
-    // Condition slope softened 0.55 → 0.25. Fatigue already hits this
-    // same decision three other ways — the effective-skill composites
-    // inside selection/execution, the shot profile's condition discount
-    // on expected_xg (raising the floor-gate kill rate), and the
-    // balance factor — so a steep willingness slope made tired players
-    // stop ATTEMPTING shots entirely, which is why engine scoring
-    // decayed across the match (25%→11% per band) while real football
-    // RISES late (~11%→26%): in reality tired strikers keep shooting
-    // and finish worse (already modeled via execution), while tired
-    // defenders give up better chances. Keep a mild attempt penalty,
-    // let the execution-side fatigue do the realistic damage.
-    let condition_mult = (1.0 - low_condition_penalty * 0.25).clamp(0.40, 1.05);
-    let gk_context_mult = gk_proximity;
-    // Marginal-chance gate: when xg < min_xg + 0.05 a high-selection
-    // player damps willingness; a low-selection player lifts it.
-    let marginal = (xg < min_xg + 0.05) as i32 as f32;
-    let selection_marginal_adj = marginal * (0.5 - selection) * 0.20;
-    let mut willingness = base_willingness
-        * xg_boost
-        * clarity_mult
-        * body_control_mult
-        * condition_mult
-        * gk_context_mult
-        * balance_factor
-        * (1.0 + selection_marginal_adj);
-    if inside_six {
-        // Inside-six floor scales with execution_skill so a 5/20
-        // player floors near 0.15, not 0.30.
-        let inside_six_will_floor = (0.10 + execution_skill * 0.30).clamp(0.10, 0.45);
-        willingness = willingness.max(inside_six_will_floor);
-    }
+    // Base floor is flat — a forward of any skill level pulls the
+    // trigger on a clear chance; skill differences show up in the
+    // matchup ratio and in shot execution, not in hesitation.
+    let base_floor = 0.012_f32;
+    let matchup  = shot_matchup_factor(ctx, distance);
+    let window   = shot_optimal_window(ctx, distance);
+    let closing  = shot_window_closing(ctx);
+    let mut willingness = base_floor * matchup * window * closing;
+    // Suppress the usual close-range clarity requirement: inside the box
+    // the clear-shot gate is already bypassed, so `clarity` isn't
+    // consulted there. Outside the box the gate already filtered this
+    // path, so we don't double-count it in willingness.
+    // (close-range floors applied post-scale below, after all dampeners)
 
     // ── Shot-share dampener (anti-monopoly) ───────────────────────────
     // The engine funnels nearly every chance to whichever forward is
@@ -763,16 +687,65 @@ pub fn evaluate_forward_shot_decision(
     // volume + zero skill penalties above 80% condition), so the
     // feel-out suppression carries more of the early-goal correction
     // than before.
-    let settle_window: u64 = 900_000;
+    // Gaffer game uses 10-minute matches; scale settle window proportionally
+    // (original 900s / 9 ≈ 100s). 1 minute settle leaves 9 minutes of active play.
+    let settle_window: u64 = 60_000;
     if ctx.context.total_match_time < settle_window {
         let progress = ctx.context.total_match_time as f32 / settle_window as f32;
         willingness *= 0.30 + 0.70 * progress;
     }
 
+    // Gaffer uses 10-minute matches (1/9 the ticks of the calibrated
+    // 90-min engine). Boost willingness so forwards shoot at a realistic
+    // rate despite seeing fewer possession cycles per half.
+    willingness *= 4.0;
+
+    // Post-scale close-range floors — applied AFTER all dampeners (settle
+    // window, post-goal modifiers) and the ×4 Gaffer multiplier so no
+    // combination of suppressors can drive a forward's close-range
+    // willingness back to near zero. Previously these floors sat pre-scale
+    // and were cut by the settle window (×0.30 at kick-off) + recent-
+    // concede (×0.78), which recreated the "runs into GK" bug under
+    // normal game conditions.
+    //
+    // The 18-36u floor was raised from 0.20-0.25 → 0.50-0.55 so a
+    // viable box shot fires within ~2 ticks rather than ~5. The 5-tick
+    // window left enough time for a sprinting forward to run visibly
+    // into the GK before firing. Low-xG inside-the-box scenarios are
+    // now routed to Pass (see xG gate above) rather than Hold, so the
+    // floor only applies to shots that cleared the xG gate anyway.
+    //
+    // Target rates per tick (guaranteed minimums):
+    //   ≤18u (tap-in):         0.40-0.50 → shoot within 2-3 ticks
+    //   18-36u (penalty area): 0.50-0.55 → shoot within 1-2 ticks
+    if inside_six {
+        let floor = (0.40 + execution_skill * 0.10).clamp(0.40, 0.50);
+        willingness = willingness.max(floor);
+    } else if distance <= 36.0 {
+        // Raised from 0.20-0.25 to 0.50-0.55: once xG clears the gate
+        // (any viable shot inside the box), the player fires within ~2 ticks
+        // instead of ~5. The 5-tick window was long enough for a sprinting
+        // forward to run several units toward the keeper — the visual
+        // "runs straight into GK" problem.
+        let floor = (0.50 + execution_skill * 0.05).clamp(0.50, 0.55);
+        willingness = willingness.max(floor);
+    }
+
     // Cap trimmed 0.48/0.60 → 0.34/0.44. Floor dropped 0.012 → 0.006,
     // then halved with the base coefficients (→ 0.003) so the floor
     // doesn't swallow the global trim for low-willingness rolls.
-    let cap = if xg >= 0.35 { 0.44 } else { 0.34 };
+    // Inside the penalty area (≤36u), cap raised to 0.60 so the
+    // close-range floors (0.50-0.55 for 18-36u, 0.40-0.50 for ≤18u)
+    // are not stripped back by the mid-range ceilings calibrated for
+    // open-play long shots. The open-play cap targets apply unchanged
+    // from 36u out.
+    let cap = if distance <= 36.0 {
+        0.60
+    } else if xg >= 0.35 {
+        0.44
+    } else {
+        0.34
+    };
     willingness = willingness.clamp(0.0021, cap);
 
     #[cfg(feature = "match-logs")]
@@ -794,6 +767,152 @@ pub fn evaluate_forward_shot_decision(
     } else {
         ShotDecision::Hold
     }
+}
+
+// ── Three-factor willingness helpers ─────────────────────────────────────
+
+/// Relative matchup: how much better or worse is the forward compared to the
+/// defenders and GK actually involved in this episode?
+///
+/// Only players within 40u (active closers) count — a strong centre-back
+/// sitting 80u away isn't in the episode. GK weight shifts toward 1.0 as
+/// the forward gets closer to goal (close in: GK is the primary obstacle;
+/// far out: outfield defenders matter more).
+///
+/// Returns a multiplier [0.35, 2.0]:
+///   1.0  — equally matched
+///   > 1  — forward is better → more willing to shoot from here
+///   < 1  — defense is better → needs a cleaner look before firing
+fn shot_matchup_factor(ctx: &StateProcessingContext, distance: f32) -> f32 {
+    let s = &ctx.player.skills;
+    let fwd = (s.technical.finishing
+        + s.technical.technique
+        + s.mental.composure
+        + s.mental.decisions)
+        / (4.0 * 20.0);
+
+    let gk_skill = ctx
+        .players()
+        .opponents()
+        .goalkeeper()
+        .next()
+        .and_then(|g| ctx.context.players.by_id(g.id))
+        .map(|g| {
+            (g.skills.goalkeeping.reflexes
+                + g.skills.goalkeeping.handling
+                + g.skills.goalkeeping.one_on_ones)
+                / (3.0 * 20.0)
+        })
+        .unwrap_or(0.5);
+
+    let gk_id = ctx
+        .players()
+        .opponents()
+        .goalkeeper()
+        .next()
+        .map(|g| g.id);
+
+    let mut def_sum = 0.0_f32;
+    let mut def_n = 0u32;
+    for opp in ctx.players().opponents().nearby(40.0) {
+        if Some(opp.id) == gk_id {
+            continue;
+        }
+        if let Some(p) = ctx.context.players.by_id(opp.id) {
+            def_sum += (p.skills.technical.marking
+                + p.skills.technical.tackling
+                + p.skills.mental.positioning
+                + p.skills.mental.anticipation)
+                / (4.0 * 20.0);
+            def_n += 1;
+        }
+    }
+
+    // Close to goal → GK dominates; far → outfield defenders matter more.
+    let gk_w = if distance <= 45.0 {
+        0.75
+    } else if distance <= 80.0 {
+        0.55
+    } else {
+        0.35
+    };
+    let avg_def = if def_n > 0 {
+        def_sum / def_n as f32
+    } else {
+        gk_skill
+    };
+    let defense = gk_w * gk_skill + (1.0 - gk_w) * avg_def;
+
+    let ratio = fwd / defense.max(0.05);
+    ratio.powf(0.6_f32).clamp(0.35, 2.0)
+}
+
+/// Parabolic GK-proximity window: peak at ~25–40u from GK (~3–5m), the
+/// classic 1v1 sweet spot where the keeper has committed but hasn't yet
+/// closed the angle. Shooting earlier sacrifices angle; shooting later
+/// the keeper can smother or grab.
+///
+/// For shots from > 80u, GK timing is secondary (long-range decision is
+/// driven by xG and matchup, not keeper position) → returns flat 1.0.
+fn shot_optimal_window(ctx: &StateProcessingContext, distance: f32) -> f32 {
+    if distance > 80.0 {
+        return 1.0;
+    }
+    let gk_dist = ctx
+        .players()
+        .opponents()
+        .goalkeeper()
+        .next()
+        .map(|g| (g.position - ctx.player.position).magnitude())
+        .unwrap_or(200.0);
+
+    // > 75u  : 0.70 — far, advancing strongly improves position
+    // 75→50u : 0.70→1.50 — approaching the window
+    // 50→35u : 1.50→2.50 — entering sweet spot
+    // 35→22u : 2.50       — peak zone
+    // 22→12u : 2.50→0.50 — window closing fast (keeper commits)
+    // < 12u  : 0.50→0.20 — keeper can smother
+    if gk_dist >= 75.0 {
+        0.70
+    } else if gk_dist >= 50.0 {
+        let t = (75.0 - gk_dist) / 25.0;
+        0.70 + t * 0.80
+    } else if gk_dist >= 35.0 {
+        let t = (50.0 - gk_dist) / 15.0;
+        1.50 + t * 1.00
+    } else if gk_dist >= 22.0 {
+        2.50
+    } else if gk_dist >= 12.0 {
+        let t = (gk_dist - 12.0) / 10.0;
+        0.50 + t * 2.00
+    } else {
+        let t = gk_dist / 12.0;
+        0.20 + t * 0.30
+    }
+}
+
+/// Window-closing urgency: outfield defenders converging on the carrier.
+/// Each nearby opponent contributes proportionally to their proximity —
+/// a defender at 5u is nearly closing the window; one at 35u is a mild
+/// pressure. GK excluded (handled by `shot_optimal_window`).
+///
+/// Returns a multiplier [1.0, 1.8].
+fn shot_window_closing(ctx: &StateProcessingContext) -> f32 {
+    let gk_id = ctx
+        .players()
+        .opponents()
+        .goalkeeper()
+        .next()
+        .map(|g| g.id);
+    let mut acc = 0.0_f32;
+    for opp in ctx.players().opponents().nearby(40.0) {
+        if Some(opp.id) == gk_id {
+            continue;
+        }
+        let dist = (opp.position - ctx.player.position).magnitude();
+        acc += ((1.0 - dist / 40.0) * 0.30).max(0.0);
+    }
+    1.0 + acc.min(0.80)
 }
 
 /// Find a central midfielder arriving unmarked in a shooting position —

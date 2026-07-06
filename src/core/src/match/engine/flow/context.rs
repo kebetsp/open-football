@@ -221,6 +221,11 @@ pub struct MatchContext {
     /// active roster changes (sub / red card / formation swap).
     pub skill_aggregates_dirty: bool,
 
+    /// total_match_time when the second half kicked off. Set in
+    /// handle_state_finish(HalfTime) and surfaced via MatchResultRaw
+    /// so the Gaffer frontend can display 45+/90+ stoppage time correctly.
+    pub second_half_start_ms: u64,
+
     /// Match-owned seedable RNG. Engine decision paths draw from this
     /// (substitution timing, shootout, foul cards, corner contest,
     /// passing / shooting / save / first-touch / tackle rolls, every
@@ -373,6 +378,7 @@ impl MatchContext {
             starting_away_tactic: None,
             home_skill_aggregates: TeamSkillAggregates::neutral(),
             away_skill_aggregates: TeamSkillAggregates::neutral(),
+            second_half_start_ms: 0,
             last_skill_aggregate_tick: 0,
             skill_aggregates_dirty: true,
             rng: MatchRng::from_entropy(),

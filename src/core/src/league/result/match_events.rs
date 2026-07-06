@@ -2393,6 +2393,7 @@ mod canonical_rating_tests {
                 left_team_players: FieldSquad::new(),
                 right_team_players: FieldSquad::new(),
                 match_time_ms: 90 * 60 * 1000,
+                second_half_start_ms: 0,
                 additional_time_ms: 0,
                 player_stats: stats,
                 substitutions: Vec::new(),

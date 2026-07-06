@@ -1,3 +1,6 @@
+pub mod slot_coverage;
+pub use slot_coverage::*;
+
 pub mod defender_skill;
 pub mod defensive;
 pub mod dribble_duel;

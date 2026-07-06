@@ -2,6 +2,7 @@ use crate::IntegerUtils;
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondition};
 use crate::r#match::player::events::PlayerEvent;
+use crate::r#match::player::strategies::common::players::ops::slot_coverage::find_vacant_midfielder_slot;
 use crate::r#match::{
     ConditionContext, PlayerDistanceFromStartPosition, StateChangeResult, StateProcessingContext,
     StateProcessingHandler, SteeringBehavior, VectorExtensions,
@@ -129,6 +130,19 @@ impl StateProcessingHandler for DefenderWalkingState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        // Step into midfield if no midfielder is contesting the ball in centre
+        if let Some(slot_target) = find_vacant_midfielder_slot(ctx) {
+            return Some(
+                SteeringBehavior::Arrive {
+                    target: slot_target,
+                    slowing_distance: 30.0,
+                }
+                .calculate(ctx.player)
+                .velocity
+                    * 0.7, // Controlled pace — defender shouldn't sprint into midfield
+            );
+        }
+
         // Check if player should follow waypoints
         if ctx.player.should_follow_waypoints(ctx) {
             let waypoints = ctx.player.get_waypoints_as_vectors();

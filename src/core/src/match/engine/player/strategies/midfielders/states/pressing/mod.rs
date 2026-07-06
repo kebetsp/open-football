@@ -39,10 +39,10 @@ impl StateProcessingHandler for MidfielderPressingState {
             ));
         }
 
-        // Opponent GK holds ball in hands — can't challenge, back off
-        if ctx.ball().is_held_by_opponent_goalkeeper() {
+        // Opponent restart (GK holding or goal kick) — retreat to start position.
+        if ctx.ball().is_opponent_restart() {
             return Some(StateChangeResult::with_midfielder_state(
-                MidfielderState::Running,
+                MidfielderState::Returning,
             ));
         }
 

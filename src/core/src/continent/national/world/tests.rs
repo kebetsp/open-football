@@ -269,6 +269,7 @@ fn synth_match_result(home_score: u8, away_score: u8, scorer_id: Option<u32>) ->
         left_team_players: FieldSquad::new(),
         right_team_players: FieldSquad::new(),
         match_time_ms: 5_400_000,
+        second_half_start_ms: 0,
         additional_time_ms: 0,
         player_stats,
         substitutions: Vec::new(),

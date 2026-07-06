@@ -145,7 +145,7 @@ pub mod tackle_stats {
 // Realistic shooting distances (field is 840 units)
 // Real football: most goals scored from within 18m (~36 units)
 #[allow(dead_code)]
-const MAX_SHOOTING_DISTANCE: f32 = 90.0; // ~45m - absolute max for elite long shots
+const MAX_SHOOTING_DISTANCE: f32 = 220.0; // ~27m — xG floor suppresses attempts beyond ~15m; hard cap only for beyond realistic open-play range
 #[allow(dead_code)]
 const MIN_SHOOTING_DISTANCE: f32 = 5.0;
 const POINT_BLANK_DISTANCE: f32 = 36.0; // ~18m — inside-the-box strike. Below this, the
@@ -174,6 +174,13 @@ pub struct ForwardRunningState {}
 
 impl StateProcessingHandler for ForwardRunningState {
     fn process(&self, ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        // Opponent restart (GK holding or goal kick) — retreat immediately.
+        if !ctx.player.has_ball(ctx) && ctx.ball().is_opponent_restart() {
+            return Some(StateChangeResult::with_forward_state(
+                ForwardState::Returning,
+            ));
+        }
+
         // Offside discipline — if we don't have the ball, we're not
         // currently pressing the carrier, and we're stranded past the
         // opposing defensive line, drop back. Standing/Walking check
@@ -202,6 +209,15 @@ impl StateProcessingHandler for ForwardRunningState {
             // Corner taker: set the corner up via Crossing (which holds the
             // delivery until centre-backs have pushed up to attack it).
             if ctx.ball().is_team_attacking_corner() {
+                return Some(StateChangeResult::with_forward_state(
+                    ForwardState::Crossing,
+                ));
+            }
+
+            // Byline crossing: player has drifted wide near the goal line.
+            // Shooting angle is too narrow — deliver a cross into the box
+            // instead of continuing to dribble toward the near post.
+            if self.should_cross_from_byline(ctx) {
                 return Some(StateChangeResult::with_forward_state(
                     ForwardState::Crossing,
                 ));
@@ -468,7 +484,7 @@ impl StateProcessingHandler for ForwardRunningState {
             // shot is good. Skill-stratified caps double-punished low-fin
             // strikers (penalised by xG already and by willingness, then
             // additionally vetoed by a hard distance cap).
-            let max_shot_distance = 90.0f32;
+            let max_shot_distance = 220.0f32;
             // GAME-MANAGEMENT SHOT SUPPRESSION (PRIO 0.5 only). The
             // unified helper does NOT scale by gm_intensity — that's a
             // tempo decision the coach makes, not the helper's
@@ -780,8 +796,13 @@ impl StateProcessingHandler for ForwardRunningState {
                 }
             }
 
-            // Under pressure - quick decision needed
-            if ctx.player().pressure().is_under_immediate_pressure() {
+            // Under pressure - quick decision needed.
+            // Guard: if ALL nearby opponents are behind the carrier
+            // (chasing from their own half), keep running forward —
+            // passing backward into a chaser immediately loses the ball.
+            if ctx.player().pressure().is_under_immediate_pressure()
+                && !self.pressure_only_from_behind(ctx)
+            {
                 if self.should_pass_under_pressure(ctx) {
                     return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
                 } else if self.can_dribble_out_of_pressure(ctx) {
@@ -857,6 +878,16 @@ impl StateProcessingHandler for ForwardRunningState {
                 ));
             }
 
+            // Corner set-piece: take assigned zone position before any other priority.
+            if ctx.ball().is_team_attacking_corner() {
+                use crate::r#match::player::strategies::common::set_pieces::player_corner_zone;
+                if player_corner_zone(ctx).is_some() {
+                    return Some(StateChangeResult::with_forward_state(
+                        ForwardState::CornerRun,
+                    ));
+                }
+            }
+
             // Priority 0.5: Aerial ball approaching — head it
             if ctx.tick_context.positions.ball.position.z >= 1.5
                 && ctx.ball().is_towards_player_with_angle(0.5)
@@ -892,6 +923,23 @@ impl StateProcessingHandler for ForwardRunningState {
                 return Some(StateChangeResult::with_forward_state(
                     ForwardState::Pressing,
                 ));
+            }
+
+            // Priority 2.5: Attacking-third crowding prevention. When
+            // we're already within 80u of the opponent goal without the
+            // ball and the team has possession, go straight to
+            // CreatingSpace so find_optimal_free_zone() picks an open
+            // angle (near post, far post, cutback spot) instead of the
+            // velocity slot system pulling us toward the goal mouth.
+            // Fixes multiple forwards bunching on the goalkeeper.
+            if ctx.team().is_control_ball() {
+                let dist_to_opp_goal =
+                    (ctx.player().opponent_goal_position() - ctx.player.position).magnitude();
+                if dist_to_opp_goal < 80.0 {
+                    return Some(StateChangeResult::with_forward_state(
+                        ForwardState::CreatingSpace,
+                    ));
+                }
             }
 
             // Priority 3: Create space when team has possession
@@ -1179,6 +1227,28 @@ impl ForwardRunningState {
         None
     }
 
+    /// True when the player is wide near the opponent's goal line and the
+    /// shooting angle is too narrow to be useful — they should cross instead.
+    fn should_cross_from_byline(&self, ctx: &StateProcessingContext) -> bool {
+        let field_height = ctx.context.field_size.height as f32;
+        let y = ctx.player.position.y;
+        let wide_margin = field_height * 0.20; // same threshold as CrossingState
+
+        // Must be in the wide/byline zone
+        if !(y < wide_margin || y > field_height - wide_margin) {
+            return false;
+        }
+
+        // Must be close enough to the opponent goal to justify a cross
+        let dist_to_goal = ctx.ball().distance_to_opponent_goal();
+        if dist_to_goal > 130.0 || dist_to_goal < 15.0 {
+            return false;
+        }
+
+        // Need a few ticks of control — don't cross on first reception
+        ctx.in_state_time >= 5
+    }
+
     /// Check if there's open space ahead toward the opponent goal
     fn has_open_space_ahead(&self, ctx: &StateProcessingContext) -> bool {
         let player_pos = ctx.player.position;
@@ -1233,6 +1303,28 @@ impl ForwardRunningState {
         let has_space = self.find_dribbling_space(ctx).is_some();
 
         skill_factor > 0.5 && has_space
+    }
+
+    /// Returns true when every nearby pressuring opponent is BEHIND the carrier
+    /// (between the carrier and their own goal). In that case keep running —
+    /// passing backward goes straight to the chasing defender.
+    fn pressure_only_from_behind(&self, ctx: &StateProcessingContext) -> bool {
+        let player_pos = ctx.player.position;
+        let goal_pos = ctx.player().opponent_goal_position();
+        let to_goal = (goal_pos - player_pos).normalize();
+
+        let mut found_any = false;
+        for opp in ctx.players().opponents().nearby(20.0) {
+            found_any = true;
+            let to_opp = (opp.position - player_pos).normalize();
+            // dot > 0 ⟹ opponent is ahead of carrier (toward goal) → real blocker
+            if to_opp.dot(&to_goal) > 0.0 {
+                return false;
+            }
+        }
+
+        // Only suppress the pass gate if there is at least one chaser
+        found_any
     }
 
     /// Find space to dribble into
@@ -1403,55 +1495,23 @@ impl ForwardRunningState {
 
     /// Determine if should create space
     fn should_create_space(&self, ctx: &StateProcessingContext) -> bool {
-        // Ball carrier doesn't create space — they MOVE with the ball.
-        let ball_distance = ctx.ball().distance();
-        if ball_distance < 5.0 {
+        // Ball carrier moves with the ball — not this state.
+        if ctx.ball().distance() < 5.0 {
             return false;
         }
 
-        // Teammate has the ball: the primary trigger for space creation.
-        // Real football: the WHOLE attacking unit spreads to open passing
-        // lanes and stretch the defence. Previously this only fired when
-        // I was >60u from the ball, which meant close forwards stayed
-        // huddled around the carrier instead of making the diagonal runs
-        // that create triangles.
+        // Any teammate has possession: find space. No distance condition —
+        // a forward without the ball should always be spreading and making
+        // runs regardless of where they are on the pitch relative to the ball.
         if let Some(owner_id) = ctx.ball().owner_id() {
             if owner_id != ctx.player.id {
                 if let Some(owner) = ctx.context.players.by_id(owner_id) {
-                    if owner.team_id == ctx.player.team_id {
-                        // Create space whenever we're clustered with
-                        // another forward / any teammate — the exact
-                        // distance to the ball doesn't matter, what
-                        // matters is whether we're bunched.
-                        let me_pos = ctx.player.position;
-                        let bunched = ctx.players().teammates().all().any(|t| {
-                            if t.id == ctx.player.id {
-                                return false;
-                            }
-                            let d_sq = (t.position - me_pos).norm_squared();
-                            d_sq < 22.0 * 22.0 // < ~2.5m
-                        });
-                        if bunched {
-                            return true;
-                        }
-                        // Even without an immediate cluster: if I'm
-                        // reasonably close to the ball (30-150u, the
-                        // "attacking support" band), make a run to pull
-                        // defenders. Carriers need OPTIONS, not another
-                        // nearby body.
-                        return ball_distance > 30.0 && ball_distance < 150.0;
-                    }
+                    return owner.team_id == ctx.player.team_id;
                 }
             }
         }
 
-        // No teammate has ball - still try to create space if we're not closest
-        let closest_to_ball = !ctx.players().teammates().all().any(|t| {
-            let t_dist = (t.position - ctx.tick_context.positions.ball.position).magnitude();
-            t_dist < ball_distance * 0.9
-        });
-
-        !closest_to_ball
+        false
     }
 
     /// Detect counter-attack opportunity (team just won possession, opponents high)
@@ -1818,12 +1878,10 @@ impl ForwardRunningState {
         ctx.players().teammates().nearby(200.0).any(|teammate| {
             let teammate_distance =
                 (teammate.position - ctx.player().opponent_goal_position()).magnitude();
-            // Teammate must be significantly closer (at least 35% closer).
-            // Boundary tightened to 0.65 + `<=` so a teammate exactly
-            // 40% closer (e.g. 24u when we're at 40u) still counts
-            // as a better option — previously the strict < at 0.6
-            // missed that exact boundary case.
-            let is_much_closer = teammate_distance <= own_distance * 0.65;
+            // Teammate must be 45%+ closer (ratio ≤ 0.55). Tightened from 0.65
+            // because a 35% distance advantage (~0.04 xG delta) is not worth
+            // giving up a clear shooting chance.
+            let is_much_closer = teammate_distance <= own_distance * 0.55;
             let has_clear_pass = ctx.player().has_clear_pass(teammate.id);
             let not_heavily_marked = ctx.tick_context.grid.opponents(teammate.id, 8.0).count() < 2;
 

@@ -79,6 +79,22 @@ impl<'b> BallOperationsImpl<'b> {
         }
     }
 
+    /// True when the opponent team has a dead-ball restart: either the GK
+    /// is holding the ball in hand, or a goal kick is in progress. In either
+    /// case attacking players must retreat rather than press.
+    pub fn is_opponent_restart(&self) -> bool {
+        self.is_opponent_goal_kick() || self.is_held_by_opponent_goalkeeper()
+    }
+
+    /// True while the opponent has a goal kick from their own goal area.
+    /// The ball is right at the goal we're attacking (distance < 80u).
+    /// Forwards and midfielders should retreat rather than press the GK.
+    pub fn is_opponent_goal_kick(&self) -> bool {
+        use crate::r#match::PassOriginRestart;
+        self.ctx.tick_context.ball.pass_origin_restart == PassOriginRestart::GoalKick
+            && self.distance_to_opponent_goal() < 80.0
+    }
+
     #[inline]
     pub fn is_in_flight(&self) -> bool {
         self.ctx.tick_context.ball.is_in_flight_state > 0

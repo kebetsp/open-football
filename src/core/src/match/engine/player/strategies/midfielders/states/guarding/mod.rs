@@ -130,7 +130,14 @@ impl StateProcessingHandler for MidfielderGuardingState {
             // Continue guarding from distance
             None
         } else {
-            // No one to guard — go to Running (NOT Returning, which would loop back here)
+            // No guard target nearby. If ball is in our own half, drop back into
+            // defensive block rather than drifting in midfield.
+            if ctx.ball().on_own_side() {
+                return Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::Returning,
+                ));
+            }
+            // Ball still on opponent side — rejoin attack
             Some(StateChangeResult::with_midfielder_state(
                 MidfielderState::Running,
             ))

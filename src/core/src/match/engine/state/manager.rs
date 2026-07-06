@@ -93,7 +93,8 @@ impl StateManager {
                 field.ball.reset();
             }
             MatchState::HalfTime => {
-                // Half-time finished - reset time for second half
+                // Record the exact global timestamp where the second half begins.
+                context.second_half_start_ms = context.total_match_time;
                 context.reset_period_time();
                 field.reset_players_positions();
                 field.ball.reset();

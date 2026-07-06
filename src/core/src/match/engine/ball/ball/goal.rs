@@ -146,18 +146,22 @@ impl Ball {
                 };
 
                 result.add_ball_event(BallEvent::Goal(goal_event_metadata));
+
+                // Kickoff setup and reset only when a valid scoreable goal has
+                // been identified. Previously these ran unconditionally in the
+                // outer `is_goal` branch — so a ball that crossed the line with
+                // both `current_owner` and `previous_owner` None triggered a
+                // full centre-circle restart with no score change (phantom kickoff).
+                self.kickoff_team_side = match goal_side {
+                    GoalSide::Home => Some(PlayerSide::Left),
+                    GoalSide::Away => Some(PlayerSide::Right),
+                };
+                self.goal_scored = true;
+                self.reset();
             }
-
-            // Determine which side should kick off (the conceding team)
-            // Home goal (x=0) = Left side conceded → Left kicks off
-            // Away goal (x=field_width) = Right side conceded → Right kicks off
-            self.kickoff_team_side = match goal_side {
-                GoalSide::Home => Some(PlayerSide::Left),
-                GoalSide::Away => Some(PlayerSide::Right),
-            };
-
-            self.goal_scored = true;
-            self.reset();
+            // No scorer found: skip the reset entirely. Ball stays live;
+            // check_wide_of_goal / check_over_goal on the next tick resolve
+            // it as a goal kick.
         }
     }
 
@@ -218,6 +222,8 @@ impl Ball {
             self.record_touch(gk_id, gk_team, self.current_tick_cached, true);
 
             events.add_ball_event(BallEvent::Claimed(gk_id));
+            context.dead_ball_until_ms =
+                context.total_match_time + context.rng.range_u64(1, 3) * 1000;
         }
     }
 
@@ -226,7 +232,7 @@ impl Ball {
     /// which team last touched the ball.
     pub(super) fn check_wide_of_goal(
         &mut self,
-        context: &MatchContext,
+        context: &mut MatchContext,
         players: &[MatchPlayer],
         events: &mut EventCollection,
     ) {
@@ -417,6 +423,8 @@ impl Ball {
                         .push((*cb_id, Vector3::new(box_x, y, 0.0)));
                 }
 
+                context.dead_ball_until_ms =
+                    context.total_match_time + context.rng.range_u64(1, 3) * 1000;
                 return;
             }
             // If no eligible outfielder was found, fall through to goal kick
@@ -459,6 +467,8 @@ impl Ball {
             // ownership because the GK was ~35 units away at the goal
             // line when the ball crossed the end line.
             self.pending_set_piece_teleport = Some((gk_id, self.position));
+            context.dead_ball_until_ms =
+                context.total_match_time + context.rng.range_u64(1, 3) * 1000;
         }
     }
 }

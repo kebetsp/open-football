@@ -1485,29 +1485,49 @@ impl PlayerEventDispatcher {
             .map(|p| p.velocity)
             .unwrap_or(Vector3::zeros());
 
-        // Lead pass: target where the receiver will be when the ball
-        // arrives. Ground-pass flight time is `distance * 0.015 * 1.15`
-        // ÷ friction ≈ 70-95 ticks across short/medium passes. Elite
-        // passers predict this correctly; poor passers under- or
-        // over-estimate, so the lead itself is skill-dependent.
+        // Lead pass: aim where the receiver will be when the ball arrives.
         //
-        // Flight-time estimate: we aim `lead_ticks` ahead along the
-        // receiver's current velocity, where `lead_ticks` = a fraction
-        // of true flight time determined by vision + passing quality.
+        // Two bugs in the old implementation caused "pass to nobody":
+        //
+        //  1. flight_time_est = distance * 0.85 was ~2× the true physics
+        //     value (ball decelerates under friction; 100u takes ~42 ticks,
+        //     not 85). This doubled every lead, sending the ball 2× too far.
+        //
+        //  2. The lead used the raw receiver_velocity vector, including
+        //     perpendicular (sideways) movement. A winger running up the
+        //     flank while a midfielder passes across got a target 100+ units
+        //     off to the side — beyond any teammate, often out of bounds.
+        //
+        // Fix 1: physics-correct flight time.
+        //   Ball kinematics: D = V0*(1-(1-F)^T)/F  →  T = ln(1-D*F/V0)/ln(1-F)
+        //   V0=MAX_PASS_VELOCITY=3.2, F=GROUND_FRICTION=0.015 (both from this file)
         let pass_distance_est = (receiver_pos - passer_position).magnitude();
-        let flight_time_est = (pass_distance_est * 0.85).clamp(25.0, 95.0);
-        // Vision = how well we anticipate the receiver's run.
-        // Passing = technical precision on the pass itself.
+        const LEAD_BALL_SPEED: f32 = 3.2;   // matches MAX_PASS_VELOCITY below
+        const LEAD_FRICTION: f32 = 0.015;    // matches GROUND_FRICTION below
+        let clamped_dist = pass_distance_est.min(LEAD_BALL_SPEED / LEAD_FRICTION * 0.90);
+        let range_fraction = (clamped_dist * LEAD_FRICTION / LEAD_BALL_SPEED).clamp(0.0, 0.999);
+        let flight_time_est = ((1.0_f32 - range_fraction).ln()
+            / (1.0_f32 - LEAD_FRICTION).ln())
+            .clamp(8.0, 80.0);
         let anticipation = (skills.vision * 0.6 + skills.passing * 0.4).clamp(0.0, 1.0);
-        // Skilled passers lead fully; poor passers lead most of the way.
-        // Widened base from 0.40 → 0.60 after the pass-accuracy audit
-        // showed average-anticipation passers were under-leading by
-        // enough that receivers arrived at the ball 3-6u short — just
-        // outside the tightest receiver claim windows, enough passes
-        // failed to push team accuracy to 72% instead of the 85% target.
-        let lead_fraction = 0.60 + anticipation * 0.35; // 0.60..0.95
+        let lead_fraction = 0.60 + anticipation * 0.35;
         let lead_ticks = flight_time_est * lead_fraction;
-        let ideal_target = receiver_pos + receiver_velocity * lead_ticks;
+
+        // Fix 2: project receiver velocity onto the pass direction.
+        // Only the component moving away from the passer contributes; a
+        // winger running perpendicular gets zero lead (ball aimed at current
+        // position), a runner going in behind gets the forward lead.
+        // Cap at 40% of pass distance — ball physics can't sustain more than
+        // that for fast runners, so capping prevents passes to unreachable spots.
+        let pass_direction = if pass_distance_est > 1.0 {
+            (receiver_pos - passer_position).normalize()
+        } else {
+            Vector3::zeros()
+        };
+        let velocity_along_pass = receiver_velocity.dot(&pass_direction).max(0.0);
+        let lead_displacement =
+            (velocity_along_pass * lead_ticks).min(pass_distance_est * 0.40);
+        let ideal_target = receiver_pos + pass_direction * lead_displacement;
 
         // Always use passer's position as pass origin — ball position may lag behind
         let pass_origin = passer_position;
@@ -1685,8 +1705,17 @@ impl PlayerEventDispatcher {
             &field.players,
         );
 
-        // Goalkeeper long kicks must always be high arcs (goal kicks from penalty area)
+        // Corner deliveries must arc high so the ball clears the packed penalty box —
+        // interactions.rs gates interception above 2.5u, so a lofted corner bypasses
+        // the ground-level wall of bodies and reaches the aerial contest at the far end.
+        // Open-play crosses keep their contextually-selected trajectory (typically
+        // LowDriven/MediumArc from the box obstacle check) — forcing HighArc on
+        // winger crosses makes them overshoot and look unnatural.
+        let is_corner_delivery =
+            field.ball.pass_origin_restart == PassOriginRestart::Corner && was_cross;
         let trajectory_type = if passer_is_goalkeeper && actual_horizontal_distance > 60.0 {
+            TrajectoryType::HighArc
+        } else if is_corner_delivery && actual_horizontal_distance > 25.0 {
             TrajectoryType::HighArc
         } else {
             trajectory_type
@@ -1702,9 +1731,12 @@ impl PlayerEventDispatcher {
         );
 
         let base_max_z = Self::calculate_max_z_velocity(actual_horizontal_distance, &skills);
-        // Goalkeeper long kicks get a higher z-cap — goal kicks should fly high
+        // Goalkeeper long kicks get a higher z-cap — goal kicks should fly high.
+        // Corner deliveries also get extra lift so the ball reaches the far post.
         let max_z_velocity = if passer_is_goalkeeper && actual_horizontal_distance > 60.0 {
             base_max_z * 1.5
+        } else if is_corner_delivery && actual_horizontal_distance > 25.0 {
+            base_max_z * 1.3
         } else {
             base_max_z
         };

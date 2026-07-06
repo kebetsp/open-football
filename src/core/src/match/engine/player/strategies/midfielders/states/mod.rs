@@ -1,5 +1,6 @@
 pub mod attack_supporting;
 pub mod common;
+pub mod corner_run;
 pub mod creating_space;
 pub mod crossing;
 pub mod distance_shooting;
@@ -21,6 +22,7 @@ pub mod takeball;
 pub mod walking;
 
 pub use attack_supporting::*;
+pub use corner_run::*;
 pub use creating_space::*;
 pub use crossing::*;
 pub use distance_shooting::*;

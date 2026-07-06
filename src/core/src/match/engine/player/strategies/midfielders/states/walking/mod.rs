@@ -1,6 +1,7 @@
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
 use crate::r#match::player::strategies::common::players::MatchPlayerIteratorExt;
+use crate::r#match::player::strategies::common::players::ops::slot_coverage::find_vacant_forward_slot;
 use crate::r#match::{
     ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
     SteeringBehavior,
@@ -18,12 +19,27 @@ impl StateProcessingHandler for MidfielderWalkingState {
             ));
         }
 
+        // Corner set-piece: take assigned zone position.
+        if ctx.ball().is_team_attacking_corner() {
+            use crate::r#match::player::strategies::common::set_pieces::player_corner_zone;
+            if player_corner_zone(ctx).is_some() {
+                return Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::CornerRun,
+                ));
+            }
+        }
+
+        // Opponent goal kick — don't press the GK, let velocity() pull back
+        if ctx.ball().is_opponent_goal_kick() {
+            return None;
+        }
+
         // CRITICAL: Check for opponent with ball first (highest priority)
         // Using new chaining syntax: nearby(100.0).with_ball(ctx)
         if let Some(opponent) = ctx
             .players()
             .opponents()
-            .nearby(100.0)
+            .nearby(60.0)
             .with_ball(ctx)
             .next()
         {
@@ -125,8 +141,11 @@ impl StateProcessingHandler for MidfielderWalkingState {
             ));
         }
 
-        // Midfielders shouldn't walk for long — get back into the action
-        if ctx.in_state_time > 20 {
+        // During possession, hold shape for longer — velocity() uses the
+        // dynamic anchor to keep midfielders in position rather than rushing
+        // toward the ball. When the opponent has the ball, exit quickly.
+        let walk_limit = if ctx.team().is_control_ball() { 120 } else { 20 };
+        if ctx.in_state_time > walk_limit {
             return Some(StateChangeResult::with_midfielder_state(
                 MidfielderState::Running,
             ));
@@ -136,6 +155,29 @@ impl StateProcessingHandler for MidfielderWalkingState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if ctx.ball().is_opponent_goal_kick() {
+            return Some(
+                SteeringBehavior::Arrive {
+                    target: ctx.player.start_position,
+                    slowing_distance: 30.0,
+                }
+                .calculate(ctx.player)
+                .velocity,
+            );
+        }
+
+        // Step into the forward zone if no striker is ahead during attack
+        if let Some(slot_target) = find_vacant_forward_slot(ctx) {
+            return Some(
+                SteeringBehavior::Arrive {
+                    target: slot_target,
+                    slowing_distance: 30.0,
+                }
+                .calculate(ctx.player)
+                .velocity,
+            );
+        }
+
         if ctx.player.should_follow_waypoints(ctx) {
             let waypoints = ctx.player.get_waypoints_as_vectors();
 
@@ -152,16 +194,24 @@ impl StateProcessingHandler for MidfielderWalkingState {
             }
         }
 
-        // Walk toward start position at reduced speed — no random jitter
-        let to_start = ctx.player.start_position - ctx.player.position;
-        let dist = to_start.magnitude();
+        // Dynamic shape anchor: the team block shifts longitudinally with the
+        // ball. Factor 0.15 means a ball 200u ahead of centre shifts the
+        // anchor ~30u forward — enough to feel connected without emptying the
+        // midfield. Works for both attacking directions because the sign of
+        // (ball_x - centre_x) naturally flips when the team defends the other end.
+        let pitch_center_x = ctx.context.field_size.width as f32 / 2.0;
+        let ball_x = ctx.tick_context.positions.ball.position.x;
+        let mut shape_anchor = ctx.player.start_position;
+        shape_anchor.x += (ball_x - pitch_center_x) * 0.15;
+
+        let dist = (shape_anchor - ctx.player.position).magnitude();
         if dist < 5.0 {
             return Some(Vector3::zeros());
         }
 
         Some(
             SteeringBehavior::Arrive {
-                target: ctx.player.start_position,
+                target: shape_anchor,
                 slowing_distance: 30.0,
             }
             .calculate(ctx.player)

@@ -27,9 +27,9 @@ impl StateProcessingHandler for ForwardPressingState {
             return Some(StateChangeResult::with_forward_state(ForwardState::Running));
         }
 
-        // Opponent GK holds ball in hands — can't challenge, retreat
-        if ctx.ball().is_held_by_opponent_goalkeeper() {
-            return Some(StateChangeResult::with_forward_state(ForwardState::Running));
+        // Opponent restart (GK holding or goal kick) — retreat to start position.
+        if ctx.ball().is_opponent_restart() {
+            return Some(StateChangeResult::with_forward_state(ForwardState::Returning));
         }
 
         // Loose ball nearby — go claim it directly instead of pressing thin air

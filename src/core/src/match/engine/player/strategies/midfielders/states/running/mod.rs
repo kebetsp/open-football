@@ -67,6 +67,13 @@ impl StateProcessingHandler for MidfielderRunningState {
             }
         }
 
+        // Opponent restart (GK holding or goal kick) — retreat immediately.
+        if !ctx.player.has_ball(ctx) && ctx.ball().is_opponent_restart() {
+            return Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Returning,
+            ));
+        }
+
         // Phase-first dispatch — midfielders are the engine's pivot
         // between defence and attack, so the phase signal matters most
         // for them. See `phase_dispatch` for behaviour per phase.
@@ -642,29 +649,38 @@ impl StateProcessingHandler for MidfielderRunningState {
                     ));
                 }
 
-                // If ball is in attacking third and we're nearby, make attacking runs
-                if goal_dist < field_width * 0.4 && ball_distance < 300.0 {
+                // Zone-band gate: each midfielder is responsible for a lateral
+                // band centred on their start_position.y (≈136u apart in 4-4-2).
+                // Only the 1–2 midfielders whose band contains the ball should
+                // push into an attacking run; the others hold shape. 100u half-
+                // width gives 64u overlap so there's always at least one
+                // midfielder in zone for any ball position.
+                let ball_y = ctx.tick_context.positions.ball.position.y;
+                let in_lateral_zone =
+                    (ball_y - ctx.player.start_position.y).abs() < 100.0;
+
+                // Only attack when ball is in our lateral zone
+                if goal_dist < field_width * 0.4 && ball_distance < 300.0 && in_lateral_zone {
                     return Some(StateChangeResult::with_midfielder_state(
                         MidfielderState::AttackSupporting,
                     ));
                 }
 
-                // If far from ball, create space to offer a passing option
-                if ball_distance > 200.0 {
+                // Ball is far AND in our zone — offer a passing option
+                if ball_distance > 200.0 && in_lateral_zone {
                     return Some(StateChangeResult::with_midfielder_state(
                         MidfielderState::CreatingSpace,
                     ));
                 }
 
-                // Medium range: actively support (don't just drift)
-                // Require enough time in Running to avoid rapid oscillation with AttackSupporting
-                if ctx.in_state_time > 80 {
+                // Medium range in-zone: actively support after a brief settle
+                if ctx.in_state_time > 80 && in_lateral_zone {
                     return Some(StateChangeResult::with_midfielder_state(
                         MidfielderState::AttackSupporting,
                     ));
                 }
 
-                // First 80 ticks: stay in Running with active velocity
+                // Ball outside our zone — hold shape; velocity() enforces positioning
                 return None;
             }
 
@@ -690,6 +706,16 @@ impl StateProcessingHandler for MidfielderRunningState {
                 return Some(StateChangeResult::with_midfielder_state(
                     MidfielderState::TakeBall,
                 ));
+            }
+
+            // Corner set-piece: take assigned zone position.
+            if ctx.ball().is_team_attacking_corner() {
+                use crate::r#match::player::strategies::common::set_pieces::player_corner_zone;
+                if player_corner_zone(ctx).is_some() {
+                    return Some(StateChangeResult::with_midfielder_state(
+                        MidfielderState::CornerRun,
+                    ));
+                }
             }
 
             // Track dangerous runners — opponent forwards sprinting toward our goal
@@ -960,8 +986,15 @@ impl StateProcessingHandler for MidfielderRunningState {
             let forward_offset = attacking_direction * 40.0;
             let target_x = start_pos.x * (1.0 - ball_pull) + (qball_x + forward_offset) * ball_pull;
 
-            // Y: mostly start_pos, pulled slightly toward ball Y
-            let target_y = start_pos.y * (1.0 - ball_pull) + qball_y * ball_pull;
+            // Y: zone-band discipline. Each midfielder orbits their start_position.y
+            // within ±80u. When ball is outside that band, lateral pull is zero —
+            // the player holds their y and only shifts longitudinally with the ball.
+            // When ball is inside the band, normal pull (0.15) applies.
+            const ZONE_HALF_WIDTH: f32 = 80.0;
+            let in_zone_y = (qball_y - start_pos.y).abs() < ZONE_HALF_WIDTH;
+            let lateral_pull = if in_zone_y { ball_pull } else { 0.0 };
+            let target_y = (start_pos.y + (qball_y - start_pos.y) * lateral_pull)
+                .clamp(start_pos.y - ZONE_HALF_WIDTH, start_pos.y + ZONE_HALF_WIDTH);
 
             let target = Vector3::new(
                 target_x.clamp(30.0, field_width - 30.0),

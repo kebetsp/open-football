@@ -1,6 +1,7 @@
 use crate::IntegerUtils;
 use crate::r#match::forwarders::states::ForwardState;
 use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondition};
+use crate::r#match::player::strategies::common::players::ops::slot_coverage::find_vacant_midfielder_slot;
 use crate::r#match::{
     ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
     SteeringBehavior,
@@ -19,6 +20,25 @@ impl StateProcessingHandler for ForwardWalkingState {
             return Some(StateChangeResult::with_forward_state(
                 ForwardState::Returning,
             ));
+        }
+
+        // Corner set-piece handling.
+        if ctx.ball().is_team_attacking_corner() {
+            if ctx.player.has_ball(ctx) {
+                // This forward is the corner taker — set up the delivery.
+                return Some(StateChangeResult::with_forward_state(ForwardState::Crossing));
+            }
+            use crate::r#match::player::strategies::common::set_pieces::player_corner_zone;
+            if player_corner_zone(ctx).is_some() {
+                return Some(StateChangeResult::with_forward_state(
+                    ForwardState::CornerRun,
+                ));
+            }
+        }
+
+        // Opponent goal kick — suppress pressing into their box, let velocity() pull back
+        if ctx.ball().is_opponent_goal_kick() {
+            return None;
         }
 
         if ctx.ball().is_owned() {
@@ -44,6 +64,29 @@ impl StateProcessingHandler for ForwardWalkingState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if ctx.ball().is_opponent_goal_kick() {
+            return Some(
+                SteeringBehavior::Seek {
+                    target: ctx.player.start_position,
+                }
+                .calculate(ctx.player)
+                .velocity,
+            );
+        }
+
+        // Drop into midfield if the CM zone is uncontested and this forward
+        // is the nearest player to the ball in the centre third
+        if let Some(slot_target) = find_vacant_midfielder_slot(ctx) {
+            return Some(
+                SteeringBehavior::Arrive {
+                    target: slot_target,
+                    slowing_distance: 30.0,
+                }
+                .calculate(ctx.player)
+                .velocity,
+            );
+        }
+
         if ctx.player.should_follow_waypoints(ctx) {
             let waypoints = ctx.player.get_waypoints_as_vectors();
 

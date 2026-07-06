@@ -186,15 +186,24 @@ impl ShotQualityEvaluator {
 
     fn goalkeeper_factor(ctx: &StateProcessingContext, distance: f32) -> f32 {
         if let Some(gk) = ctx.players().opponents().goalkeeper().next() {
-            let gk_distance = (gk.position - ctx.player.position).magnitude();
+            let gk_dist = (gk.position - ctx.player.position).magnitude();
 
-            // 1v1 situation (very close to GK). Real football: 1v1
-            // conversion is famously skill-sensitive — top finishers
-            // bury 50%+ of them, replacement-level strikers under 25%.
-            // Bonus is graded by composure, first touch, and decisions,
-            // each read through `effective_skill` so a tired forward's
-            // late-game 1v1s lose their cool edge.
-            if gk_distance < 25.0 && distance < 80.0 {
+            // Zone A — penalty zone (<12u): GK can physically grab or block.
+            // Mirrors the parabolic willingness suppression below 12u —
+            // the two curves now agree: "don't shoot here, and if you do,
+            // you won't score." Linear: 0.25 at GK's feet → 0.65 at 12u.
+            if gk_dist < 12.0 && distance < 80.0 {
+                let t = gk_dist / 12.0;
+                return (0.25 + t * 0.40).clamp(0.25, 0.65);
+            }
+
+            // Zone B — 1v1 sweet spot (12–30u): the window the parabolic
+            // willingness curve peaks at (30u = 2× multiplier). Extended
+            // from the old 25u boundary to align with that peak.
+            // Skill-based: composure, first touch, decisions determine
+            // whether the forward picks a corner or hits the keeper.
+            // 0.85 (panicked) … 1.40 (composed).
+            if gk_dist < 30.0 && distance < 80.0 {
                 let minute = sc::minute_from_ms(ctx.context.total_match_time);
                 let composure = effective_skill(
                     ctx.player,
@@ -212,29 +221,37 @@ impl ShotQualityEvaluator {
                     EffActionContext::mental(minute),
                 ) / 20.0;
                 let cool = (composure + first_touch + decisions) / 3.0;
-                // 0.85 (panicked Composure-6) … 1.40 (composed Composure-18).
                 return (0.85 + cool * 0.55).clamp(0.85, 1.40);
             }
 
             let goal_pos = ctx.player().goal_position();
             let gk_to_goal = (goal_pos - gk.position).magnitude();
 
-            // GK off their line = better chance
-            if gk_to_goal > 30.0 {
-                return 1.15;
-            }
-
-            // GK well-positioned = harder
-            // Check if GK is on the shot line
+            // Shot-path check comes BEFORE the off-line bonus.
+            // Previous order was wrong: a GK who rushed out centrally got the
+            // 1.15 off-line bonus instead of the blocking penalty.
+            //
+            // When the GK IS blocking the shot line, the penalty scales with
+            // how far off their line they've come — a committed GK has left
+            // the goal exposed for a placed shot past them:
+            //   on the line   (gk_to_goal ≈  0u): 0.60 — hard to beat
+            //   middle of box (gk_to_goal ≈ 22u): 0.80 — committed, beatable
+            //   well out      (gk_to_goal ≈ 30u): 0.88 — exposed, clear window
             let shot_dir = (goal_pos - ctx.player.position).normalize();
             let to_gk = gk.position - ctx.player.position;
             let projection = to_gk.dot(&shot_dir);
-
             if projection > 0.0 && projection < distance {
                 let gk_on_line_dist = (to_gk - shot_dir * projection).magnitude();
                 if gk_on_line_dist < 5.0 {
-                    return 0.6; // GK directly in path
+                    let exposure = (gk_to_goal / 30.0).clamp(0.0, 1.0);
+                    return 0.60 + exposure * 0.28;
                 }
+            }
+
+            // GK not in the direct shot path AND well off their line —
+            // the angle to the open post is unobstructed.
+            if gk_to_goal > 30.0 {
+                return 1.15;
             }
 
             // Default GK-present factor — lifted from 0.85. The engine's

@@ -154,20 +154,12 @@ impl MatchPlayerCollection {
 // Types: MatchTime, PlayMatchStateResult
 // ───────────────────────────────────────────────────────────────────────────────
 
-#[cfg(debug_assertions)]
+// Gaffer game: 5-minute halves in all build modes. Short match gives
+// comfortable dot speed (≈2.75×) at the 240s playback target. Extra
+// time kept minimal so cup matches don't run to 31 minutes.
 pub const MATCH_HALF_TIME_MS: u64 = 5 * 60 * 1000;
-#[cfg(not(debug_assertions))]
-pub const MATCH_HALF_TIME_MS: u64 = 45 * 60 * 1000;
-
 pub const MATCH_TIME_MS: u64 = MATCH_HALF_TIME_MS * 2;
-
-/// Extra time is a single continuous 30-minute period in this simulation.
-/// Real football splits it into 2×15 with an interval; we skip the break
-/// since there's no tactical depth to add between the two halves here.
-#[cfg(debug_assertions)]
-pub const MATCH_EXTRA_TIME_MS: u64 = 3 * 60 * 1000;
-#[cfg(not(debug_assertions))]
-pub const MATCH_EXTRA_TIME_MS: u64 = 30 * 60 * 1000;
+pub const MATCH_EXTRA_TIME_MS: u64 = 1 * 60 * 1000;
 
 pub struct MatchTime {
     pub time: u64,

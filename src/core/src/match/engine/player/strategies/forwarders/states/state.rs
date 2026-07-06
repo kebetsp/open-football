@@ -1,9 +1,10 @@
 use crate::r#match::forwarders::states::{
-    ForwardAssistingState, ForwardCreatingSpaceState, ForwardCrossReceivingState,
-    ForwardCrossingState, ForwardDribblingState, ForwardFinishingState, ForwardHeadingState,
-    ForwardInterceptingState, ForwardPassingState, ForwardPressingState, ForwardRestingState,
-    ForwardReturningState, ForwardRunningInBehindState, ForwardRunningState, ForwardShootingState,
-    ForwardStandingState, ForwardTacklingState, ForwardTakeBallState, ForwardWalkingState,
+    ForwardAssistingState, ForwardCornerRunState, ForwardCreatingSpaceState,
+    ForwardCrossReceivingState, ForwardCrossingState, ForwardDribblingState,
+    ForwardFinishingState, ForwardHeadingState, ForwardInterceptingState, ForwardPassingState,
+    ForwardPressingState, ForwardRestingState, ForwardReturningState, ForwardRunningInBehindState,
+    ForwardRunningState, ForwardShootingState, ForwardStandingState, ForwardTacklingState,
+    ForwardTakeBallState, ForwardWalkingState,
 };
 use crate::r#match::{StateProcessingResult, StateProcessor};
 use std::fmt::Result;
@@ -30,6 +31,7 @@ pub enum ForwardState {
     Intercepting,    // Intercepting the ball,
     Returning,       // Returning the ball
     Resting,         // Recovering stamina when fatigued
+    CornerRun,       // Running to an assigned zone during a corner set-piece
 }
 
 pub struct ForwardStrategies {}
@@ -64,6 +66,7 @@ impl ForwardStrategies {
             }
             ForwardState::Returning => state_processor.process(ForwardReturningState::default()),
             ForwardState::Resting => state_processor.process(ForwardRestingState::default()),
+            ForwardState::CornerRun => state_processor.process(ForwardCornerRunState::default()),
         }
     }
 }
@@ -90,6 +93,7 @@ impl Display for ForwardState {
             ForwardState::Intercepting => write!(f, "Intercepting"),
             ForwardState::Returning => write!(f, "Returning"),
             ForwardState::Resting => write!(f, "Resting"),
+            ForwardState::CornerRun => write!(f, "Corner Run"),
         }
     }
 }
