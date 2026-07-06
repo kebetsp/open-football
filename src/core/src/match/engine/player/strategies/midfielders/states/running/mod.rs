@@ -102,6 +102,32 @@ impl StateProcessingHandler for MidfielderRunningState {
                 ));
             }
 
+            // Conditional (Level 2): lay off ONLY long-ball receptions —
+            // see the forward-state twin.
+            if ctx.player.behavioral_directive == Some(BehavioralDirective::LayOffOnLongBall)
+                && ctx.tick_context.ball.ownership_duration < 60
+                && ctx.ball().is_long_reception(140.0)
+            {
+                return Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::Passing,
+                ));
+            }
+
+            // Conditional (Level 2): carry into a clear forward cone —
+            // see the forward-state twin.
+            if ctx.player.behavioral_directive == Some(BehavioralDirective::CarryWhenSpaceAhead) {
+                let goal_pos = ctx.player().opponent_goal_position();
+                let to_goal = (goal_pos - ctx.player.position).normalize();
+                let blocker_ahead = ctx.players().opponents().nearby(35.0).any(|o| {
+                    (o.position - ctx.player.position).normalize().dot(&to_goal) > 0.3
+                });
+                if !blocker_ahead {
+                    return Some(StateChangeResult::with_midfielder_state(
+                        MidfielderState::Dribbling,
+                    ));
+                }
+            }
+
             // Behavioural directive: byline_and_cross. A wide midfielder
             // (the 4-4-2 winger) with this directive bypasses the entire
             // pass/shot decision tree while in the wide band of the

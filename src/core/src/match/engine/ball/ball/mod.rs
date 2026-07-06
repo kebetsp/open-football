@@ -269,6 +269,13 @@ pub struct Ball {
     /// still credits the assister with a key pass. None outside the
     /// shot-after-pass window.
     pub last_completed_pass_passer_id: Option<u32>,
+    /// Where the most recent pass was struck from, and by which team.
+    /// Unlike `previous_owner` (cleared mid-flight once the passer is far
+    /// from the ball — which erases exactly the long deliveries), these
+    /// survive until the next pass or reset, so a receiver can gate
+    /// behaviour on how far the ball travelled (lay_off_on_long_ball).
+    pub pass_origin_position: Option<Vector3<f32>>,
+    pub pass_origin_team: Option<u32>,
     pub last_completed_pass_receiver_id: Option<u32>,
     pub last_completed_pass_tick: u64,
 
@@ -422,6 +429,8 @@ impl Ball {
             pending_pass_target: None,
             pending_pass_was_cross: false,
             last_completed_pass_passer_id: None,
+            pass_origin_position: None,
+            pass_origin_team: None,
             last_completed_pass_receiver_id: None,
             last_completed_pass_tick: 0,
             pressers_at_pass: [0; 4],
@@ -809,6 +818,8 @@ impl Ball {
         self.last_completed_pass_passer_id = None;
         self.last_completed_pass_receiver_id = None;
         self.last_completed_pass_tick = 0;
+        self.pass_origin_position = None;
+        self.pass_origin_team = None;
     }
 
     /// Snapshot the most-recent completed pass so the shot-handler

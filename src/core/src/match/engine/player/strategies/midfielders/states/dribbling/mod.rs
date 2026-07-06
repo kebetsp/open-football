@@ -33,6 +33,17 @@ impl StateProcessingHandler for MidfielderDribblingState {
             ));
         }
 
+        // Conditional (Level 2): lay off ONLY long-ball receptions —
+        // see the forward-state twin for the 60-tick window rationale.
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::LayOffOnLongBall)
+            && ctx.tick_context.ball.ownership_duration < 60
+            && ctx.ball().is_long_reception(140.0)
+        {
+            return Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Passing,
+            ));
+        }
+
         // Behavioural directive: byline_and_cross. While wide, commit to
         // the touchline carry — cross on reaching the byline, bail out
         // only under a genuine two-man press. Skips the carry-budget

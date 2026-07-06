@@ -27,6 +27,16 @@ impl StateProcessingHandler for ForwardDribblingState {
             return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
         }
 
+        // Conditional (Level 2): lay off ONLY long-ball receptions. Wider
+        // 60-tick window: a long delivery takes longer to control and the
+        // receiving state routes through here late.
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::LayOffOnLongBall)
+            && ctx.tick_context.ball.ownership_duration < 60
+            && ctx.ball().is_long_reception(140.0)
+        {
+            return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
+        }
+
         // Behavioural directive: byline_and_cross. While wide, commit to
         // the touchline carry: cross on reaching the byline, bail out only
         // under a genuine two-man press. The generic exits below (no-

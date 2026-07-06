@@ -1,6 +1,7 @@
 use crate::r#match::{
     MatchField, MatchObjectsPositions, PassOriginRestart, ShotTarget, Space, SpatialGrid,
 };
+use nalgebra::Vector3;
 
 pub struct GameTickContext {
     pub positions: MatchObjectsPositions,
@@ -61,6 +62,12 @@ pub struct BallMetadata {
     pub current_owner: Option<u32>,
     pub last_owner: Option<u32>,
 
+    /// Strike point + team of the most recent pass — survives the
+    /// in-flight `previous_owner` clearing. Read by the
+    /// lay_off_on_long_ball directive gate (`BallOps::is_long_reception`).
+    pub pass_origin_position: Option<Vector3<f32>>,
+    pub pass_origin_team: Option<u32>,
+
     notified_buf: [u32; 4],
     notified_len: u8,
 
@@ -103,6 +110,8 @@ impl BallMetadata {
         self.is_in_flight_state = field.ball.flags.in_flight_state;
         self.current_owner = field.ball.current_owner;
         self.last_owner = field.ball.previous_owner;
+        self.pass_origin_position = field.ball.pass_origin_position;
+        self.pass_origin_team = field.ball.pass_origin_team;
         self.ownership_duration = field.ball.ownership_duration;
 
         self.notified_len = field.ball.take_ball_notified_players.len().min(4) as u8;
@@ -134,6 +143,8 @@ impl From<&MatchField> for BallMetadata {
             is_in_flight_state: 0,
             current_owner: None,
             last_owner: None,
+            pass_origin_position: None,
+            pass_origin_team: None,
             notified_buf: [0; 4],
             notified_len: 0,
             ownership_duration: 0,

@@ -124,6 +124,35 @@ impl<'b> BallOperationsImpl<'b> {
         self.ctx.tick_context.ball.last_owner
     }
 
+    /// The player's current possession began with a delivery from a
+    /// teammate at least `min_distance` units away — i.e. this was a
+    /// long-ball reception, not a short combination pass. Used by the
+    /// lay_off_on_long_ball behavioural directive to gate the
+    /// first-touch release on how the ball arrived.
+    pub fn is_long_reception(&self, min_distance: f32) -> bool {
+        if self.owner_id() != Some(self.ctx.player.id) {
+            return false;
+        }
+        // Pass origin survives in-flight previous_owner clearing (which
+        // erases exactly the long deliveries this gate exists to detect).
+        let Some(origin) = self.ctx.tick_context.ball.pass_origin_position else {
+            return false;
+        };
+        if self.ctx.tick_context.ball.pass_origin_team != Some(self.ctx.player.team_id) {
+            return false;
+        }
+        let dist = (origin - self.ctx.player.position).magnitude();
+        if dist > min_distance {
+            log::debug!(
+                "LONG_RECEPTION player={} dist={:.0}",
+                self.ctx.player.id,
+                dist
+            );
+            return true;
+        }
+        false
+    }
+
     /// Check if the current player has had stable possession long enough to make controlled actions
     /// Returns true if the player has owned the ball for at least MIN_POSSESSION_FOR_ACTIONS ticks
     #[inline]

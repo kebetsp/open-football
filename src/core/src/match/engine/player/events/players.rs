@@ -1785,6 +1785,17 @@ impl PlayerEventDispatcher {
         // Record the passer in recent passers history before clearing ownership
         field.ball.record_passer(event_model.from_player_id);
 
+        // Record the strike point + team for this delivery — survives the
+        // in-flight previous_owner clearing so long-ball receivers can
+        // measure how far the ball travelled (lay_off_on_long_ball).
+        let passer_team = field
+            .ball
+            .current_owner
+            .and_then(|id| field.players.iter().find(|p| p.id == id))
+            .map(|p| p.team_id);
+        field.ball.pass_origin_position = Some(field.ball.position);
+        field.ball.pass_origin_team = passer_team;
+
         field.ball.previous_owner = field.ball.current_owner;
         field.ball.current_owner = None;
         field.ball.pass_target_player_id = Some(event_model.to_player_id);

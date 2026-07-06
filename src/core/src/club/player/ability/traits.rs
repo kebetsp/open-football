@@ -82,6 +82,15 @@ pub enum BehavioralDirective {
     /// Release the ball immediately on reception — first-touch lay-off
     /// to the best available teammate instead of turning or carrying.
     LayItOffFirstTouch,
+    /// Conditional (Level 2): first-touch lay-off ONLY when the
+    /// reception is a long ball (the pass travelled from a teammate far
+    /// away). Normal short receptions behave exactly as without the
+    /// directive — the condition gating is the point.
+    LayOffOnLongBall,
+    /// Conditional (Level 2): when there is clear space ahead (no
+    /// opponent in the forward cone), carry the ball forward instead of
+    /// releasing an early pass; under pressure behave as normal.
+    CarryWhenSpaceAhead,
 }
 
 impl PlayerTrait {
