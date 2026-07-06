@@ -78,7 +78,24 @@ pub struct MatchPlayer {
     /// Manager-issued per-match movement directive (at most one).
     /// Injected via the match API; checked by strategy states at their
     /// decision points. See `BehavioralDirective` in club/player/ability.
+    /// May be swapped at runtime by a teammate trigger (see below);
+    /// `directive_base` holds the static value it reverts to.
     pub behavioral_directive: Option<BehavioralDirective>,
+    /// The statically-assigned directive (from the match API). The
+    /// effective `behavioral_directive` reverts to this when a teammate
+    /// trigger deactivates.
+    pub directive_base: Option<BehavioralDirective>,
+    /// Cross-player defensive assignment: press this opponent whenever
+    /// they have the ball (velocity override in the state processor).
+    pub press_target: Option<u32>,
+    /// Cross-player defensive assignment: man-mark this opponent while
+    /// our team is out of possession (goal-side stick, plus the press
+    /// chase when they receive).
+    pub mark_target: Option<u32>,
+    /// Cross-player attacking trigger: when teammate `.0` has the ball,
+    /// this player's effective directive becomes `.1` (evaluated per
+    /// possession change in the engine loop).
+    pub teammate_trigger: Option<(u32, BehavioralDirective)>,
 
     /// Manager flag protecting this player from fatigue / development subs.
     /// Mirrored from `Player::is_force_match_selection` at squad-build time.
@@ -251,6 +268,10 @@ impl MatchPlayer {
             tackle_cooldown: 0,
             pending_shot_reason: None,
             behavioral_directive: None,
+            directive_base: None,
+            press_target: None,
+            mark_target: None,
+            teammate_trigger: None,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
             entry_match_time_ms: 0,
@@ -312,6 +333,10 @@ impl MatchPlayer {
             tackle_cooldown: 0,
             pending_shot_reason: None,
             behavioral_directive: None,
+            directive_base: None,
+            press_target: None,
+            mark_target: None,
+            teammate_trigger: None,
             is_force_match_selection,
             birth_date,
             entry_match_time_ms: 0,

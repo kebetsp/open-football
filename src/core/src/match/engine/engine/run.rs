@@ -743,6 +743,12 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             (initial_t / Self::POSITION_RECORD_INTERVAL_MS + 1) * Self::POSITION_RECORD_INTERVAL_MS;
         let track_positions = match_data.is_tracking_positions();
 
+        // Cross-player teammate triggers ("when the 6 receives, X makes a
+        // run"): re-evaluated only when the ball owner changes. Skipped
+        // entirely when no player carries a trigger assignment.
+        let any_teammate_triggers = field.players.iter().any(|p| p.teammate_trigger.is_some());
+        let mut last_trigger_owner: Option<u32> = None;
+
         while context.increment_time() {
             tick_count += 1;
 
@@ -824,6 +830,23 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // Only re-resolve `team_id` via a 22-element scan when the
             // raw id actually changed since the last evaluation.
             let raw_owner = field.ball.current_owner;
+
+            // Teammate triggers: on any owner change, actors with a
+            // trigger switch their effective directive on (trigger
+            // teammate on the ball) or revert to their base directive.
+            if any_teammate_triggers && raw_owner != last_trigger_owner {
+                last_trigger_owner = raw_owner;
+                for p in field.players.iter_mut() {
+                    if let Some((trigger_id, action)) = p.teammate_trigger {
+                        p.behavioral_directive = if raw_owner == Some(trigger_id) {
+                            Some(action)
+                        } else {
+                            p.directive_base
+                        };
+                    }
+                }
+            }
+
             let current_owner_team = if raw_owner == last_owner_id {
                 last_possession_team
             } else {

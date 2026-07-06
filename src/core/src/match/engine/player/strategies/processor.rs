@@ -306,6 +306,16 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
+        // Cross-player assignment overrides (press / mark). Applied AFTER
+        // the state handler so the manager's man-assignment wins over
+        // normal state movement, regardless of which state the player is
+        // in. States still handle their own transitions (tackling fires
+        // naturally once the chase brings the ball into range).
+        if let Some(velocity) = Self::assignment_override_velocity(&processing_ctx) {
+            let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
+            result.velocity = Some(velocity * tempo);
+        }
+
         // common logic
         let complete_result = |state_results: StateChangeResult,
                                mut result: StateProcessingResult| {
@@ -337,6 +347,74 @@ impl<'p> StateProcessor<'p> {
 
     pub fn into_ctx(self) -> StateProcessingContext<'p> {
         StateProcessingContext::from(self)
+    }
+
+    /// Velocity override for manager-issued cross-player assignments.
+    ///
+    /// PRESS (`press_target`): whenever the assigned opponent has the
+    /// ball, sprint straight at them (predictive-free chase — the visible
+    /// proof is the dot hunting the target on every possession).
+    /// MARK (`mark_target`): same chase when the target has the ball;
+    /// otherwise, while our team is out of possession, hold a goal-side
+    /// position 8u off the target. In possession the marker plays normal.
+    ///
+    /// Never fires for goalkeepers or for a player currently on the ball.
+    fn assignment_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.press_target.is_none() && player.mark_target.is_none() {
+            return None;
+        }
+        if player
+            .tactical_position
+            .current_position
+            .is_goalkeeper()
+        {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None;
+        }
+
+        let chase = |target_id: u32| -> Vector3<f32> {
+            let target_pos = ctx.tick_context.positions.players.position(target_id);
+            let to_target = target_pos - player.position;
+            if to_target.magnitude() < 2.0 {
+                return ctx.player().separation_velocity() * 0.05;
+            }
+            let direction = to_target.normalize();
+            direction * player.skills.physical.pace
+                + ctx.player().separation_velocity() * 0.05
+        };
+
+        let ball_owner = ctx.ball().owner_id();
+
+        if let Some(target_id) = player.press_target {
+            if ball_owner == Some(target_id) && !ctx.ball().is_held_by_opponent_goalkeeper() {
+                return Some(chase(target_id));
+            }
+        }
+
+        if let Some(target_id) = player.mark_target {
+            if ball_owner == Some(target_id) {
+                return Some(chase(target_id));
+            }
+            if !ctx.team().is_control_ball() {
+                let target_pos = ctx.tick_context.positions.players.position(target_id);
+                let own_goal = ctx.ball().direction_to_own_goal();
+                let goal_side = (own_goal - target_pos).normalize() * 8.0;
+                let anchor = target_pos + goal_side;
+                let to_anchor = anchor - player.position;
+                if to_anchor.magnitude() > 3.0 {
+                    return Some(
+                        to_anchor.normalize() * player.skills.physical.pace * 0.9
+                            + ctx.player().separation_velocity() * 0.3,
+                    );
+                }
+                return Some(ctx.player().separation_velocity() * 0.3);
+            }
+        }
+
+        None
     }
 }
 

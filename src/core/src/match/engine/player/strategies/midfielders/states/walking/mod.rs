@@ -1,3 +1,5 @@
+use crate::club::player::traits::BehavioralDirective;
+use crate::r#match::PlayerSide;
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
 use crate::r#match::player::strategies::common::players::MatchPlayerIteratorExt;
@@ -155,6 +157,42 @@ impl StateProcessingHandler for MidfielderWalkingState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        // run_channel_in_behind: an ordered channel run overrides the
+        // walking shape-hold — midfielders spend most possession time in
+        // Walking (shape discipline), so without this hook a teammate-
+        // triggered run never visibly starts. Same onside hold as the
+        // Running-state twin.
+        if !ctx.player.has_ball(ctx)
+            && ctx.player.behavioral_directive == Some(BehavioralDirective::RunChannelInBehind)
+            && ctx.team().is_control_ball()
+        {
+            let goal = ctx.player().opponent_goal_position();
+            let mut target_x = goal.x;
+            let teammate_on_ball = !ctx.ball().is_in_flight()
+                && ctx
+                    .ball()
+                    .owner_id()
+                    .and_then(|id| ctx.context.players.by_id(id))
+                    .map_or(false, |o| o.team_id == ctx.player.team_id && o.id != ctx.player.id);
+            if teammate_on_ball {
+                const ONSIDE_HOLD: f32 = 6.0;
+                let line = ctx.player().defensive().find_defensive_line();
+                target_x = match ctx.player.side {
+                    Some(PlayerSide::Left) => target_x.min(line - ONSIDE_HOLD),
+                    Some(PlayerSide::Right) => target_x.max(line + ONSIDE_HOLD),
+                    None => target_x,
+                };
+            }
+            let target = Vector3::new(target_x, ctx.player.start_position.y, 0.0);
+            let to_target = target - ctx.player.position;
+            if to_target.magnitude() > 4.0 {
+                return Some(
+                    to_target.normalize() * ctx.player.skills.physical.pace * 1.1
+                        + ctx.player().separation_velocity() * 0.3,
+                );
+            }
+        }
+
         if ctx.ball().is_opponent_goal_kick() {
             return Some(
                 SteeringBehavior::Arrive {

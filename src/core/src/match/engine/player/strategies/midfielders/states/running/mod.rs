@@ -915,6 +915,43 @@ impl StateProcessingHandler for MidfielderRunningState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        // run_channel_in_behind (midfielder version): an ordered off-ball
+        // run — sprint toward the opponent goal line at the player's own
+        // channel while the team holds the ball. Mirrors the forwards'
+        // RunningInBehind channel run, including the onside hold: while a
+        // teammate is still ON the ball, the run stops at the shoulder of
+        // the last defender and releases the moment the pass is struck.
+        if !ctx.player.has_ball(ctx)
+            && ctx.player.behavioral_directive == Some(BehavioralDirective::RunChannelInBehind)
+            && ctx.team().is_control_ball()
+        {
+            let goal = ctx.player().opponent_goal_position();
+            let mut target_x = goal.x;
+            let teammate_on_ball = !ctx.ball().is_in_flight()
+                && ctx
+                    .ball()
+                    .owner_id()
+                    .and_then(|id| ctx.context.players.by_id(id))
+                    .map_or(false, |o| o.team_id == ctx.player.team_id && o.id != ctx.player.id);
+            if teammate_on_ball {
+                const ONSIDE_HOLD: f32 = 6.0;
+                let line = ctx.player().defensive().find_defensive_line();
+                target_x = match ctx.player.side {
+                    Some(PlayerSide::Left) => target_x.min(line - ONSIDE_HOLD),
+                    Some(PlayerSide::Right) => target_x.max(line + ONSIDE_HOLD),
+                    None => target_x,
+                };
+            }
+            let target = Vector3::new(target_x, ctx.player.start_position.y, 0.0);
+            let to_target = target - ctx.player.position;
+            if to_target.magnitude() > 4.0 {
+                return Some(
+                    to_target.normalize() * ctx.player.skills.physical.pace * 1.1
+                        + ctx.player().separation_velocity() * 0.3,
+                );
+            }
+        }
+
         // Simplified waypoint following
         if ctx.player.should_follow_waypoints(ctx) {
             let waypoints = ctx.player.get_waypoints_as_vectors();
