@@ -165,6 +165,18 @@ impl MatchField {
                 if let Some(new_pos) = get_player_position(p, new_side) {
                     p.start_position = new_pos;
                 }
+                // Re-apply manager anchors, mirrored 180° for the second
+                // half (teams switch ends).
+                if p.start_anchor_x.is_some() || p.start_anchor_y.is_some() {
+                    let w = self.size.width as f32;
+                    let h = self.size.height as f32;
+                    if let Some(ax) = p.start_anchor_x {
+                        p.start_position.x = w - ax;
+                    }
+                    if let Some(ay) = p.start_anchor_y {
+                        p.start_position.y = h - ay;
+                    }
+                }
             }
         });
     }
@@ -292,7 +304,15 @@ fn setup_player_on_field(
             player.side = Some(side);
             player.tactical_position.regenerate_waypoints(Some(side));
             player.rebuild_waypoint_cache();
-            if let Some(position) = get_player_position(&player, side) {
+            if let Some(mut position) = get_player_position(&player, side) {
+                // Manager anchors override the formation-table position
+                // (first-half coordinates; the halftime swap mirrors them).
+                if let Some(ax) = player.start_anchor_x {
+                    position.x = ax;
+                }
+                if let Some(ay) = player.start_anchor_y {
+                    position.y = ay;
+                }
                 player.position = position;
                 player.start_position = position;
                 players.push(player);

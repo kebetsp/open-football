@@ -270,12 +270,20 @@ impl StateProcessingHandler for ForwardRunningState {
             // exists for; without the bypass the pass-EV branches below
             // lay the ball off centrally on almost every possession.
             if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+                // Gate on the player's assigned CHANNEL (start_position.y,
+                // set by the startY anchor), not their current position —
+                // forward states position wingers centrally, so a
+                // current-y gate never engages (measured: 0% wide-band
+                // occupancy for a 4-3-3 FL). The dribble steering then
+                // pulls them out to the channel.
                 let field_h = ctx.context.field_size.height as f32;
-                let y = ctx.player.position.y;
-                let is_wide = y < field_h * 0.26 || y > field_h * 0.74;
-                if is_wide {
+                let start_y = ctx.player.start_position.y;
+                let channel_wide = start_y < field_h * 0.30 || start_y > field_h * 0.70;
+                if channel_wide {
                     let goal_x = ctx.player().opponent_goal_position().x;
-                    if (goal_x - ctx.player.position.x).abs() < 40.0 {
+                    let y = ctx.player.position.y;
+                    let currently_wide = y < field_h * 0.30 || y > field_h * 0.70;
+                    if currently_wide && (goal_x - ctx.player.position.x).abs() < 40.0 {
                         return Some(StateChangeResult::with_forward_state(
                             ForwardState::Crossing,
                         ));

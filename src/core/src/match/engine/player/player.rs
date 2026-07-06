@@ -96,6 +96,13 @@ pub struct MatchPlayer {
     /// this player's effective directive becomes `.1` (evaluated per
     /// possession change in the engine loop).
     pub teammate_trigger: Option<(u32, BehavioralDirective)>,
+    /// Manager-issued start-position anchors (per axis, first-half
+    /// coordinates). `setup_player_on_field` overwrites start_position
+    /// from the formation table, which silently discarded the API's
+    /// startX/startY overrides — these survive setup and are mirrored
+    /// at the halftime swap.
+    pub start_anchor_x: Option<f32>,
+    pub start_anchor_y: Option<f32>,
 
     /// Manager flag protecting this player from fatigue / development subs.
     /// Mirrored from `Player::is_force_match_selection` at squad-build time.
@@ -272,6 +279,8 @@ impl MatchPlayer {
             press_target: None,
             mark_target: None,
             teammate_trigger: None,
+            start_anchor_x: None,
+            start_anchor_y: None,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
             entry_match_time_ms: 0,
@@ -337,6 +346,8 @@ impl MatchPlayer {
             press_target: None,
             mark_target: None,
             teammate_trigger: None,
+            start_anchor_x: None,
+            start_anchor_y: None,
             is_force_match_selection,
             birth_date,
             entry_match_time_ms: 0,

@@ -43,11 +43,15 @@ impl StateProcessingHandler for ForwardDribblingState {
         // opponent bail, dribble timeout, single-chaser pass-out) would
         // otherwise cancel the run on almost every touchline duel.
         if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+            // Channel-gated (start_position.y), not current-y — see the
+            // Running-state twin for why.
             let field_h = ctx.context.field_size.height as f32;
-            let y = ctx.player.position.y;
-            if y < field_h * 0.26 || y > field_h * 0.74 {
+            let start_y = ctx.player.start_position.y;
+            if start_y < field_h * 0.30 || start_y > field_h * 0.70 {
                 let goal_x = ctx.player().opponent_goal_position().x;
-                if (goal_x - ctx.player.position.x).abs() < 40.0 {
+                let y = ctx.player.position.y;
+                let currently_wide = y < field_h * 0.30 || y > field_h * 0.70;
+                if currently_wide && (goal_x - ctx.player.position.x).abs() < 40.0 {
                     return Some(StateChangeResult::with_forward_state(
                         ForwardState::Crossing,
                     ));
@@ -152,14 +156,12 @@ impl StateProcessingHandler for ForwardDribblingState {
             Some(BehavioralDirective::BylineAndCross | BehavioralDirective::StayWideNoCutInside)
         ) {
             let field_h = ctx.context.field_size.height as f32;
+            let start_y = ctx.player.start_position.y;
             let y = ctx.player.position.y;
-            if y < field_h * 0.26 || y > field_h * 0.74 {
-                let start_y = ctx.player.start_position.y;
-                let channel_y = if start_y < field_h * 0.30 || start_y > field_h * 0.70 {
-                    start_y
-                } else {
-                    y
-                };
+            let channel_wide = start_y < field_h * 0.30 || start_y > field_h * 0.70;
+            let currently_wide = y < field_h * 0.30 || y > field_h * 0.70;
+            if channel_wide || currently_wide {
+                let channel_y = if channel_wide { start_y } else { y };
                 return Some(
                     SteeringBehavior::Arrive {
                         target: Vector3::new(goal.x, channel_y, 0.0),

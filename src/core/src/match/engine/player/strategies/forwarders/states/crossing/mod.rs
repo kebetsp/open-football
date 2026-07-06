@@ -36,6 +36,25 @@ impl StateProcessingHandler for ForwardCrossingState {
             return None;
         }
 
+        // BYLINE-DIRECTIVE HOLD: a byline_and_cross winger often beats
+        // their own runners to the byline — shield briefly until a target
+        // arrives in crossing range (mirrors the midfielder crossing state).
+        if ctx.player.behavioral_directive
+            == Some(crate::club::player::traits::BehavioralDirective::BylineAndCross)
+            && !ctx.ball().is_team_attacking_corner()
+            && ctx.in_state_time < 60
+        {
+            let goal_pos = ctx.player().opponent_goal_position();
+            let target_ready = ctx
+                .players()
+                .teammates()
+                .all()
+                .any(|t| t.id != ctx.player.id && (t.position - goal_pos).magnitude() < 165.0);
+            if !target_ready {
+                return None;
+            }
+        }
+
         // After windup time, deliver the cross
         if ctx.in_state_time > CROSS_EXECUTION_TIME {
             if ctx.ball().is_team_attacking_corner() {
@@ -140,8 +159,12 @@ impl ForwardCrossingState {
                 continue;
             }
 
-            // Ground-lane check only for open-play — corners are lofted.
-            if !is_corner && !ctx.player().has_clear_pass(teammate.id) {
+            // Ground-lane check only for open-play — corners and
+            // byline-directive deliveries are lofted over the defenders.
+            let lofted = is_corner
+                || ctx.player.behavioral_directive
+                    == Some(crate::club::player::traits::BehavioralDirective::BylineAndCross);
+            if !lofted && !ctx.player().has_clear_pass(teammate.id) {
                 continue;
             }
 

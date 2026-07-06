@@ -50,11 +50,14 @@ impl StateProcessingHandler for MidfielderDribblingState {
         // timeout and mid-dribble pass-outs below, which would otherwise
         // cancel the run before the byline.
         if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+            // Channel-gated (start_position.y) — see the forward-state twin.
             let field_h = ctx.context.field_size.height as f32;
-            let y = ctx.player.position.y;
-            if y < field_h * 0.26 || y > field_h * 0.74 {
+            let start_y = ctx.player.start_position.y;
+            if start_y < field_h * 0.30 || start_y > field_h * 0.70 {
+                let y = ctx.player.position.y;
+                let currently_wide = y < field_h * 0.30 || y > field_h * 0.70;
                 let goal_x = ctx.player().opponent_goal_position().x;
-                if (goal_x - ctx.player.position.x).abs() < 40.0 {
+                if currently_wide && (goal_x - ctx.player.position.x).abs() < 40.0 {
                     return Some(StateChangeResult::with_midfielder_state(
                         MidfielderState::Crossing,
                     ));
@@ -177,14 +180,12 @@ impl StateProcessingHandler for MidfielderDribblingState {
             Some(BehavioralDirective::BylineAndCross | BehavioralDirective::StayWideNoCutInside)
         ) {
             let field_h = ctx.context.field_size.height as f32;
+            let start_y = ctx.player.start_position.y;
             let y = ctx.player.position.y;
-            if y < field_h * 0.26 || y > field_h * 0.74 {
-                let start_y = ctx.player.start_position.y;
-                goal_pos.y = if start_y < field_h * 0.30 || start_y > field_h * 0.70 {
-                    start_y
-                } else {
-                    y
-                };
+            let channel_wide = start_y < field_h * 0.30 || start_y > field_h * 0.70;
+            let currently_wide = y < field_h * 0.30 || y > field_h * 0.70;
+            if channel_wide || currently_wide {
+                goal_pos.y = if channel_wide { start_y } else { y };
             }
         }
         let player_pos = ctx.player.position;

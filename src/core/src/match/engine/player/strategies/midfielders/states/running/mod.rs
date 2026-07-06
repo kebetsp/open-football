@@ -138,13 +138,18 @@ impl StateProcessingHandler for MidfielderRunningState {
             if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
                 let field_h = ctx.context.field_size.height as f32;
                 let field_w = ctx.context.field_size.width as f32;
-                let y = ctx.player.position.y;
-                let is_wide = y < field_h * 0.26 || y > field_h * 0.74;
+                // Channel-gated (start_position.y), not current-y, so the
+                // directive engages regardless of where team shape has
+                // pulled the player — see the forward-state twin.
+                let start_y = ctx.player.start_position.y;
+                let channel_wide = start_y < field_h * 0.30 || start_y > field_h * 0.70;
                 let in_attacking_zone =
                     ctx.ball().distance_to_opponent_goal() < field_w * 0.70;
-                if is_wide && in_attacking_zone {
+                if channel_wide && in_attacking_zone {
+                    let y = ctx.player.position.y;
+                    let currently_wide = y < field_h * 0.30 || y > field_h * 0.70;
                     let goal_x = ctx.player().opponent_goal_position().x;
-                    if (goal_x - ctx.player.position.x).abs() < 40.0 {
+                    if currently_wide && (goal_x - ctx.player.position.x).abs() < 40.0 {
                         return Some(StateChangeResult::with_midfielder_state(
                             MidfielderState::Crossing,
                         ));
