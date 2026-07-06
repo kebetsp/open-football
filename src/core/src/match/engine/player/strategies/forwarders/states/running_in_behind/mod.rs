@@ -136,8 +136,16 @@ impl StateProcessingHandler for ForwardRunningInBehindState {
 
 impl ForwardRunningInBehindState {
     fn is_run_viable(&self, ctx: &StateProcessingContext) -> bool {
-        // Check if there's still space to run into
-        let space_ahead = self.space_ahead(ctx);
+        // run_channel_in_behind: the manager ordered the runs — a blocker
+        // ahead doesn't abort them (the onside clamp in velocity() already
+        // keeps the run legal). Stamina and a capable passer still gate.
+        let space_ahead = if ctx.player.behavioral_directive
+            == Some(crate::club::player::traits::BehavioralDirective::RunChannelInBehind)
+        {
+            true
+        } else {
+            self.space_ahead(ctx)
+        };
 
         // Check if the player is still in a good position to receive a pass
         let in_passing_lane = self.in_passing_lane(ctx);

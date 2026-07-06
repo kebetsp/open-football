@@ -64,6 +64,24 @@ pub enum BehavioralDirective {
     /// the player's own channel, and deliver a cross from there —
     /// instead of the default cut-inside-and-pass-centrally pattern.
     BylineAndCross,
+    /// Keep dribbles in the wide channel — never angle in toward goal
+    /// centre with the ball. Softer than BylineAndCross: the normal
+    /// pass/shot/cross decision tree still runs, only the carry route
+    /// is shaped.
+    StayWideNoCutInside,
+    /// Action-selection bias toward shooting: the willingness roll in
+    /// the shared shot-decision helper is scaled up, so the player
+    /// pulls the trigger materially more often when a shot is live.
+    /// Distinct from a finishing-skill nudge (which only changes how
+    /// well the same shots go in).
+    ShootOnSight,
+    /// Make runs in behind far more readily (skill gate lowered); the
+    /// run targets the player's own channel via the channel-aware
+    /// logic already in RunningInBehind.
+    RunChannelInBehind,
+    /// Release the ball immediately on reception — first-touch lay-off
+    /// to the best available teammate instead of turning or carrying.
+    LayItOffFirstTouch,
 }
 
 impl PlayerTrait {

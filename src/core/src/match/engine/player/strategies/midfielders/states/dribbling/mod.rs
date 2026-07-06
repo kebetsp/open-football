@@ -23,6 +23,16 @@ impl StateProcessingHandler for MidfielderDribblingState {
             ));
         }
 
+        // Behavioural directive: lay_it_off_first_touch — a reception can
+        // land straight in Dribbling; release immediately here too.
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::LayItOffFirstTouch)
+            && ctx.tick_context.ball.ownership_duration < 30
+        {
+            return Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Passing,
+            ));
+        }
+
         // Behavioural directive: byline_and_cross. While wide, commit to
         // the touchline carry — cross on reaching the byline, bail out
         // only under a genuine two-man press. Skips the carry-budget
@@ -147,11 +157,14 @@ impl StateProcessingHandler for MidfielderDribblingState {
         }
 
         let mut goal_pos = ctx.player().opponent_goal_position();
-        // Behavioural directive: byline_and_cross — dribble target is the
-        // byline at the player's own channel, not the goal centre. The
-        // evasion blending below then dodges defenders while still
-        // tracking the touchline route.
-        if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+        // Behavioural directives: byline_and_cross / stay_wide_no_cut_inside
+        // — dribble target is the byline at the player's own channel, not
+        // the goal centre. The evasion blending below then dodges
+        // defenders while still tracking the touchline route.
+        if matches!(
+            ctx.player.behavioral_directive,
+            Some(BehavioralDirective::BylineAndCross | BehavioralDirective::StayWideNoCutInside)
+        ) {
             let field_h = ctx.context.field_size.height as f32;
             let y = ctx.player.position.y;
             if y < field_h * 0.26 || y > field_h * 0.74 {

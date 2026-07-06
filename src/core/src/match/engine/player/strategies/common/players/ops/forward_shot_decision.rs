@@ -414,6 +414,15 @@ pub fn evaluate_forward_shot_decision(
     if hog_shots > 7 {
         min_xg += ((hog_shots - 7) as f32 * 0.010).min(0.05);
     }
+    // shoot_on_sight: the manager ordered attempts, including speculative
+    // ones — halve the xG bar so looks the player would normally decline
+    // (longer range, tighter angles) reach the willingness roll. This is
+    // the action-selection change; execution quality is untouched.
+    if ctx.player.behavioral_directive
+        == Some(crate::club::player::traits::BehavioralDirective::ShootOnSight)
+    {
+        min_xg *= 0.5;
+    }
     let inside_six = distance <= 18.0;
     // Inside-six floor: skill-graded, so a 5/20 player floors near 0.15
     // instead of inheriting the unconditional 0.30 free pass.
@@ -700,6 +709,15 @@ pub fn evaluate_forward_shot_decision(
     // rate despite seeing fewer possession cycles per half.
     willingness *= 4.0;
 
+    // Behavioural directive: shoot_on_sight — an action-selection bias,
+    // not a skill nudge. The player elects to shoot materially more
+    // often; shot execution quality is unchanged.
+    if ctx.player.behavioral_directive
+        == Some(crate::club::player::traits::BehavioralDirective::ShootOnSight)
+    {
+        willingness *= 1.6;
+    }
+
     // Post-scale close-range floors — applied AFTER all dampeners (settle
     // window, post-goal modifiers) and the ×4 Gaffer multiplier so no
     // combination of suppressors can drive a forward's close-range
@@ -739,13 +757,28 @@ pub fn evaluate_forward_shot_decision(
     // are not stripped back by the mid-range ceilings calibrated for
     // open-play long shots. The open-play cap targets apply unchanged
     // from 36u out.
-    let cap = if distance <= 36.0 {
+    let mut cap = if distance <= 36.0 {
         0.60
     } else if xg >= 0.35 {
         0.44
     } else {
         0.34
     };
+    // shoot_on_sight: the ×1.6 willingness bias above saturates against
+    // this cap for any decent chance (measured: zero shot-volume change
+    // with the multiplier alone), so the cap scales with the directive too,
+    // and a hard floor guarantees the trigger gets pulled within a few
+    // ticks of any consult that survived the (halved) xG gate. This is
+    // deliberately blunt — "shoot on sight" is the manager overriding the
+    // engine's chance-quality discipline for this one player.
+    if ctx.player.behavioral_directive
+        == Some(crate::club::player::traits::BehavioralDirective::ShootOnSight)
+    {
+        cap = f32::min(cap * 1.5, 0.85);
+        if distance <= 120.0 {
+            willingness = willingness.max(0.30);
+        }
+    }
     willingness = willingness.clamp(0.0021, cap);
 
     #[cfg(feature = "match-logs")]

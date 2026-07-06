@@ -91,6 +91,17 @@ impl StateProcessingHandler for MidfielderRunningState {
                 ));
             }
 
+            // Behavioural directive: lay_it_off_first_touch — release the
+            // ball immediately on reception instead of turning/carrying.
+            // 30-tick window — see the forward-state twin for rationale.
+            if ctx.player.behavioral_directive == Some(BehavioralDirective::LayItOffFirstTouch)
+                && ctx.tick_context.ball.ownership_duration < 30
+            {
+                return Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::Passing,
+                ));
+            }
+
             // Behavioural directive: byline_and_cross. A wide midfielder
             // (the 4-4-2 winger) with this directive bypasses the entire
             // pass/shot decision tree while in the wide band of the

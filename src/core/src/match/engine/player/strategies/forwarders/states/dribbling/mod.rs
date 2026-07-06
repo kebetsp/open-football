@@ -19,6 +19,14 @@ impl StateProcessingHandler for ForwardDribblingState {
             return Some(StateChangeResult::with_forward_state(ForwardState::Running));
         }
 
+        // Behavioural directive: lay_it_off_first_touch — a reception can
+        // land straight in Dribbling; release immediately here too.
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::LayItOffFirstTouch)
+            && ctx.tick_context.ball.ownership_duration < 30
+        {
+            return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
+        }
+
         // Behavioural directive: byline_and_cross. While wide, commit to
         // the touchline carry: cross on reaching the byline, bail out only
         // under a genuine two-man press. The generic exits below (no-
@@ -123,12 +131,16 @@ impl StateProcessingHandler for ForwardDribblingState {
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         let goal = ctx.player().opponent_goal_position();
 
-        // Behavioural directive: byline_and_cross — steer along the
-        // touchline to the byline at the player's own channel instead of
-        // angling in toward goal centre. Uses start_position.y as the
+        // Behavioural directives: byline_and_cross / stay_wide_no_cut_inside
+        // — steer along the touchline at the player's own channel instead
+        // of angling in toward goal centre. Uses start_position.y as the
         // channel when the player's slot is a wide one; otherwise holds
-        // the current wide lane.
-        if ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross) {
+        // the current wide lane. (StayWide shapes only the carry route;
+        // BylineAndCross additionally bypasses the pass tree in process().)
+        if matches!(
+            ctx.player.behavioral_directive,
+            Some(BehavioralDirective::BylineAndCross | BehavioralDirective::StayWideNoCutInside)
+        ) {
             let field_h = ctx.context.field_size.height as f32;
             let y = ctx.player.position.y;
             if y < field_h * 0.26 || y > field_h * 0.74 {

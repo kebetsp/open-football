@@ -224,6 +224,18 @@ impl StateProcessingHandler for ForwardRunningState {
                 ));
             }
 
+            // Behavioural directive: lay_it_off_first_touch — release the
+            // ball immediately on reception instead of turning/carrying.
+            // Passing state picks the best available teammate.
+            // Window is 30 ticks (300ms): reception often lands in another
+            // state (Standing/Intercepting) and takes a few ticks to route
+            // through Running — a 12-tick window missed most receptions.
+            if ctx.player.behavioral_directive == Some(BehavioralDirective::LayItOffFirstTouch)
+                && ctx.tick_context.ball.ownership_duration < 30
+            {
+                return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
+            }
+
             // Behavioural directive: byline_and_cross. In the wide band,
             // bypass the entire shot/pass decision tree — carry to the
             // byline (Dribbling's velocity steers the route) and deliver
@@ -258,6 +270,27 @@ impl StateProcessingHandler for ForwardRunningState {
             // every AI tick and accumulate 30-50 shots per match.
             let can_shoot_self = ctx.player().can_shoot();
             let can_shoot = can_shoot_team && can_shoot_self;
+
+            // Behavioural directive: shoot_on_sight — long-range unlock.
+            // The normal priorities only consult the shot helper inside
+            // ~90u after settled possession; a shoot-on-sight player also
+            // consults from distance, immediately. Only the Shoot decision
+            // is acted on (Pass/Hold fall through to the normal tree), and
+            // the helper's xG gate — halved for this directive — still
+            // filters hopeless attempts.
+            if ctx.player.behavioral_directive == Some(BehavioralDirective::ShootOnSight)
+                && can_shoot
+                && distance_to_goal < 140.0
+            {
+                if let ShotDecision::Shoot { reason } =
+                    evaluate_forward_shot_decision(ctx, "FWD_RUN_SHOOT_ON_SIGHT")
+                {
+                    return Some(
+                        StateChangeResult::with_forward_state(ForwardState::Shooting)
+                            .with_shot_reason(reason),
+                    );
+                }
+            }
 
             // ── Snapshot under heavy pressure ──────────────────────────
             //
@@ -968,6 +1001,18 @@ impl StateProcessingHandler for ForwardRunningState {
 
             // Priority 3: Create space when team has possession
             if ctx.team().is_control_ball() {
+                // run_channel_in_behind: the run comes FIRST — before the
+                // create-space election that would otherwise absorb the
+                // player into zone-finding.
+                if ctx.player.behavioral_directive
+                    == Some(BehavioralDirective::RunChannelInBehind)
+                    && self.should_make_run_in_behind(ctx)
+                {
+                    return Some(StateChangeResult::with_forward_state(
+                        ForwardState::RunningInBehind,
+                    ));
+                }
+
                 if self.should_create_space(ctx) {
                     return Some(StateChangeResult::with_forward_state(
                         ForwardState::CreatingSpace,
@@ -1575,9 +1620,19 @@ impl ForwardRunningState {
         let off_ball = ctx.player.skills.mental.off_the_ball / 20.0;
         let stamina = ctx.player.player_attributes.condition_percentage() as f32 / 100.0;
 
-        // Counter-attack: lower skill threshold — be more aggressive
+        // Counter-attack: lower skill threshold — be more aggressive.
+        // run_channel_in_behind directive: the manager has ordered the
+        // runs, so the skill gate drops further still — frequency is the
+        // instruction; the space/offside viability checks below still apply.
         let is_counter = self.is_counter_attack_opportunity(ctx);
-        let skill_threshold = if is_counter { 0.25 } else { 0.4 };
+        let skill_threshold =
+            if ctx.player.behavioral_directive == Some(BehavioralDirective::RunChannelInBehind) {
+                0.15
+            } else if is_counter {
+                0.25
+            } else {
+                0.4
+            };
 
         // Combined skill check - if player is good at any of these, allow the run
         let skill_score = pace * 0.4 + off_ball * 0.4 + stamina * 0.2;
@@ -1603,6 +1658,17 @@ impl ForwardRunningState {
 
         // During counter-attacks, be much more willing to run
         if is_counter && teammate_has_ball {
+            return true;
+        }
+
+        // run_channel_in_behind: the manager ordered the runs — start one
+        // whenever a teammate is on the ball, like the counter fast-path.
+        // (The skill-gate relaxation alone measured no frequency change:
+        // this space/attacking-third condition was the binding gate.
+        // RunningInBehind's own viability + onside clamp still apply.)
+        if ctx.player.behavioral_directive == Some(BehavioralDirective::RunChannelInBehind)
+            && teammate_has_ball
+        {
             return true;
         }
 
