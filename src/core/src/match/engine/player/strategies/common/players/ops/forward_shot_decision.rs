@@ -347,7 +347,15 @@ pub fn evaluate_forward_shot_decision(
     // Pre-shot xG (matches `handle_shoot_event`'s formula). Low-xG
     // attempts are rejected outright; the inside-six bypass below
     // applies a skill-graded floor instead of letting any tap-in pass.
-    let xg = profile.expected_xg(distance, ctx.player().has_clear_shot());
+    let mut xg = profile.expected_xg(distance, ctx.player().has_clear_shot());
+    // Wishlist #19: first-touch strikes are possible but rarer and worse.
+    // An unsettled ball (owned < 300ms) takes a 0.65 xG haircut instead of
+    // the old hard settle gate in Priority 0.5 — snap-shots now happen
+    // exactly when the underlying chance is good enough to survive the
+    // stiffer bar, instead of never.
+    if ctx.tick_context.ball.ownership_duration < 30 {
+        xg *= 0.65;
+    }
     // Skill-graded xG floor — heavy penalty for poor finishers, soft
     // ceiling for elites. The floor must accommodate THREE distance
     // bands: inside-box (<= 36u, xG 0.10–0.40), mid-range (36..60u,

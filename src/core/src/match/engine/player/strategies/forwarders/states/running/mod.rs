@@ -639,8 +639,10 @@ impl StateProcessingHandler for ForwardRunningState {
             // GM suppression is applied as a probability gate on top of
             // the helper's Shoot decision so a leading-late team still
             // game-manages without dropping the helper's calibration.
-            let pre_gate_passed = has_settled
-                && can_shoot
+            // Wishlist #19: the hard has_settled gate here was replaced by
+            // an unsettled-ball 0.65 xG haircut inside the helper, so
+            // first-touch shots are possible-but-rarer instead of never.
+            let pre_gate_passed = can_shoot
                 && !defer_to_teammate
                 && distance_to_goal <= max_shot_distance
                 && ctx.player().has_clear_shot();
