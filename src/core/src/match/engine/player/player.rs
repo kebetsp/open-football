@@ -25,6 +25,79 @@ use std::fmt::*;
 #[cfg(debug_assertions)]
 use log::debug;
 
+/// Trigger half of a whole-team shape rule (plan Phase 5). Ball-lane
+/// triggers are from the PLAYER's attacking perspective ("left" =
+/// the manager's left wing), side-corrected each tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeTrigger {
+    InPossession,
+    OutOfPossession,
+    BallLeft,
+    BallCenter,
+    BallRight,
+}
+
+/// Action half of a shape rule — computed relative to the player's
+/// `shape_base` and side, so no absolute-coordinate mirroring bugs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeAction {
+    /// Fullback inverts: step up ~16% of the pitch and halfway toward
+    /// the central lane.
+    StepIntoMidfield,
+    /// Pin to the nearest touchline, slightly advanced.
+    HoldWidth,
+    /// Come infield ~55% toward the central lane, same depth.
+    TuckInside,
+    /// Drop ~12% of the pitch toward own goal, same lane.
+    DropDeeper,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShapeRule {
+    pub trigger: ShapeTrigger,
+    pub action: ShapeAction,
+}
+
+impl ShapeRule {
+    /// Target position for this rule's action, relative to `base`.
+    pub fn target(
+        &self,
+        base: Vector3<f32>,
+        side: PlayerSide,
+        field_width: f32,
+        field_height: f32,
+    ) -> Vector3<f32> {
+        let dir = match side {
+            PlayerSide::Left => 1.0,
+            PlayerSide::Right => -1.0,
+        };
+        let centre = field_height / 2.0;
+        match self.action {
+            ShapeAction::StepIntoMidfield => Vector3::new(
+                (base.x + dir * field_width * 0.16).clamp(20.0, field_width - 20.0),
+                base.y + (centre - base.y) * 0.5,
+                0.0,
+            ),
+            ShapeAction::HoldWidth => {
+                let ty = if base.y < centre { 28.0 } else { field_height - 28.0 };
+                Vector3::new(
+                    (base.x + dir * field_width * 0.05).clamp(20.0, field_width - 20.0),
+                    ty,
+                    0.0,
+                )
+            }
+            ShapeAction::TuckInside => {
+                Vector3::new(base.x, base.y + (centre - base.y) * 0.55, 0.0)
+            }
+            ShapeAction::DropDeeper => Vector3::new(
+                (base.x - dir * field_width * 0.12).clamp(20.0, field_width - 20.0),
+                base.y,
+                0.0,
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchPlayer {
     pub id: u32,
@@ -103,6 +176,20 @@ pub struct MatchPlayer {
     /// at the halftime swap.
     pub start_anchor_x: Option<f32>,
     pub start_anchor_y: Option<f32>,
+    /// Whole-team shape rules (plan Phase 5): each tick the engine loop
+    /// evaluates the first rule whose trigger holds and moves this
+    /// player's `start_position` (the shape anchor every positional
+    /// state blends toward — never a hard snap) to the action's target;
+    /// with no active rule it reverts to `shape_base`.
+    pub shape_rules: Vec<ShapeRule>,
+    /// The formation-table start position (anchors included) captured
+    /// after setup and re-captured after the halftime swap — the revert
+    /// target for shape rules.
+    pub shape_base: Option<Vector3<f32>>,
+    /// Team-wide directional attack bias: -1 = manager's left, 1 =
+    /// right, 0 = centre. Pass-evaluator weight toward that lateral
+    /// third ("build down the left").
+    pub attack_bias: Option<i8>,
 
     /// Manager flag protecting this player from fatigue / development subs.
     /// Mirrored from `Player::is_force_match_selection` at squad-build time.
@@ -281,6 +368,9 @@ impl MatchPlayer {
             teammate_trigger: None,
             start_anchor_x: None,
             start_anchor_y: None,
+            shape_rules: Vec::new(),
+            shape_base: None,
+            attack_bias: None,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
             entry_match_time_ms: 0,
@@ -348,6 +438,9 @@ impl MatchPlayer {
             teammate_trigger: None,
             start_anchor_x: None,
             start_anchor_y: None,
+            shape_rules: Vec::new(),
+            shape_base: None,
+            attack_bias: None,
             is_force_match_selection,
             birth_date,
             entry_match_time_ms: 0,

@@ -177,6 +177,8 @@ impl MatchField {
                         p.start_position.y = h - ay;
                     }
                 }
+                // Re-capture the shape-rule revert base for the new half.
+                p.shape_base = Some(p.start_position);
             }
         });
     }
@@ -315,6 +317,8 @@ fn setup_player_on_field(
                 }
                 player.position = position;
                 player.start_position = position;
+                // Shape rules revert to this base (see MatchPlayer docs).
+                player.shape_base = Some(position);
                 players.push(player);
             }
         }

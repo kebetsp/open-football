@@ -1356,9 +1356,41 @@ impl PassEvaluator {
                 1.0
             };
 
+            // Directional attack bias ("build down the left"): receivers
+            // in the manager's target lateral third score up, the
+            // opposite third down. Side-corrected so "left" stays the
+            // manager's left after the halftime swap.
+            let bias_modifier = if let Some(bias) = ctx.player.attack_bias {
+                let h = ctx.context.field_size.height as f32;
+                let third = h / 3.0;
+                let y = teammate.position.y;
+                let raw_lane: i8 = if y < third {
+                    -1
+                } else if y > h - third {
+                    1
+                } else {
+                    0
+                };
+                let lane = match ctx.player.side.unwrap_or(PlayerSide::Left) {
+                    PlayerSide::Left => raw_lane,
+                    PlayerSide::Right => -raw_lane,
+                };
+                if bias == 0 {
+                    if lane == 0 { 1.25 } else { 0.9 }
+                } else if lane == bias {
+                    1.35
+                } else if lane == -bias {
+                    0.75
+                } else {
+                    1.0
+                }
+            } else {
+                1.0
+            };
+
             // Apply graduated recency penalty to discourage ping-pong passing
             // Apply congestion penalty to force ball out of huddles
-            let score = score * recency_penalty * congestion_penalty * gm_modifier;
+            let score = score * recency_penalty * congestion_penalty * gm_modifier * bias_modifier;
 
             if score > best_score && is_acceptable {
                 best_score = score;

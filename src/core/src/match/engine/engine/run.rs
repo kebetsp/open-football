@@ -748,6 +748,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // entirely when no player carries a trigger assignment.
         let any_teammate_triggers = field.players.iter().any(|p| p.teammate_trigger.is_some());
         let mut last_trigger_owner: Option<u32> = None;
+        // Whole-team shape rules (plan Phase 5): evaluated per tick for
+        // ruled players only. Mutating start_position moves the anchor
+        // every positional state blends toward — a walk/run to the new
+        // spot, never a snap.
+        let any_shape_rules = field.players.iter().any(|p| !p.shape_rules.is_empty());
 
         while context.increment_time() {
             tick_count += 1;
@@ -854,6 +859,55 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 raw_owner
                     .and_then(|id| field.players.iter().find(|p| p.id == id).map(|p| p.team_id))
             };
+            // Shape rules: first active rule wins; no active rule reverts
+            // to the captured base. Ball-lane triggers are side-corrected
+            // so "left" is always the manager's left wing.
+            if any_shape_rules {
+                let w = context.field_size.width as f32;
+                let h = context.field_size.height as f32;
+                let third = h / 3.0;
+                let ball_y = field.ball.position.y;
+                for p in field.players.iter_mut() {
+                    if p.shape_rules.is_empty() {
+                        continue;
+                    }
+                    let Some(base) = p.shape_base else { continue };
+                    let side = match p.side {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                    let in_possession = current_owner_team == Some(p.team_id);
+                    let raw_lane: i8 = if ball_y < third {
+                        -1
+                    } else if ball_y > h - third {
+                        1
+                    } else {
+                        0
+                    };
+                    let lane = match side {
+                        PlayerSide::Left => raw_lane,
+                        PlayerSide::Right => -raw_lane,
+                    };
+                    let mut target = base;
+                    for rule in &p.shape_rules {
+                        let active = match rule.trigger {
+                            crate::r#match::player::ShapeTrigger::InPossession => in_possession,
+                            crate::r#match::player::ShapeTrigger::OutOfPossession => {
+                                !in_possession && current_owner_team.is_some()
+                            }
+                            crate::r#match::player::ShapeTrigger::BallLeft => lane == -1,
+                            crate::r#match::player::ShapeTrigger::BallCenter => lane == 0,
+                            crate::r#match::player::ShapeTrigger::BallRight => lane == 1,
+                        };
+                        if active {
+                            target = rule.target(base, side, w, h);
+                            break;
+                        }
+                    }
+                    p.start_position = target;
+                }
+            }
+
             let possession_changed =
                 current_owner_team != last_possession_team && current_owner_team.is_some();
             let home_score_now = context.score.home_team.get();
