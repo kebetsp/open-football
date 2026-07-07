@@ -35,6 +35,18 @@ pub enum ShapeTrigger {
     BallLeft,
     BallCenter,
     BallRight,
+    /// Score-state triggers (Phase 7.3), from this player's team's
+    /// perspective: active while winning / level / losing.
+    Leading,
+    Level,
+    Trailing,
+    /// Elapsed-time trigger: active from this DISPLAYED minute onward
+    /// (0-90 scale, mapped onto the engine's compressed match clock).
+    AfterMinute(u32),
+    /// Combined score x time (the wishlist #14 case: "when winning
+    /// after 70 minutes, drop into a mid-block").
+    LeadingAfterMinute(u32),
+    TrailingAfterMinute(u32),
 }
 
 /// Action half of a shape rule — computed relative to the player's

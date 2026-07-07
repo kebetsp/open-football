@@ -885,6 +885,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 let h = context.field_size.height as f32;
                 let third = h / 3.0;
                 let ball_y = field.ball.position.y;
+                // Score/time trigger inputs (Phase 7.3). The displayed
+                // minute maps the compressed match clock onto 0-90.
+                let shape_home_id = field.home_team_id;
+                let shape_home_goals = context.score.home_team.get();
+                let shape_away_goals = context.score.away_team.get();
+                let minute_now =
+                    (context.total_match_time * 90 / super::MATCH_TIME_MS) as u32;
                 for p in field.players.iter_mut() {
                     if p.shape_rules.is_empty() {
                         continue;
@@ -906,16 +913,32 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         PlayerSide::Left => raw_lane,
                         PlayerSide::Right => -raw_lane,
                     };
+                    let (goals_for, goals_against) = if p.team_id == shape_home_id {
+                        (shape_home_goals, shape_away_goals)
+                    } else {
+                        (shape_away_goals, shape_home_goals)
+                    };
                     let mut target = base;
                     for rule in &p.shape_rules {
+                        use crate::r#match::player::ShapeTrigger as ST;
                         let active = match rule.trigger {
-                            crate::r#match::player::ShapeTrigger::InPossession => in_possession,
-                            crate::r#match::player::ShapeTrigger::OutOfPossession => {
+                            ST::InPossession => in_possession,
+                            ST::OutOfPossession => {
                                 !in_possession && current_owner_team.is_some()
                             }
-                            crate::r#match::player::ShapeTrigger::BallLeft => lane == -1,
-                            crate::r#match::player::ShapeTrigger::BallCenter => lane == 0,
-                            crate::r#match::player::ShapeTrigger::BallRight => lane == 1,
+                            ST::BallLeft => lane == -1,
+                            ST::BallCenter => lane == 0,
+                            ST::BallRight => lane == 1,
+                            ST::Leading => goals_for > goals_against,
+                            ST::Level => goals_for == goals_against,
+                            ST::Trailing => goals_for < goals_against,
+                            ST::AfterMinute(m) => minute_now >= m,
+                            ST::LeadingAfterMinute(m) => {
+                                goals_for > goals_against && minute_now >= m
+                            }
+                            ST::TrailingAfterMinute(m) => {
+                                goals_for < goals_against && minute_now >= m
+                            }
                         };
                         if active {
                             target = rule.target(base, side, w, h);
