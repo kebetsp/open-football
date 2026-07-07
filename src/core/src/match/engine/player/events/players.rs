@@ -258,6 +258,21 @@ pub struct CardsShown {
     pub red: bool,
 }
 
+/// A foul restart resolved by `award_restart_for_foul` — used by
+/// callers to emit FreeKickAwarded/PenaltyAwarded record events.
+#[derive(Debug, Clone, Copy)]
+pub struct RestartAwarded {
+    pub penalty: bool,
+    pub taker_id: u32,
+}
+
+/// Everything the referee settled for an immediately-whistled foul.
+#[derive(Debug, Clone, Copy)]
+pub struct FoulRuling {
+    pub cards: CardsShown,
+    pub restart: Option<RestartAwarded>,
+}
+
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     Goal(u32, bool),
@@ -266,6 +281,10 @@ pub enum PlayerEvent {
     /// these exist so cards appear in the recorded event stream.
     YellowCard(u32),
     RedCard(u32),
+    /// Record-only: a foul restart was awarded and set up by
+    /// `award_restart_for_foul` (payload = taker id).
+    FreeKickAwarded(u32),
+    PenaltyAwarded(u32),
     BallCollision(u32),
     TacklingBall(u32),
     BallOwnerChange(u32),
@@ -340,12 +359,19 @@ impl FoulResolver {
                 field.ball.flags.in_flight_state = 150;
                 field.ball.contested_claim_count = 0;
             }
-            PlayerEventDispatcher::award_restart_for_foul(
+            let restart = PlayerEventDispatcher::award_restart_for_foul(
                 adv.fouler_id,
                 adv.severity,
                 field,
                 context,
             );
+            if let Some(r) = restart {
+                events.add_player_event(if r.penalty {
+                    PlayerEvent::PenaltyAwarded(r.taker_id)
+                } else {
+                    PlayerEvent::FreeKickAwarded(r.taker_id)
+                });
+            }
             let cards = PlayerEventDispatcher::apply_card_decision(
                 adv.fouler_id,
                 adv.severity,
@@ -835,12 +861,19 @@ impl PlayerEventDispatcher {
                 Self::handle_request_ball_receive(player_id, field);
             }
             PlayerEvent::CommitFoul(fouler_id, severity) => {
-                if let Some(cards) = Self::handle_commit_foul_event(fouler_id, severity, field, context) {
-                    if cards.yellow {
+                if let Some(ruling) = Self::handle_commit_foul_event(fouler_id, severity, field, context) {
+                    if ruling.cards.yellow {
                         remaining_events.push(Event::PlayerEvent(PlayerEvent::YellowCard(fouler_id)));
                     }
-                    if cards.red {
+                    if ruling.cards.red {
                         remaining_events.push(Event::PlayerEvent(PlayerEvent::RedCard(fouler_id)));
+                    }
+                    if let Some(r) = ruling.restart {
+                        remaining_events.push(Event::PlayerEvent(if r.penalty {
+                            PlayerEvent::PenaltyAwarded(r.taker_id)
+                        } else {
+                            PlayerEvent::FreeKickAwarded(r.taker_id)
+                        }));
                     }
                 }
             }
@@ -3284,7 +3317,7 @@ impl PlayerEventDispatcher {
         severity: FoulSeverity,
         field: &mut MatchField,
         context: &mut MatchContext,
-    ) -> Option<CardsShown> {
+    ) -> Option<FoulRuling> {
         // Referee marginal-call gate. The tackling code emits a foul
         // whenever a contact passes its `committed_foul` roll; the
         // referee then decides whether to actually blow the whistle.
@@ -3364,7 +3397,7 @@ impl PlayerEventDispatcher {
             field.ball.flags.in_flight_state = 150;
             field.ball.contested_claim_count = 0;
         }
-        Self::award_restart_for_foul(fouler_id, severity, field, context);
+        let restart = Self::award_restart_for_foul(fouler_id, severity, field, context);
 
         // Count the foul for the player (advantage path counted it above).
         if let Some(p) = field.get_player_mut(fouler_id) {
@@ -3372,14 +3405,15 @@ impl PlayerEventDispatcher {
             p.statistics.add_foul(match_second);
         }
 
-        Some(Self::apply_card_decision(
+        let cards = Self::apply_card_decision(
             fouler_id,
             severity,
             card_yellow_prob,
             card_red_prob,
             field,
             context,
-        ))
+        );
+        Some(FoulRuling { cards, restart })
     }
 
     /// Compute the (yellow_prob, red_prob) pair for the foul. Reads
@@ -4010,7 +4044,7 @@ impl PlayerEventDispatcher {
         _severity: FoulSeverity,
         field: &mut MatchField,
         context: &mut MatchContext,
-    ) {
+    ) -> Option<RestartAwarded> {
         // Resolve fouler + side; the victim is everyone on the OTHER side.
         let (fouler_side, fouler_team_id) = match field
             .players
@@ -4019,7 +4053,7 @@ impl PlayerEventDispatcher {
             .and_then(|p| p.side.map(|s| (s, p.team_id)))
         {
             Some(x) => x,
-            None => return,
+            None => return None,
         };
         let victim_side = match fouler_side {
             PlayerSide::Left => PlayerSide::Right,
@@ -4095,7 +4129,7 @@ impl PlayerEventDispatcher {
         };
         let taker_id = match taker_id {
             Some(id) => id,
-            None => return, // Whole team off the field — nothing to do.
+            None => return None, // Whole team off the field — nothing to do.
         };
 
         // Tell the engine to teleport the taker onto the ball next tick.
@@ -4128,6 +4162,114 @@ impl PlayerEventDispatcher {
             .ball
             .record_touch(taker_id, team_id, context.current_tick(), true);
         field.ball.pending_set_piece_teleport = Some((taker_id, restart_pos));
+
+        // ── Physically form the restart shape ──────────────────────
+        // The wall was previously only statistical (wall_block_prob on
+        // the eventual shot); place real bodies so the replay shows a
+        // positioned restart instead of play continuing from wherever
+        // players happened to stand. Same drained-teleport idiom as
+        // corners, minus the state override — normal positioning
+        // resumes after the restart window.
+        let mid_y = field_h * 0.5;
+        let goal_x = match fouler_side {
+            PlayerSide::Left => 0.0,
+            PlayerSide::Right => field_w,
+        };
+        let is_gk = |p: &MatchPlayer| {
+            p.tactical_position.current_position.position_group()
+                == PlayerFieldPositionGroup::Goalkeeper
+        };
+        let mut teleports: Vec<(u32, Vector3<f32>)> = Vec::new();
+
+        if in_penalty_area {
+            // Penalty: keeper-vs-taker 1v1. Everyone except the taker
+            // and the defending GK clears the box to just outside the
+            // area edge, keeping their lateral spread.
+            let box_depth = field_w * (165.0 / 840.0);
+            let box_half_h = field_h * (403.0 / 545.0) * 0.5;
+            let (box_x_min, box_x_max, edge_x) = match fouler_side {
+                PlayerSide::Left => (0.0, box_depth, box_depth + 10.0),
+                PlayerSide::Right => (field_w - box_depth, field_w, field_w - box_depth - 10.0),
+            };
+            for p in field.players.iter() {
+                if p.id == taker_id || p.is_sent_off {
+                    continue;
+                }
+                if is_gk(p) && p.side == Some(fouler_side) {
+                    continue; // defending keeper stays on his line
+                }
+                let inside = p.position.x >= box_x_min
+                    && p.position.x <= box_x_max
+                    && (p.position.y - mid_y).abs() <= box_half_h;
+                if inside {
+                    let y = p.position.y.clamp(mid_y - box_half_h, mid_y + box_half_h);
+                    teleports.push((p.id, Vector3::new(edge_x, y, 0.0)));
+                }
+            }
+        } else {
+            // Direct free kick: a wall at the 9.15 m (73 u) mark on the
+            // ball→goal line, sized by the engine's own distance band;
+            // remaining defenders inside the exclusion radius retreat.
+            let goal_center = Vector3::new(goal_x, mid_y, 0.0);
+            let to_goal = goal_center - restart_pos;
+            let dist_goal = (to_goal.x * to_goal.x + to_goal.y * to_goal.y).sqrt();
+            if dist_goal > 40.0 {
+                let dir = to_goal / dist_goal;
+                let band = FreeKickBand::from_distance(dist_goal);
+                let is_wide_angle = (restart_pos.y - mid_y).abs() > dist_goal * 0.5;
+                let wall_n = wall_size_for(band, is_wide_angle).clamp(2, 6) as usize;
+                let wall_dist = 73.0_f32.min(dist_goal * 0.6);
+                let wall_center = restart_pos + dir * wall_dist;
+                let perp = Vector3::new(-dir.y, dir.x, 0.0);
+
+                // Nearest defending outfield players form the wall.
+                let mut candidates: Vec<(f32, u32)> = field
+                    .players
+                    .iter()
+                    .filter(|p| p.side == Some(fouler_side) && !p.is_sent_off && !is_gk(p))
+                    .map(|p| {
+                        let d = p.position - wall_center;
+                        ((d.x * d.x + d.y * d.y).sqrt(), p.id)
+                    })
+                    .collect();
+                candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                let wall_ids: Vec<u32> =
+                    candidates.iter().take(wall_n).map(|&(_, id)| id).collect();
+                for (i, &pid) in wall_ids.iter().enumerate() {
+                    let lateral = (i as f32 - (wall_n as f32 - 1.0) * 0.5) * 9.0;
+                    let mut pos = wall_center + perp * lateral;
+                    pos.x = pos.x.clamp(2.0, field_w - 2.0);
+                    pos.y = pos.y.clamp(2.0, field_h - 2.0);
+                    teleports.push((pid, pos));
+                }
+                // Everyone else defending inside 73 u retreats to the edge
+                // of the exclusion radius (goal-side of the ball).
+                for p in field.players.iter() {
+                    if p.side != Some(fouler_side)
+                        || p.is_sent_off
+                        || is_gk(p)
+                        || wall_ids.contains(&p.id)
+                    {
+                        continue;
+                    }
+                    let d = p.position - restart_pos;
+                    let dist = (d.x * d.x + d.y * d.y).sqrt();
+                    if dist < 73.0 {
+                        let out_dir = if dist > 1.0 { d / dist } else { dir };
+                        let mut pos = restart_pos + out_dir * 78.0;
+                        pos.x = pos.x.clamp(2.0, field_w - 2.0);
+                        pos.y = pos.y.clamp(2.0, field_h - 2.0);
+                        teleports.push((p.id, pos));
+                    }
+                }
+            }
+        }
+        field.ball.pending_restart_teleports.extend(teleports);
+
+        Some(RestartAwarded {
+            penalty: in_penalty_area,
+            taker_id,
+        })
     }
 
     fn pick_penalty_taker(field: &MatchField, victim_side: PlayerSide) -> Option<u32> {

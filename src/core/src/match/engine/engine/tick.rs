@@ -115,6 +115,22 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             }
         }
 
+        // Foul-restart set-up: place the free-kick wall / retreating
+        // defenders, or clear the box for a penalty. No state override —
+        // players resume normal positioning after the restart window
+        // (there's no stoppage in the sim to walk the wall up during).
+        if !field.ball.pending_restart_teleports.is_empty() {
+            let teleports = std::mem::take(&mut field.ball.pending_restart_teleports);
+            for (player_id, pos) in teleports {
+                if let Some(idx) = field.player_index(player_id) {
+                    let p = &mut field.players[idx];
+                    p.position = pos;
+                    p.velocity = Vector3::zeros();
+                    p.in_state_time = 0;
+                }
+            }
+        }
+
         // Corner dead-ball set-up: teleport the pushed-up centre-backs
         // into the box so they can attack the delivery (see
         // `Ball::pending_corner_teleports` — there's no stoppage in the

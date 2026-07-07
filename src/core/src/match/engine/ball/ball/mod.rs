@@ -171,6 +171,13 @@ pub struct Ball {
     /// this the CBs cannot cover the length of the pitch before the cross
     /// is delivered, so defenders never get to attack corners.
     pub pending_corner_teleports: Vec<(u32, Vector3<f32>)>,
+    /// Bodies to place for a foul restart — the free-kick wall and
+    /// retreating defenders, or the box-clear for a penalty. Populated
+    /// by `award_restart_for_foul`, drained by the engine alongside the
+    /// taker teleport. Unlike corner teleports these do NOT override the
+    /// player's state: the wall holds only through the restart window
+    /// (claim cooldown), then normal positioning resumes.
+    pub pending_restart_teleports: Vec<(u32, Vector3<f32>)>,
     /// Fire-once guard for the discrete corner aerial contest. A played-out
     /// lofted corner can't thread the congested box to a specific runner, so
     /// once the cross is struck the engine resolves a single skill-weighted
@@ -410,6 +417,7 @@ impl Ball {
             cached_landing_position: Vector3::new(x, y, 0.0),
             pending_set_piece_teleport: None,
             pending_corner_teleports: Vec::new(),
+            pending_restart_teleports: Vec::new(),
             corner_contest_resolved: true,
             pending_corner_routine: None,
             owned_stuck_ticks: 0,
@@ -803,6 +811,7 @@ impl Ball {
         self.cached_landing_position = self.position;
         self.pending_set_piece_teleport = None;
         self.pending_corner_teleports.clear();
+        self.pending_restart_teleports.clear();
         self.owned_stuck_ticks = 0;
         self.owned_stuck_logged = false;
         self.stall_anchor_pos = self.position;
