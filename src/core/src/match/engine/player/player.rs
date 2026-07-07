@@ -195,6 +195,13 @@ pub struct MatchPlayer {
     /// TEAMMATE of the named target — passes to the target are
     /// preferred, long balls especially.
     pub supply_target: Option<u32>,
+    /// "Push the keeper up for corners late on" (wishlist #16): set on
+    /// the GK only. From this displayed minute, own-team corners
+    /// teleport him into the opposition box (no state override) and a
+    /// velocity override keeps him there through the delivery, then
+    /// sprints him home. The manager's risk is real — the goal is
+    /// genuinely open while he's up.
+    pub gk_up_after_minute: Option<u32>,
     /// Manager-issued start-position anchors (per axis, first-half
     /// coordinates). `setup_player_on_field` overwrites start_position
     /// from the formation table, which silently discarded the API's
@@ -395,6 +402,7 @@ impl MatchPlayer {
             link_target: None,
             intercept_target: None,
             supply_target: None,
+            gk_up_after_minute: None,
             start_anchor_x: None,
             start_anchor_y: None,
             shape_rules: Vec::new(),
@@ -468,6 +476,7 @@ impl MatchPlayer {
             link_target: None,
             intercept_target: None,
             supply_target: None,
+            gk_up_after_minute: None,
             start_anchor_x: None,
             start_anchor_y: None,
             shape_rules: Vec::new(),

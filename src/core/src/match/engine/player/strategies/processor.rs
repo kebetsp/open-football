@@ -349,6 +349,58 @@ impl<'p> StateProcessor<'p> {
         StateProcessingContext::from(self)
     }
 
+    /// "GK up for corners" velocity override. Active only for the
+    /// flagged goalkeeper, from the configured displayed minute, while
+    /// the ball's restart origin is a corner at the OPPONENT's end
+    /// (own-team corner). Adds a sprint-home leg for whenever the
+    /// window has closed but the keeper is still stranded upfield.
+    fn gk_up_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        use crate::r#match::PassOriginRestart;
+        let player = ctx.player;
+        let threshold = player.gk_up_after_minute?;
+        if !player.tactical_position.current_position.is_goalkeeper() {
+            return None;
+        }
+        let field_w = ctx.context.field_size.width as f32;
+        let field_h = ctx.context.field_size.height as f32;
+        let (own_goal_x, opp_goal_x) = match player.side? {
+            crate::r#match::PlayerSide::Left => (0.0_f32, field_w),
+            crate::r#match::PlayerSide::Right => (field_w, 0.0_f32),
+        };
+        let minute = (ctx.context.total_match_time * 90
+            / crate::r#match::engine::engine::MATCH_TIME_MS) as u32;
+        let ball_pos = ctx.tick_context.positions.ball.position;
+        let corner_live = ctx.tick_context.ball.pass_origin_restart == PassOriginRestart::Corner
+            && (ball_pos.x - opp_goal_x).abs() < field_w * 0.30;
+
+        if minute >= threshold && corner_live {
+            // Hold a spot around the penalty-spot depth, offset from the
+            // centre so he doesn't stack on the pushed-up centre-backs.
+            let target_x = if opp_goal_x == 0.0 { 88.0 } else { field_w - 88.0 };
+            let target = Vector3::new(target_x, field_h * 0.5 + 34.0, 0.0);
+            let to_target = target - player.position;
+            if to_target.magnitude() < 4.0 {
+                return Some(ctx.player().separation_velocity() * 0.1);
+            }
+            return Some(to_target.normalize() * player.skills.physical.pace);
+        }
+
+        // Sprint-home leg: window closed but keeper is stranded upfield.
+        let home_spot = Vector3::new(
+            own_goal_x + if own_goal_x == 0.0 { 10.0 } else { -10.0 },
+            field_h * 0.5,
+            0.0,
+        );
+        let dist_home = (player.position - home_spot).magnitude();
+        if dist_home > field_w * 0.30 {
+            return Some(
+                (home_spot - player.position).normalize()
+                    * (player.skills.physical.pace * 1.1),
+            );
+        }
+        None
+    }
+
     /// Velocity override for manager-issued cross-player assignments.
     ///
     /// PRESS (`press_target`): whenever the assigned opponent has the

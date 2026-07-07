@@ -423,6 +423,32 @@ impl Ball {
                         .push((*cb_id, Vector3::new(box_x, y, 0.0)));
                 }
 
+                // "GK up for late corners" (wishlist #16): teleport the
+                // flagged attacking keeper up with the CBs — he can't
+                // run the pitch length inside the cross window either.
+                // Uses the state-preserving restart-teleport list, NOT
+                // pending_corner_teleports (which forces the defender
+                // AttackingCorner state and would strand a GK in the
+                // outfield state machine). The state processor's
+                // override holds him there and sprints him home when
+                // the corner resolves.
+                let minute_now = (context.total_match_time * 90
+                    / crate::r#match::engine::engine::MATCH_TIME_MS)
+                    as u32;
+                if let Some(gk) = players.iter().find(|p| {
+                    p.side == Some(attacking_side)
+                        && p.tactical_position.current_position.is_goalkeeper()
+                }) {
+                    if gk.gk_up_after_minute.is_some_and(|m| minute_now >= m) {
+                        let gk_x = match side {
+                            GoalSide::Home => 88.0,
+                            GoalSide::Away => field_width - 88.0,
+                        };
+                        self.pending_restart_teleports
+                            .push((gk.id, Vector3::new(gk_x, center_y + 34.0, 0.0)));
+                    }
+                }
+
                 context.dead_ball_until_ms =
                     context.total_match_time + context.rng.range_u64(1, 3) * 1000;
                 return;
