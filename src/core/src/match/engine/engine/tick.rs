@@ -84,7 +84,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // Resolve any deferred-foul / advantage state. Cheap (one
         // Option read in the dominant no-advantage case) so we run it
         // every full tick rather than waiting for the next event.
-        FoulResolver::tick_advantage(field, context);
+        FoulResolver::tick_advantage(field, context, events);
         // Ownership may have changed inside play_ball (new claim, pass
         // target receive, etc.). Refresh the ball view so player state
         // dispatch sees the current owner — without this, the

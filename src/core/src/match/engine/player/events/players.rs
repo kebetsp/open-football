@@ -5,7 +5,7 @@ use crate::r#match::engine::officiating::referee::{ContactLocation, FoulCallCont
 use crate::r#match::engine::psychology::{NegativeEvent, PositiveEvent};
 use crate::r#match::engine::set_pieces::{FreeKickBand, wall_block_prob, wall_size_for};
 use crate::r#match::engine::zones::MatchZone;
-use crate::r#match::events::Event;
+use crate::r#match::events::{Event, EventCollection};
 use crate::r#match::player::events::{PassingEventContext, ShootingEventContext};
 use crate::r#match::player::statistics::MatchStatisticType;
 use crate::r#match::player::strategies::players::ShotSkillInputs;
@@ -248,10 +248,24 @@ pub enum FoulSeverity {
     Violent,
 }
 
+/// What the referee showed for a called foul. Returned by
+/// `apply_card_decision` so callers can emit YellowCard/RedCard events
+/// into the match event stream (the decision itself already mutated
+/// player state; the events are record-only).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CardsShown {
+    pub yellow: bool,
+    pub red: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     Goal(u32, bool),
     Assist(u32),
+    /// Record-only: the card was already applied by `apply_card_decision`;
+    /// these exist so cards appear in the recorded event stream.
+    YellowCard(u32),
+    RedCard(u32),
     BallCollision(u32),
     TacklingBall(u32),
     BallOwnerChange(u32),
@@ -298,7 +312,13 @@ impl FoulResolver {
     /// and award the restart. If the window expires (or the advantage
     /// materialised into a shot / deep entry), settle the card without
     /// stopping play. Called once per tick from the engine loop.
-    pub fn tick_advantage(field: &mut MatchField, context: &mut MatchContext) {
+    /// `events` receives record-only YellowCard/RedCard events when the
+    /// deferred card is finally settled.
+    pub fn tick_advantage(
+        field: &mut MatchField,
+        context: &mut MatchContext,
+        events: &mut EventCollection,
+    ) {
         let adv = match context.pending_advantage {
             Some(a) => a,
             None => return,
@@ -326,7 +346,7 @@ impl FoulResolver {
                 field,
                 context,
             );
-            PlayerEventDispatcher::apply_card_decision(
+            let cards = PlayerEventDispatcher::apply_card_decision(
                 adv.fouler_id,
                 adv.severity,
                 adv.yellow_prob,
@@ -334,6 +354,7 @@ impl FoulResolver {
                 field,
                 context,
             );
+            Self::emit_card_events(adv.fouler_id, cards, events);
             return;
         }
 
@@ -341,7 +362,7 @@ impl FoulResolver {
         // play continues without restart.
         if now >= adv.expire_tick {
             context.pending_advantage = None;
-            PlayerEventDispatcher::apply_card_decision(
+            let cards = PlayerEventDispatcher::apply_card_decision(
                 adv.fouler_id,
                 adv.severity,
                 adv.yellow_prob,
@@ -349,6 +370,17 @@ impl FoulResolver {
                 field,
                 context,
             );
+            Self::emit_card_events(adv.fouler_id, cards, events);
+        }
+    }
+
+    /// Push record-only card events for a settled card decision.
+    fn emit_card_events(fouler_id: u32, cards: CardsShown, events: &mut EventCollection) {
+        if cards.yellow {
+            events.add_player_event(PlayerEvent::YellowCard(fouler_id));
+        }
+        if cards.red {
+            events.add_player_event(PlayerEvent::RedCard(fouler_id));
         }
     }
 
@@ -523,7 +555,7 @@ impl PlayerEventDispatcher {
         context: &mut MatchContext,
         match_data: &mut ResultMatchPositionData,
     ) -> Vec<Event> {
-        let remaining_events = Vec::new();
+        let mut remaining_events = Vec::new();
 
         if context.logging_enabled {
             match event {
@@ -803,7 +835,14 @@ impl PlayerEventDispatcher {
                 Self::handle_request_ball_receive(player_id, field);
             }
             PlayerEvent::CommitFoul(fouler_id, severity) => {
-                Self::handle_commit_foul_event(fouler_id, severity, field, context);
+                if let Some(cards) = Self::handle_commit_foul_event(fouler_id, severity, field, context) {
+                    if cards.yellow {
+                        remaining_events.push(Event::PlayerEvent(PlayerEvent::YellowCard(fouler_id)));
+                    }
+                    if cards.red {
+                        remaining_events.push(Event::PlayerEvent(PlayerEvent::RedCard(fouler_id)));
+                    }
+                }
             }
             PlayerEvent::Offside(player_id, position) => {
                 Self::handle_offside_event(player_id, position, field);
@@ -3245,7 +3284,7 @@ impl PlayerEventDispatcher {
         severity: FoulSeverity,
         field: &mut MatchField,
         context: &mut MatchContext,
-    ) {
+    ) -> Option<CardsShown> {
         // Referee marginal-call gate. The tackling code emits a foul
         // whenever a contact passes its `committed_foul` roll; the
         // referee then decides whether to actually blow the whistle.
@@ -3262,7 +3301,7 @@ impl PlayerEventDispatcher {
             // marginal-call behaviour that lets a lenient referee
             // produce a low-foul match without changing the underlying
             // tackle / press model.
-            return;
+            return None;
         }
 
         // Compute card probabilities up front — used either to record
@@ -3273,7 +3312,7 @@ impl PlayerEventDispatcher {
             match Self::compute_card_probs(fouler_id, severity, field, match_second, card_modifier)
             {
                 Some(p) => p,
-                None => return,
+                None => return None,
             };
 
         // Advantage: if the fouled team kept possession, the ball is in
@@ -3312,7 +3351,9 @@ impl PlayerEventDispatcher {
                     p.fouls_committed = p.fouls_committed.saturating_add(1);
                     p.statistics.add_foul(match_second);
                 }
-                return;
+                // Card (if any) is resolved later by tick_advantage,
+                // which emits the card events itself.
+                return None;
             }
         }
 
@@ -3331,14 +3372,14 @@ impl PlayerEventDispatcher {
             p.statistics.add_foul(match_second);
         }
 
-        Self::apply_card_decision(
+        Some(Self::apply_card_decision(
             fouler_id,
             severity,
             card_yellow_prob,
             card_red_prob,
             field,
             context,
-        );
+        ))
     }
 
     /// Compute the (yellow_prob, red_prob) pair for the foul. Reads
@@ -3462,7 +3503,7 @@ impl PlayerEventDispatcher {
         card_red_prob: f32,
         field: &mut MatchField,
         context: &mut MatchContext,
-    ) {
+    ) -> CardsShown {
         let match_second = context.total_match_time;
         let roll_red = context.rng.unit_f32();
         let roll_yellow = context.rng.unit_f32();
@@ -3471,7 +3512,7 @@ impl PlayerEventDispatcher {
         let got_yellow = !direct_red && roll_yellow < card_yellow_prob;
 
         if !direct_red && !got_yellow {
-            return;
+            return CardsShown::default();
         }
 
         // Re-enabled red cards. The unified foul model + GK violent
@@ -3481,7 +3522,7 @@ impl PlayerEventDispatcher {
         let (second_yellow, ends_with_red, temperament_for_psych) = {
             let player = match field.get_player_mut(fouler_id) {
                 Some(p) => p,
-                None => return,
+                None => return CardsShown::default(),
             };
             let temperament = player.attributes.temperament;
             if direct_red {
@@ -3560,6 +3601,12 @@ impl PlayerEventDispatcher {
                 "Yellow card: player {} at {}s (severity {:?})",
                 fouler_id, match_second, severity
             );
+        }
+
+        CardsShown {
+            // A direct red shows no yellow; a second yellow shows both.
+            yellow: !direct_red,
+            red: ends_with_red,
         }
     }
 
