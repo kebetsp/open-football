@@ -347,7 +347,28 @@ impl MidfielderPassingState {
         let target_skills = player.skills(teammate.id);
         let finishing_skill = target_skills.technical.finishing / 20.0;
 
-        (goal_distance_value * 0.5) + (space_value * 0.3) + (finishing_skill * 0.2)
+        let base = (goal_distance_value * 0.5) + (space_value * 0.3) + (finishing_skill * 0.2);
+
+        // Manager pass-preference assignments also apply on the
+        // breakthrough path — midfielders try this BEFORE the central
+        // scorer, so without these the biggest source of striker supply
+        // ignored "feed X" / "block passes into X" entirely.
+        let supply_mult = if ctx.player.supply_target == Some(teammate.id) {
+            1.5
+        } else {
+            1.0
+        };
+        let intercept_mult = if ctx.context.intercept_assignments.iter().any(|&(i, t)| {
+            t == teammate.id
+                && (ctx.tick_context.positions.players.position(i) - teammate.position).norm()
+                    < 80.0
+        }) {
+            0.35
+        } else {
+            1.0
+        };
+
+        base * supply_mult * intercept_mult
     }
 
     /// Check for clear passing lanes with improved logic

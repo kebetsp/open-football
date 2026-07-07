@@ -172,6 +172,13 @@ pub struct MatchContext {
     /// callers that compute one-touch passing / handoff success.
     pub chemistry: ChemistryMap,
 
+    /// "Block passes into X" assignments (wishlist #8), seeded at
+    /// kickoff from MatchPlayer.intercept_target: (interceptor_id,
+    /// target_id). Static for the match; the pass evaluator checks the
+    /// interceptor's LIVE position against the receiver at evaluation
+    /// time.
+    pub intercept_assignments: Vec<(u32, u32)>,
+
     /// Tactical familiarity per side (0..1) — drives press timing /
     /// offside trap synchronisation.
     pub tactical_familiarity_home: TacticalFamiliarity,
@@ -369,6 +376,7 @@ impl MatchContext {
             set_piece_history: SetPieceHistory::default(),
             psychology: PsychologyState::default(),
             chemistry: ChemistryMap::default(),
+            intercept_assignments: Vec::new(),
             tactical_familiarity_home: TacticalFamiliarity::default(),
             tactical_familiarity_away: TacticalFamiliarity::default(),
             last_shape_change_tick: u64::MAX,

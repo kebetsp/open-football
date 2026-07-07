@@ -126,9 +126,25 @@ impl PassEvaluator {
         } else {
             0.0
         };
-        let success_probability =
-            (raw_success_probability + env_delta + psych_delta + chemistry_delta + link_delta)
-                .clamp(0.1, 0.99);
+        // "Block passes into X" (wishlist #8): an opposing interceptor
+        // assigned to this receiver, currently within range of them,
+        // makes the pass genuinely harder to complete.
+        let intercept_delta = if ctx.context.intercept_assignments.iter().any(|&(i, t)| {
+            t == receiver.id
+                && (ctx.tick_context.positions.players.position(i) - receiver.position).norm()
+                    < 80.0
+        }) {
+            -0.10
+        } else {
+            0.0
+        };
+        let success_probability = (raw_success_probability
+            + env_delta
+            + psych_delta
+            + chemistry_delta
+            + link_delta
+            + intercept_delta)
+            .clamp(0.1, 0.99);
 
         // Calculate risk level (inverse of some success factors)
         let risk_level = Self::calculate_risk_level(&factors);
@@ -1411,6 +1427,27 @@ impl PassEvaluator {
                 1.0
             };
 
+            // "Feed X" directed supply (wishlist #9): the named target is
+            // a preferred receiver — long balls into them especially.
+            let supply_modifier = if ctx.player.supply_target == Some(teammate.id) {
+                if pass_distance >= 60.0 { 1.6 } else { 1.15 }
+            } else {
+                1.0
+            };
+
+            // "Block passes into X" (wishlist #8): an assigned opposing
+            // interceptor within range of the receiver makes this pass
+            // notably less attractive to select at all.
+            let intercept_modifier = if ctx.context.intercept_assignments.iter().any(|&(i, t)| {
+                t == teammate.id
+                    && (ctx.tick_context.positions.players.position(i) - teammate.position).norm()
+                        < 80.0
+            }) {
+                0.35
+            } else {
+                1.0
+            };
+
             // Apply graduated recency penalty to discourage ping-pong passing
             // Apply congestion penalty to force ball out of huddles
             let score = score
@@ -1418,7 +1455,9 @@ impl PassEvaluator {
                 * congestion_penalty
                 * gm_modifier
                 * bias_modifier
-                * link_modifier;
+                * link_modifier
+                * supply_modifier
+                * intercept_modifier;
 
             if score > best_score && is_acceptable {
                 best_score = score;

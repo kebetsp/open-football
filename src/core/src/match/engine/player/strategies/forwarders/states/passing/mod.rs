@@ -311,6 +311,21 @@ impl ForwardPassingState {
             score *= 1.5;
         }
 
+        // "Feed X" directed supply: preferred receiver, long balls
+        // especially; and "block passes into X": an in-range assigned
+        // interceptor discounts the option (mirrors the central scorer).
+        let pass_dist = (teammate.position - ctx.player.position).magnitude();
+        if ctx.player.supply_target == Some(teammate.id) {
+            score *= if pass_dist >= 60.0 { 1.6 } else { 1.15 };
+        }
+        if ctx.context.intercept_assignments.iter().any(|&(i, t)| {
+            t == teammate.id
+                && (ctx.tick_context.positions.players.position(i) - teammate.position).norm()
+                    < 80.0
+        }) {
+            score *= 0.35;
+        }
+
         score
     }
 

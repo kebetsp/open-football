@@ -174,6 +174,15 @@ pub struct MatchPlayer {
     /// pair's chemistry is pinned high at kickoff. Set symmetrically on
     /// both players by the API layer.
     pub link_target: Option<u32>,
+    /// "Block passes into X" (wishlist #8): this player is assigned to
+    /// cut out passes to the named OPPONENT — opposing passers see a
+    /// success/selection penalty on passes to that target while this
+    /// interceptor is within range of them.
+    pub intercept_target: Option<u32>,
+    /// "Feed X" directed supply (wishlist #9): stamped on every
+    /// TEAMMATE of the named target — passes to the target are
+    /// preferred, long balls especially.
+    pub supply_target: Option<u32>,
     /// Manager-issued start-position anchors (per axis, first-half
     /// coordinates). `setup_player_on_field` overwrites start_position
     /// from the formation table, which silently discarded the API's
@@ -372,6 +381,8 @@ impl MatchPlayer {
             mark_target: None,
             teammate_trigger: None,
             link_target: None,
+            intercept_target: None,
+            supply_target: None,
             start_anchor_x: None,
             start_anchor_y: None,
             shape_rules: Vec::new(),
@@ -443,6 +454,8 @@ impl MatchPlayer {
             mark_target: None,
             teammate_trigger: None,
             link_target: None,
+            intercept_target: None,
+            supply_target: None,
             start_anchor_x: None,
             start_anchor_y: None,
             shape_rules: Vec::new(),

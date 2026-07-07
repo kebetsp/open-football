@@ -127,6 +127,14 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             }
         }
 
+        // "Block passes into X" assignments: snapshot for the pass
+        // evaluator (static pairing; positions are read live).
+        for p in field.players.iter() {
+            if let Some(target) = p.intercept_target {
+                context.intercept_assignments.push((p.id, target));
+            }
+        }
+
         // Home-crowd arousal — the play-quality half of home advantage.
         // Stamped once on every match player (starters AND bench, so
         // substitutes carry it on) and consumed inside `effective_skill`.
