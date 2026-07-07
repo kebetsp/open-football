@@ -62,7 +62,7 @@ impl MatchField {
         let away_coach_snapshot = right_team_squad.coach_snapshot.clone();
 
         let (players_on_field, substitutes) =
-            setup_player_on_field(left_team_squad, right_team_squad);
+            setup_player_on_field(left_team_squad, right_team_squad, width as f32);
 
         let field = MatchField {
             size: MatchFieldSize::new(width, height),
@@ -96,8 +96,9 @@ impl MatchField {
     }
 
     pub fn reset_players_positions(&mut self) {
+        let field_width = self.size.width as f32;
         self.players.iter_mut().for_each(|p| {
-            p.position = p.start_position;
+            p.position = clamp_restart_position(p.start_position, p.side, field_width);
             p.velocity = Vector3::zeros();
 
             p.set_default_state();
@@ -297,6 +298,7 @@ impl MatchField {
 fn setup_player_on_field(
     left_team_squad: MatchSquad,
     right_team_squad: MatchSquad,
+    field_width: f32,
 ) -> (Vec<MatchPlayer>, Vec<MatchPlayer>) {
     let setup_squad = |squad: MatchSquad, side: PlayerSide| {
         let mut players = Vec::with_capacity(squad.main_squad.len());
@@ -315,7 +317,9 @@ fn setup_player_on_field(
                 if let Some(ay) = player.start_anchor_y {
                     position.y = ay;
                 }
-                player.position = position;
+                // The kickoff snapshot must be legal (own half) even when
+                // the anchor itself is advanced — see clamp_restart_position.
+                player.position = clamp_restart_position(position, Some(side), field_width);
                 player.start_position = position;
                 // Shape rules revert to this base (see MatchPlayer docs).
                 player.shape_base = Some(position);
@@ -354,6 +358,38 @@ fn setup_player_on_field(
     substitutes.extend(right_subs);
 
     (players, substitutes)
+}
+
+/// Keep the restart snapshot off the halfway line itself so the shape
+/// reads as legal, not merely borderline.
+const RESTART_HALF_MARGIN: f32 = 12.0;
+
+/// Clamp a restart-instant position to the player's own half.
+///
+/// The laws require every player except the kickoff taker to be inside
+/// their own half when the ball is kicked off (match start, after a
+/// goal, second-half restart). Manager position anchors (`start_x`/
+/// `start_y` overrides such as `drop_deep`/`push_into_box`, and shape-
+/// rule mutations of `start_position`) may legally pull the *live*
+/// anchor into the opponent's half — so only the snapshot applied at a
+/// restart is clamped, never `start_position` itself. Once play is
+/// live, the positional states walk the player back out to the anchor.
+fn clamp_restart_position(
+    mut position: Vector3<f32>,
+    side: Option<PlayerSide>,
+    field_width: f32,
+) -> Vector3<f32> {
+    let halfway = field_width * 0.5;
+    match side {
+        Some(PlayerSide::Left) => {
+            position.x = position.x.min(halfway - RESTART_HALF_MARGIN);
+        }
+        Some(PlayerSide::Right) => {
+            position.x = position.x.max(halfway + RESTART_HALF_MARGIN);
+        }
+        None => {}
+    }
+    position
 }
 
 fn get_player_position(player: &MatchPlayer, side: PlayerSide) -> Option<Vector3<f32>> {
