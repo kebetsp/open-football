@@ -115,8 +115,20 @@ impl PassEvaluator {
             .get(passer.id, receiver.id)
             .map(|chem| chemistry_modifiers(chem).one_touch_pass_bonus)
             .unwrap_or(0.0);
+        // "Link with X" (wishlist #5): an explicit manager-issued pair
+        // preference. Stacked on top of chemistry because the one-touch
+        // bonus is a flat 0.04 above the 0.65 gate — for naturally
+        // adjacent pairs, forcing chemistry higher alone changes
+        // nothing. The extra success feeds expected_value, so the
+        // linked receiver wins ties against an equally-placed option.
+        let link_delta = if passer.link_target == Some(receiver.id) {
+            0.05
+        } else {
+            0.0
+        };
         let success_probability =
-            (raw_success_probability + env_delta + psych_delta + chemistry_delta).clamp(0.1, 0.99);
+            (raw_success_probability + env_delta + psych_delta + chemistry_delta + link_delta)
+                .clamp(0.1, 0.99);
 
         // Calculate risk level (inverse of some success factors)
         let risk_level = Self::calculate_risk_level(&factors);
@@ -1388,9 +1400,25 @@ impl PassEvaluator {
                 1.0
             };
 
+            // "Link with X" pair preference: the linked partner wins ties
+            // and close calls against equally-placed alternatives. A
+            // multiplier (same idiom as bias_modifier) rather than an EV
+            // delta — the selection scale is dominated by the multiplier
+            // chain, so a probability nudge alone is invisible here.
+            let link_modifier = if ctx.player.link_target == Some(teammate.id) {
+                1.5
+            } else {
+                1.0
+            };
+
             // Apply graduated recency penalty to discourage ping-pong passing
             // Apply congestion penalty to force ball out of huddles
-            let score = score * recency_penalty * congestion_penalty * gm_modifier * bias_modifier;
+            let score = score
+                * recency_penalty
+                * congestion_penalty
+                * gm_modifier
+                * bias_modifier
+                * link_modifier;
 
             if score > best_score && is_acceptable {
                 best_score = score;

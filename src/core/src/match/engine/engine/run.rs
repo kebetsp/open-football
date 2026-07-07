@@ -117,6 +117,16 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         let field_h = field.size.height as f32;
         context.chemistry.seed_from_roster(&chemistry_roster, field_h);
 
+        // "Link with X" pairs: pin the pair's chemistry high so the
+        // one-touch bonus (>0.65 gate) is guaranteed on top of the
+        // evaluator's explicit link bias. Symmetric fields, so one
+        // direction of the scan is enough.
+        for p in field.players.iter() {
+            if let Some(partner) = p.link_target {
+                context.chemistry.set(p.id, partner, 0.90);
+            }
+        }
+
         // Home-crowd arousal — the play-quality half of home advantage.
         // Stamped once on every match player (starters AND bench, so
         // substitutes carry it on) and consumed inside `effective_skill`.

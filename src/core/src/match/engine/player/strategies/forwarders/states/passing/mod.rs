@@ -304,6 +304,13 @@ impl ForwardPassingState {
             }
         }
 
+        // "Link with X" pair preference: the linked partner wins close
+        // calls. Multiplicative so it scales with the additive bonus
+        // stack rather than drowning in it.
+        if ctx.player.link_target == Some(teammate.id) {
+            score *= 1.5;
+        }
+
         score
     }
 

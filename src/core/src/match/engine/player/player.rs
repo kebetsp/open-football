@@ -169,6 +169,11 @@ pub struct MatchPlayer {
     /// this player's effective directive becomes `.1` (evaluated per
     /// possession change in the engine loop).
     pub teammate_trigger: Option<(u32, BehavioralDirective)>,
+    /// "Link with X" pair preference (wishlist #5): passes toward this
+    /// teammate get a success/EV bias in the pass evaluator, and the
+    /// pair's chemistry is pinned high at kickoff. Set symmetrically on
+    /// both players by the API layer.
+    pub link_target: Option<u32>,
     /// Manager-issued start-position anchors (per axis, first-half
     /// coordinates). `setup_player_on_field` overwrites start_position
     /// from the formation table, which silently discarded the API's
@@ -366,6 +371,7 @@ impl MatchPlayer {
             press_target: None,
             mark_target: None,
             teammate_trigger: None,
+            link_target: None,
             start_anchor_x: None,
             start_anchor_y: None,
             shape_rules: Vec::new(),
@@ -436,6 +442,7 @@ impl MatchPlayer {
             press_target: None,
             mark_target: None,
             teammate_trigger: None,
+            link_target: None,
             start_anchor_x: None,
             start_anchor_y: None,
             shape_rules: Vec::new(),
