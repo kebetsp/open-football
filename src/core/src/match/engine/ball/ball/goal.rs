@@ -423,6 +423,80 @@ impl Ball {
                         .push((*cb_id, Vector3::new(box_x, y, 0.0)));
                 }
 
+                // Defensive corner shape (wishlist #20 issue 4): the
+                // defending team previously ignored corners — measured
+                // 2/4 of the back line stranded 300-630u upfield while
+                // the ball was delivered into their box. Pull the six
+                // nearest defending outfielders into a compact goal-side
+                // block: two on the posts, two covering the spot, two on
+                // the edge of the area for second balls. State-preserving
+                // teleports (pending_restart_teleports) so they resume
+                // normal marking/clearing states from a legal starting
+                // shape rather than being frozen in a set-piece state.
+                let def_goal_x = match side {
+                    GoalSide::Home => 0.0,
+                    GoalSide::Away => field_width,
+                };
+                let into = match side {
+                    GoalSide::Home => 1.0_f32,
+                    GoalSide::Away => -1.0_f32,
+                };
+                // (depth from goal line, lateral offset from centre).
+                let block_slots: [(f32, f32); 6] = [
+                    (10.0, -field_height * 0.10), // near post
+                    (10.0, field_height * 0.10),  // far post
+                    (30.0, -field_height * 0.05), // spot cover L
+                    (30.0, field_height * 0.05),  // spot cover R
+                    (58.0, -field_height * 0.09), // edge-of-box L (second ball)
+                    (58.0, field_height * 0.09),  // edge-of-box R
+                ];
+                // Selecting by ROLE, not distance, is the whole point: the
+                // stranded players are the FULLBACKS pushed highest up, i.e.
+                // the FARTHEST defending outfielders — a nearest-N scan
+                // excluded exactly the ones that needed pulling back. Put
+                // the back line (regardless of how far it strayed) on the
+                // four goal-block slots, then the two nearest midfielders on
+                // the edge-of-box slots.
+                let dist_to_goal = |p: &MatchPlayer| {
+                    let dx = p.position.x - def_goal_x;
+                    let dy = p.position.y - center_y;
+                    (dx * dx + dy * dy).sqrt()
+                };
+                let mut block_ids: Vec<u32> = Vec::with_capacity(6);
+                let mut back_line: Vec<(u32, f32)> = players
+                    .iter()
+                    .filter(|p| {
+                        p.side == Some(defending_side)
+                            && p.tactical_position.current_position.is_defender()
+                    })
+                    .map(|p| (p.id, dist_to_goal(p)))
+                    .collect();
+                back_line.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                let mut mids: Vec<(u32, f32)> = players
+                    .iter()
+                    .filter(|p| {
+                        p.side == Some(defending_side)
+                            && p.tactical_position.current_position.is_midfielder()
+                    })
+                    .map(|p| (p.id, dist_to_goal(p)))
+                    .collect();
+                mids.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                // Back line fills the goal-block slots (up to 4); midfielders
+                // top up any remaining goal slots plus the two edge slots.
+                block_ids.extend(back_line.iter().take(4).map(|&(id, _)| id));
+                block_ids.extend(
+                    mids.iter()
+                        .take(6 - block_ids.len())
+                        .map(|&(id, _)| id),
+                );
+                for (slot, def_id) in block_ids.iter().enumerate() {
+                    let (depth, lateral) = block_slots[slot];
+                    self.pending_restart_teleports.push((
+                        *def_id,
+                        Vector3::new(def_goal_x + into * depth, center_y + lateral, 0.0),
+                    ));
+                }
+
                 // "GK up for late corners" (wishlist #16): teleport the
                 // flagged attacking keeper up with the CBs — he can't
                 // run the pitch length inside the cross window either.
