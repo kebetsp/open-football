@@ -423,6 +423,38 @@ impl Ball {
                         .push((*cb_id, Vector3::new(box_x, y, 0.0)));
                 }
 
+                // Second attacking wave (wishlist #20 issue 3): two
+                // midfielders hold the edge of the box rather than everyone
+                // crashing the six-yard area — they pick up knock-downs and
+                // second balls and give counter-cover if it's cleared.
+                // State-preserving so they resume normal states from the edge.
+                {
+                    let box_edge = field_width * (165.0 / 840.0);
+                    let edge_x = match side {
+                        GoalSide::Home => box_edge,
+                        GoalSide::Away => field_width - box_edge,
+                    };
+                    let mut second_wave: Vec<u32> = players
+                        .iter()
+                        .filter(|p| {
+                            p.side == Some(attacking_side)
+                                && p.id != taker_id
+                                && p.tactical_position.current_position.is_midfielder()
+                        })
+                        .map(|p| p.id)
+                        .collect();
+                    second_wave.truncate(2);
+                    for (i, mid_id) in second_wave.iter().enumerate() {
+                        let ly = if i == 0 {
+                            center_y - field_height * 0.08
+                        } else {
+                            center_y + field_height * 0.08
+                        };
+                        self.pending_restart_teleports
+                            .push((*mid_id, Vector3::new(edge_x, ly, 0.0)));
+                    }
+                }
+
                 // Defensive corner shape (wishlist #20 issue 4): the
                 // defending team previously ignored corners — measured
                 // 2/4 of the back line stranded 300-630u upfield while
