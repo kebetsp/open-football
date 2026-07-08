@@ -106,8 +106,23 @@ pub fn player_corner_zone(ctx: &StateProcessingContext) -> Option<Vector3<f32>> 
     if !ctx.ball().is_team_attacking_corner() {
         return None;
     }
-    let taker_id = ctx.tick_context.ball.current_owner?;
-    let taker_pos = ctx.tick_context.positions.players.position(taker_id);
+    // Wishlist #20 issue 2: keep the zone assignment alive through the
+    // FLIGHT, not just while the taker holds the ball. current_owner goes
+    // None the instant the corner is struck, so keying on it made every
+    // runner abandon their zone exactly when the ball was in the air. Fall
+    // back to last_owner (the taker) and anchor the geometry to the ball's
+    // strike point (the corner spot, stable) rather than the taker's live
+    // position (he's now running off).
+    let taker_id = ctx
+        .tick_context
+        .ball
+        .current_owner
+        .or(ctx.tick_context.ball.last_owner)?;
+    let taker_pos = ctx
+        .tick_context
+        .ball
+        .pass_origin_position
+        .unwrap_or_else(|| ctx.tick_context.positions.players.position(taker_id));
     let goal_pos = ctx.player().opponent_goal_position();
     let field_w = ctx.context.field_size.width as f32;
     let field_h = ctx.context.field_size.height as f32;
