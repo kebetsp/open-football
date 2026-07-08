@@ -567,6 +567,70 @@ impl Ball {
             // ownership because the GK was ~35 units away at the goal
             // line when the ball crossed the end line.
             self.pending_set_piece_teleport = Some((gk_id, self.position));
+
+            // Goal-kick shape (§8.3): previously nobody was positioned —
+            // the kicking team crowded their own box and pressers stood
+            // inside it. Spread the kicking team's back four wide across
+            // their own third to offer real receiving options, and push
+            // any pressing attacker OUT of the penalty area to its edge
+            // (a legal, onside retreat). State-preserving teleports so
+            // both sides resume normal play from a sane starting shape.
+            {
+                let gk_goal_x = match side {
+                    GoalSide::Home => 0.0,
+                    GoalSide::Away => field_width,
+                };
+                let into = match side {
+                    GoalSide::Home => 1.0_f32,
+                    GoalSide::Away => -1.0_f32,
+                };
+                let fh = context.field_size.height as f32;
+                let cy = fh * 0.5;
+                let box_depth = field_width * (165.0 / 840.0);
+                // Kicking team's back four: wide + half-space receiving spots
+                // just outside the box, so the GK has a short option each side.
+                let recv_slots: [(f32, f32); 4] = [
+                    (box_depth + 15.0, -fh * 0.34), // wide left
+                    (box_depth + 15.0, fh * 0.34),  // wide right
+                    (box_depth + 55.0, -fh * 0.14), // half-space left
+                    (box_depth + 55.0, fh * 0.14),  // half-space right
+                ];
+                let mut kicking_backs: Vec<u32> = players
+                    .iter()
+                    .filter(|p| {
+                        p.side == Some(defending_side)
+                            && p.tactical_position.current_position.is_defender()
+                    })
+                    .map(|p| p.id)
+                    .collect();
+                kicking_backs.truncate(4);
+                for (i, id) in kicking_backs.iter().enumerate() {
+                    let (depth, lateral) = recv_slots[i];
+                    self.pending_restart_teleports
+                        .push((*id, Vector3::new(gk_goal_x + into * depth, cy + lateral, 0.0)));
+                }
+                // Pressing team: anyone inside the penalty area retreats to
+                // its edge (goal-side of the ball), keeping their lateral spot.
+                for p in players.iter() {
+                    if p.side != Some(attacking_side)
+                        || p.tactical_position.current_position.is_goalkeeper()
+                    {
+                        continue;
+                    }
+                    let depth_from_goal = (p.position.x - gk_goal_x) * into;
+                    let in_box = depth_from_goal >= 0.0
+                        && depth_from_goal < box_depth + 6.0
+                        && (p.position.y - cy).abs() < fh * 0.37;
+                    if in_box {
+                        let y = p.position.y.clamp(cy - fh * 0.45, cy + fh * 0.45);
+                        self.pending_restart_teleports.push((
+                            p.id,
+                            Vector3::new(gk_goal_x + into * (box_depth + 12.0), y, 0.0),
+                        ));
+                    }
+                }
+            }
+
             context.dead_ball_until_ms =
                 context.total_match_time + context.rng.range_u64(1, 3) * 1000;
         }
