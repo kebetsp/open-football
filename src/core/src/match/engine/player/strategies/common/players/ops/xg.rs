@@ -24,6 +24,10 @@ pub enum ShotType {
     Rebound,
     Penalty,
     DirectFreeKick,
+    /// Chip/lob over an onrushing keeper (wishlist #18). Only offered in
+    /// the GK-smother zone where a driven shot is otherwise suppressed;
+    /// a well-executed chip over a committed keeper converts well.
+    Chip,
 }
 
 impl ShotType {
@@ -39,6 +43,9 @@ impl ShotType {
             ShotType::Rebound => 1.15,
             ShotType::Penalty => 0.76,
             ShotType::DirectFreeKick => 0.55,
+            // Slightly below a clean 1v1: the chip is a higher-difficulty
+            // finish (easy to over/under-hit) but the keeper is beaten.
+            ShotType::Chip => 1.10,
         }
     }
 }

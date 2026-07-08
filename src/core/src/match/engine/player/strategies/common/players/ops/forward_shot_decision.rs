@@ -342,6 +342,34 @@ pub fn evaluate_forward_shot_decision(
     let pressure_penalty = profile.pressure_penalty;
     let low_condition_penalty = profile.low_condition_penalty;
 
+    // ── Chip over an onrushing keeper (wishlist #18) ──────────────────
+    // In the GK-smother zone (keeper <15u and advanced off the line) the
+    // parabolic shot_optimal_window crushes normal shot willingness and
+    // the forward routes to Pass/Hold (2026-06-20 fix). A chip is the
+    // correct POSITIVE action there — loft the ball over the committed
+    // keeper. This ONLY fires in that narrow zone, so it converts an
+    // existing no-shot into a shot rather than altering any calibrated
+    // shot. Composure-gated so only a settled finisher tries it; the
+    // handle_shoot_event chip branch supplies the lofted trajectory.
+    if let Some(gk) = ctx.players().opponents().goalkeeper().next() {
+        let gk_dist = (gk.position - ctx.player.position).magnitude();
+        let goal = ctx.player().opponent_goal_position();
+        let gk_off_line = (gk.position - goal).magnitude();
+        let composure = skills.mental.composure / 20.0;
+        if gk_dist < 15.0
+            && gk_dist > 3.0
+            && gk_off_line > 12.0   // keeper genuinely advanced — space behind to drop into
+            && distance < 60.0      // realistic chipping range
+            && distance > 8.0       // not point-blank (just tap it in)
+            && composure > 0.45
+        {
+            // Per-tick chip probability; the shot cooldown prevents spam.
+            let chip_prob = ((composure - 0.35) * 0.9).clamp(0.0, 0.55);
+            if ctx.context.rng.unit_f32() < chip_prob {
+                return ShotDecision::Shoot { reason: "FWD_CHIP" };
+            }
+        }
+    }
 
     // ── xG quality ────────────────────────────────────────────────────
     // Pre-shot xG (matches `handle_shoot_event`'s formula). Low-xG

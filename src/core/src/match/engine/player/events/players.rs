@@ -2943,6 +2943,25 @@ impl PlayerEventDispatcher {
         let mut final_velocity =
             Vector3::new(horizontal_velocity.x, horizontal_velocity.y, z_velocity);
 
+        // Chip over an onrushing keeper (wishlist #18). The keeper is <15u
+        // in front and beaten; loft the ball above his reach (interactions.rs
+        // exempts z > 2.5u from interception/save) on a slow arc that drops
+        // back under the bar. Slower horizontal than a driven shot so the
+        // ball has time to descend inside the goal; z chosen to clear the
+        // keeper early and fall under GOAL_HEIGHT (8u) by the line. Total
+        // magnitude kept under MAX_SHOT_VELOCITY so the clamp below is inert.
+        if shoot_event_model.reason == "FWD_CHIP" {
+            let to_goal = goal_center - field.ball.position;
+            let dir2d = Vector3::new(to_goal.x, to_goal.y, 0.0);
+            let dir2d = if dir2d.norm() > 0.01 {
+                dir2d.normalize()
+            } else {
+                Vector3::new(1.0, 0.0, 0.0)
+            };
+            let chip_speed = (horizontal_distance * 0.045).clamp(1.3, 1.75);
+            final_velocity = Vector3::new(dir2d.x * chip_speed, dir2d.y * chip_speed, 2.55);
+        }
+
         // CRITICAL: Validate and clamp velocity to prevent cosmic-speed shots
         // Check for NaN or infinity
         if final_velocity.x.is_nan()
