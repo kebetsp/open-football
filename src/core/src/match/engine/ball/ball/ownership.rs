@@ -199,7 +199,13 @@ impl Ball {
         events: &mut EventCollection,
     ) {
         // Check if pass target can claim the ball
-        if let Some(target_id) = self.pass_target_player_id {
+        // §9.4.1: a locked restart taker can never claim via the
+        // pass-target privilege either (covers give-and-go edge cases
+        // where the target resolves back to the taker).
+        if let Some(target_id) = self
+            .pass_target_player_id
+            .filter(|&id| self.restart_taker_lock != Some(id))
+        {
             if let Some(target_player) = players.iter().find(|p| p.id == target_id) {
                 // Use cached landing position for aerial balls, current position for ground balls
                 let effective_ball_pos = if self.is_aerial() {
@@ -424,6 +430,11 @@ impl Ball {
             let mut all_players_missing = true;
 
             for notified_player_id in &self.take_ball_notified_players {
+                // §9.4.1: the restart taker may sit in the notified list
+                // from BEFORE his strike — he must not claim through it.
+                if self.restart_taker_lock == Some(*notified_player_id) {
+                    continue;
+                }
                 if let Some(player) = players.iter().find(|p| p.id == *notified_player_id) {
                     all_players_missing = false;
 
@@ -831,7 +842,13 @@ impl Ball {
         }
 
         // Priority claim for pass target receiver (larger radius before normal competition)
-        if let Some(target_id) = self.pass_target_player_id {
+        // §9.4.1: a locked restart taker can never claim via the
+        // pass-target privilege either (covers give-and-go edge cases
+        // where the target resolves back to the taker).
+        if let Some(target_id) = self
+            .pass_target_player_id
+            .filter(|&id| self.restart_taker_lock != Some(id))
+        {
             if let Some(target_player) = players.iter().find(|p| p.id == target_id) {
                 let dx = target_player.position.x - self.position.x;
                 let dy = target_player.position.y - self.position.y;
