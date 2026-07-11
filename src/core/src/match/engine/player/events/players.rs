@@ -789,8 +789,15 @@ impl PlayerEventDispatcher {
                 let shooter_id = shoot_event_model.from_player_id;
                 let now_tick = context.current_tick();
                 const KEY_PASS_WINDOW_TICKS: u64 = 300;
+                // Assist window (§9.1.1) is wider than the key-pass
+                // window: a striker who receives, carries a few touches
+                // into the box and finishes (~3-6 s) still owes the
+                // assist to the passer, but a genuinely long solo run
+                // does not. Key-pass stats keep the tighter 3 s window.
+                const ASSIST_WINDOW_TICKS: u64 = 600;
                 let shooter_team = field.get_player(shooter_id).map(|p| p.team_id);
                 let mut direct_assister_id: Option<u32> = None;
+                let mut goal_assister_id: Option<u32> = None;
                 if let (Some(passer_id), Some(receiver_id)) = (
                     field.ball.last_completed_pass_passer_id,
                     field.ball.last_completed_pass_receiver_id,
@@ -801,11 +808,16 @@ impl PlayerEventDispatcher {
                     let passer_not_shooter = passer_id != shooter_id;
                     let passer_team = field.get_player(passer_id).map(|p| p.team_id);
                     let same_team = passer_team.is_some() && passer_team == shooter_team;
-                    if in_window && receiver_is_shooter && passer_not_shooter && same_team {
-                        if let Some(passer) = field.get_player_mut(passer_id) {
-                            passer.statistics.add_key_pass();
+                    if receiver_is_shooter && passer_not_shooter && same_team {
+                        if in_window {
+                            if let Some(passer) = field.get_player_mut(passer_id) {
+                                passer.statistics.add_key_pass();
+                            }
+                            direct_assister_id = Some(passer_id);
                         }
-                        direct_assister_id = Some(passer_id);
+                        if elapsed <= ASSIST_WINDOW_TICKS {
+                            goal_assister_id = Some(passer_id);
+                        }
                     }
                     // Single-credit guarantee: even if the shot resolves
                     // into a goal that fires another event, the link is
@@ -813,6 +825,7 @@ impl PlayerEventDispatcher {
                     field.ball.last_completed_pass_passer_id = None;
                     field.ball.last_completed_pass_receiver_id = None;
                 }
+                field.ball.last_shot_assister_id = goal_assister_id;
                 // ── Error leading to shot/goal ────────────────────────
                 // If an opponent gave the ball away within the response
                 // window and the shooter is on the opposite team, the
@@ -2460,6 +2473,7 @@ impl PlayerEventDispatcher {
             field.ball.cached_shot_target = None;
             field.ball.last_shot_xg = 0.0;
             field.ball.last_shot_shooter_id = None;
+            field.ball.last_shot_assister_id = None;
             // Restart origin is consumed by the wall — return to
             // open play so the next tick doesn't repeat the block.
             field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
@@ -3076,6 +3090,9 @@ impl PlayerEventDispatcher {
         // require the keeper to save anything.
         field.ball.last_shot_xg = prevented_xg;
         field.ball.last_shot_shooter_id = Some(shoot_event_model.from_player_id);
+        // `last_shot_assister_id` was already stamped at the dispatch
+        // site with the assist-window (~6 s) link — don't overwrite it
+        // with the tighter key-pass-window value here.
 
         field.ball.previous_owner = Some(shoot_event_model.from_player_id);
         field.ball.current_owner = None;

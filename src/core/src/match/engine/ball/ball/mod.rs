@@ -302,6 +302,13 @@ pub struct Ball {
     /// ownership change.
     pub last_shot_xg: f32,
     pub last_shot_shooter_id: Option<u32>,
+    /// Qualified assister of the most recent shot — the passer whose
+    /// completed pass the shooter received inside the key-pass window
+    /// (~3 s) before shooting. None for solo runs / long carries, so a
+    /// goal from this shot only records an assist when the reception
+    /// genuinely led to the finish. Same lifecycle as
+    /// `last_shot_shooter_id`.
+    pub last_shot_assister_id: Option<u32>,
 
     /// Tick of the most recent live rebound — a dangerous GK parry or
     /// a loose shot-block deflection that left the ball contestable in
@@ -445,6 +452,7 @@ impl Ball {
             pressers_at_pass_count: 0,
             last_shot_xg: 0.0,
             last_shot_shooter_id: None,
+            last_shot_assister_id: None,
             last_rebound_tick: 0,
             last_giveaway_player_id: None,
             last_giveaway_team_id: None,
@@ -493,6 +501,7 @@ impl Ball {
         self.pending_error_to_shot_player_id = None;
         self.last_shot_xg = 0.0;
         self.last_shot_shooter_id = None;
+        self.last_shot_assister_id = None;
     }
 
     /// Soft invariant check on the ball's lifecycle flags. Returns the
@@ -900,6 +909,7 @@ impl Ball {
     pub fn clear_shot_metadata(&mut self) {
         self.last_shot_xg = 0.0;
         self.last_shot_shooter_id = None;
+        self.last_shot_assister_id = None;
     }
 
     /// Stamp the giveaway tracker for the player who just lost the ball

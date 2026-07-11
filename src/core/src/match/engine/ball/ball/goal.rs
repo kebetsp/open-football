@@ -127,13 +127,19 @@ impl Ball {
                         (goalscorer, is_auto_goal)
                     };
 
-                // Find assist provider: most recent passer who isn't the goalscorer
-                let assist_player_id = if !final_is_auto_goal {
-                    self.recent_passers
-                        .iter()
-                        .rev()
-                        .find(|&&id| id != final_scorer)
-                        .copied()
+                // Assist provider: the qualified assister captured at
+                // shot time (§9.1.1). `last_shot_assister_id` is only
+                // Some when the shooter received a completed teammate
+                // pass inside the key-pass window (~3 s) before
+                // shooting — a long dribble/solo run yields None, so no
+                // assist is credited, matching how real assists are
+                // judged. Gated on the scorer being that shot's shooter
+                // so a deflection credited to another attacker can't
+                // inherit an unrelated pass link.
+                let assist_player_id = if !final_is_auto_goal
+                    && self.last_shot_shooter_id == Some(final_scorer)
+                {
+                    self.last_shot_assister_id.filter(|&id| id != final_scorer)
                 } else {
                     None
                 };
