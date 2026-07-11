@@ -4302,6 +4302,20 @@ impl PlayerEventDispatcher {
         }
         field.ball.pending_restart_teleports.extend(teleports);
 
+        // §9.3.1 — genuine dead-ball stoppage: fouls now pause the sim
+        // the same way goals/corners do (run.rs skips the tick body
+        // until the window elapses). The restart teleports above drain
+        // on the first active tick after the pause; the replay layer
+        // interpolates across the sample gap, so the wall/retreat reads
+        // as a walk into position during the stoppage, not a snap.
+        // Penalties get a longer whistle-to-kick window than free kicks.
+        let pause_secs = if in_penalty_area {
+            context.rng.range_u64(3, 5)
+        } else {
+            context.rng.range_u64(2, 4)
+        };
+        context.dead_ball_until_ms = context.total_match_time + pause_secs * 1000;
+
         Some(RestartAwarded {
             penalty: in_penalty_area,
             taker_id,
