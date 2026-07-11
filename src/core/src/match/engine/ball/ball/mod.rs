@@ -249,6 +249,20 @@ pub struct Ball {
     /// Read by the delayed-offside resolver. Resets to OpenPlay on any
     /// non-restart pass or once the pass-window expires.
     pub pass_origin_restart: PassOriginRestart,
+    /// Same-touch rule (law of the game): the player who takes a restart
+    /// (corner / free kick / penalty / throw-in / goal kick) must not be
+    /// the next to touch the ball. Set to the taker at the restart
+    /// strike, cleared the moment any OTHER player registers a touch
+    /// (`record_touch`). While set, every claim / intercept / force-claim
+    /// candidate selection skips this player.
+    pub restart_taker_lock: Option<u32>,
+    /// The player staged to take the current restart (set where the
+    /// dead ball is handed to a taker). The same-touch lock engages only
+    /// when THIS player strikes — a later open-play pass under a stale
+    /// restart origin (e.g. the Corner origin deliberately preserved
+    /// through the cross for the aerial-contest resolver) must not lock
+    /// whoever happens to make it.
+    pub restart_pending_taker: Option<u32>,
     /// Set at pass-kick. Lives for the pass window (~220 ticks) and the
     /// offside resolver fires the call only when the receiver becomes
     /// active (touches the ball or claims). Cleared on resolution,
@@ -433,6 +447,8 @@ impl Ball {
             stall_anchor_tick: 0,
             cached_shot_target: None,
             pending_save_credit: None,
+            restart_taker_lock: None,
+            restart_pending_taker: None,
             last_touch_player_id: None,
             last_touch_team_id: None,
             last_touch_tick: 0,
@@ -467,6 +483,16 @@ impl Ball {
     /// Record a meaningful touch. Drives restart resolution. `controlled`
     /// distinguishes a clean reception from a deflection / failed save.
     pub fn record_touch(&mut self, player_id: u32, team_id: u32, tick: u64, controlled: bool) {
+        // A touch by anyone other than the staged taker voids the
+        // pending-restart marker (the restart was stolen / re-staged).
+        if self.restart_pending_taker.is_some() && self.restart_pending_taker != Some(player_id) {
+            self.restart_pending_taker = None;
+        }
+        // Any touch by a different player releases the restart taker's
+        // same-touch lock (§9.4.1).
+        if self.restart_taker_lock.is_some() && self.restart_taker_lock != Some(player_id) {
+            self.restart_taker_lock = None;
+        }
         self.last_touch_player_id = Some(player_id);
         self.last_touch_team_id = Some(team_id);
         self.last_touch_tick = tick;
@@ -832,6 +858,8 @@ impl Ball {
         self.last_touch_tick = 0;
         self.last_touch_was_controlled = false;
         self.pass_origin_restart = PassOriginRestart::OpenPlay;
+        self.restart_taker_lock = None;
+        self.restart_pending_taker = None;
         self.offside_snapshot = None;
         self.last_completed_pass_passer_id = None;
         self.last_completed_pass_receiver_id = None;

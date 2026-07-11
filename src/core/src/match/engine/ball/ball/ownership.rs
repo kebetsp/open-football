@@ -248,6 +248,7 @@ impl Ball {
                             self.flags.in_flight_state = 0;
                             self.cached_shot_target = None;
                             self.pass_origin_restart = PassOriginRestart::FreeKick;
+                            self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
                             events.add_ball_event(BallEvent::Offside(target_id, restart_pos));
                             return;
                         }
@@ -307,8 +308,12 @@ impl Ball {
         // Also allow previous owner (passer) to reclaim if ball bounced back
         // BUT only after the ball has had time to travel away (in_flight_state < 10)
         // This prevents the passer from immediately reclaiming on low-force passes
+        // §9.4.1: never the restart taker reclaiming his own delivery.
         if self.flags.in_flight_state < 10 {
-            if let Some(prev_id) = self.previous_owner {
+            if let Some(prev_id) = self
+                .previous_owner
+                .filter(|&id| self.restart_taker_lock != Some(id))
+            {
                 if let Some(prev_player) = players.iter().find(|p| p.id == prev_id) {
                     let dx = prev_player.position.x - self.position.x;
                     let dy = prev_player.position.y - self.position.y;
@@ -530,6 +535,8 @@ impl Ball {
                 let claim_distance_sq = claim_distance * claim_distance;
                 if let Some(nearest_player) = players
                     .iter()
+                    // §9.4.1: restart taker excluded from force-claims too.
+                    .filter(|p| self.restart_taker_lock != Some(p.id))
                     .filter_map(|p| {
                         let dx = p.position.x - self.position.x;
                         let dy = p.position.y - self.position.y;
@@ -653,6 +660,11 @@ impl Ball {
         let mut team_b_best: Option<(u32, f32)> = None;
 
         for player in players {
+            // §9.4.1: don't send the restart taker chasing a ball he's
+            // barred from touching.
+            if self.restart_taker_lock == Some(player.id) {
+                continue;
+            }
             let dx = player.position.x - ball_position.x;
             let dy = player.position.y - ball_position.y;
             let dist_sq = dx * dx + dy * dy;
@@ -886,6 +898,11 @@ impl Ball {
         let ball_height_reachable = self.position.z <= PLAYER_JUMP_REACH;
 
         for player in players.iter() {
+            // §9.4.1 same-touch rule: the restart taker cannot claim
+            // his own delivery until someone else touches it.
+            if self.restart_taker_lock == Some(player.id) {
+                continue;
+            }
             let dx = player.position.x - self.position.x;
             let dy = player.position.y - self.position.y;
             let dist_sq = dx * dx + dy * dy;

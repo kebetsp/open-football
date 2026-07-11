@@ -1881,6 +1881,25 @@ impl PlayerEventDispatcher {
         field.ball.pass_origin_position = Some(field.ball.position);
         field.ball.pass_origin_team = passer_team;
 
+        // §9.4.1 same-touch rule: if this pass IS the staged restart
+        // delivery (struck by the pending taker), the taker is locked
+        // out of the next touch until someone else registers one. Keyed
+        // on the staged taker, NOT the restart origin — the Corner
+        // origin is deliberately preserved through the cross for the
+        // aerial-contest resolver, so a later clearance under that
+        // stale origin must not lock whoever happens to make it.
+        if field.ball.restart_pending_taker == Some(event_model.from_player_id) {
+            field.ball.restart_taker_lock = Some(event_model.from_player_id);
+            field.ball.restart_pending_taker = None;
+        } else if field.ball.restart_taker_lock.is_some()
+            && field.ball.restart_taker_lock != Some(event_model.from_player_id)
+        {
+            // A strike by any other player is a touch — releases the
+            // lock even on paths that never call record_touch (e.g. a
+            // first-touch snapshot shot/pass without a claim).
+            field.ball.restart_taker_lock = None;
+        }
+
         field.ball.previous_owner = field.ball.current_owner;
         field.ball.current_owner = None;
         field.ball.pass_target_player_id = Some(event_model.to_player_id);
@@ -2281,6 +2300,11 @@ impl PlayerEventDispatcher {
     }
 
     fn handle_claim_ball_event(player_id: u32, field: &mut MatchField, context: &MatchContext) {
+        // §9.4.1 same-touch rule: the restart taker cannot be the next
+        // toucher of his own delivery.
+        if field.ball.restart_taker_lock == Some(player_id) {
+            return;
+        }
         // CLAIM COOLDOWN: Prevent rapid ping-pong between players
         // If the ball was just claimed by someone else, reject this claim
         const CLAIM_COOLDOWN_TICKS: u32 = 15; // ~250ms at 60fps - time before ball can change hands
@@ -2397,6 +2421,10 @@ impl PlayerEventDispatcher {
     }
 
     fn handle_gain_ball_event(player_id: u32, field: &mut MatchField) {
+        // §9.4.1 same-touch rule (see handle_claim_ball_event).
+        if field.ball.restart_taker_lock == Some(player_id) {
+            return;
+        }
         Self::secure_ball_for(player_id, field);
         field.ball.clear_pass_history();
         field.ball.flags.in_flight_state = 100;
@@ -2438,6 +2466,20 @@ impl PlayerEventDispatcher {
         // speed ratio observed in real football (vs. the engine's prior ~10×).
         const MAX_SHOT_VELOCITY: f32 = 3.2;
         const MIN_SHOT_DISTANCE: f32 = 1.0; // Minimum distance to prevent NaN from normalization
+
+        // §9.4.1 same-touch rule: a shot struck directly from a restart
+        // (direct free kick at goal) locks the taker out of the next
+        // touch, e.g. his own rebound off the keeper or post. Keyed on
+        // the staged taker, same as the pass path.
+        if field.ball.restart_pending_taker == Some(shoot_event_model.from_player_id) {
+            field.ball.restart_taker_lock = Some(shoot_event_model.from_player_id);
+            field.ball.restart_pending_taker = None;
+        } else if field.ball.restart_taker_lock.is_some()
+            && field.ball.restart_taker_lock != Some(shoot_event_model.from_player_id)
+        {
+            // Another player's strike is a touch (see pass handler).
+            field.ball.restart_taker_lock = None;
+        }
 
         let rng = &context.rng;
 
@@ -3907,6 +3949,8 @@ impl PlayerEventDispatcher {
             field.ball.previous_owner = field.ball.current_owner;
             field.ball.current_owner = Some(opponent_id);
             field.ball.ownership_duration = 0;
+            // §9.4.1: this player is the staged free-kick taker.
+            field.ball.restart_pending_taker = Some(opponent_id);
         }
 
         // Protected possession (same pattern as foul free kick)
@@ -4187,6 +4231,8 @@ impl PlayerEventDispatcher {
         } else {
             PassOriginRestart::DirectFreeKick
         };
+        ball.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
+        ball.restart_pending_taker = Some(taker_id);
         let team_id = field
             .players
             .iter()

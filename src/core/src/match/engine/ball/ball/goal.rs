@@ -224,6 +224,8 @@ impl Ball {
             self.cached_shot_target = None;
             self.recent_passers.clear();
             self.pass_origin_restart = PassOriginRestart::GoalKick;
+            self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
+            self.restart_pending_taker = Some(gk_id);
             self.offside_snapshot = None;
             self.record_touch(gk_id, gk_team, self.current_tick_cached, true);
 
@@ -354,6 +356,8 @@ impl Ball {
                 // explanation).
                 self.cached_shot_target = None;
                 self.pass_origin_restart = PassOriginRestart::Corner;
+                self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
+                self.restart_pending_taker = Some(taker_id);
                 // Pick the corner routine via the SetPieceHistory-aware
                 // helper so repeated identical routines (with no chance
                 // produced) get blocked, varying the delivery flavour
@@ -596,6 +600,8 @@ impl Ball {
             // save for a shot that ended out of play.
             self.cached_shot_target = None;
             self.pass_origin_restart = PassOriginRestart::GoalKick;
+            self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
+            self.restart_pending_taker = Some(gk_id);
             self.offside_snapshot = None;
             self.record_touch(gk_id, gk_team, self.current_tick_cached, true);
 

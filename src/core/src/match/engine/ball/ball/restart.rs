@@ -79,6 +79,8 @@ impl Ball {
         self.cached_shot_target = None;
         self.offside_snapshot = None;
         self.pass_origin_restart = PassOriginRestart::ThrowIn;
+        self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
+        self.restart_pending_taker = Some(thrower_id);
 
         let team_id = players
             .iter()

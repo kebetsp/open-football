@@ -108,6 +108,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
     /// nulls ownership on the very next tick — ball stalls for seconds.
     pub(super) fn apply_pending_set_piece_teleport(field: &mut MatchField) {
         if let Some((player_id, ball_pos)) = field.ball.pending_set_piece_teleport.take() {
+            // Handing the ball to a staged taker starts a NEW restart —
+            // any live same-touch lock belongs to a dead delivery chain
+            // (§9.4.1). Without this, a taker whose previous restart went
+            // straight out of play stays barred from his own new kick.
+            field.ball.restart_taker_lock = None;
             if let Some(idx) = field.player_index(player_id) {
                 let p = &mut field.players[idx];
                 p.position = ball_pos;
@@ -288,6 +293,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         field.ball.last_shot_shooter_id = Some(taker_id);
         field.ball.last_shot_assister_id = None;
         field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
+        // §9.4.1 same-touch rule — covers the rebound case: a saved or
+        // missed penalty must not be re-taken by the taker before any
+        // other player touches it (the SAVE branch's keeper touch clears
+        // the lock immediately, matching the law).
+        field.ball.restart_taker_lock = Some(taker_id);
 
         if context.rng.bernoulli(p_goal) {
             // GOAL — flat driven shot into a corner. The keeper stands
