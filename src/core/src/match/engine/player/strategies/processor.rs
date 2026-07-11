@@ -306,6 +306,17 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
+        // §9.2.2 live recovery pull: while OUR goalkeeper holds the ball
+        // in open play, teammates drift back toward their formation
+        // anchors — a continuous velocity blend, not a scripted
+        // pause-and-walk. Applied BEFORE the press/mark overrides so an
+        // explicit man-assignment still wins outright.
+        if let Some(pull) = Self::gk_possession_recovery_velocity(&processing_ctx) {
+            let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
+            let base = result.velocity.unwrap_or_else(Vector3::zeros);
+            result.velocity = Some(base * 0.35 + pull * tempo * 0.65);
+        }
+
         // Cross-player assignment overrides (press / mark). Applied AFTER
         // the state handler so the manager's man-assignment wins over
         // normal state movement, regardless of which state the player is
@@ -403,6 +414,30 @@ impl<'p> StateProcessor<'p> {
 
     /// Velocity override for manager-issued cross-player assignments.
     ///
+    /// §9.2.2 — recovery pull while our own goalkeeper holds the ball in
+    /// open play. Teammates drift toward their formation anchor
+    /// (`start_position` — the live anchor, same recovery target the
+    /// §9.2.1 dead-ball shape uses) at a jog. Returns None for the GK
+    /// himself, the rare on-ball teammate, players already home, and
+    /// whenever our keeper doesn't hold the ball.
+    fn gk_possession_recovery_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.tactical_position.current_position.is_goalkeeper() {
+            return None;
+        }
+        if !ctx.ball().is_held_by_own_goalkeeper() {
+            return None;
+        }
+        let to_anchor = player.start_position - player.position;
+        let dist = to_anchor.magnitude();
+        if dist < 25.0 {
+            return None;
+        }
+        // Jog, not sprint: recovery under no direct pressure. Half the
+        // press-chase magnitude convention (direction × pace).
+        Some(to_anchor.normalize() * player.skills.physical.pace * 0.5)
+    }
+
     /// PRESS (`press_target`): whenever the assigned opponent has the
     /// ball, sprint straight at them (predictive-free chase — the visible
     /// proof is the dot hunting the target on every possession).

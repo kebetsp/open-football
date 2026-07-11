@@ -119,6 +119,20 @@ impl<'b> BallOperationsImpl<'b> {
         false
     }
 
+    /// Check if OUR OWN goalkeeper currently holds the ball (§9.2.2 —
+    /// the trigger for the live recovery pull toward formation anchors).
+    pub fn is_held_by_own_goalkeeper(&self) -> bool {
+        if let Some(owner_id) = self.ctx.tick_context.ball.current_owner {
+            if let Some(owner) = self.ctx.context.players.by_id(owner_id) {
+                if owner.team_id != self.ctx.player.team_id {
+                    return false;
+                }
+                return owner.tactical_position.current_position.is_goalkeeper();
+            }
+        }
+        false
+    }
+
     #[inline]
     pub fn previous_owner_id(&self) -> Option<u32> {
         self.ctx.tick_context.ball.last_owner
