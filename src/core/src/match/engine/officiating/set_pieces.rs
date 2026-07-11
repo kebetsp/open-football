@@ -582,6 +582,80 @@ pub fn pick_taker(
         .map(|t| t.player_id)
 }
 
+/// §9.2.1 dead-ball recovery shape. During a restart window every
+/// outfield player not specifically staged (wall, back-four spread,
+/// box-clear, taker) recovers toward his formation anchor
+/// (`start_position` — the live anchor including shape-rule shifts and
+/// the halftime mirror). For goal kicks (`press_high = true`) the
+/// non-kicking team's forwards instead take a pressing line confronting
+/// the kicking team's spread back line at the edge of their third — the
+/// attacking team presses higher, it doesn't passively retreat.
+///
+/// Pure: returns `(player_id, target)` pairs. Callers apply them as
+/// state-preserving placements (queued teleports or direct writes) —
+/// the replay layer's dead-ball easing (§8.0.2) walks the movement, so
+/// the recovery reads as a jog into shape, never a snap. Non-kicking
+/// players are kept ≥73u from the restart spot (the legal retreat,
+/// §9.3.1). Players already within 20u of their target are left alone.
+pub fn recovery_shape_targets(
+    players: &[crate::r#match::MatchPlayer],
+    kicking_side: crate::r#match::PlayerSide,
+    restart_pos: nalgebra::Vector3<f32>,
+    field_width: f32,
+    press_high: bool,
+    exclude: &[u32],
+) -> Vec<(u32, nalgebra::Vector3<f32>)> {
+    use crate::PlayerFieldPositionGroup;
+    use nalgebra::Vector3;
+
+    // Pressing line for the non-kicking forwards on a goal kick: just
+    // beyond the kicking team's third (box edge ~165u + 30).
+    let byline_x = if restart_pos.x < field_width * 0.5 {
+        0.0
+    } else {
+        field_width
+    };
+    let into: f32 = if byline_x == 0.0 { 1.0 } else { -1.0 };
+    let press_x = byline_x + into * 195.0;
+
+    players
+        .iter()
+        .filter(|p| {
+            !p.is_sent_off
+                && !p.tactical_position.current_position.is_goalkeeper()
+                && !exclude.contains(&p.id)
+        })
+        .filter_map(|p| {
+            let is_kicking = p.side == Some(kicking_side);
+            let group = p.tactical_position.current_position.position_group();
+            let mut target = p.start_position;
+            if press_high && !is_kicking && group == PlayerFieldPositionGroup::Forward {
+                target.x = press_x;
+            }
+            if !is_kicking {
+                // Legal retreat: the non-kicking team stays ≥73u off the
+                // restart spot.
+                let d = Vector3::new(target.x - restart_pos.x, target.y - restart_pos.y, 0.0);
+                let dist = (d.x * d.x + d.y * d.y).sqrt();
+                if dist < 73.0 {
+                    let dir = if dist > 0.5 {
+                        d / dist
+                    } else {
+                        Vector3::new(-into, 0.0, 0.0)
+                    };
+                    target = restart_pos + dir * 73.0;
+                }
+            }
+            let off = Vector3::new(p.position.x - target.x, p.position.y - target.y, 0.0);
+            if (off.x * off.x + off.y * off.y).sqrt() < 20.0 {
+                None
+            } else {
+                Some((p.id, Vector3::new(target.x, target.y, 0.0)))
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -4395,7 +4395,35 @@ impl PlayerEventDispatcher {
         // Place restart bodies directly too (same &mut field reasoning
         // as the taker above): the wall / box-clear must be formed when
         // the §9.3.1 freeze starts, not after it ends.
+        let mut staged_ids: Vec<u32> = teleports.iter().map(|(id, _)| *id).collect();
         for (player_id, pos) in teleports {
+            if let Some(idx) = field.player_index(player_id) {
+                let p = &mut field.players[idx];
+                p.position = pos;
+                p.velocity = Vector3::zeros();
+                p.in_state_time = 0;
+            }
+        }
+
+        // §9.2.1 — everyone NOT involved in the restart (wall, box-clear,
+        // taker) recovers toward formation shape during the foul
+        // stoppage: the same dead-ball recovery mechanism goal kicks use
+        // (no press-high line here — that's a goal-kick concept). The
+        // replay layer's dead-ball easing walks the movement.
+        staged_ids.push(taker_id);
+        let kicking_side = match fouler_side {
+            PlayerSide::Left => PlayerSide::Right,
+            PlayerSide::Right => PlayerSide::Left,
+        };
+        let recovery = crate::r#match::engine::set_pieces::recovery_shape_targets(
+            &field.players,
+            kicking_side,
+            restart_pos,
+            field_w,
+            false,
+            &staged_ids,
+        );
+        for (player_id, pos) in recovery {
             if let Some(idx) = field.player_index(player_id) {
                 let p = &mut field.players[idx];
                 p.position = pos;

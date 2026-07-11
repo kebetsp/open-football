@@ -50,8 +50,8 @@ pub use officiating::set_pieces::{
     CornerRoutine, CornerScores, FreeKickBand, FreeKickChoice, FreeKickChoiceScores,
     ROUTINE_REPEAT_XG_THRESHOLD, SetPieceHistory, TakerScore, ThrowRoutine,
     penalty_conversion_prob, pick_corner_routine, pick_taker, pick_throw_routine,
-    score_corner_routines, score_corner_taker, score_free_kick_choices, score_free_kick_taker,
-    score_keeper_save, score_penalty_taker, wall_block_prob, wall_size_for,
+    recovery_shape_targets, score_corner_routines, score_corner_taker, score_free_kick_choices,
+    score_free_kick_taker, score_keeper_save, score_penalty_taker, wall_block_prob, wall_size_for,
 };
 pub use officiating::{management, referee, set_pieces};
 

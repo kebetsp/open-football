@@ -230,6 +230,20 @@ impl Ball {
             self.record_touch(gk_id, gk_team, self.current_tick_cached, true);
 
             events.add_ball_event(BallEvent::Claimed(gk_id));
+
+            // §9.2.1 full-team recovery on the over-the-bar goal kick
+            // too (same mechanism as the wide-of-goal path).
+            self.pending_restart_teleports.extend(
+                crate::r#match::engine::set_pieces::recovery_shape_targets(
+                    players,
+                    defending_side,
+                    self.position,
+                    self.field_width,
+                    true,
+                    &[gk_id],
+                ),
+            );
+
             context.dead_ball_until_ms =
                 context.total_match_time + context.rng.range_u64(1, 3) * 1000;
         }
@@ -651,6 +665,27 @@ impl Ball {
             // line when the ball crossed the end line.
             self.pending_set_piece_teleport = Some((gk_id, self.position));
 
+            // §9.2.1 full-team recovery: every outfield player on both
+            // teams drifts toward his formation anchor during the
+            // goal-kick window; the non-kicking team's forwards take a
+            // pressing line against the spread back four instead of
+            // retreating. Queued FIRST so the specific placements below
+            // (back-four spread, presser box-clear) override where they
+            // apply — the drain applies entries in order, last wins.
+            let recovery_ids: Vec<u32> = {
+                let rec = crate::r#match::engine::set_pieces::recovery_shape_targets(
+                    players,
+                    defending_side,
+                    self.position,
+                    field_width,
+                    true,
+                    &[gk_id],
+                );
+                let ids = rec.iter().map(|(id, _)| *id).collect();
+                self.pending_restart_teleports.extend(rec);
+                ids
+            };
+
             // Goal-kick shape (§8.3): previously nobody was positioned —
             // the kicking team crowded their own box and pressers stood
             // inside it. Spread the kicking team's back four wide across
@@ -694,9 +729,14 @@ impl Ball {
                 }
                 // Pressing team: anyone inside the penalty area retreats to
                 // its edge (goal-side of the ball), keeping their lateral spot.
+                // §9.2.1: skip players the recovery shape already moves —
+                // their queued anchor/press-line target is outside the box,
+                // and this later entry would override it back to the edge
+                // (positions checked here are the PRE-recovery snapshot).
                 for p in players.iter() {
                     if p.side != Some(attacking_side)
                         || p.tactical_position.current_position.is_goalkeeper()
+                        || recovery_ids.contains(&p.id)
                     {
                         continue;
                     }
