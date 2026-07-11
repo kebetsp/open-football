@@ -465,6 +465,45 @@ impl Ball {
                     }
                 }
 
+                // §9.4.2 short-corner option: sometimes a teammate walks
+                // over to the near zone before the kick (real teams stage
+                // the short option during the corner stoppage; the sim has
+                // no stoppage, so position him directly). The delivery
+                // picker only plays short when this zone is ACTUALLY
+                // occupied at kick time — with nobody staged, the short
+                // branch simply stays unavailable.
+                if context.rng.bernoulli(0.25) {
+                    let toward_centre_y: f32 =
+                        if corner_y < center_y { 1.0 } else { -1.0 };
+                    let inward_x: f32 = match side {
+                        GoalSide::Home => 1.0,
+                        GoalSide::Away => -1.0,
+                    };
+                    let short_spot = Vector3::new(
+                        corner_x + inward_x * 18.0,
+                        corner_y + toward_centre_y * 42.0,
+                        0.0,
+                    );
+                    let cb_ids: Vec<u32> =
+                        cbs.iter().take(2).map(|(id, _)| *id).collect();
+                    if let Some(opt) = players
+                        .iter()
+                        .filter(|p| {
+                            p.side == Some(attacking_side)
+                                && p.id != taker_id
+                                && !p.tactical_position.current_position.is_goalkeeper()
+                                && !cb_ids.contains(&p.id)
+                        })
+                        .min_by(|a, b| {
+                            let da = (a.position - self.position).norm_squared();
+                            let db = (b.position - self.position).norm_squared();
+                            da.partial_cmp(&db).unwrap_or(Ordering::Equal)
+                        })
+                    {
+                        self.pending_restart_teleports.push((opt.id, short_spot));
+                    }
+                }
+
                 // Defensive corner shape (wishlist #20 issue 4): the
                 // defending team previously ignored corners — measured
                 // 2/4 of the back line stranded 300-630u upfield while

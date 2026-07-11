@@ -187,6 +187,37 @@ pub fn pick_corner_delivery(
     let field_w = ctx.context.field_size.width as f32;
     let field_h = ctx.context.field_size.height as f32;
 
+    // §9.4.2 short corner — a distinct decision branch, not a zone. Only
+    // available when a teammate is ACTUALLY standing in the near zone
+    // (the band between the corner arc and the six-yard box) at the
+    // moment of the kick: then the delivery may be a precise, deliberate
+    // pass at that teammate's real position. An empty near zone is never
+    // a target for any delivery mode.
+    if let Some(mate) = ctx
+        .players()
+        .teammates()
+        .all()
+        .filter(|t| {
+            t.id != taker_id
+                && (t.position - taker_pos).magnitude() < 70.0
+                // Still outside the box mouth — a runner already at
+                // the near post is a cross target, not a short option.
+                && (t.position.y - field_h * 0.5).abs() > 84.0
+        })
+        .min_by(|a, b| {
+            let da = (a.position - taker_pos).magnitude();
+            let db = (b.position - taker_pos).magnitude();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+    {
+        // The taker MAY go short — usually does when an option was
+        // staged, but a cross stays possible so defences can't sit on
+        // the short ball.
+        if ctx.context.rng.bernoulli(0.7) {
+            return Some((mate.id, mate.position));
+        }
+    }
+
     let assignments = assign_corner_runners(
         taker_id,
         taker_pos,
@@ -217,5 +248,38 @@ pub fn pick_corner_delivery(
                 - if *j == preferred_idx { 30.0 } else { 0.0 };
             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         })
-        .map(|(_, &assignment)| assignment)
+        .map(|(_, &(pid, zone))| {
+            (pid, clamp_cross_target_out_of_short_band(zone, goal_pos, field_w, field_h))
+        })
+}
+
+/// §9.4.2 hard clamp, cross branch only: a cross-style corner target
+/// must be at or beyond the six-yard box line — never in the band
+/// between the corner arc and the box (near the byline, outside the
+/// box mouth). The six-yard area is ~55u deep and its mouth spans
+/// goal-centre ± 84u (29u half-goal + 55u). Zone geometry already
+/// respects this; the clamp guarantees it against any future retune.
+fn clamp_cross_target_out_of_short_band(
+    target: Vector3<f32>,
+    goal_pos: Vector3<f32>,
+    field_w: f32,
+    field_h: f32,
+) -> Vector3<f32> {
+    const SIX_YARD_DEPTH: f32 = 55.0;
+    const SIX_YARD_HALF_MOUTH: f32 = 84.0;
+    let byline_x = if goal_pos.x > field_w * 0.5 { field_w } else { 0.0 };
+    let cy = field_h * 0.5;
+    let depth = (target.x - byline_x).abs();
+    let lateral = (target.y - cy).abs();
+    if depth < SIX_YARD_DEPTH && lateral > SIX_YARD_HALF_MOUTH {
+        // Pull the target laterally to the six-yard mouth edge — the
+        // nearest legal point for a genuine cross.
+        let clamped_y = if target.y > cy {
+            cy + SIX_YARD_HALF_MOUTH
+        } else {
+            cy - SIX_YARD_HALF_MOUTH
+        };
+        return Vector3::new(target.x, clamped_y, target.z);
+    }
+    target
 }
