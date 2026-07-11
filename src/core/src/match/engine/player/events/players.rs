@@ -4252,6 +4252,12 @@ impl PlayerEventDispatcher {
             if dist_goal > 40.0 {
                 let dir = to_goal / dist_goal;
                 let band = FreeKickBand::from_distance(dist_goal);
+                // §9.3.2 — a formal multi-player wall only for fouls in
+                // realistic direct-shot/cross range (Close/Mid/Long,
+                // ≤180u). Beyond that the 73u retreat below is the whole
+                // requirement — real teams don't build a wall for a
+                // midfield free kick, they just keep their distance.
+                let form_wall = band != FreeKickBand::Far;
                 let is_wide_angle = (restart_pos.y - mid_y).abs() > dist_goal * 0.5;
                 let wall_n = wall_size_for(band, is_wide_angle).clamp(2, 6) as usize;
                 let wall_dist = 73.0_f32.min(dist_goal * 0.6);
@@ -4259,18 +4265,22 @@ impl PlayerEventDispatcher {
                 let perp = Vector3::new(-dir.y, dir.x, 0.0);
 
                 // Nearest defending outfield players form the wall.
-                let mut candidates: Vec<(f32, u32)> = field
-                    .players
-                    .iter()
-                    .filter(|p| p.side == Some(fouler_side) && !p.is_sent_off && !is_gk(p))
-                    .map(|p| {
-                        let d = p.position - wall_center;
-                        ((d.x * d.x + d.y * d.y).sqrt(), p.id)
-                    })
-                    .collect();
-                candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                let wall_ids: Vec<u32> =
-                    candidates.iter().take(wall_n).map(|&(_, id)| id).collect();
+                let wall_ids: Vec<u32> = if form_wall {
+                    let mut candidates: Vec<(f32, u32)> = field
+                        .players
+                        .iter()
+                        .filter(|p| p.side == Some(fouler_side) && !p.is_sent_off && !is_gk(p))
+                        .map(|p| {
+                            let d = p.position - wall_center;
+                            ((d.x * d.x + d.y * d.y).sqrt(), p.id)
+                        })
+                        .collect();
+                    candidates
+                        .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                    candidates.iter().take(wall_n).map(|&(_, id)| id).collect()
+                } else {
+                    Vec::new()
+                };
                 for (i, &pid) in wall_ids.iter().enumerate() {
                     let lateral = (i as f32 - (wall_n as f32 - 1.0) * 0.5) * 9.0;
                     let mut pos = wall_center + perp * lateral;
