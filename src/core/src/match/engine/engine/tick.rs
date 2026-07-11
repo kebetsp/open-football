@@ -80,6 +80,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         Self::play_ball(field, context, tick_ctx, events);
         Self::apply_pending_set_piece_teleport(field);
         Self::apply_pending_save_credit(field);
+        Self::resolve_penalty_kick(field, context);
         Self::resolve_corner_contest(field, context);
         // Resolve any deferred-foul / advantage state. Cheap (one
         // Option read in the dominant no-advantage case) so we run it
@@ -171,6 +172,232 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
     /// carried by a corner header's ~0.10-0.14 xG in the shot pipeline —
     /// only ~3-4% of corners end in a goal (real ≈ 3%), giving defenders
     /// their realistic set-piece share without inflating totals.
+    /// §9.3.3 — discrete in-match penalty resolution. A penalty is a
+    /// fixed, isolated 1v1 by definition, so instead of letting the
+    /// taker's open-play state machine improvise from the spot (pass!
+    /// dribble!), the kick resolves through the same skill model the
+    /// shootout uses (`penalty_conversion_prob`), the moment the taker
+    /// is staged on the ball after the §9.3.1 stoppage. Runs BEFORE
+    /// `play_players` in the tick, so the taker's AI never gets a
+    /// decision tick with the ball.
+    ///
+    /// Outcomes are then animated physically:
+    ///   * goal   — ball launched into a corner on a high arc
+    ///              (position.z > 2.5 is exempt from interception; the
+    ///              claim cooldown covers the flight), resolved by the
+    ///              normal `check_goal` path so score/stats credit
+    ///              normally (no assist — `last_shot_assister_id` None).
+    ///   * saved  — ball placed in the keeper's hands; save + on-target
+    ///              stats credited via `pending_save_credit`.
+    ///   * missed — ball sails over the bar; `check_over_goal` resolves
+    ///              it into the normal goal-kick restart.
+    pub(super) fn resolve_penalty_kick(field: &mut MatchField, context: &mut MatchContext) {
+        use crate::r#match::PassOriginRestart;
+        use crate::r#match::engine::set_pieces::{
+            penalty_conversion_prob, score_keeper_save, score_penalty_taker,
+        };
+        use nalgebra::Vector3;
+
+        if field.ball.pass_origin_restart != PassOriginRestart::Penalty {
+            return;
+        }
+        let Some(taker_id) = field.ball.current_owner else {
+            return;
+        };
+        // Staged: taker teleport has drained and he stands on the ball.
+        let Some(taker) = field.players.iter().find(|p| p.id == taker_id) else {
+            return;
+        };
+        let d = taker.position - field.ball.position;
+        if (d.x * d.x + d.y * d.y).sqrt() > 6.0 {
+            return;
+        }
+
+        // Which goal: the nearer one (the ball sits on the penalty spot,
+        // 88u from the goal line — always unambiguous).
+        let gl = context.goal_positions.left;
+        let gr = context.goal_positions.right;
+        let ball_pos = field.ball.position;
+        let goal = if (ball_pos - gl).magnitude() < (ball_pos - gr).magnitude() {
+            gl
+        } else {
+            gr
+        };
+
+        // Defending keeper: nearest opposing GK (placed on his line at
+        // award time). May be absent after a red card with no sub — the
+        // conversion model's keeper-score floor handles that.
+        let taker_team = taker.team_id;
+        let gk = field
+            .players
+            .iter()
+            .find(|p| {
+                p.team_id != taker_team
+                    && !p.is_sent_off
+                    && p.tactical_position.current_position.is_goalkeeper()
+            })
+            .map(|p| {
+                let g = &p.skills.goalkeeping;
+                let m = &p.skills.mental;
+                (
+                    p.id,
+                    score_keeper_save(
+                        g.reflexes,
+                        p.skills.physical.agility,
+                        g.handling,
+                        m.anticipation,
+                        p.attributes.pressure,
+                        m.concentration,
+                    )
+                    .clamp(0.05, 1.0),
+                )
+            });
+        let taker_score = {
+            let t = &taker.skills.technical;
+            let m = &taker.skills.mental;
+            score_penalty_taker(
+                t.penalty_taking,
+                t.finishing,
+                m.composure,
+                taker.attributes.pressure,
+                t.technique,
+                0.0,
+            )
+            .clamp(0.05, 1.0)
+        };
+        let keeper_score = gk.map(|(_, s)| s).unwrap_or(0.05);
+
+        // Late-match pressure bump, same spirit as the shootout's round
+        // ramp but mild for in-play penalties.
+        let minute = (context.total_match_time / 60_000) as u32;
+        let pressure = if minute >= 75 { 0.55 } else { 0.35 };
+        let p_goal = penalty_conversion_prob(taker_score, keeper_score, pressure, false);
+
+        let tick = context.current_tick();
+        let dir2d = {
+            let v = Vector3::new(goal.x - ball_pos.x, goal.y - ball_pos.y, 0.0);
+            if v.norm() > 0.01 {
+                v.normalize()
+            } else {
+                Vector3::new(1.0, 0.0, 0.0)
+            }
+        };
+        // Penalty xG is effectively fixed (~0.79) — stamp it so the GK
+        // xg_prevented credit/debit works in both save and goal paths.
+        field.ball.last_shot_xg = 0.79;
+        field.ball.last_shot_shooter_id = Some(taker_id);
+        field.ball.last_shot_assister_id = None;
+        field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
+
+        if context.rng.bernoulli(p_goal) {
+            // GOAL — flat driven shot into a corner. The keeper stands
+            // at goal centre; the ball's closest approach to him is the
+            // ~18u aim offset, outside every claim/intercept radius,
+            // and the claim cooldown plus the absent `cached_shot_target`
+            // keep the physics save & GK state machine out of it — the
+            // outcome was already decided by the conversion model.
+            let corner_y = if context.rng.bernoulli(0.5) { 18.0 } else { -18.0 };
+            let aim = Vector3::new(goal.x, goal.y + corner_y, 0.0);
+            let dir = {
+                let v = Vector3::new(aim.x - ball_pos.x, aim.y - ball_pos.y, 0.0);
+                v.normalize()
+            };
+            // Launch from the trajectory midpoint: the full 88u flight
+            // at 4 u/tick gives the keeper ~22 ticks (~25u of lateral
+            // cover — he eats the decided goal). From ~44u he gets ~12
+            // ticks (~13u), inside the 18u corner offset, so the model's
+            // verdict stands. Reads as an unstoppable strike in replay.
+            let mid = Vector3::new(
+                (ball_pos.x + aim.x) * 0.5,
+                (ball_pos.y + aim.y) * 0.5,
+                0.0,
+            );
+            field.ball.position = mid;
+            field.ball.velocity = Vector3::new(dir.x * 4.0, dir.y * 4.0, 0.0);
+            // Mark the ball as a live shot. `check_goal` only credits a
+            // crossing when the scorer has recent shot MEMORY (invisible
+            // here — it reads `context.players`, a copy that never sees
+            // our `field` write) or when a shot is in flight via this
+            // cache — the path every open-play goal takes. The
+            // `physics_save_rolled` latch goes in pre-consumed so
+            // `try_save_shot` can't re-roll an outcome the conversion
+            // model already decided.
+            {
+                use crate::r#match::engine::ball::ball::ShotTarget;
+                let defending_side = if goal.x < ball_pos.x {
+                    PlayerSide::Left
+                } else {
+                    PlayerSide::Right
+                };
+                field.ball.cached_shot_target = Some(ShotTarget {
+                    goal_line_y: aim.y,
+                    goal_line_z: 0.5,
+                    defending_side,
+                    deflected: false,
+                    physics_save_rolled: true,
+                });
+            }
+            field.ball.previous_owner = Some(taker_id);
+            field.ball.current_owner = None;
+            field.ball.claim_cooldown = 80;
+            field.ball.flags.in_flight_state = 80;
+            if let Some(p) = field.get_player_mut(taker_id) {
+                p.memory.record_shot(tick, true);
+            }
+        } else if context.rng.bernoulli(0.60) {
+            // SAVED (60% of non-goals) — keeper holds it.
+            if let Some((gk_id, _)) = gk {
+                let gk_pos = field
+                    .players
+                    .iter()
+                    .find(|p| p.id == gk_id)
+                    .map(|p| p.position)
+                    .unwrap_or(Vector3::new(goal.x, goal.y, 0.0));
+                let gk_team = field
+                    .players
+                    .iter()
+                    .find(|p| p.id == gk_id)
+                    .map(|p| p.team_id)
+                    .unwrap_or(0);
+                field.ball.position = Vector3::new(gk_pos.x, gk_pos.y, 0.0);
+                field.ball.velocity = Vector3::zeros();
+                field.ball.previous_owner = Some(taker_id);
+                field.ball.current_owner = Some(gk_id);
+                field.ball.ownership_duration = 0;
+                field.ball.claim_cooldown = 60;
+                field.ball.flags.in_flight_state = 60;
+                field.ball.pending_save_credit = Some((gk_id, taker_id));
+                field.ball.record_touch(gk_id, gk_team, tick, true);
+                if let Some(p) = field.get_player_mut(taker_id) {
+                    p.memory.record_shot(tick, true);
+                }
+            } else {
+                // No keeper to save it — treat as a miss over the bar.
+                field.ball.velocity = Vector3::new(dir2d.x * 2.8, dir2d.y * 2.8, 3.0);
+                field.ball.previous_owner = Some(taker_id);
+                field.ball.current_owner = None;
+                field.ball.claim_cooldown = 80;
+                field.ball.flags.in_flight_state = 80;
+                if let Some(p) = field.get_player_mut(taker_id) {
+                    p.memory.record_shot(tick, false);
+                }
+            }
+        } else {
+            // MISSED — over the bar; check_over_goal turns it into a
+            // goal kick.
+            field.ball.velocity = Vector3::new(dir2d.x * 2.8, dir2d.y * 2.8, 3.0);
+            field.ball.previous_owner = Some(taker_id);
+            field.ball.current_owner = None;
+            field.ball.claim_cooldown = 80;
+            field.ball.flags.in_flight_state = 80;
+            field.ball.last_shot_xg = 0.0;
+            field.ball.last_shot_shooter_id = None;
+            if let Some(p) = field.get_player_mut(taker_id) {
+                p.memory.record_shot(tick, false);
+            }
+        }
+    }
+
     pub(super) fn resolve_corner_contest(field: &mut MatchField, context: &mut MatchContext) {
         use crate::r#match::PassOriginRestart;
         use nalgebra::Vector3;

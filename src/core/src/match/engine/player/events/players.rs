@@ -4197,7 +4197,18 @@ impl PlayerEventDispatcher {
         field
             .ball
             .record_touch(taker_id, team_id, context.current_tick(), true);
-        field.ball.pending_set_piece_teleport = Some((taker_id, restart_pos));
+        // Stage the taker on the ball DIRECTLY (we hold &mut field here,
+        // unlike the corner path in ball.rs). The pending-teleport queue
+        // drains after play_ball in the tick, which is too late for a
+        // foul awarded during event dispatch: the first active tick's
+        // ball.update saw a 100u-distant owner and nulled ownership,
+        // leaving the penalty resolver (§9.3.3) with an ownerless ball.
+        if let Some(idx) = field.player_index(taker_id) {
+            let p = &mut field.players[idx];
+            p.position = restart_pos;
+            p.velocity = Vector3::zeros();
+            p.in_state_time = 0;
+        }
 
         // ── Physically form the restart shape ──────────────────────
         // The wall was previously only statistical (wall_block_prob on
@@ -4227,18 +4238,43 @@ impl PlayerEventDispatcher {
                 PlayerSide::Left => (0.0, box_depth, box_depth + 10.0),
                 PlayerSide::Right => (field_w - box_depth, field_w, field_w - box_depth - 10.0),
             };
+            // §9.3.3 — the defending keeper stands ON his line for the
+            // penalty (not wherever the foul left him).
+            if let Some(gk) = field
+                .players
+                .iter()
+                .find(|p| p.side == Some(fouler_side) && !p.is_sent_off && is_gk(p))
+            {
+                let line_x = match fouler_side {
+                    PlayerSide::Left => 3.0,
+                    PlayerSide::Right => field_w - 3.0,
+                };
+                teleports.push((gk.id, Vector3::new(line_x, mid_y, 0.0)));
+            }
             for p in field.players.iter() {
                 if p.id == taker_id || p.is_sent_off {
                     continue;
                 }
                 if is_gk(p) && p.side == Some(fouler_side) {
-                    continue; // defending keeper stays on his line
+                    continue; // defending keeper placed on his line above
                 }
                 let inside = p.position.x >= box_x_min
                     && p.position.x <= box_x_max
                     && (p.position.y - mid_y).abs() <= box_half_h;
                 if inside {
-                    let y = p.position.y.clamp(mid_y - box_half_h, mid_y + box_half_h);
+                    let mut y = p.position.y.clamp(mid_y - box_half_h, mid_y + box_half_h);
+                    // §9.3.3 — outside the box AND outside the D: the
+                    // clear spot at the box edge must also be ≥73u from
+                    // the penalty spot (the D exists exactly for this).
+                    let spot = restart_pos;
+                    let d = Vector3::new(edge_x - spot.x, y - spot.y, 0.0);
+                    let dist = (d.x * d.x + d.y * d.y).sqrt();
+                    if dist < 73.0 {
+                        let dx_sq = (edge_x - spot.x) * (edge_x - spot.x);
+                        let need_dy = (73.0_f32 * 73.0 - dx_sq).max(0.0).sqrt();
+                        y = if y >= spot.y { spot.y + need_dy } else { spot.y - need_dy };
+                        y = y.clamp(2.0, field_h - 2.0);
+                    }
                     teleports.push((p.id, Vector3::new(edge_x, y, 0.0)));
                 }
             }
@@ -4310,7 +4346,17 @@ impl PlayerEventDispatcher {
                 }
             }
         }
-        field.ball.pending_restart_teleports.extend(teleports);
+        // Place restart bodies directly too (same &mut field reasoning
+        // as the taker above): the wall / box-clear must be formed when
+        // the §9.3.1 freeze starts, not after it ends.
+        for (player_id, pos) in teleports {
+            if let Some(idx) = field.player_index(player_id) {
+                let p = &mut field.players[idx];
+                p.position = pos;
+                p.velocity = Vector3::zeros();
+                p.in_state_time = 0;
+            }
+        }
 
         // §9.3.1 — genuine dead-ball stoppage: fouls now pause the sim
         // the same way goals/corners do (run.rs skips the tick body
