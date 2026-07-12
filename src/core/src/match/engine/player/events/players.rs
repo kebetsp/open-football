@@ -4403,6 +4403,68 @@ impl PlayerEventDispatcher {
                         teleports.push((p.id, pos));
                     }
                 }
+
+                // §11.7 — attacking free-kick shape for crossable range,
+                // mirroring the §8.3 corner pattern: the two best headers
+                // of the kicking team take near/far-post spots at
+                // penalty-spot depth for the delivery, and two midfielders
+                // hold the edge of the box for knock-downs and rebounds.
+                // Free kicks too far out to cross directly (>280u ≈ 35m
+                // from the attacked goal) keep the plain formation
+                // recovery — no artificial box-crowding at midfield.
+                if dist_goal <= 280.0 {
+                    let depth_dir = match fouler_side {
+                        PlayerSide::Left => 1.0_f32,  // attacked goal at x=0
+                        PlayerSide::Right => -1.0_f32, // attacked goal at x=field_w
+                    };
+                    let box_x = goal_x + depth_dir * (field_w * (95.0 / 840.0));
+                    let edge_x = goal_x + depth_dir * (field_w * (165.0 / 840.0));
+                    let mut headers: Vec<(f32, u32)> = field
+                        .players
+                        .iter()
+                        .filter(|p| {
+                            p.side == Some(victim_side)
+                                && p.id != taker_id
+                                && !p.is_sent_off
+                                && !is_gk(p)
+                        })
+                        .map(|p| (p.skills.technical.heading, p.id))
+                        .collect();
+                    headers.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let box_ids: Vec<u32> =
+                        headers.iter().take(2).map(|&(_, id)| id).collect();
+                    for (i, &pid) in box_ids.iter().enumerate() {
+                        let y = if i == 0 {
+                            mid_y - field_h * 0.085
+                        } else {
+                            mid_y + field_h * 0.085
+                        };
+                        teleports.push((pid, Vector3::new(box_x, y, 0.0)));
+                    }
+                    let second_wave: Vec<u32> = field
+                        .players
+                        .iter()
+                        .filter(|p| {
+                            p.side == Some(victim_side)
+                                && p.id != taker_id
+                                && !p.is_sent_off
+                                && !box_ids.contains(&p.id)
+                                && p.tactical_position.current_position.is_midfielder()
+                        })
+                        .map(|p| p.id)
+                        .take(2)
+                        .collect();
+                    for (i, &pid) in second_wave.iter().enumerate() {
+                        let y = if i == 0 {
+                            mid_y - field_h * 0.08
+                        } else {
+                            mid_y + field_h * 0.08
+                        };
+                        teleports.push((pid, Vector3::new(edge_x, y, 0.0)));
+                    }
+                }
             }
         }
         // Place restart bodies directly too (same &mut field reasoning
