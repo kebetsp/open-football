@@ -3540,8 +3540,14 @@ impl PlayerEventDispatcher {
             .clamp(-0.25, 0.70);
 
         let (y, r) = match severity {
+            // Normal-severity yellow base 0.04 → 0.10, cap 0.18 → 0.30
+            // (§11.2): with fouls calibrated to ~10/match (§11.1), cards
+            // ran at 6.6% of fouls vs the real ~15-20%. Normal severity
+            // is ~94% of all fouls, so it carries the card rate; the
+            // reckless/violent arms and the red ceilings stay untouched
+            // to protect the 2026-06 red-card calibration (~0.15/match).
             FoulSeverity::Normal => (
-                (0.04 + aggressor_factor * 0.18 + persistent * 0.6).clamp(0.02, 0.18),
+                (0.10 + aggressor_factor * 0.18 + persistent * 0.6).clamp(0.04, 0.30),
                 0.0_f32,
             ),
             // Reckless direct-red ceiling 0.18 → 0.08: reckless is
@@ -3556,7 +3562,7 @@ impl PlayerEventDispatcher {
             FoulSeverity::Violent => (0.10_f32, (0.70 + aggressor_factor * 0.30).clamp(0.60, 1.0)),
         };
         let (lo_y, hi_y, lo_r, hi_r) = match severity {
-            FoulSeverity::Normal => (0.02, 0.18, 0.0, 0.0),
+            FoulSeverity::Normal => (0.04, 0.30, 0.0, 0.0),
             FoulSeverity::Reckless => (0.30, 0.85, 0.01, 0.08),
             FoulSeverity::Violent => (0.0, 0.20, 0.60, 1.0),
         };
