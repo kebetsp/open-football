@@ -629,8 +629,24 @@ pub fn recovery_shape_targets(
             let is_kicking = p.side == Some(kicking_side);
             let group = p.tactical_position.current_position.position_group();
             let mut target = p.start_position;
-            if press_high && !is_kicking && group == PlayerFieldPositionGroup::Forward {
-                target.x = press_x;
+            // §11.8 role-based goal-kick shape for the NON-kicking team.
+            // The old forward-only press left everyone else on their own-
+            // half formation anchors, which read as two clean blocks
+            // split at the halfway line. Real teams stay interspersed by
+            // role: forwards press the spread back line (195u from the
+            // kicking byline), midfielders hold their band just inside
+            // the kicking half (320u — among the kicking team's own
+            // midfield anchors), defenders keep a high line just inside
+            // their own half (500u) rather than retreating to the box.
+            // Lateral (y) stays on each player's own anchor, so the
+            // bands keep their normal formation spread.
+            if press_high && !is_kicking {
+                target.x = match group {
+                    PlayerFieldPositionGroup::Forward => press_x,
+                    PlayerFieldPositionGroup::Midfielder => byline_x + into * 320.0,
+                    PlayerFieldPositionGroup::Defender => byline_x + into * 500.0,
+                    PlayerFieldPositionGroup::Goalkeeper => target.x,
+                };
             }
             if !is_kicking {
                 // Legal retreat: the non-kicking team stays ≥73u off the
