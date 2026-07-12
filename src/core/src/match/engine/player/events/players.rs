@@ -285,6 +285,13 @@ pub enum PlayerEvent {
     /// `award_restart_for_foul` (payload = taker id).
     FreeKickAwarded(u32),
     PenaltyAwarded(u32),
+    /// Record-only: which zone a corner delivery targeted (taker id, zone).
+    /// Emitted by the crossing states alongside the corner PassTo so batch
+    /// harnesses can tally the sampled zone mix (§10.2).
+    CornerDelivery(
+        u32,
+        crate::r#match::player::strategies::set_pieces::CornerDeliveryZone,
+    ),
     BallCollision(u32),
     TacklingBall(u32),
     BallOwnerChange(u32),

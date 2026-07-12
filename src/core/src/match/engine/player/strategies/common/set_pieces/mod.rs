@@ -171,7 +171,27 @@ pub fn corner_box_loaded(ctx: &StateProcessingContext) -> bool {
     ready >= 2
 }
 
-/// Choose a delivery zone and return `(receiver_id, zone_target)`.
+/// Which delivery the corner taker chose — record-only tag carried on the
+/// `PlayerEvent::CornerDelivery` event so batch harnesses can tally the
+/// sampled zone mix (§10.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CornerDeliveryZone {
+    Short,
+    NearPost,
+    FarPost,
+    PenaltySpot,
+    EdgeOfBox,
+}
+
+/// Zone identity for each index of the `assign_corner_runners` zone list.
+const ZONE_KINDS: [CornerDeliveryZone; 4] = [
+    CornerDeliveryZone::NearPost,
+    CornerDeliveryZone::FarPost,
+    CornerDeliveryZone::PenaltySpot,
+    CornerDeliveryZone::EdgeOfBox,
+];
+
+/// Choose a delivery zone and return `(receiver_id, zone_target, zone_kind)`.
 ///
 /// Picks the runner who is **closest to their assigned zone** — delivering to
 /// a runner who is already in position rather than one who is still running.
@@ -180,7 +200,7 @@ pub fn corner_box_loaded(ctx: &StateProcessingContext) -> bool {
 pub fn pick_corner_delivery(
     ctx: &StateProcessingContext,
     zone_rotation: u8,
-) -> Option<(u32, Vector3<f32>)> {
+) -> Option<(u32, Vector3<f32>, CornerDeliveryZone)> {
     let taker_id = ctx.player.id;
     let taker_pos = ctx.player.position;
     let goal_pos = ctx.player().opponent_goal_position();
@@ -214,7 +234,7 @@ pub fn pick_corner_delivery(
         // staged, but a cross stays possible so defences can't sit on
         // the short ball.
         if ctx.context.rng.bernoulli(0.7) {
-            return Some((mate.id, mate.position));
+            return Some((mate.id, mate.position, CornerDeliveryZone::Short));
         }
     }
 
@@ -236,21 +256,39 @@ pub fn pick_corner_delivery(
 
     // Score each assignment: distance to zone minus a bias for the preferred
     // rotation index.  Lower score = deliver here.
-    assignments
+    let mut scored: Vec<(f32, usize)> = assignments
         .iter()
         .enumerate()
-        .min_by(|(i, (pid_a, zone_a)), (j, (pid_b, zone_b))| {
-            let pos_a = ctx.tick_context.positions.players.position(*pid_a);
-            let pos_b = ctx.tick_context.positions.players.position(*pid_b);
-            let da = (pos_a - zone_a).magnitude()
-                - if *i == preferred_idx { 30.0 } else { 0.0 };
-            let db = (pos_b - zone_b).magnitude()
-                - if *j == preferred_idx { 30.0 } else { 0.0 };
-            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        .map(|(i, (pid, zone))| {
+            let pos = ctx.tick_context.positions.players.position(*pid);
+            let score =
+                (pos - zone).magnitude() - if i == preferred_idx { 30.0 } else { 0.0 };
+            (score, i)
         })
-        .map(|(_, &(pid, zone))| {
-            (pid, clamp_cross_target_out_of_short_band(zone, goal_pos, field_w, field_h))
-        })
+        .collect();
+    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut chosen = scored[0].1;
+
+    // §10.2 near-post frequency cap: runner geometry favours the near post
+    // far beyond its real-football share (measured 37.4% of all corners).
+    // When near-post wins the scoring, keep it only with probability
+    // NEAR_POST_KEEP and otherwise deliver to the next-best zone, so the
+    // sampled near-post share stays under ~15% of all corners.
+    const NEAR_POST_KEEP: f32 = 0.30;
+    if ZONE_KINDS[chosen.min(ZONE_KINDS.len() - 1)] == CornerDeliveryZone::NearPost
+        && scored.len() > 1
+        && !ctx.context.rng.bernoulli(NEAR_POST_KEEP)
+    {
+        chosen = scored[1].1;
+    }
+
+    let (pid, zone) = assignments[chosen];
+    Some((
+        pid,
+        clamp_cross_target_out_of_short_band(zone, goal_pos, field_w, field_h),
+        ZONE_KINDS[chosen.min(ZONE_KINDS.len() - 1)],
+    ))
 }
 
 /// §9.4.2 hard clamp, cross branch only: a cross-style corner target

@@ -62,14 +62,16 @@ impl StateProcessingHandler for ForwardCrossingState {
                 // arrives at the intended area regardless of where the runner is
                 // at the moment of the kick.
                 let zone_rotation = ((ctx.context.total_match_time / 2000) % 3) as u8;
-                if let Some((receiver_id, zone_target)) = pick_corner_delivery(ctx, zone_rotation) {
+                if let Some((receiver_id, zone_target, zone_kind)) =
+                    pick_corner_delivery(ctx, zone_rotation)
+                {
                     #[cfg(feature = "match-logs")]
                     {
                         use std::sync::atomic::Ordering;
                         use crate::r#match::player::strategies::common::players::ops::forward_shot_decision::mid_run_diag;
                         mid_run_diag::CORNER_CROSS_SENT.fetch_add(1, Ordering::Relaxed);
                     }
-                    return Some(StateChangeResult::with_forward_state_and_event(
+                    let mut result = StateChangeResult::with_forward_state_and_event(
                         ForwardState::Running,
                         Event::PlayerEvent(PlayerEvent::PassTo(
                             PassingEventContext::new()
@@ -79,7 +81,12 @@ impl StateProcessingHandler for ForwardCrossingState {
                                 .with_reason("FWD_CORNER")
                                 .build(ctx),
                         )),
+                    );
+                    result.events.add_player_event(PlayerEvent::CornerDelivery(
+                        ctx.player.id,
+                        zone_kind,
                     ));
+                    return Some(result);
                 }
                 return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
             }
