@@ -3,6 +3,7 @@ use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
 use crate::r#match::player::events::{FoulSeverity, PlayerEvent};
 use crate::r#match::player::strategies::common::players::ops::midfielder_skill::MidfielderSkillProfile;
+use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::{
     ConditionContext, MatchPlayerLite, PlayerSide, StateChangeResult, StateProcessingContext,
     StateProcessingHandler, SteeringBehavior,
@@ -87,7 +88,17 @@ impl StateProcessingHandler for MidfielderTacklingState {
                 crate::tackle_stats::MID_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                 let (tackle_success, committed_foul, foul_severity) =
                     self.attempt_tackle(ctx, &opponent);
-                if tackle_success {
+                // Foul resolves before a clean win — same order as the
+                // forward tackling state (§11.1: a successful roll
+                // previously discarded the foul roll).
+                if committed_foul {
+                    let mut result = StateChangeResult::with_midfielder_state_and_event(
+                        MidfielderState::Standing,
+                        Event::PlayerEvent(PlayerEvent::CommitFoul(ctx.player.id, foul_severity)),
+                    );
+                    result.start_tackle_cooldown = true;
+                    return Some(result);
+                } else if tackle_success {
                     // Double-check ball is not in flight before claiming.
                     if !ctx.ball().is_in_flight() {
                         #[cfg(feature = "match-logs")]
@@ -99,13 +110,6 @@ impl StateProcessingHandler for MidfielderTacklingState {
                         result.start_tackle_cooldown = true;
                         return Some(result);
                     }
-                } else if committed_foul {
-                    let mut result = StateChangeResult::with_midfielder_state_and_event(
-                        MidfielderState::Standing,
-                        Event::PlayerEvent(PlayerEvent::CommitFoul(ctx.player.id, foul_severity)),
-                    );
-                    result.start_tackle_cooldown = true;
-                    return Some(result);
                 } else {
                     // Missed tackle, no foul — still cooldown so we don't
                     // re-attempt next tick
@@ -200,6 +204,10 @@ impl MidfielderTacklingState {
         let mut base_foul = 0.062 + aggression01 * 0.11 - mid_profile.discipline * 0.07;
         if !tackle_success {
             base_foul *= 1.75;
+        } else {
+            // Won-ball fouls stay a minority outcome — see the defender
+            // model's §11.1 note.
+            base_foul *= 0.30;
         }
         // Tired midfielders foul more.
         base_foul += (1.0 - mid_profile.mid_condition_mult).max(0.0) * 0.08;
@@ -217,7 +225,9 @@ impl MidfielderTacklingState {
         if ctx.player.yellow_cards > 0 {
             base_foul *= 0.70;
         }
-        let foul_chance = base_foul.max(0.005);
+        // §11.1 time-compression scaling — see FOUL_TIME_COMPRESSION's
+        // doc comment and the defender model.
+        let foul_chance = (base_foul * sc::FOUL_TIME_COMPRESSION).clamp(0.005, 0.85);
 
         let committed_foul = rng.random::<f32>() < foul_chance;
 

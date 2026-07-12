@@ -84,6 +84,23 @@ pub fn minute_from_ticks(tick: u64) -> u32 {
     (tick / 6000) as u32
 }
 
+/// Per-duel → per-match foul-rate compression (§11.1 calibration).
+///
+/// The sim runs 2×5-minute halves representing a 90-minute match
+/// (`MATCH_HALF_TIME_MS`), while the tackling states' foul models were
+/// calibrated in the 45-minute-half regime (~350 tackle attempts/match;
+/// the "2026-06 discipline recalibration" comments). Measured now:
+/// ~19 attempts/match, so each duel event stands in for ~9 real duels
+/// and CommitFouls ran at ~2/match vs the real 15–25 per 90.
+///
+/// Multiplied into the tackling states' foul roll only — tackle success
+/// and severity classification are per-duel judgments and stay unscaled.
+/// Nominal compression is 9×; 6.0 is used because the fail-side roll
+/// saturates its 0.85 clamp well before 9× while the success-side
+/// ("won the ball but took the man") roll must stay a minority outcome.
+/// Target band: ~10–25 CommitFouls/match.
+pub const FOUL_TIME_COMPRESSION: f32 = 6.0;
+
 /// `match_readiness`-driven sharpening factor in [0.85, 1.0].
 /// Multiply an execution composite by this when you want a readiness
 /// curve on top — e.g. fresh-out-of-injury players executing at 92%.

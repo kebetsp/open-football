@@ -373,7 +373,9 @@ impl ForwardTacklingState {
                 - skill_protection
         };
 
-        let foul_chance = foul_chance.clamp(0.0, 0.4); // Cap maximum foul chance
+        // §11.1 time-compression scaling — see FOUL_TIME_COMPRESSION's
+        // doc comment. Cap lifted 0.4 → 0.85 alongside it.
+        let foul_chance = (foul_chance * sc::FOUL_TIME_COMPRESSION).clamp(0.0, 0.85);
         let committed_foul = rng.random::<f32>() < foul_chance;
 
         // Forwards rarely go studs-up; tackling-from-behind (low angle factor)

@@ -95,19 +95,23 @@ impl StateProcessingHandler for DefenderTacklingState {
             let (tackle_success, committed_foul, foul_severity) =
                 self.attempt_sliding_tackle(ctx, &opponent);
 
-            return if tackle_success {
+            // Foul resolves before a clean win — a challenge that takes
+            // the man as well as the ball is a foul, same order the
+            // forward tackling state already uses. (§11.1: previously a
+            // successful roll silently discarded the foul roll.)
+            return if committed_foul {
+                let mut result = StateChangeResult::with_defender_state_and_event(
+                    DefenderState::Standing,
+                    Event::PlayerEvent(PlayerEvent::CommitFoul(ctx.player.id, foul_severity)),
+                );
+                result.start_tackle_cooldown = true;
+                Some(result)
+            } else if tackle_success {
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::DEF_SUCCESSES.fetch_add(1, Ordering::Relaxed);
                 let mut result = StateChangeResult::with_defender_state_and_event(
                     DefenderState::Standing,
                     Event::PlayerEvent(PlayerEvent::TacklingBall(ctx.player.id)),
-                );
-                result.start_tackle_cooldown = true;
-                Some(result)
-            } else if committed_foul {
-                let mut result = StateChangeResult::with_defender_state_and_event(
-                    DefenderState::Standing,
-                    Event::PlayerEvent(PlayerEvent::CommitFoul(ctx.player.id, foul_severity)),
                 );
                 result.start_tackle_cooldown = true;
                 Some(result)
@@ -291,6 +295,11 @@ impl DefenderTacklingState {
         let mut base_foul = 0.075 + aggression01 * 0.12 - def_profile.discipline * 0.075;
         if !tackle_success {
             base_foul *= 1.80;
+        } else {
+            // Won-ball fouls exist ("got the ball but took the man")
+            // now that the caller resolves foul before success, but
+            // they must stay a minority outcome of clean wins.
+            base_foul *= 0.30;
         }
         base_foul += (1.0 - def_profile.def_condition_mult).max(0.0) * 0.08;
         // Own-box restraint: real defenders stay on their feet inside
@@ -314,7 +323,12 @@ impl DefenderTacklingState {
         if ctx.player.yellow_cards > 0 {
             base_foul *= 0.70;
         }
-        let foul_chance = base_foul.clamp(0.006, 0.30);
+        // §11.1: scale the per-duel roll to the compressed match length
+        // (each duel event represents ~9 real duels — see the constant's
+        // doc comment) and lift the cap accordingly: an event-level foul
+        // probability near 1 is the honest per-90 rate, same reasoning
+        // as the goals-per-match calibration.
+        let foul_chance = (base_foul * sc::FOUL_TIME_COMPRESSION).clamp(0.006, 0.85);
 
         let committed_foul = rng.random::<f32>() < foul_chance;
 
