@@ -181,6 +181,13 @@ pub struct MatchPlayer {
     /// this player's effective directive becomes `.1` (evaluated per
     /// possession change in the engine loop).
     pub teammate_trigger: Option<(u32, BehavioralDirective)>,
+    /// §11.5 kickoff short-pass window, in remaining ticks (0 = inactive).
+    /// Set on the kickoff taker by `assign_kickoff`; while active and the
+    /// player still owns the ball, the state processor forces the role's
+    /// Passing state so the taker taps a short ball instead of setting
+    /// off on a solo carry. Cleared in the engine loop the moment the
+    /// taker releases the ball or the budget runs out.
+    pub kickoff_pass_pending: u16,
     /// "Link with X" pair preference (wishlist #5): passes toward this
     /// teammate get a success/EV bias in the pass evaluator, and the
     /// pair's chemistry is pinned high at kickoff. Set symmetrically on
@@ -399,6 +406,7 @@ impl MatchPlayer {
             press_target: None,
             mark_target: None,
             teammate_trigger: None,
+            kickoff_pass_pending: 0,
             link_target: None,
             intercept_target: None,
             supply_target: None,
@@ -473,6 +481,7 @@ impl MatchPlayer {
             press_target: None,
             mark_target: None,
             teammate_trigger: None,
+            kickoff_pass_pending: 0,
             link_target: None,
             intercept_target: None,
             supply_target: None,

@@ -349,11 +349,46 @@ impl<'p> StateProcessor<'p> {
             result
         };
 
+        // §11.5: the kickoff taker's first act is a short pass, not a
+        // solo carry — while the window is open and he still owns the
+        // ball, force the role's Passing state ahead of normal action
+        // selection. The window is cleared in the engine loop as soon
+        // as the ball leaves his feet, so this cannot pin a player in
+        // Passing during open play.
+        if let Some(state_result) = Self::kickoff_pass_override(&processing_ctx) {
+            return complete_result(state_result, result);
+        }
+
         if let Some(state_result) = handler.process(&processing_ctx) {
             return complete_result(state_result, result);
         }
 
         result
+    }
+
+    /// Forced Passing-state transition for the kickoff taker (§11.5).
+    /// Active only while `kickoff_pass_pending` > 0 AND the player owns
+    /// the ball; a no-op when already in a Passing state so the pass
+    /// evaluation isn't restarted every tick.
+    fn kickoff_pass_override(ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        if ctx.player.kickoff_pass_pending == 0 || !ctx.player.has_ball(ctx) {
+            return None;
+        }
+        match ctx.player.state {
+            Forward(ForwardState::Passing)
+            | Midfielder(MidfielderState::Passing)
+            | Defender(DefenderState::Passing) => None,
+            Forward(_) => Some(StateChangeResult::with_forward_state(ForwardState::Passing)),
+            Midfielder(_) => Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Passing,
+            )),
+            Defender(_) => Some(StateChangeResult::with_defender_state(
+                DefenderState::Passing,
+            )),
+            // assign_kickoff never picks the goalkeeper; an injured
+            // taker has bigger problems than pass selection.
+            Goalkeeper(_) | PlayerState::Injured => None,
+        }
     }
 
     pub fn into_ctx(self) -> StateProcessingContext<'p> {

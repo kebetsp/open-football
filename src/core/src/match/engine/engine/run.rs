@@ -870,6 +870,20 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 }
             }
 
+            // §11.5 kickoff short-pass window maintenance: the window
+            // dies the moment the taker releases the ball (any ownership
+            // change, including the pass leaving the foot) or the tick
+            // budget runs out. At most one player can hold a window.
+            for p in field.players.iter_mut() {
+                if p.kickoff_pass_pending > 0 {
+                    if raw_owner != Some(p.id) {
+                        p.kickoff_pass_pending = 0;
+                    } else {
+                        p.kickoff_pass_pending -= 1;
+                    }
+                }
+            }
+
             let current_owner_team = if raw_owner == last_owner_id {
                 last_possession_team
             } else {

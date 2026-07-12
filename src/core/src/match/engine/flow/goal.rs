@@ -96,6 +96,10 @@ pub fn assign_kickoff(field: &mut MatchField, side: PlayerSide) {
             kicker.velocity = Vector3::zeros();
             kicker.set_default_state();
             kicker.in_state_time = 0;
+            // §11.5: the taker's first act must be a short pass, not a
+            // solo carry from the centre circle. ~3s window (300 ticks);
+            // the engine loop clears it the moment the ball is released.
+            kicker.kickoff_pass_pending = 300;
         }
         field.ball.current_owner = Some(player_id);
         // Short ping-pong guard only — the kicker needs to take the
