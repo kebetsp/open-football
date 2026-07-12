@@ -9,7 +9,7 @@ pub mod processor;
 pub use common::states as common_states;
 pub use common::{
     ball::{BallOperationsImpl, MatchBallLogic},
-    passing, players, set_pieces, team,
+    passing, players, set_pieces, spacing, team,
 };
 
 // Re-export defenders items

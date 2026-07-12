@@ -98,7 +98,12 @@ impl StateProcessingHandler for DefenderPushingUpState {
             );
         }
 
-        let optimal_position = self.calculate_optimal_pushing_up_position(ctx);
+        // §10.3: spacing-refined so the push-up supports open space and a
+        // real passing lane instead of drifting onto a teammate's position.
+        let optimal_position = crate::r#match::player::strategies::spacing::refine_support_position(
+            ctx,
+            self.calculate_optimal_pushing_up_position(ctx),
+        );
 
         Some(
             SteeringBehavior::Pursuit {

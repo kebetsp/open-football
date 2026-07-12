@@ -235,13 +235,19 @@ impl StateProcessingHandler for MidfielderAttackSupportingState {
                     // Make attacking run, but bias the y-target toward this
                     // player's home y-lane so each midfielder naturally occupies
                     // a different corridor rather than converging on the ball.
+                    // §10.3: then spacing-refine so the run also respects
+                    // teammate separation and lane quality.
                     let raw_target = self.calculate_attacking_run_position(ctx);
-                    let target_position = Vector3::new(
-                        raw_target.x,
-                        raw_target.y * 0.40 + ctx.player.start_position.y * 0.60,
-                        0.0,
-                    )
-                    .clamp_to_field(field_width, field_height);
+                    let target_position =
+                        crate::r#match::player::strategies::spacing::refine_support_position(
+                            ctx,
+                            Vector3::new(
+                                raw_target.x,
+                                raw_target.y * 0.40 + ctx.player.start_position.y * 0.60,
+                                0.0,
+                            )
+                            .clamp_to_field(field_width, field_height),
+                        );
 
                     let urgency_factor = self.calculate_urgency_factor(ctx);
                     let slowing_distance = 20.0 * (1.0 - urgency_factor * 0.3);
@@ -808,16 +814,25 @@ impl MidfielderAttackSupportingState {
                 field_height,
             )
         } else if distance_to_goal < field_width * 0.5 {
-            // Middle attacking third - create passing triangles and support wide
-            self.calculate_middle_third_support(ctx, attacking_direction, field_width, field_height)
-        } else {
-            // Build-up phase - provide passing options
-            self.calculate_buildup_support_position(
+            // Middle attacking third - create passing triangles and support wide.
+            // §10.3: spacing-refined so support spreads instead of bunching.
+            let proposed = self.calculate_middle_third_support(
                 ctx,
                 attacking_direction,
                 field_width,
                 field_height,
-            )
+            );
+            crate::r#match::player::strategies::spacing::refine_support_position(ctx, proposed)
+        } else {
+            // Build-up phase - provide passing options.
+            // §10.3: spacing-refined so support spreads instead of bunching.
+            let proposed = self.calculate_buildup_support_position(
+                ctx,
+                attacking_direction,
+                field_width,
+                field_height,
+            );
+            crate::r#match::player::strategies::spacing::refine_support_position(ctx, proposed)
         }
     }
 
