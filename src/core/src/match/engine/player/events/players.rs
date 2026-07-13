@@ -273,6 +273,17 @@ pub struct FoulRuling {
     pub restart: Option<RestartAwarded>,
 }
 
+/// How the referee resolved a CommitFoul contact. Distinguishes the
+/// three legibility-relevant paths (§12.1): a marginal contact waved
+/// on (no whistle, nothing recorded), advantage played (whistle held,
+/// card settled later by `tick_advantage`), and an immediate call.
+#[derive(Debug, Clone, Copy)]
+pub enum FoulOutcome {
+    NoCall,
+    Advantage,
+    Called(FoulRuling),
+}
+
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     Goal(u32, bool),
@@ -285,6 +296,15 @@ pub enum PlayerEvent {
     /// `award_restart_for_foul` (payload = taker id).
     FreeKickAwarded(u32),
     PenaltyAwarded(u32),
+    /// Record-only: the referee actually called this foul — whistled it
+    /// or played advantage on it. `CommitFoul` alone also covers
+    /// marginal contacts the referee waves on, so UI foul flashes key
+    /// off this event instead (§12.1). Payload = (fouler id, severity).
+    FoulCalled(u32, FoulSeverity),
+    /// Record-only: the referee played advantage for a called foul —
+    /// play continues; a restart only follows if the fouled team loses
+    /// possession inside the advantage window. Payload = fouler id.
+    Advantage(u32),
     /// Record-only: which zone a corner delivery targeted (taker id, zone).
     /// Emitted by the crossing states alongside the corner PassTo so batch
     /// harnesses can tally the sampled zone mix (§10.2).
@@ -881,19 +901,36 @@ impl PlayerEventDispatcher {
                 Self::handle_request_ball_receive(player_id, field);
             }
             PlayerEvent::CommitFoul(fouler_id, severity) => {
-                if let Some(ruling) = Self::handle_commit_foul_event(fouler_id, severity, field, context) {
-                    if ruling.cards.yellow {
-                        remaining_events.push(Event::PlayerEvent(PlayerEvent::YellowCard(fouler_id)));
+                match Self::handle_commit_foul_event(fouler_id, severity, field, context) {
+                    // Waved on — no whistle, nothing to surface.
+                    FoulOutcome::NoCall => {}
+                    // Advantage — the foul stands (FoulCalled) but play
+                    // continues; the Advantage record lets the UI show
+                    // why no restart follows (§12.1).
+                    FoulOutcome::Advantage => {
+                        remaining_events.push(Event::PlayerEvent(PlayerEvent::FoulCalled(
+                            fouler_id, severity,
+                        )));
+                        remaining_events
+                            .push(Event::PlayerEvent(PlayerEvent::Advantage(fouler_id)));
                     }
-                    if ruling.cards.red {
-                        remaining_events.push(Event::PlayerEvent(PlayerEvent::RedCard(fouler_id)));
-                    }
-                    if let Some(r) = ruling.restart {
-                        remaining_events.push(Event::PlayerEvent(if r.penalty {
-                            PlayerEvent::PenaltyAwarded(r.taker_id)
-                        } else {
-                            PlayerEvent::FreeKickAwarded(r.taker_id)
-                        }));
+                    FoulOutcome::Called(ruling) => {
+                        remaining_events.push(Event::PlayerEvent(PlayerEvent::FoulCalled(
+                            fouler_id, severity,
+                        )));
+                        if ruling.cards.yellow {
+                            remaining_events.push(Event::PlayerEvent(PlayerEvent::YellowCard(fouler_id)));
+                        }
+                        if ruling.cards.red {
+                            remaining_events.push(Event::PlayerEvent(PlayerEvent::RedCard(fouler_id)));
+                        }
+                        if let Some(r) = ruling.restart {
+                            remaining_events.push(Event::PlayerEvent(if r.penalty {
+                                PlayerEvent::PenaltyAwarded(r.taker_id)
+                            } else {
+                                PlayerEvent::FreeKickAwarded(r.taker_id)
+                            }));
+                        }
                     }
                 }
             }
@@ -3402,7 +3439,7 @@ impl PlayerEventDispatcher {
         severity: FoulSeverity,
         field: &mut MatchField,
         context: &mut MatchContext,
-    ) -> Option<FoulRuling> {
+    ) -> FoulOutcome {
         // Referee marginal-call gate. The tackling code emits a foul
         // whenever a contact passes its `committed_foul` roll; the
         // referee then decides whether to actually blow the whistle.
@@ -3419,7 +3456,7 @@ impl PlayerEventDispatcher {
             // marginal-call behaviour that lets a lenient referee
             // produce a low-foul match without changing the underlying
             // tackle / press model.
-            return None;
+            return FoulOutcome::NoCall;
         }
 
         // Compute card probabilities up front — used either to record
@@ -3430,7 +3467,7 @@ impl PlayerEventDispatcher {
             match Self::compute_card_probs(fouler_id, severity, field, match_second, card_modifier)
             {
                 Some(p) => p,
-                None => return None,
+                None => return FoulOutcome::NoCall,
             };
 
         // Advantage: if the fouled team kept possession, the ball is in
@@ -3471,7 +3508,7 @@ impl PlayerEventDispatcher {
                 }
                 // Card (if any) is resolved later by tick_advantage,
                 // which emits the card events itself.
-                return None;
+                return FoulOutcome::Advantage;
             }
         }
 
@@ -3498,7 +3535,7 @@ impl PlayerEventDispatcher {
             field,
             context,
         );
-        Some(FoulRuling { cards, restart })
+        FoulOutcome::Called(FoulRuling { cards, restart })
     }
 
     /// Compute the (yellow_prob, red_prob) pair for the foul. Reads
