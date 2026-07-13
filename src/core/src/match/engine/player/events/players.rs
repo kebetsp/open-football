@@ -4391,12 +4391,15 @@ impl PlayerEventDispatcher {
             if dist_goal > 40.0 {
                 let dir = to_goal / dist_goal;
                 let band = FreeKickBand::from_distance(dist_goal);
-                // §9.3.2 — a formal multi-player wall only for fouls in
-                // realistic direct-shot/cross range (Close/Mid/Long,
-                // ≤180u). Beyond that the 73u retreat below is the whole
-                // requirement — real teams don't build a wall for a
-                // midfield free kick, they just keep their distance.
-                let form_wall = band != FreeKickBand::Far;
+                // §9.3.2/§12.3 — a formal wall for every foul in
+                // shot-or-cross range. The gate now matches the §11.7
+                // attacking-shape gate (≤280u): if attackers get a
+                // set-piece shape, the defence organizes too. In the
+                // Far band (250–280u) `wall_size_for` gives the token
+                // 2-man wall. Beyond 280u the 73u retreat below is the
+                // whole requirement — real teams don't build a wall for
+                // a midfield free kick, they just keep their distance.
+                let form_wall = dist_goal <= 280.0;
                 let is_wide_angle = (restart_pos.y - mid_y).abs() > dist_goal * 0.5;
                 let wall_n = wall_size_for(band, is_wide_angle).clamp(2, 6) as usize;
                 let wall_dist = 73.0_f32.min(dist_goal * 0.6);
@@ -4507,6 +4510,49 @@ impl PlayerEventDispatcher {
                             mid_y + field_h * 0.08
                         };
                         teleports.push((pid, Vector3::new(edge_x, y, 0.0)));
+                    }
+
+                    // §12.3 — defensive mirror of the attacking shape.
+                    // The two box attackers appear by teleport, so their
+                    // markers must too (formation recovery walks and can
+                    // leave the box empty at the kick — measured 2/13
+                    // crossable FKs with ≥2 attackers and ZERO defenders
+                    // in the box). One goal-side marker per staged box
+                    // attacker plus a zonal defender at six-yard depth.
+                    // Marker depth clamps so opponents stay ≥73u (9.15m)
+                    // from the ball — the attacking side has no such
+                    // restriction, which is why markers sit goal-side.
+                    let marker_depth =
+                        (field_w * (95.0 / 840.0) - 14.0).min(dist_goal - 76.0).max(35.0);
+                    let marker_x = goal_x + depth_dir * marker_depth;
+                    let zone_x = goal_x + depth_dir * 55.0;
+                    let marker_spots = [
+                        Vector3::new(marker_x, mid_y - field_h * 0.085, 0.0),
+                        Vector3::new(marker_x, mid_y + field_h * 0.085, 0.0),
+                        Vector3::new(zone_x, mid_y, 0.0),
+                    ];
+                    let mut assigned: Vec<u32> =
+                        teleports.iter().map(|(id, _)| *id).collect();
+                    for spot in marker_spots {
+                        let nearest = field
+                            .players
+                            .iter()
+                            .filter(|p| {
+                                p.side == Some(fouler_side)
+                                    && !p.is_sent_off
+                                    && !is_gk(p)
+                                    && !assigned.contains(&p.id)
+                            })
+                            .min_by(|a, b| {
+                                let da = (a.position - spot).magnitude_squared();
+                                let db = (b.position - spot).magnitude_squared();
+                                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|p| p.id);
+                        if let Some(pid) = nearest {
+                            assigned.push(pid);
+                            teleports.push((pid, spot));
+                        }
                     }
                 }
             }
