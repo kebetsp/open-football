@@ -304,6 +304,18 @@ impl ForwardPassingState {
             }
         }
 
+        // §12.6 — retreating from an OPEN chance: when the passer has a
+        // clear goalward corridor from a dangerous position, a backward
+        // pass is heavily deprioritized at this scorer's own scale
+        // (the base evaluator's tactical-value delta is noise against
+        // the ±15-35 point bonuses above). Deliberately NOT waived by
+        // passer pressure — the waiver is the corridor obstruction test
+        // itself: a chaser at your back with an open lane in front is a
+        // reason to advance, not to turn around.
+        if is_backward_pass && PassEvaluator::passer_has_open_chance(ctx) {
+            score -= 25.0;
+        }
+
         // "Link with X" pair preference: the linked partner wins close
         // calls. Multiplicative so it scales with the additive bonus
         // stack rather than drowning in it.

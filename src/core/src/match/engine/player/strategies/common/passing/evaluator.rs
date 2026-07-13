@@ -749,6 +749,34 @@ impl PassEvaluator {
             0.0
         };
 
+        // === §12.6 RESULTING SCORING DANGER ===
+        // Value a pass by how dangerous the RECEIVING position is — a
+        // lightweight positional-value proxy (distance to goal, angle,
+        // defender proximity), the passing-side mirror of the shot
+        // decision's xG shape. This is a ranking term among viable
+        // candidates: with two similarly-open options, the one closer
+        // to goal at a better angle wins; it never hard-gates anything.
+        let attack_goal_x = match side {
+            PlayerSide::Left => field_width,
+            PlayerSide::Right => 0.0,
+        };
+        let recv_goal_dist = ((receiver_position.x - attack_goal_x).powi(2)
+            + (receiver_position.y - field_center_y).powi(2))
+        .sqrt();
+        let danger_value = {
+            let dist01 = (1.0 - recv_goal_dist / 320.0).clamp(0.0, 1.0);
+            let central01 = 1.0 - (receiver_y_offset / (field_height * 0.5)).clamp(0.0, 1.0);
+            let recv_opps = ctx.tick_context.grid.opponents(receiver.id, 15.0).count();
+            let space01 = match recv_opps {
+                0 => 1.0,
+                1 => 0.55,
+                _ => 0.25,
+            };
+            // Squared distance term concentrates the value in the final
+            // quarter, where scoring danger actually lives.
+            dist01 * dist01 * (0.5 + 0.5 * central01) * space01
+        };
+
         // === SIDE-DENSITY OVERLOAD ===
         // Use the team-shared side density signal: too many of OUR
         // players on one side discourages another pass into that side
@@ -790,6 +818,7 @@ impl PassEvaluator {
             position_value * 0.08 +
             long_pass_bonus * 0.05 +
             width_bonus * 0.22 +
+            danger_value * 0.06 +            // §12.6: resulting scoring danger (tie-breaker)
             switch_total +                   // Capped flat: classic + underload ≤ 0.45
             cutback_bonus +
             arriving_runner_bonus +
@@ -825,8 +854,74 @@ impl PassEvaluator {
             tactical_value += long_pass_bonus * 0.15;
         }
 
+        // === §12.6 CHANCE-RETREAT PENALTY ===
+        // When the passer HAS an open or near-open scoring opportunity in
+        // front of them (advanced, central-ish, clear run/pass corridor
+        // to goal), a pass that retreats from goal is heavily
+        // deprioritized — advancing or shooting should dominate. A
+        // backward outlet only survives when a genuine obstruction (an
+        // outfield defender directly in the goalward corridor) forces
+        // it. This governs WHICH pass target wins once passing was
+        // chosen; the shot-vs-pass deferral rule in the shot decision
+        // code is untouched.
+        if forward_progress < 0.0 && Self::passer_has_open_chance(ctx) {
+            tactical_value -= 0.9; // saturates to the clamp floor
+        }
+
         // Allow negative tactical values for backward passes
         tactical_value.clamp(-0.5, 1.8)
+    }
+
+    /// §12.6 — does the passer currently hold a GENUINE open goal-scoring
+    /// opportunity? A real chance, tightly gated so the retreat penalty
+    /// fires only where it's clearly warranted (a wide gate over-forced
+    /// shots and inflated the goals band): advanced (progress > 0.78),
+    /// central (within 22% of field height of centre), inside ~170u
+    /// (≈21m) of goal, with NO outfield defender directly in the goalward
+    /// corridor (16u half-width, up to 90u). The goalkeeper is the
+    /// chance, not an obstruction. Shared by the central tactical-value
+    /// term and the forwards' pass scorer so both deprioritize retreat
+    /// passes on the same definition of "a defender genuinely forcing
+    /// the outlet".
+    pub fn passer_has_open_chance(ctx: &StateProcessingContext) -> bool {
+        let field_width = ctx.context.field_size.width as f32;
+        let field_height = ctx.context.field_size.height as f32;
+        let field_center_y = field_height * 0.5;
+        let side = ctx.player.side.unwrap_or(PlayerSide::Left);
+        let passer_position = ctx.player.position;
+        let attack_goal_x = match side {
+            PlayerSide::Left => field_width,
+            PlayerSide::Right => 0.0,
+        };
+        let passer_progress = side.attacking_progress_x(passer_position.x, field_width);
+        let passer_y_offset = (passer_position.y - field_center_y).abs();
+        let passer_goal_dist = ((passer_position.x - attack_goal_x).powi(2)
+            + (passer_position.y - field_center_y).powi(2))
+        .sqrt();
+        if passer_progress <= 0.78
+            || passer_y_offset >= field_height * 0.22
+            || passer_goal_dist >= 170.0
+        {
+            return false;
+        }
+        let goal_dir_x = (attack_goal_x - passer_position.x) / passer_goal_dist.max(1.0);
+        let goal_dir_y = (field_center_y - passer_position.y) / passer_goal_dist.max(1.0);
+        let corridor_len = passer_goal_dist.min(90.0);
+        let obstructed = ctx.players().opponents().all().any(|o| {
+            if o.tactical_positions.is_goalkeeper() {
+                return false; // the keeper is the chance, not an obstruction
+            }
+            let rel_x = o.position.x - passer_position.x;
+            let rel_y = o.position.y - passer_position.y;
+            let along = rel_x * goal_dir_x + rel_y * goal_dir_y;
+            if along <= 0.0 || along > corridor_len {
+                return false;
+            }
+            let px = rel_x - goal_dir_x * along;
+            let py = rel_y - goal_dir_y * along;
+            (px * px + py * py).sqrt() < 16.0
+        });
+        !obstructed
     }
 
     /// Calculate overall success probability from factors
@@ -965,6 +1060,10 @@ impl PassEvaluator {
         let is_pragmatic = roll()
             < SkillCurve::new(dec_raw, 15.0, 0.6).probability()
                 * SkillCurve::new(pass_raw, 12.0, 0.6).probability();
+
+        // §12.6 — computed once per selection: an open chance in front of
+        // the passer discounts every backward candidate below.
+        let passer_open_chance = Self::passer_has_open_chance(ctx);
 
         // Calculate minimum pass distance based on pressure
         // NOTE: This filter prevents "too short" passes that don't progress the ball
@@ -1296,6 +1395,28 @@ impl PassEvaluator {
                         * optimal_distance_bonus
                         * goalkeeper_penalty
                 }
+            };
+
+            // §12.6 — retreating from an OPEN chance is multiplicative,
+            // not additive: the additive tactical-value penalty is
+            // routinely out-muscled by the congestion/space multipliers,
+            // which count TEAMMATES — so in the exact failure case
+            // (three attackers in the box, no defenders) every forward
+            // option looked "congested" and the lone backward outlet
+            // still won. With a clear goalward corridor, a backward
+            // target keeps ~⅛ of its score; a genuinely obstructed
+            // chance is untouched (the corridor test is the waiver).
+            let score = if passer_open_chance
+                && ctx
+                    .player
+                    .side
+                    .unwrap_or(PlayerSide::Left)
+                    .forward_delta(ctx.player.position.x, teammate.position.x)
+                    < 0.0
+            {
+                score * 0.18
+            } else {
+                score
             };
 
             // Hard reject: never pass through 2+ opponents unless
