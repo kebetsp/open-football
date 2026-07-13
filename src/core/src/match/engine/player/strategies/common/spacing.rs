@@ -24,6 +24,106 @@ const SHORT_SUPPORT_RADIUS: f32 = 28.0;
 /// the refinement repositions within the state's intent, never wanders.
 const TETHER_WEIGHT: f32 = 0.15;
 
+/// §11.9 hard exclusion radius (~3m at the ~8u/m conversion): no two
+/// teammates may target the same spot or the same small area around it.
+/// Unlike the soft repulsion above, a candidate inside this radius of a
+/// claimed point is EXCLUDED outright, not merely down-scored — the
+/// penalty approach alone demonstrably failed to stop actual overlap.
+pub const EXCLUSION_RADIUS: f32 = 24.0;
+/// Run-destination projection horizon in engine ticks (~0.8s at 10ms/tick;
+/// velocities are u/tick). A moving player "owns" the space he is running
+/// into, not just the spot he stands on.
+const PROJECTION_TICKS: f32 = 80.0;
+
+/// Points already claimed by the rest of the team (§11.9): the ball
+/// carrier's projected run destination, plus every other teammate's
+/// current position AND projected destination.
+pub fn claimed_points(ctx: &StateProcessingContext) -> Vec<Vector3<f32>> {
+    let mut pts = Vec::with_capacity(24);
+    if let Some(h) = ball_holder(ctx) {
+        pts.push(h.position + h.velocity(ctx) * PROJECTION_TICKS);
+    }
+    for t in ctx
+        .players()
+        .teammates()
+        .all()
+        .filter(|t| t.id != ctx.player.id)
+    {
+        let v = t.velocity(ctx);
+        pts.push(t.position);
+        pts.push(t.position + v * PROJECTION_TICKS);
+    }
+    pts
+}
+
+/// Diagnostic counters for the §11.9 exclusion (match-logs builds only) —
+/// same opt-in pattern as `tackle_stats`. Proves the hard rule actually
+/// fires at the mechanism level, since aggregate movement proxies are
+/// dominated by paths this rule deliberately doesn't touch.
+#[cfg(feature = "match-logs")]
+pub mod spacing_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Candidates dropped by the hard exclusion.
+    pub static EXCLUDED: AtomicU64 = AtomicU64::new(0);
+    /// RunningInBehind targets shifted out of the carrier's space.
+    pub static CARRIER_SHIFTS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn reset() {
+        EXCLUDED.store(0, Ordering::Relaxed);
+        CARRIER_SHIFTS.store(0, Ordering::Relaxed);
+    }
+
+    pub fn snapshot() -> [u64; 2] {
+        [
+            EXCLUDED.load(Ordering::Relaxed),
+            CARRIER_SHIFTS.load(Ordering::Relaxed),
+        ]
+    }
+}
+
+/// True when `candidate` falls inside the hard exclusion radius of any
+/// claimed point.
+pub fn violates_exclusion(candidate: Vector3<f32>, claimed: &[Vector3<f32>]) -> bool {
+    let r_sq = EXCLUSION_RADIUS * EXCLUSION_RADIUS;
+    let hit = claimed
+        .iter()
+        .any(|c| (c - candidate).norm_squared() < r_sq);
+    #[cfg(feature = "match-logs")]
+    if hit {
+        spacing_stats::EXCLUDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    hit
+}
+
+/// §11.9 carrier-space guard for direct run targets (e.g. RunningInBehind,
+/// which doesn't go through candidate scoring): if `target` converges on
+/// the space the ball carrier is already running into, shift it laterally
+/// to just outside the exclusion radius. The carrier owns that space.
+pub fn avoid_carrier_space(
+    ctx: &StateProcessingContext,
+    target: Vector3<f32>,
+) -> Vector3<f32> {
+    let Some(h) = ball_holder(ctx) else {
+        return target;
+    };
+    if ctx.player.link_target == Some(h.id) {
+        return target; // a one-two deliberately plays into the carrier's space
+    }
+    let carrier_dest = h.position + h.velocity(ctx) * PROJECTION_TICKS;
+    let d = target - carrier_dest;
+    let dist_sq = d.x * d.x + d.y * d.y;
+    if dist_sq >= EXCLUSION_RADIUS * EXCLUSION_RADIUS {
+        return target;
+    }
+    #[cfg(feature = "match-logs")]
+    spacing_stats::CARRIER_SHIFTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let field_height = ctx.context.field_size.height as f32;
+    let away: f32 = if target.y >= carrier_dest.y { 1.0 } else { -1.0 };
+    let y = (carrier_dest.y + away * (EXCLUSION_RADIUS + 4.0)).clamp(15.0, field_height - 15.0);
+    Vector3::new(target.x, y, 0.0)
+}
+
 /// Refine a state's proposed off-ball support target by scoring candidates
 /// around it. Returns the best-scoring position (possibly `proposed`
 /// itself). Callers pass the target their own heuristics produced.
@@ -61,10 +161,22 @@ pub fn refine_support_position(
         .map(|t| (t.id, t.position))
         .collect();
 
+    // §11.9 hard exclusion: candidates inside ~3m of the carrier's run
+    // destination or any teammate's position/destination are dropped
+    // outright before scoring. The soft repulsion below still shapes
+    // preferences among the survivors.
+    let claimed = claimed_points(ctx);
+
     // Candidate ring around the proposed target (25 positions), plus the
     // player's current position so "stay put" competes fairly.
     let mut best = proposed;
     let mut best_score = f32::MIN;
+    // Fallback if EVERY candidate is excluded (dense box, all space
+    // claimed): best-scoring candidate regardless of exclusion beats
+    // returning an unvetted `proposed`.
+    let mut best_any = proposed;
+    let mut best_any_score = f32::MIN;
+    let mut found_valid = false;
     let offsets: [f32; 5] = [-50.0, -25.0, 0.0, 25.0, 50.0];
     let mut consider = |candidate: Vector3<f32>| {
         let clamped = Vector3::new(
@@ -75,6 +187,14 @@ pub fn refine_support_position(
         let score = score_candidate(
             clamped, proposed, &holder, goal_pos, &opponents, &teammates,
         );
+        if score > best_any_score {
+            best_any_score = score;
+            best_any = clamped;
+        }
+        if violates_exclusion(clamped, &claimed) {
+            return;
+        }
+        found_valid = true;
         if score > best_score {
             best_score = score;
             best = clamped;
@@ -87,7 +207,7 @@ pub fn refine_support_position(
     }
     consider(ctx.player.position);
 
-    best
+    if found_valid { best } else { best_any }
 }
 
 fn score_candidate(

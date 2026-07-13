@@ -1,5 +1,6 @@
 use crate::TacticalStyle;
 use crate::r#match::forwarders::states::ForwardState;
+use crate::r#match::player::strategies::spacing;
 use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondition};
 use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
@@ -214,9 +215,18 @@ impl ForwardCreatingSpaceState {
 
         candidate_positions.push(player_pos);
 
+        // §11.9 hard exclusion: a zone the carrier is running into, or
+        // one another teammate already occupies/targets, is not a free
+        // zone — drop it before scoring instead of merely down-scoring
+        // (the separation penalty alone did not stop actual overlap).
+        let claimed = spacing::claimed_points(ctx);
+
         // Evaluate candidates using pre-collected data
         let mut best_position = player_pos;
         let mut best_score = f32::MIN;
+        let mut best_any = player_pos;
+        let mut best_any_score = f32::MIN;
+        let mut found_valid = false;
 
         for candidate in candidate_positions {
             let clamped = Vector3::new(
@@ -234,10 +244,24 @@ impl ForwardCreatingSpaceState {
                 is_attacking_left,
             );
 
+            if score > best_any_score {
+                best_any_score = score;
+                best_any = clamped;
+            }
+            if spacing::violates_exclusion(clamped, &claimed) {
+                continue;
+            }
+            found_valid = true;
             if score > best_score {
                 best_score = score;
                 best_position = clamped;
             }
+        }
+
+        // All ~40 candidates claimed (packed box) — fall back to the best
+        // scorer rather than standing still.
+        if !found_valid {
+            best_position = best_any;
         }
 
         self.apply_forward_tactical_adjustment(ctx, best_position)

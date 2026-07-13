@@ -115,6 +115,12 @@ impl StateProcessingHandler for ForwardRunningInBehindState {
             }
         }
 
+        // §11.9: never run into the space the ball carrier is already
+        // running into — the carrier owns that space. Shifts the run
+        // target laterally out of the ~3m exclusion radius when needed.
+        run_target =
+            crate::r#match::player::strategies::spacing::avoid_carrier_space(ctx, run_target);
+
         let direction = (run_target - current_position).normalize();
 
         let ownership_duration = ctx.tick_context.ball.ownership_duration;
