@@ -317,6 +317,20 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(base * 0.35 + pull * tempo * 0.65);
         }
 
+        // §12.5 universal off-ball separation: same-team outfielders
+        // inside the §11.9 exclusion radius of each other separate, in
+        // EVERY phase — defensive shape included. A weighted blend that
+        // progressively replaces the state's own movement at close range
+        // (an additive nudge loses to the state's convergence pull).
+        // Applied BEFORE the press/mark overrides so explicit
+        // man-assignments still win outright.
+        if let Some((separation, w)) =
+            crate::r#match::player::strategies::common::spacing::separation_nudge(&processing_ctx)
+        {
+            let base = result.velocity.unwrap_or_else(Vector3::zeros);
+            result.velocity = Some(base * (1.0 - w) + separation * w);
+        }
+
         // Cross-player assignment overrides (press / mark). Applied AFTER
         // the state handler so the manager's man-assignment wins over
         // normal state movement, regardless of which state the player is

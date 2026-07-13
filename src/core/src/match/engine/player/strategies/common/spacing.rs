@@ -124,6 +124,98 @@ pub fn avoid_carrier_space(
     Vector3::new(target.x, y, 0.0)
 }
 
+/// §12.5 — universal off-ball separation, every phase (extends §11.9,
+/// which only guarded attacking-support target selection). A gentle
+/// repulsion velocity between same-team outfielders standing inside the
+/// exclusion radius of each other, applied at the processor level so it
+/// covers defensive shape, out-of-possession shifts, and every other
+/// off-ball path without touching each state's own logic.
+///
+/// Deliberately NOT applied to: restarts/set-piece shapes (walls stand
+/// 9u apart by design — gated on an OpenPlay origin), the ball carrier
+/// or anyone within 60u of the ball (receivers, duels, pressing),
+/// goalkeepers, and link-play pairs (a one-two needs close support).
+/// Returns `(separation_velocity, blend_weight)`. The caller blends
+/// `state_velocity * (1-w) + separation * w` — an additive-only nudge
+/// demonstrably loses to the state's own convergence pull (two players
+/// walking to near-identical anchors equilibrate a few units apart, or
+/// fully overlapped), so at close range the separation must progressively
+/// REPLACE the state's movement, not fight it. Asymmetric by id: the
+/// higher-id player yields (full weight), the lower-id player mostly
+/// holds — one of the two owns the contested zone, mirroring how real
+/// players resolve a shared space.
+pub fn separation_nudge(ctx: &StateProcessingContext) -> Option<(Vector3<f32>, f32)> {
+    use crate::r#match::PassOriginRestart;
+
+    let ball_meta = &ctx.tick_context.ball;
+    // Skip only while a set piece is STAGED (restart origin + a taker
+    // holding the ball): walls and blocks stand deliberately tight. A
+    // restart origin alone isn't enough to skip — origins persist through
+    // the delivery flight and loose scrambles for many seconds, which
+    // disabled separation exactly when post-set-piece clusters form.
+    if ball_meta.pass_origin_restart != PassOriginRestart::OpenPlay && ball_meta.is_owned {
+        return None;
+    }
+    if ctx
+        .player
+        .tactical_position
+        .current_position
+        .is_goalkeeper()
+    {
+        return None;
+    }
+    if ball_meta.current_owner == Some(ctx.player.id) {
+        return None;
+    }
+    if ctx.ball().distance() < 60.0 {
+        return None;
+    }
+
+    /// Outward speed at full blend (~comfortable jog; velocities are u/tick).
+    const SEPARATION_SPEED: f32 = 0.30;
+
+    let mut dir_sum = Vector3::zeros();
+    let mut w_max = 0.0f32;
+    for t in ctx
+        .players()
+        .teammates()
+        .all()
+        .filter(|t| t.id != ctx.player.id)
+    {
+        if ctx.player.link_target == Some(t.id) {
+            continue;
+        }
+        if ball_meta.current_owner == Some(t.id) {
+            continue;
+        }
+        let d = ctx.player.position - t.position;
+        let dist = (d.x * d.x + d.y * d.y).sqrt();
+        if dist >= EXCLUSION_RADIUS {
+            continue;
+        }
+        let dir = if dist > 0.5 {
+            d / dist
+        } else if ctx.player.id > t.id {
+            // Deterministic split for exact overlap.
+            Vector3::new(0.0, 1.0, 0.0)
+        } else {
+            Vector3::new(0.0, -1.0, 0.0)
+        };
+        // 1.5× slope: full takeover inside ~8u, tapering to zero at the
+        // exclusion radius. Equilibrium against a typical 0.3 u/tick
+        // state pull lands around 16u (~2m) — outside visual overlap.
+        let closeness = (1.5 * (1.0 - dist / EXCLUSION_RADIUS)).clamp(0.0, 1.0);
+        let yield_factor = if ctx.player.id > t.id { 1.0 } else { 0.4 };
+        let w = closeness * yield_factor;
+        dir_sum += dir * w;
+        w_max = w_max.max(w);
+    }
+    if w_max < 1e-3 || dir_sum.norm_squared() < 1e-6 {
+        return None;
+    }
+    Some((dir_sum.normalize() * SEPARATION_SPEED, w_max))
+}
+
 /// Refine a state's proposed off-ball support target by scoring candidates
 /// around it. Returns the best-scoring position (possibly `proposed`
 /// itself). Callers pass the target their own heuristics produced.
