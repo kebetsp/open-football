@@ -58,9 +58,9 @@ impl StateProcessingHandler for MidfielderCrossingState {
         if ctx.in_state_time > CROSS_EXECUTION_TIME {
             if ctx.ball().is_team_attacking_corner() {
                 // Zone-based corner delivery: ball goes to the zone centre.
-                let zone_rotation = ((ctx.context.total_match_time / 2000) % 3) as u8;
+                // §12.4: hard 10/5/65/20 table.
                 if let Some((receiver_id, zone_target, zone_kind)) =
-                    pick_corner_delivery(ctx, zone_rotation)
+                    pick_corner_delivery(ctx)
                 {
                     #[cfg(feature = "match-logs")]
                     {

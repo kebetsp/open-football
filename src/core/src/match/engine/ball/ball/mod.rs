@@ -269,6 +269,12 @@ pub struct Ball {
     /// outcome isn't re-rolled every tick until the taker releases the
     /// ball. Reset when a new foul restart is awarded.
     pub free_kick_decided: bool,
+    /// §12.4 — the teammate staged as the short-corner option for the
+    /// current corner (None when nobody was staged). The state processor
+    /// holds this player at his staged spot while the corner origin is
+    /// live and un-struck, so the delivery picker's "genuinely standing
+    /// there, stationary" gate can actually be met.
+    pub corner_short_option: Option<u32>,
     /// Set at pass-kick. Lives for the pass window (~220 ticks) and the
     /// offside resolver fires the call only when the receiver becomes
     /// active (touches the ball or claims). Cleared on resolution,
@@ -456,6 +462,7 @@ impl Ball {
             restart_taker_lock: None,
             restart_pending_taker: None,
             free_kick_decided: false,
+            corner_short_option: None,
             last_touch_player_id: None,
             last_touch_team_id: None,
             last_touch_tick: 0,

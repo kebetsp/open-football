@@ -60,10 +60,9 @@ impl StateProcessingHandler for ForwardCrossingState {
             if ctx.ball().is_team_attacking_corner() {
                 // Zone-based corner delivery: ball goes to the zone centre so it
                 // arrives at the intended area regardless of where the runner is
-                // at the moment of the kick.
-                let zone_rotation = ((ctx.context.total_match_time / 2000) % 3) as u8;
+                // at the moment of the kick. §12.4: hard 10/5/65/20 table.
                 if let Some((receiver_id, zone_target, zone_kind)) =
-                    pick_corner_delivery(ctx, zone_rotation)
+                    pick_corner_delivery(ctx)
                 {
                     #[cfg(feature = "match-logs")]
                     {

@@ -88,6 +88,11 @@ pub struct BallMetadata {
     /// attack the delivery).
     pub pass_origin_restart: PassOriginRestart,
 
+    /// §12.4 — the staged short-corner option for the current corner,
+    /// if any. Read by the processor's hold override so he stays put
+    /// (and genuinely stationary) until the kick.
+    pub corner_short_option: Option<u32>,
+
     /// Tick of the most recent live rebound (dangerous parry / loose
     /// block deflection). Read by the team shot gate to suspend the
     /// shot-spacing cooldown during box scrambles. 0 = none yet.
@@ -132,6 +137,7 @@ impl BallMetadata {
 
         self.cached_shot_target = field.ball.cached_shot_target;
         self.pass_origin_restart = field.ball.pass_origin_restart;
+        self.corner_short_option = field.ball.corner_short_option;
         self.last_rebound_tick = field.ball.last_rebound_tick;
     }
 }
@@ -152,6 +158,7 @@ impl From<&MatchField> for BallMetadata {
             recent_len: 0,
             cached_shot_target: None,
             pass_origin_restart: PassOriginRestart::OpenPlay,
+            corner_short_option: None,
             last_rebound_tick: 0,
         };
         meta.update(field);

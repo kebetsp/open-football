@@ -183,111 +183,137 @@ pub enum CornerDeliveryZone {
     EdgeOfBox,
 }
 
-/// Zone identity for each index of the `assign_corner_runners` zone list.
-const ZONE_KINDS: [CornerDeliveryZone; 4] = [
-    CornerDeliveryZone::NearPost,
-    CornerDeliveryZone::FarPost,
-    CornerDeliveryZone::PenaltySpot,
-    CornerDeliveryZone::EdgeOfBox,
-];
-
 /// Choose a delivery zone and return `(receiver_id, zone_target, zone_kind)`.
 ///
-/// Picks the runner who is **closest to their assigned zone** — delivering to
-/// a runner who is already in position rather than one who is still running.
-/// `zone_rotation` adds a 30u bias toward a preferred zone so consecutive
-/// corners vary when distances are similar.
+/// §12.4 — a HARD weighted-random probability table, not a scored
+/// heuristic. Two scoring-based attempts (§9.4.2's mode split, §10.2's
+/// near-post cap) each fixed the bucket they measured while the
+/// pre-zone short branch stayed an uncapped second path into the same
+/// visual "near post, short of the six-yard box" band (~16% of corners,
+/// delivered at a possibly-moving teammate's position). The table:
+///
+///   10% — near post: the zone between the six-yard border and the near
+///         post itself, never short of the six-yard line. "Near" is the
+///         post on the taker's side, computed per kick.
+///    5% — short: a precise pass to a teammate genuinely standing
+///         (stationary, right now) in the flag-to-six-yard zone. If no
+///         such teammate exists this bucket rerolls into the box bucket
+///         — an empty near zone is never a target.
+///   65% — into the box (penalty-spot / central-box area).
+///   20% — far post.
 pub fn pick_corner_delivery(
     ctx: &StateProcessingContext,
-    zone_rotation: u8,
 ) -> Option<(u32, Vector3<f32>, CornerDeliveryZone)> {
     let taker_id = ctx.player.id;
     let taker_pos = ctx.player.position;
     let goal_pos = ctx.player().opponent_goal_position();
     let field_w = ctx.context.field_size.width as f32;
     let field_h = ctx.context.field_size.height as f32;
+    let cy = field_h * 0.5;
+    let gx = goal_pos.x;
+    // `inward` points from the goal line into the pitch; `near_sign`
+    // points from the lateral centre toward the taker's side.
+    let inward: f32 = if gx > field_w * 0.5 { -1.0 } else { 1.0 };
+    let near_sign: f32 = if taker_pos.y < cy { -1.0 } else { 1.0 };
+    let rng = &ctx.context.rng;
 
-    // §9.4.2 short corner — a distinct decision branch, not a zone. Only
-    // available when a teammate is ACTUALLY standing in the near zone
-    // (the band between the corner arc and the six-yard box) at the
-    // moment of the kick: then the delivery may be a precise, deliberate
-    // pass at that teammate's real position. An empty near zone is never
-    // a target for any delivery mode.
-    if let Some(mate) = ctx
+    // The 5% bucket's precondition: a teammate ACTUALLY standing in the
+    // zone between the corner flag and the six-yard box at this moment.
+    // The velocity gate rejects runners passing through at speed (max
+    // run ~0.36-0.6 u/tick) while tolerating the idle shuffle of a
+    // staged short option (~0.1) — the failure mode this closes is the
+    // leading pass at a projected arrival, not a man shifting his feet.
+    let short_mate = ctx
         .players()
         .teammates()
         .all()
         .filter(|t| {
             t.id != taker_id
                 && (t.position - taker_pos).magnitude() < 70.0
-                // Still outside the box mouth — a runner already at
-                // the near post is a cross target, not a short option.
-                && (t.position.y - field_h * 0.5).abs() > 84.0
+                && (t.position.y - cy).abs() > 84.0
+                && t.velocity(ctx).norm() < 0.15
         })
         .min_by(|a, b| {
             let da = (a.position - taker_pos).magnitude();
             let db = (b.position - taker_pos).magnitude();
             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-        })
-    {
-        // The taker MAY go short — usually does when an option was
-        // staged, but a cross stays possible so defences can't sit on
-        // the short ball.
-        if ctx.context.rng.bernoulli(0.7) {
-            return Some((mate.id, mate.position, CornerDeliveryZone::Short));
+        });
+
+    #[derive(PartialEq)]
+    enum Bucket {
+        Near,
+        Short,
+        Box,
+        Far,
+    }
+    let r = rng.unit_f32();
+    let bucket = if r < 0.10 {
+        Bucket::Near
+    } else if r < 0.15 {
+        if short_mate.is_some() {
+            Bucket::Short
+        } else {
+            Bucket::Box // reroll: empty near zone is never a target
         }
+    } else if r < 0.80 {
+        Bucket::Box
+    } else {
+        Bucket::Far
+    };
+
+    if bucket == Bucket::Short {
+        let mate = short_mate.expect("gated on is_some above");
+        return Some((mate.id, mate.position, CornerDeliveryZone::Short));
     }
 
-    let assignments = assign_corner_runners(
-        taker_id,
-        taker_pos,
-        goal_pos,
-        field_w,
-        field_h,
-        ctx.players().teammates().all(),
-    );
+    // Cross-style buckets: the ball is aimed at the ZONE, the receiver is
+    // whichever teammate is best placed to attack it. Near/far-post
+    // targets live between the six-yard line's depth band and the post
+    // (lateral ≤ 58u < the 84u box-mouth edge, so they can never fall in
+    // the short band); the box bucket is the penalty-spot area.
+    let (zone_kind, target) = match bucket {
+        Bucket::Near => (
+            CornerDeliveryZone::NearPost,
+            Vector3::new(
+                gx + inward * (28.0 + rng.unit_f32() * 22.0),
+                cy + near_sign * (30.0 + rng.unit_f32() * 28.0),
+                0.0,
+            ),
+        ),
+        Bucket::Far => (
+            CornerDeliveryZone::FarPost,
+            Vector3::new(
+                gx + inward * (28.0 + rng.unit_f32() * 22.0),
+                cy - near_sign * (30.0 + rng.unit_f32() * 28.0),
+                0.0,
+            ),
+        ),
+        _ => (
+            CornerDeliveryZone::PenaltySpot,
+            Vector3::new(
+                gx + inward * (80.0 + rng.unit_f32() * 20.0),
+                cy + (rng.unit_f32() * 2.0 - 1.0) * 25.0,
+                0.0,
+            ),
+        ),
+    };
 
-    if assignments.is_empty() {
-        return None;
-    }
+    // Receiver: nearest outfield teammate to the aimed zone.
+    let receiver = ctx
+        .players()
+        .teammates()
+        .all()
+        .filter(|t| t.id != taker_id && !t.tactical_positions.is_goalkeeper())
+        .min_by(|a, b| {
+            let da = (a.position - target).magnitude_squared();
+            let db = (b.position - target).magnitude_squared();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })?;
 
-    let n = assignments.len();
-    let preferred_idx = (zone_rotation as usize) % n;
-
-    // Score each assignment: distance to zone minus a bias for the preferred
-    // rotation index.  Lower score = deliver here.
-    let mut scored: Vec<(f32, usize)> = assignments
-        .iter()
-        .enumerate()
-        .map(|(i, (pid, zone))| {
-            let pos = ctx.tick_context.positions.players.position(*pid);
-            let score =
-                (pos - zone).magnitude() - if i == preferred_idx { 30.0 } else { 0.0 };
-            (score, i)
-        })
-        .collect();
-    scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let mut chosen = scored[0].1;
-
-    // §10.2 near-post frequency cap: runner geometry favours the near post
-    // far beyond its real-football share (measured 37.4% of all corners).
-    // When near-post wins the scoring, keep it only with probability
-    // NEAR_POST_KEEP and otherwise deliver to the next-best zone, so the
-    // sampled near-post share stays under ~15% of all corners.
-    const NEAR_POST_KEEP: f32 = 0.30;
-    if ZONE_KINDS[chosen.min(ZONE_KINDS.len() - 1)] == CornerDeliveryZone::NearPost
-        && scored.len() > 1
-        && !ctx.context.rng.bernoulli(NEAR_POST_KEEP)
-    {
-        chosen = scored[1].1;
-    }
-
-    let (pid, zone) = assignments[chosen];
     Some((
-        pid,
-        clamp_cross_target_out_of_short_band(zone, goal_pos, field_w, field_h),
-        ZONE_KINDS[chosen.min(ZONE_KINDS.len() - 1)],
+        receiver.id,
+        clamp_cross_target_out_of_short_band(target, goal_pos, field_w, field_h),
+        zone_kind,
     ))
 }
 

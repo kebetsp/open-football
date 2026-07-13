@@ -327,6 +327,14 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
+        // §12.4: the staged short-corner option holds his spot until the
+        // corner is struck — without this his state machine runs him back
+        // toward his anchor and the delivery picker's "genuinely
+        // stationary in the zone" gate can never be met.
+        if let Some(velocity) = Self::corner_short_hold_velocity(&processing_ctx) {
+            result.velocity = Some(velocity);
+        }
+
         // common logic
         let complete_result = |state_results: StateChangeResult,
                                mut result: StateProcessingResult| {
@@ -364,6 +372,24 @@ impl<'p> StateProcessor<'p> {
         }
 
         result
+    }
+
+    /// §12.4 hold for the staged short-corner option: zero velocity while
+    /// the corner origin is live and the taker still holds the ball. Once
+    /// the kick is struck (owner goes None / origin decays on the next
+    /// touch) this stops matching and normal movement resumes.
+    fn corner_short_hold_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        use crate::r#match::PassOriginRestart;
+        let ball = &ctx.tick_context.ball;
+        if ball.pass_origin_restart != PassOriginRestart::Corner {
+            return None;
+        }
+        if ball.corner_short_option != Some(ctx.player.id) {
+            return None;
+        }
+        // Only while the taker is still preparing the kick.
+        ball.current_owner?;
+        Some(Vector3::zeros())
     }
 
     /// Forced Passing-state transition for the kickoff taker (§11.5).

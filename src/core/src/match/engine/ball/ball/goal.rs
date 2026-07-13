@@ -372,6 +372,7 @@ impl Ball {
                 self.pass_origin_restart = PassOriginRestart::Corner;
                 self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
                 self.restart_pending_taker = Some(taker_id);
+                self.corner_short_option = None; // §12.4 — set below iff staged
                 // Pick the corner routine via the SetPieceHistory-aware
                 // helper so repeated identical routines (with no chance
                 // produced) get blocked, varying the delivery flavour
@@ -515,6 +516,11 @@ impl Ball {
                         })
                     {
                         self.pending_restart_teleports.push((opt.id, short_spot));
+                        // §12.4 — the processor holds him at this spot so
+                        // he's genuinely stationary in the zone at kick
+                        // time (previously his state machine ran him back
+                        // toward his anchor and 0 short corners fired).
+                        self.corner_short_option = Some(opt.id);
                     }
                 }
 
