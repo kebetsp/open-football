@@ -263,6 +263,12 @@ pub struct Ball {
     /// through the cross for the aerial-contest resolver) must not lock
     /// whoever happens to make it.
     pub restart_pending_taker: Option<u32>,
+    /// §12.2 one-shot latch for the free-kick taker's dedicated decision
+    /// (direct shot / box delivery / short). Set once the decision has
+    /// been made for the currently-staged free kick so a "play short"
+    /// outcome isn't re-rolled every tick until the taker releases the
+    /// ball. Reset when a new foul restart is awarded.
+    pub free_kick_decided: bool,
     /// Set at pass-kick. Lives for the pass window (~220 ticks) and the
     /// offside resolver fires the call only when the receiver becomes
     /// active (touches the ball or claims). Cleared on resolution,
@@ -449,6 +455,7 @@ impl Ball {
             pending_save_credit: None,
             restart_taker_lock: None,
             restart_pending_taker: None,
+            free_kick_decided: false,
             last_touch_player_id: None,
             last_touch_team_id: None,
             last_touch_tick: 0,

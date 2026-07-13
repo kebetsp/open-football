@@ -81,6 +81,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         Self::apply_pending_set_piece_teleport(field);
         Self::apply_pending_save_credit(field);
         Self::resolve_penalty_kick(field, context);
+        Self::resolve_free_kick(field, context, match_data);
         Self::resolve_corner_contest(field, context);
         // Resolve any deferred-foul / advantage state. Cheap (one
         // Option read in the dominant no-advantage case) so we run it
@@ -405,6 +406,283 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             if let Some(p) = field.get_player_mut(taker_id) {
                 p.memory.record_shot(tick, false);
             }
+        }
+    }
+
+    /// §12.2 — dedicated free-kick-taking decision, distinct from the
+    /// open-play shot/pass evaluation the staged taker would otherwise
+    /// fall through to (which judged a 25-30 yard set-piece shot like a
+    /// pressured open-play shot and always played the nearest-teammate
+    /// pass). Runs once per staged direct free kick, right after the
+    /// §9.3.1 stoppage ends: rolls the (previously dead) pure scoring
+    /// model in `officiating::set_pieces::score_free_kick_choices` into
+    /// a weighted choice and executes it through the NORMAL event
+    /// pipeline — a `Shoot` (which already carries the direct-FK wall
+    /// block, `wall_blocks_direct_fk`) or a lofted box-delivery `PassTo`
+    /// at the §11.7-staged headers. Short/recycle outcomes leave the
+    /// taker to his open-play state machine — the old behaviour, now the
+    /// exception rather than the default. Events dispatch immediately so
+    /// the taker's own AI never gets a decision tick with the ball
+    /// (same reasoning as `resolve_penalty_kick`).
+    pub(super) fn resolve_free_kick(
+        field: &mut MatchField,
+        context: &mut MatchContext,
+        match_data: &mut ResultMatchPositionData,
+    ) {
+        use crate::r#match::PassOriginRestart;
+        use crate::r#match::engine::events::dispatcher::Event;
+        use crate::r#match::engine::set_pieces::{
+            FreeKickBand, FreeKickChoice, score_free_kick_choices,
+        };
+        use crate::r#match::player::events::{
+            PassingEventContext, PlayerEvent, ShootingEventContext,
+        };
+        use crate::r#match::player::strategies::players::ShotType;
+
+        if field.ball.pass_origin_restart != PassOriginRestart::DirectFreeKick
+            || field.ball.free_kick_decided
+        {
+            return;
+        }
+        let Some(taker_id) = field.ball.current_owner else {
+            return;
+        };
+        if field.ball.restart_pending_taker != Some(taker_id) {
+            return;
+        }
+        // Staged: the taker stands on the ball (mirrors the penalty gate).
+        let Some(taker) = field.players.iter().find(|p| p.id == taker_id) else {
+            return;
+        };
+        let d = taker.position - field.ball.position;
+        if (d.x * d.x + d.y * d.y).sqrt() > 6.0 {
+            return;
+        }
+        let Some(taker_side) = taker.side else {
+            return;
+        };
+
+        let field_w = context.field_size.width as f32;
+        let field_h = context.field_size.height as f32;
+        let mid_y = field_h * 0.5;
+        // Left defends x≈0 and attacks x=field_w (see award_restart_for_foul's
+        // goal_x, which is the FOULER's own goal).
+        let goal_x = match taker_side {
+            PlayerSide::Left => field_w,
+            PlayerSide::Right => 0.0,
+        };
+        let ball_pos = field.ball.position;
+        let to_goal = Vector3::new(goal_x - ball_pos.x, mid_y - ball_pos.y, 0.0);
+        let dist_goal = (to_goal.x * to_goal.x + to_goal.y * to_goal.y).sqrt();
+
+        // Beyond crossing range (matches the §11.7 attacking-shape gate)
+        // there is nothing set-piece-specific to decide — the deep-FK
+        // short pass IS the realistic outcome. Latch and fall through.
+        if dist_goal > 280.0 {
+            field.ball.free_kick_decided = true;
+            if context.logging_enabled {
+                match_data.add_match_event(
+                    context.total_match_time,
+                    "player",
+                    format!("FreeKickPlan({}, Deep, {})", taker_id, dist_goal as u32),
+                );
+            }
+            return;
+        }
+
+        let band = FreeKickBand::from_distance(dist_goal);
+        let taker_team = taker.team_id;
+        let taker_fk = taker.skills.technical.free_kicks;
+        let taker_crossing = taker.skills.technical.crossing;
+
+        // Aerial advantage of the staged box targets vs the defenders
+        // around the goal — the §11.7 shape put the two best headers at
+        // the post spots, so compare the best two on each side inside
+        // delivery range.
+        let mut atk_heading: Vec<f32> = Vec::new();
+        let mut def_heading: Vec<f32> = Vec::new();
+        for p in field.players.iter() {
+            if p.is_sent_off
+                || p.id == taker_id
+                || p.tactical_position.current_position.is_goalkeeper()
+            {
+                continue;
+            }
+            let dg = Vector3::new(goal_x - p.position.x, mid_y - p.position.y, 0.0);
+            if (dg.x * dg.x + dg.y * dg.y).sqrt() > 200.0 {
+                continue;
+            }
+            if p.team_id == taker_team {
+                atk_heading.push(p.skills.technical.heading);
+            } else {
+                def_heading.push(p.skills.technical.heading);
+            }
+        }
+        let top2 = |v: &mut Vec<f32>| -> f32 {
+            v.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            match v.len() {
+                0 => 10.0,
+                1 => v[0],
+                _ => (v[0] + v[1]) * 0.5,
+            }
+        };
+        let aerial_advantage =
+            (0.5 + (top2(&mut atk_heading) - top2(&mut def_heading)) / 40.0).clamp(0.0, 1.0);
+
+        // Match state for the scoring model.
+        let minute = (context.total_match_time / 60_000) as u32;
+        let home_goals = context.score.home_team.get() as i16;
+        let away_goals = context.score.away_team.get() as i16;
+        let own_diff = if taker_team == context.field_home_team_id {
+            home_goals - away_goals
+        } else {
+            away_goals - home_goals
+        };
+        let chasing_late = minute >= 60 && own_diff < 0;
+        let protecting_lead_late = minute >= 60 && own_diff > 0;
+
+        let scores = score_free_kick_choices(
+            band,
+            false, // foul restarts are direct free kicks here
+            taker_fk,
+            taker_crossing,
+            aerial_advantage,
+            chasing_late,
+            protecting_lead_late,
+            &context.environment,
+        );
+
+        // From a wide position a direct shot isn't realistic — the whole
+        // weight goes to the delivery/short options (§12.2).
+        let is_wide_angle = (ball_pos.y - mid_y).abs() > dist_goal * 0.6;
+        let shot_w = if is_wide_angle { 0.0 } else { scores.direct_shot };
+
+        field.ball.free_kick_decided = true;
+        let total = shot_w + scores.box_delivery + scores.short_routine + scores.recycle;
+        if total <= 0.0 {
+            return;
+        }
+        let mut roll = context.rng.unit_f32() * total;
+        let choice = if roll < shot_w {
+            FreeKickChoice::DirectShot
+        } else if {
+            roll -= shot_w;
+            roll < scores.box_delivery
+        } {
+            FreeKickChoice::BoxDelivery
+        } else {
+            // ShortRoutine and Recycle both fall through to the taker's
+            // normal state machine — the short pass IS that behaviour.
+            FreeKickChoice::ShortRoutine
+        };
+
+        // Record-only plan tag (same pattern as CornerDelivery §10.2) so
+        // batch harnesses can tally choices per distance band.
+        if context.logging_enabled {
+            match_data.add_match_event(
+                context.total_match_time,
+                "player",
+                format!("FreeKickPlan({}, {:?}, {})", taker_id, choice, dist_goal as u32),
+            );
+        }
+
+        match choice {
+            FreeKickChoice::DirectShot => {
+                // Aim inside a post (goal half-width 29u).
+                let aim_off = 8.0 + context.rng.unit_f32() * 14.0;
+                let aim_y = if context.rng.bernoulli(0.5) {
+                    mid_y + aim_off
+                } else {
+                    mid_y - aim_off
+                };
+                // Shot power — same formula as `shoot_goal_power`, computed
+                // here because there is no StateProcessingContext this deep
+                // in the tick.
+                let s = &taker.skills;
+                let distance_blend = (dist_goal / (field_w * 0.3)).clamp(0.0, 1.0);
+                let shot_skill = (s.technical.finishing / 20.0) * (1.0 - distance_blend)
+                    + (s.technical.long_shots / 20.0) * distance_blend;
+                let skill_multiplier = 0.2
+                    + 0.8
+                        * (shot_skill * 0.3
+                            + (s.technical.technique / 20.0) * 0.25
+                            + (s.physical.strength / 20.0) * 0.25
+                            + (s.mental.composure / 20.0) * 0.2);
+                let distance_factor = 1.0 + (dist_goal / field_w).clamp(0.0, 1.0) * 0.4;
+                let condition_factor =
+                    0.90 + (taker.player_attributes.condition as f32 / 10_000.0) * 0.10;
+                let force =
+                    (2.2 * skill_multiplier * distance_factor * condition_factor).clamp(1.4, 3.8);
+
+                let mut evs = EventCollection::with_event(Event::PlayerEvent(PlayerEvent::Shoot(
+                    ShootingEventContext {
+                        from_player_id: taker_id,
+                        target: Vector3::new(goal_x, aim_y, 0.0),
+                        force: force as f64,
+                        reason: "FK_DIRECT",
+                        tick: context.current_tick(),
+                        shot_type: ShotType::DirectFreeKick,
+                    },
+                )));
+                EventDispatcher::dispatch(&mut evs, field, context, match_data, true);
+                // The wall roll (if any) was consumed inside the shot
+                // handler; decay the origin so a rebound shot doesn't get
+                // a phantom second wall.
+                field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
+            }
+            FreeKickChoice::BoxDelivery => {
+                // Deliver at the best header staged in the box (§11.7 put
+                // him at a post spot at penalty-spot depth). If nobody is
+                // in delivery range, fall through to the state machine.
+                let receiver = field
+                    .players
+                    .iter()
+                    .filter(|p| {
+                        p.team_id == taker_team
+                            && p.id != taker_id
+                            && !p.is_sent_off
+                            && !p.tactical_position.current_position.is_goalkeeper()
+                    })
+                    .filter(|p| {
+                        let dg = Vector3::new(goal_x - p.position.x, mid_y - p.position.y, 0.0);
+                        (dg.x * dg.x + dg.y * dg.y).sqrt() < 200.0
+                    })
+                    .max_by(|a, b| {
+                        a.skills
+                            .technical
+                            .heading
+                            .partial_cmp(&b.skills.technical.heading)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|p| (p.id, p.position));
+                let Some((receiver_id, receiver_pos)) = receiver else {
+                    return;
+                };
+                // Pass power — same shape as `pass_teammate_power`.
+                let s = &taker.skills;
+                let skill_factor = (s.technical.passing / 20.0) * 0.35
+                    + (s.technical.technique / 20.0) * 0.2
+                    + (s.physical.strength / 20.0) * 0.15
+                    + (s.mental.vision / 20.0) * 0.15
+                    + (s.mental.composure / 20.0) * 0.15;
+                let pass_dist = (receiver_pos - ball_pos).magnitude();
+                let distance_factor = (pass_dist / (field_w * 0.8)).clamp(0.25, 1.0);
+                let condition_factor =
+                    0.92 + (taker.player_attributes.condition as f32 / 10_000.0) * 0.08;
+                let pass_force = (0.5 + 1.5 * skill_factor * distance_factor) * condition_factor;
+
+                let mut evs = EventCollection::with_event(Event::PlayerEvent(PlayerEvent::PassTo(
+                    PassingEventContext {
+                        from_player_id: taker_id,
+                        to_player_id: receiver_id,
+                        pass_target: receiver_pos,
+                        pass_force,
+                        reason: "FK_CROSS",
+                    },
+                )));
+                EventDispatcher::dispatch(&mut evs, field, context, match_data, true);
+            }
+            _ => {}
         }
     }
 

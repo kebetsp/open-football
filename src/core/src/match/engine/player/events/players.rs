@@ -1842,9 +1842,15 @@ impl PlayerEventDispatcher {
         // winger crosses makes them overshoot and look unnatural.
         let is_corner_delivery =
             field.ball.pass_origin_restart == PassOriginRestart::Corner && was_cross;
+        // §12.2 free-kick box delivery: same reasoning as corners — the
+        // ball must clear the wall and the packed box, so it arcs above
+        // the 2.5u interception ceiling. Keyed on the resolver's reason
+        // tag rather than the restart origin so short FK layoffs (also
+        // struck under a DirectFreeKick origin) keep a normal trajectory.
+        let is_fk_delivery = event_model.reason == "FK_CROSS";
         let trajectory_type = if passer_is_goalkeeper && actual_horizontal_distance > 60.0 {
             TrajectoryType::HighArc
-        } else if is_corner_delivery && actual_horizontal_distance > 25.0 {
+        } else if (is_corner_delivery || is_fk_delivery) && actual_horizontal_distance > 25.0 {
             TrajectoryType::HighArc
         } else {
             trajectory_type
@@ -1864,7 +1870,7 @@ impl PlayerEventDispatcher {
         // Corner deliveries also get extra lift so the ball reaches the far post.
         let max_z_velocity = if passer_is_goalkeeper && actual_horizontal_distance > 60.0 {
             base_max_z * 1.5
-        } else if is_corner_delivery && actual_horizontal_distance > 25.0 {
+        } else if (is_corner_delivery || is_fk_delivery) && actual_horizontal_distance > 25.0 {
             base_max_z * 1.3
         } else {
             base_max_z
@@ -4283,6 +4289,7 @@ impl PlayerEventDispatcher {
         };
         ball.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
         ball.restart_pending_taker = Some(taker_id);
+        ball.free_kick_decided = false; // §12.2 — fresh decision for this restart
         let team_id = field
             .players
             .iter()

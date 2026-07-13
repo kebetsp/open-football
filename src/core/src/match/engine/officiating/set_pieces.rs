@@ -8,27 +8,35 @@
 use crate::r#match::engine::environment::{MatchEnvironment, Pitch, Weather};
 use std::cmp::Ordering;
 
-/// Distance band of a direct free kick from goal, in field units (where
-/// 1u ≈ 0.125m). 90u ≈ 11m, 130u ≈ 16m.
+/// Distance band of a direct free kick from goal, in field units
+/// (1u = 0.125m — field is 840u = 105m).
+///
+/// §12.2 recalibration: the original thresholds (90/130/180u = 11/16/22.5m)
+/// assumed a ~2× coarser unit scale — the same unit-conversion error family
+/// as the MAX_PASS_VELOCITY fix. 11–16m is INSIDE the penalty area, where a
+/// foul is a penalty, so under the old bands virtually every direct free
+/// kick classified Long/Far and the shot weight never engaged (0 direct FK
+/// shots measured over 39 awarded FKs). Real direct-FK shooting range is
+/// ~16–30m = 130–240u.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreeKickBand {
-    /// 65–90u — close-in direct shot or near-post delivery.
+    /// ≤150u (≤19m) — close-in direct shot or near-post delivery.
     Close,
-    /// 90–130u — standard shooting/crossing range.
+    /// 150–200u (19–25m) — the classic direct free-kick shooting range.
     Mid,
-    /// 130–180u — long, normally a cross or layoff.
+    /// 200–250u (25–31m) — long-range strike territory, mostly deliveries.
     Long,
-    /// >180u — too far to shoot, recycle or long delivery.
+    /// >250u — too far to shoot, recycle or long delivery.
     Far,
 }
 
 impl FreeKickBand {
     pub fn from_distance(distance_u: f32) -> Self {
-        if distance_u <= 90.0 {
+        if distance_u <= 150.0 {
             FreeKickBand::Close
-        } else if distance_u <= 130.0 {
+        } else if distance_u <= 200.0 {
             FreeKickBand::Mid
-        } else if distance_u <= 180.0 {
+        } else if distance_u <= 250.0 {
             FreeKickBand::Long
         } else {
             FreeKickBand::Far
@@ -678,10 +686,11 @@ mod tests {
 
     #[test]
     fn fk_band_classification() {
-        assert_eq!(FreeKickBand::from_distance(70.0), FreeKickBand::Close);
-        assert_eq!(FreeKickBand::from_distance(110.0), FreeKickBand::Mid);
-        assert_eq!(FreeKickBand::from_distance(160.0), FreeKickBand::Long);
-        assert_eq!(FreeKickBand::from_distance(220.0), FreeKickBand::Far);
+        // §12.2 thresholds: 150/200/250u (19/25/31m at 1u = 0.125m).
+        assert_eq!(FreeKickBand::from_distance(130.0), FreeKickBand::Close);
+        assert_eq!(FreeKickBand::from_distance(180.0), FreeKickBand::Mid);
+        assert_eq!(FreeKickBand::from_distance(230.0), FreeKickBand::Long);
+        assert_eq!(FreeKickBand::from_distance(280.0), FreeKickBand::Far);
     }
 
     #[test]
