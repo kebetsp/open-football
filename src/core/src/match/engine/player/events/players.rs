@@ -1908,10 +1908,51 @@ impl PlayerEventDispatcher {
             final_velocity = Vector3::new(safe_direction.x * 1.5, safe_direction.y * 1.5, 0.3);
         }
 
-        // Clamp velocity magnitude to maximum
-        let velocity_magnitude = final_velocity.norm();
-        if velocity_magnitude > MAX_PASS_VELOCITY {
-            final_velocity = final_velocity * (MAX_PASS_VELOCITY / velocity_magnitude);
+        // Clamp velocity magnitude to maximum.
+        //
+        // 2026-07-16 realism pass: corner/FK HighArc deliveries clamp the
+        // HORIZONTAL component independently of z, instead of folding both
+        // into one combined-magnitude check. Diagnosed mechanism: a long
+        // corner (taker at the flag to a central box target is a genuine
+        // ~250-290u straight-line distance) needs a z-velocity near its own
+        // ceiling (`calculate_max_z_velocity`, already 8-15.6 for that
+        // distance bracket with the corner boost) just to clear the packed
+        // box — and that z component ALONE already exceeds the entire 3.2
+        // u/tick shared budget. Combining it with horizontal before the
+        // clamp scaled horizontal down to ~20-30% of what the distance
+        // requires, so the cross landed a fraction of the way to its aim
+        // and the rest of the "delivery" was a slow ground roll. z already
+        // has its own dedicated, distance-scaled ceiling — it doesn't need
+        // to also share a magnitude budget with horizontal. Every other
+        // pass type (open play, short/medium crosses) keeps the original
+        // combined clamp; this is scoped to the diagnosed mechanism only.
+        if is_corner_delivery || is_fk_delivery {
+            // `calculate_max_z_velocity`'s ceiling (8-15.6 for long
+            // distances) was only ever exercised through the OLD shared
+            // clamp, which crushed it down to an effective ~1.5-4.7 in
+            // practice — the previously-confirmed-realistic arc height
+            // (0.75-3.4m peaks) came from that throttled value, not the
+            // ceiling's raw output. Letting z reach the raw ceiling
+            // unclamped (first attempt at this fix) produced ~18-19m
+            // arcs. Cap z here at a value chosen to reproduce the
+            // already-confirmed-good peak, independent of horizontal.
+            const CORNER_FK_MAX_Z_VELOCITY: f32 = 2.9;
+            if final_velocity.z > CORNER_FK_MAX_Z_VELOCITY {
+                final_velocity.z = CORNER_FK_MAX_Z_VELOCITY;
+            }
+            let horizontal_mag = (horizontal_velocity.x * horizontal_velocity.x
+                + horizontal_velocity.y * horizontal_velocity.y)
+                .sqrt();
+            if horizontal_mag > MAX_PASS_VELOCITY {
+                let scale = MAX_PASS_VELOCITY / horizontal_mag;
+                final_velocity.x = horizontal_velocity.x * scale;
+                final_velocity.y = horizontal_velocity.y * scale;
+            }
+        } else {
+            let velocity_magnitude = final_velocity.norm();
+            if velocity_magnitude > MAX_PASS_VELOCITY {
+                final_velocity = final_velocity * (MAX_PASS_VELOCITY / velocity_magnitude);
+            }
         }
 
         // Apply ball physics
