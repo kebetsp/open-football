@@ -192,15 +192,24 @@ pub enum CornerDeliveryZone {
 /// visual "near post, short of the six-yard box" band (~16% of corners,
 /// delivered at a possibly-moving teammate's position). The table:
 ///
-///   10% — near post: the zone between the six-yard border and the near
+/// 17.5% — near post: the zone between the six-yard border and the near
 ///         post itself, never short of the six-yard line. "Near" is the
 ///         post on the taker's side, computed per kick.
 ///    5% — short: a precise pass to a teammate genuinely standing
 ///         (stationary, right now) in the flag-to-six-yard zone. If no
 ///         such teammate exists this bucket rerolls into the box bucket
 ///         — an empty near zone is never a target.
-///   65% — into the box (penalty-spot / central-box area).
+/// 57.5% — into the box (penalty-spot / central-box area).
 ///   20% — far post.
+///
+/// The near/box split was re-sourced in the 2026-07-15 realism pass: the
+/// original 10/5/65/20 was invented from feel, and 10% undershot real
+/// near-post usage (19-29% for a near-post-leaning Premier League side,
+/// Opta via The Analyst). Near-post share is style-dependent with no single
+/// correct value, so this sits at the low end of that range; the 7.5pp came
+/// out of the box bucket, which was at the high end of its own plausible
+/// range. Short and far are NOT tuned here — neither had a sourced reason
+/// to move.
 pub fn pick_corner_delivery(
     ctx: &StateProcessingContext,
 ) -> Option<(u32, Vector3<f32>, CornerDeliveryZone)> {
@@ -247,9 +256,9 @@ pub fn pick_corner_delivery(
         Far,
     }
     let r = rng.unit_f32();
-    let bucket = if r < 0.10 {
+    let bucket = if r < 0.175 {
         Bucket::Near
-    } else if r < 0.15 {
+    } else if r < 0.225 {
         if short_mate.is_some() {
             Bucket::Short
         } else {
