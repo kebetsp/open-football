@@ -178,6 +178,16 @@ pub struct Ball {
     /// player's state: the wall holds only through the restart window
     /// (claim cooldown), then normal positioning resumes.
     pub pending_restart_teleports: Vec<(u32, Vector3<f32>)>,
+    /// §13.3: true only for the exact duration a struck direct free-kick
+    /// shot is in flight after clearing the wall check. `pass_origin_restart`
+    /// cannot be reused for this — `resolve_free_kick`'s DirectShot branch
+    /// resets it to OpenPlay on the same tick the shot is dispatched (so a
+    /// rebound doesn't spuriously re-trigger a wall check), which happens
+    /// before `try_intercept`/`try_block_shot` ever run on the now-flying
+    /// ball. Set fresh by every `handle_shoot_event` call; inert once the
+    /// ball is claimed/saved/out since those interaction checks already
+    /// early-return in that case.
+    pub direct_fk_shot_in_flight: bool,
     /// Fire-once guard for the discrete corner aerial contest. A played-out
     /// lofted corner can't thread the congested box to a specific runner, so
     /// once the cross is struck the engine resolves a single skill-weighted
@@ -451,6 +461,7 @@ impl Ball {
             pending_set_piece_teleport: None,
             pending_corner_teleports: Vec::new(),
             pending_restart_teleports: Vec::new(),
+            direct_fk_shot_in_flight: false,
             corner_contest_resolved: true,
             pending_corner_routine: None,
             owned_stuck_ticks: 0,

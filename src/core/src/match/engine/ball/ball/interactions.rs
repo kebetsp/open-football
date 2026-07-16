@@ -39,6 +39,21 @@ impl Ball {
             return;
         }
 
+        // §13.3: a struck direct free-kick shot has already had its one
+        // legitimate contest — the wall (`wall_blocks_direct_fk`, rolled
+        // before the shot is even struck). Keyed on `direct_fk_shot_in_flight`
+        // rather than `pass_origin_restart`, which `resolve_free_kick`
+        // resets to OpenPlay on the same tick the shot is dispatched (to
+        // stop a rebound from re-triggering a phantom wall check) — that
+        // happens before this interaction check ever runs on the
+        // now-flying ball, so `pass_origin_restart` alone can't gate it.
+        // Once live, a covering outfield defender elsewhere on the pitch
+        // has no realistic chance to step into an already-in-flight
+        // dead-ball strike the way they might read an open-play pass.
+        if self.direct_fk_shot_in_flight {
+            return;
+        }
+
         // Don't intercept aerial balls above player reach
         if self.position.z > 2.5 {
             return;
@@ -212,6 +227,17 @@ impl Ball {
             None => return,
         };
         if self.current_owner.is_some() || self.flags.in_flight_state == 0 {
+            return;
+        }
+
+        // §13.3: same reasoning as `try_intercept` above — a direct
+        // free-kick shot already had its one legitimate contest (the
+        // wall, resolved before the shot was struck). No outfield
+        // defender outside the wall gets a second, generic shot-block
+        // chance against an already-in-flight dead-ball strike. Keyed on
+        // `direct_fk_shot_in_flight`, not `pass_origin_restart` — see the
+        // comment on `try_intercept`'s identical guard for why.
+        if self.direct_fk_shot_in_flight {
             return;
         }
         // Ball above defender reach — aerial shots aren't blocked at

@@ -2611,8 +2611,20 @@ impl PlayerEventDispatcher {
             // Restart origin is consumed by the wall — return to
             // open play so the next tick doesn't repeat the block.
             field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
+            field.ball.direct_fk_shot_in_flight = false;
             return;
         }
+
+        // §13.3: the shot cleared the wall check (or wasn't a direct FK
+        // at all) — mark whether it's a live, in-flight direct free-kick
+        // strike so `try_intercept`/`try_block_shot` can exempt it from
+        // open-play contest mechanics. Set here rather than reused from
+        // `pass_origin_restart` because `resolve_free_kick` resets that
+        // field to OpenPlay on the same tick the shot is dispatched
+        // (below), before those interaction checks ever run on the
+        // now-flying ball. Decays to false automatically on every other
+        // shot this function handles.
+        field.ball.direct_fk_shot_in_flight = shoot_event_model.reason == "FK_DIRECT";
 
         // Snapshot the bits of state we need from `field` so we can
         // build the profile without juggling overlapping borrows.
@@ -2675,22 +2687,34 @@ impl PlayerEventDispatcher {
         // shooter. We don't have the StateProcessingContext grid here,
         // so a small linear scan is used; the population of opponents
         // is bounded (<=11) so the cost is negligible.
+        //
+        // §13.3: a direct free kick is a dead ball taken with a run-up —
+        // the Laws of the Game require every opponent to retreat 9.15m
+        // (73u, already enforced by §12.3's wall/marker positioning), so
+        // there is no such thing as a defender "closing the taker down"
+        // the way there is in open play. Skip the scan entirely for
+        // FK_DIRECT rather than relying on the retreat distance to keep
+        // it at zero — the shot should resolve on the taker's skill vs.
+        // the wall (already handled separately, before the shot is even
+        // struck) and the keeper, nothing else.
         let mut pressure_5u: u32 = 0;
         let mut pressure_10u: u32 = 0;
-        if let Some(side) = shooter_side {
-            for other in field.players.iter() {
-                if other.id == shoot_event_model.from_player_id {
-                    continue;
-                }
-                if other.side == Some(side) {
-                    continue;
-                }
-                let d = (other.position - shooter_position).magnitude();
-                if d <= 5.0 {
-                    pressure_5u += 1;
-                }
-                if d <= 10.0 {
-                    pressure_10u += 1;
+        if shoot_event_model.reason != "FK_DIRECT" {
+            if let Some(side) = shooter_side {
+                for other in field.players.iter() {
+                    if other.id == shoot_event_model.from_player_id {
+                        continue;
+                    }
+                    if other.side == Some(side) {
+                        continue;
+                    }
+                    let d = (other.position - shooter_position).magnitude();
+                    if d <= 5.0 {
+                        pressure_5u += 1;
+                    }
+                    if d <= 10.0 {
+                        pressure_10u += 1;
+                    }
                 }
             }
         }
