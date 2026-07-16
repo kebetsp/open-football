@@ -389,6 +389,7 @@ impl FoulResolver {
             let restart = PlayerEventDispatcher::award_restart_for_foul(
                 adv.fouler_id,
                 adv.severity,
+                adv.foul_position,
                 field,
                 context,
             );
@@ -3487,6 +3488,13 @@ impl PlayerEventDispatcher {
         field: &mut MatchField,
         context: &mut MatchContext,
     ) -> FoulOutcome {
+        // §13.1: snapshot the ball position at the moment of contact —
+        // this is the true foul location. If advantage is played and
+        // later pulled back, the restart must use THIS position, not
+        // wherever the ball has travelled to by the time the whistle
+        // actually goes (§13.1's penalty-vs-free-kick misclassification).
+        let foul_position = field.ball.position;
+
         // Referee marginal-call gate. The tackling code emits a foul
         // whenever a contact passes its `committed_foul` roll; the
         // referee then decides whether to actually blow the whistle.
@@ -3543,6 +3551,7 @@ impl PlayerEventDispatcher {
                     start_tick,
                     expire_tick: start_tick + window,
                     fouled_team_id,
+                    foul_position,
                     severity,
                     yellow_prob: card_yellow_prob,
                     red_prob: card_red_prob,
@@ -3566,7 +3575,8 @@ impl PlayerEventDispatcher {
             field.ball.flags.in_flight_state = 150;
             field.ball.contested_claim_count = 0;
         }
-        let restart = Self::award_restart_for_foul(fouler_id, severity, field, context);
+        let restart =
+            Self::award_restart_for_foul(fouler_id, severity, foul_position, field, context);
 
         // Count the foul for the player (advantage path counted it above).
         if let Some(p) = field.get_player_mut(fouler_id) {
@@ -4219,6 +4229,7 @@ impl PlayerEventDispatcher {
     pub(crate) fn award_restart_for_foul(
         fouler_id: u32,
         _severity: FoulSeverity,
+        foul_pos: Vector3<f32>,
         field: &mut MatchField,
         context: &mut MatchContext,
     ) -> Option<RestartAwarded> {
@@ -4243,7 +4254,6 @@ impl PlayerEventDispatcher {
             PlayerSide::Left => context.penalty_area(true),
             PlayerSide::Right => context.penalty_area(false),
         };
-        let foul_pos = field.ball.position;
         let in_penalty_area = pa.contains(&foul_pos);
         #[cfg(feature = "match-logs")]
         {

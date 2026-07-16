@@ -282,6 +282,11 @@ pub struct PendingAdvantage {
     /// The fouled team (team that should KEEP possession for the
     /// advantage to materialise).
     pub fouled_team_id: u32,
+    /// Ball position at the moment of the original contact (§13.1) —
+    /// if the advantage is later pulled back, the restart (and its
+    /// penalty-box test) must use where the foul actually happened,
+    /// not wherever the ball has since travelled to.
+    pub foul_position: Vector3<f32>,
     /// Severity of the original foul — drives the card decision.
     pub severity: FoulSeverity,
     /// Card decision pre-computed at foul time so referee bias /
