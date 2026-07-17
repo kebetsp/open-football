@@ -122,27 +122,29 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             }
         }
 
-        // Foul-restart set-up: place the free-kick wall / retreating
-        // defenders, or clear the box for a penalty. No state override —
-        // players resume normal positioning after the restart window
-        // (there's no stoppage in the sim to walk the wall up during).
+        // §13.4: foul-restart set-up (free-kick wall, retreating
+        // defenders, penalty box-clear) — set a genuine retreat target
+        // instead of an instant snap, so the player walks there
+        // tick-by-tick from wherever they actually are during the
+        // `dead_ball_retreat_active` window (`apply_restart_retreat_tick`
+        // in this file). No state override — players resume normal
+        // positioning once the target is reached or the window ends.
         if !field.ball.pending_restart_teleports.is_empty() {
             let teleports = std::mem::take(&mut field.ball.pending_restart_teleports);
             for (player_id, pos) in teleports {
                 if let Some(idx) = field.player_index(player_id) {
-                    let p = &mut field.players[idx];
-                    p.position = pos;
-                    p.velocity = Vector3::zeros();
-                    p.in_state_time = 0;
+                    field.players[idx].restart_retreat_target = Some(pos);
                 }
             }
         }
 
-        // Corner dead-ball set-up: teleport the pushed-up centre-backs
-        // into the box so they can attack the delivery (see
-        // `Ball::pending_corner_teleports` — there's no stoppage in the
-        // sim for them to walk up during, and they can't run the length
-        // of the pitch inside the cross window).
+        // §13.4: corner dead-ball set-up — the pushed-up centre-backs get
+        // a genuine retreat target to walk to (not an instant snap) so
+        // they attack the delivery from a real run, not a teleport (see
+        // `Ball::pending_corner_teleports`). The AttackingCorner state
+        // override stays instant: it's a state assignment, not a
+        // position snap, and not all prior defensive states carry the
+        // entry hook into it.
         if !field.ball.pending_corner_teleports.is_empty() {
             use crate::r#match::defenders::states::DefenderState;
             use crate::r#match::player::state::PlayerState;
@@ -150,16 +152,48 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             for (player_id, pos) in teleports {
                 if let Some(idx) = field.player_index(player_id) {
                     let p = &mut field.players[idx];
-                    p.position = pos;
-                    p.velocity = Vector3::zeros();
-                    p.in_state_time = 0;
-                    // Force the AttackingCorner state directly — the CB may
-                    // have been in any defensive state when the corner was
-                    // won, and not all of them carry the entry hook. This
-                    // guarantees they attack the delivery.
+                    p.restart_retreat_target = Some(pos);
                     p.state = PlayerState::Defender(DefenderState::AttackingCorner);
                 }
             }
+        }
+    }
+
+    /// §13.4: light movement-only tick, run during a foul/corner/goal-kick
+    /// retreat window (`context.dead_ball_retreat_active`) instead of the
+    /// hard tick-skip the post-goal kickoff freeze still uses. Only
+    /// players carrying a `restart_retreat_target` move — everyone else
+    /// holds position, and no ball physics/AI/events run here, preserving
+    /// the "otherwise frozen" world the original pause relied on for
+    /// safety. Full running pace, not a jog: a whistle-driven retreat is
+    /// urgent. Self-clears a player's target on arrival; the run loop
+    /// force-clears any stragglers' targets when the window ends.
+    pub(super) fn apply_restart_retreat_tick(field: &mut MatchField, context: &MatchContext) {
+        const ARRIVAL_TOLERANCE: f32 = 4.0;
+        for player in field.players.iter_mut().filter(|p| !p.is_sent_off) {
+            let Some(target) = player.restart_retreat_target else {
+                continue;
+            };
+            let to_target = target - player.position;
+            let dist = to_target.magnitude();
+            if dist <= ARRIVAL_TOLERANCE {
+                player.velocity = Vector3::zeros();
+                player.restart_retreat_target = None;
+                continue;
+            }
+            // Clamp to the remaining distance ("arrive" steering) — `pace`
+            // (~1-20 u/tick) is frequently larger than the last few ticks'
+            // remaining distance, and without this the player overshoots
+            // the target every tick and oscillates back and forth forever
+            // instead of converging (found via raw position traces showing
+            // a player alternating between exactly 2-3 fixed points for
+            // the entire retreat window). Clamping means the player covers
+            // ground at full pace until within one tick's reach, then
+            // takes exactly the remaining distance and lands on target.
+            let speed = player.skills.physical.pace.min(dist);
+            player.velocity = to_target.normalize() * speed;
+            player.check_boundary_collision(context);
+            player.move_to();
         }
     }
 

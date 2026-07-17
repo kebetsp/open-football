@@ -244,8 +244,14 @@ impl Ball {
                 ),
             );
 
+            // §13.4: real retreat + a real wait-or-exploit window — see
+            // the design note (docs/tactical-system-phase13-13.4-design.md
+            // in The Gaffer repo) for why this differs from the post-goal
+            // freeze above (dead_ball_retreat_active is never set there).
+            context.dead_ball_min_ms = context.total_match_time + 400;
             context.dead_ball_until_ms =
                 context.total_match_time + context.rng.range_u64(1, 3) * 1000;
+            context.dead_ball_retreat_active = true;
         }
     }
 
@@ -624,8 +630,12 @@ impl Ball {
                     }
                 }
 
+                // §13.4: real retreat + a real wait-or-exploit window —
+                // see docs/tactical-system-phase13-13.4-design.md.
+                context.dead_ball_min_ms = context.total_match_time + 400;
                 context.dead_ball_until_ms =
                     context.total_match_time + context.rng.range_u64(1, 3) * 1000;
+                context.dead_ball_retreat_active = true;
                 return;
             }
             // If no eligible outfielder was found, fall through to goal kick
@@ -760,8 +770,12 @@ impl Ball {
                 }
             }
 
+            // §13.4: real retreat + a real wait-or-exploit window — see
+            // docs/tactical-system-phase13-13.4-design.md.
+            context.dead_ball_min_ms = context.total_match_time + 400;
             context.dead_ball_until_ms =
                 context.total_match_time + context.rng.range_u64(1, 3) * 1000;
+            context.dead_ball_retreat_active = true;
         }
     }
 }

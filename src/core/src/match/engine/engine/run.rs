@@ -784,7 +784,49 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // is load-bearing (it consumed the post-goal hot window
             // that made goals beget goals).
             if context.total_match_time < context.dead_ball_until_ms {
+                // §13.4: foul/corner/goal-kick windows get a real retreat
+                // instead of a total freeze — `dead_ball_retreat_active`
+                // is never set for the post-goal kickoff freeze above, so
+                // that pause stays byte-for-byte unchanged.
+                if context.dead_ball_retreat_active {
+                    Self::apply_restart_retreat_tick(field, context);
+                    if track_positions && context.total_match_time >= next_position_record_ms {
+                        Self::write_match_positions(field, context.total_match_time, match_data);
+                        next_position_record_ms += Self::POSITION_RECORD_INTERVAL_MS;
+                    }
+                    // Real wait-or-exploit decision: once past the
+                    // minimum reaction-time floor, each tick has a small
+                    // chance to end the stoppage early — whoever hasn't
+                    // reached their `restart_retreat_target` yet gets
+                    // caught short. No sourced real-world quick-vs-patient
+                    // split exists; this roll is an explicitly-flagged
+                    // estimate (tune EARLY_RESTART_ROLL_PER_TICK if the
+                    // resulting fast/patient mix needs adjusting). Real
+                    // football treats a quick restart as the exception,
+                    // not the rule — sized so a typical ~200-tick
+                    // exploitable window (the gap between the minimum
+                    // reaction floor and the maximum cap) has roughly a
+                    // 20% chance of firing early, not a coin flip.
+                    const EARLY_RESTART_ROLL_PER_TICK: u64 = 12; // /10000 ≈ 0.12%/tick
+                    if context.total_match_time >= context.dead_ball_min_ms
+                        && context.rng.range_u64(0, 10000) < EARLY_RESTART_ROLL_PER_TICK
+                    {
+                        context.dead_ball_until_ms = context.total_match_time;
+                    }
+                }
                 continue;
+            }
+            // §13.4: the retreat window (if any) just ended — either the
+            // early-exploit roll fired above or the hard maximum was
+            // reached. Sweep every player's target so a straggler who
+            // never arrived can't keep drifting toward a stale anchor
+            // once open play resumes; runs exactly once per window since
+            // the flag is cleared in the same breath.
+            if context.dead_ball_retreat_active {
+                context.dead_ball_retreat_active = false;
+                for player in field.players.iter_mut() {
+                    player.restart_retreat_target = None;
+                }
             }
 
             tick_parity += 1;

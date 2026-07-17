@@ -209,6 +209,18 @@ pub struct MatchPlayer {
     /// sprints him home. The manager's risk is real — the goal is
     /// genuinely open while he's up.
     pub gk_up_after_minute: Option<u32>,
+    /// §13.4: genuine restart-retreat steering target (foul wall/box-clear,
+    /// corner defensive block/attacking push, goal-kick recovery shape).
+    /// Set instead of an instant position snap so the player walks there
+    /// tick-by-tick from wherever they actually are — a fast restart can
+    /// then genuinely catch them short. Only ever read/written during a
+    /// `dead_ball_retreat_active` window by the engine's light retreat
+    /// tick (`FootballEngine::apply_restart_retreat_tick`, tick.rs) —
+    /// never by the normal state processor, so it can't interact with
+    /// open-play movement. Force-cleared on every player the instant a
+    /// retreat window ends (early or at the cap), so a stale target can
+    /// never leak into open play.
+    pub restart_retreat_target: Option<Vector3<f32>>,
     /// Manager-issued start-position anchors (per axis, first-half
     /// coordinates). `setup_player_on_field` overwrites start_position
     /// from the formation table, which silently discarded the API's
@@ -411,6 +423,7 @@ impl MatchPlayer {
             intercept_target: None,
             supply_target: None,
             gk_up_after_minute: None,
+            restart_retreat_target: None,
             start_anchor_x: None,
             start_anchor_y: None,
             shape_rules: Vec::new(),
@@ -486,6 +499,7 @@ impl MatchPlayer {
             intercept_target: None,
             supply_target: None,
             gk_up_after_minute: None,
+            restart_retreat_target: None,
             start_anchor_x: None,
             start_anchor_y: None,
             shape_rules: Vec::new(),

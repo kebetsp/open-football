@@ -201,6 +201,25 @@ pub struct MatchContext {
     /// equalizer-within-5-minutes rate ran 2.5x real), and it means
     /// play always resumes against a SET defense. 0 = play is live.
     pub dead_ball_until_ms: u64,
+    /// §13.4: true while the CURRENT `dead_ball_until_ms` window belongs
+    /// to a foul/corner/goal-kick retreat (never the post-goal kickoff
+    /// freeze above, which stays a total freeze on purpose — that pause
+    /// exists specifically to PREVENT a quick-restart exploit of a
+    /// just-scored-against defense, the opposite of what this flag is
+    /// for). While true, the engine loop runs a light "retreat tick"
+    /// during the freeze instead of skipping the tick body outright:
+    /// players carrying a `restart_retreat_target` walk toward it at
+    /// running pace, everyone else holds. Force-cleared (along with
+    /// every player's `restart_retreat_target`) the instant the window
+    /// ends, so it can never leak into open play.
+    pub dead_ball_retreat_active: bool,
+    /// §13.4: earliest `total_match_time` at which the taker's "restart
+    /// now" roll may fire — models the unavoidable minimum whistle-to-
+    /// restart reaction time. Below this the retreat window cannot end
+    /// early regardless of the roll; `dead_ball_until_ms` above still
+    /// acts as the hard maximum (a real ref eventually blows the whistle
+    /// either way, however much retreat has or hasn't happened).
+    pub dead_ball_min_ms: u64,
     /// Sim-minute at which the FIRST shape change fired in this match
     /// (any side). Stamped once and never overwritten so the result
     /// summary can show the moment the manager pivoted. `None` while
@@ -386,6 +405,8 @@ impl MatchContext {
             tactical_familiarity_away: TacticalFamiliarity::default(),
             last_shape_change_tick: u64::MAX,
             dead_ball_until_ms: 0,
+            dead_ball_retreat_active: false,
+            dead_ball_min_ms: 0,
             first_shape_change_minute: None,
             starting_home_tactic: None,
             starting_away_tactic: None,

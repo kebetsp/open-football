@@ -4632,16 +4632,15 @@ impl PlayerEventDispatcher {
                 }
             }
         }
-        // Place restart bodies directly too (same &mut field reasoning
-        // as the taker above): the wall / box-clear must be formed when
-        // the §9.3.1 freeze starts, not after it ends.
+        // §13.4: the wall / box-clear get a genuine retreat target (same
+        // &mut field reasoning as the taker above — this function already
+        // holds &mut field, no deferred queue needed) instead of an
+        // instant snap, so they walk there tick-by-tick during the
+        // `dead_ball_retreat_active` window set below.
         let mut staged_ids: Vec<u32> = teleports.iter().map(|(id, _)| *id).collect();
         for (player_id, pos) in teleports {
             if let Some(idx) = field.player_index(player_id) {
-                let p = &mut field.players[idx];
-                p.position = pos;
-                p.velocity = Vector3::zeros();
-                p.in_state_time = 0;
+                field.players[idx].restart_retreat_target = Some(pos);
             }
         }
 
@@ -4665,26 +4664,27 @@ impl PlayerEventDispatcher {
         );
         for (player_id, pos) in recovery {
             if let Some(idx) = field.player_index(player_id) {
-                let p = &mut field.players[idx];
-                p.position = pos;
-                p.velocity = Vector3::zeros();
-                p.in_state_time = 0;
+                field.players[idx].restart_retreat_target = Some(pos);
             }
         }
 
-        // §9.3.1 — genuine dead-ball stoppage: fouls now pause the sim
-        // the same way goals/corners do (run.rs skips the tick body
-        // until the window elapses). The restart teleports above drain
-        // on the first active tick after the pause; the replay layer
-        // interpolates across the sample gap, so the wall/retreat reads
-        // as a walk into position during the stoppage, not a snap.
-        // Penalties get a longer whistle-to-kick window than free kicks.
-        let pause_secs = if in_penalty_area {
-            context.rng.range_u64(3, 5)
+        // §9.3.1 / §13.4 — genuine dead-ball stoppage: fouls pause the
+        // sim like goals/corners/goal-kicks did originally, but now with
+        // a REAL retreat during the window instead of a total freeze
+        // (see docs/tactical-system-phase13-13.4-design.md) — the wall/
+        // box-clear/recovery targets set above are walked to tick-by-tick
+        // by `apply_restart_retreat_tick`, not snapped. Penalties get a
+        // longer whistle-to-kick window than free kicks; the minimum
+        // floor models unavoidable ref/reaction time, below which the
+        // taker's early-restart roll can never fire.
+        let (min_ms, pause_secs) = if in_penalty_area {
+            (900, context.rng.range_u64(3, 5))
         } else {
-            context.rng.range_u64(2, 4)
+            (600, context.rng.range_u64(2, 4))
         };
+        context.dead_ball_min_ms = context.total_match_time + min_ms;
         context.dead_ball_until_ms = context.total_match_time + pause_secs * 1000;
+        context.dead_ball_retreat_active = true;
 
         Some(RestartAwarded {
             penalty: in_penalty_area,
