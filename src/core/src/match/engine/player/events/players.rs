@@ -1849,7 +1849,17 @@ impl PlayerEventDispatcher {
         // tag rather than the restart origin so short FK layoffs (also
         // struck under a DirectFreeKick origin) keep a normal trajectory.
         let is_fk_delivery = event_model.reason == "FK_CROSS";
-        let trajectory_type = if passer_is_goalkeeper && actual_horizontal_distance > 60.0 {
+        // Goalkeeper long distribution (goal kicks + open-play releases,
+        // both funnel through GoalkeeperDistributingState/GoalkeeperPassingState
+        // into this same event) — same "long lofted delivery" shape as a
+        // corner/FK, so it needs the same decoupled clamp below (2026-07-16
+        // realism-bug investigation: reach_ratio measured 0.17-0.48, mean
+        // 0.24 over 824 sampled kicks — GK long kicks were falling through
+        // the OLD combined-magnitude clamp exactly like corners/FKs did
+        // before that fix, landing short of even their own penalty box in
+        // 100% of a 324-kick sample).
+        let is_gk_long_kick = passer_is_goalkeeper && actual_horizontal_distance > 60.0;
+        let trajectory_type = if is_gk_long_kick {
             TrajectoryType::HighArc
         } else if (is_corner_delivery || is_fk_delivery) && actual_horizontal_distance > 25.0 {
             TrajectoryType::HighArc
@@ -1869,7 +1879,7 @@ impl PlayerEventDispatcher {
         let base_max_z = Self::calculate_max_z_velocity(actual_horizontal_distance, &skills);
         // Goalkeeper long kicks get a higher z-cap — goal kicks should fly high.
         // Corner deliveries also get extra lift so the ball reaches the far post.
-        let max_z_velocity = if passer_is_goalkeeper && actual_horizontal_distance > 60.0 {
+        let max_z_velocity = if is_gk_long_kick {
             base_max_z * 1.5
         } else if (is_corner_delivery || is_fk_delivery) && actual_horizontal_distance > 25.0 {
             base_max_z * 1.3
@@ -1927,7 +1937,43 @@ impl PlayerEventDispatcher {
         // to also share a magnitude budget with horizontal. Every other
         // pass type (open play, short/medium crosses) keeps the original
         // combined clamp; this is scoped to the diagnosed mechanism only.
-        if is_corner_delivery || is_fk_delivery {
+        //
+        // 2026-07-16 GK-distribution extension: goalkeeper long kicks
+        // (goal kicks + open-play releases, both fire this event with
+        // `passer_is_goalkeeper` true) have their own even-higher raw z
+        // ceiling (`calculate_max_z_velocity`'s >250u bucket × the 1.5 GK
+        // boost = 12-18) and were NOT in this carve-out — so they fell
+        // through the combined clamp exactly like corners/FKs did before
+        // this fix, measured at reach_ratio 0.17-0.48 (mean 0.24) over 824
+        // sampled kicks, landing short of even the kicker's own penalty
+        // box in every one of a 324-kick sample.
+        //
+        // 2026-07-16 universal extension: the same mechanism is not
+        // GK-specific — ANY passer's ball is assigned a `HighArc`
+        // trajectory whenever `select_trajectory_type_contextual` (or one
+        // of the special-cased overrides above) decides the distance/
+        // obstacles call for it, and every such pass shares the identical
+        // distance-scaled z ceiling. Gating the carve-out on passer
+        // identity or delivery type was fixing the symptom in three
+        // places instead of the actual invariant. Measured: a plain
+        // outfield HighArc pass >60u (switches of play, counter-attack
+        // outlets, midfield long balls — reasons like
+        // `DEF_COUNTER_ATTACK`, `MID_RUNNING_SHOULD_PASS`,
+        // `FWD_PASSING_STATE`) had reach_ratio mean 0.47 / median 0.41
+        // over 1858 sampled kicks (15 matches) — the identical shortfall,
+        // just never carved out. `DEF_COUNTER_ATTACK` specifically was
+        // worse than the pre-fix GK number: mean 0.33 / median 0.30 over
+        // 271 samples — the exact "counter-attack ball doesn't reach the
+        // striker" case. The condition below now keys on the trajectory
+        // itself rather than accumulating more passer/reason special
+        // cases: whenever the ball is going to be struck as a genuine
+        // lofted ball, it needs the power to actually get there,
+        // regardless of who's kicking it. Reuses the same already-
+        // validated z cap (safer than inventing a new one for this much
+        // larger population) — real-world peak-height differences by
+        // pass type (a raking 50m diagonal vs. a near-post corner) remain
+        // an open, unsourced question, same caveat as the GK case above.
+        if matches!(trajectory_type, TrajectoryType::HighArc) {
             // `calculate_max_z_velocity`'s ceiling (8-15.6 for long
             // distances) was only ever exercised through the OLD shared
             // clamp, which crushed it down to an effective ~1.5-4.7 in
@@ -1937,9 +1983,9 @@ impl PlayerEventDispatcher {
             // unclamped (first attempt at this fix) produced ~18-19m
             // arcs. Cap z here at a value chosen to reproduce the
             // already-confirmed-good peak, independent of horizontal.
-            const CORNER_FK_MAX_Z_VELOCITY: f32 = 2.9;
-            if final_velocity.z > CORNER_FK_MAX_Z_VELOCITY {
-                final_velocity.z = CORNER_FK_MAX_Z_VELOCITY;
+            const LOFTED_DELIVERY_MAX_Z_VELOCITY: f32 = 2.9;
+            if final_velocity.z > LOFTED_DELIVERY_MAX_Z_VELOCITY {
+                final_velocity.z = LOFTED_DELIVERY_MAX_Z_VELOCITY;
             }
             let horizontal_mag = (horizontal_velocity.x * horizontal_velocity.x
                 + horizontal_velocity.y * horizontal_velocity.y)

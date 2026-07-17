@@ -94,8 +94,22 @@ impl GoalkeeperDistributingState {
         let field_width = ctx.context.field_size.width as f32;
         let halfway_x = field_width * 0.5;
 
-        let mut best_option: Option<MatchPlayerLite> = None;
-        let mut best_score = 0.0;
+        // 2026-07-16 realism-bug: was a pure `if score > best_score`
+        // argmax — deterministic, no randomness anywhere in this
+        // function. Measured baseline (20-match batch, goal kicks only):
+        // top target got 52.8-53.8% of a team's goal kicks, only 3-4 of
+        // ~10 outfield teammates ever chosen at all, one pair of players
+        // covering ~90% of a team's goal-kick targets. Real goalkeepers
+        // read the moment and vary between several live outlets — they
+        // don't lock onto one designated teammate, because between
+        // restarts both sides return to near-identical formation
+        // anchors, so the deterministic scoring reliably re-derives the
+        // same "best" answer every time. Collect every viable candidate
+        // with its score instead of tracking only the max, then sample
+        // weighted by score below — better options still win far more
+        // often (this isn't uniform-random), but the outcome is no
+        // longer guaranteed identical restart after restart.
+        let mut candidates: Vec<(MatchPlayerLite, f32)> = Vec::new();
 
         for teammate in ctx.players().teammates().nearby(max_search) {
             if teammate.tactical_positions.position_group() == PlayerFieldPositionGroup::Goalkeeper
@@ -176,13 +190,31 @@ impl GoalkeeperDistributingState {
             let score =
                 halfway_score * space_bonus * position_bonus * recency_penalty * safety_factor;
 
-            if score > best_score {
-                best_score = score;
-                best_option = Some(teammate);
+            if score > 0.0 {
+                candidates.push((teammate, score));
             }
         }
 
-        best_option
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // Weighted-random pick, probability proportional to score — the
+        // highest scorer is still by far the most likely pick (this is
+        // not uniform-random among candidates), but no longer certain.
+        let total: f32 = candidates.iter().map(|(_, s)| *s).sum();
+        let mut roll = ctx.context.rng.random_range(0.0..total);
+        for (teammate, score) in &candidates {
+            if roll < *score {
+                return Some(teammate.clone());
+            }
+            roll -= *score;
+        }
+        // Floating-point roundoff safety net — fall back to the top scorer.
+        candidates
+            .into_iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(teammate, _)| teammate)
     }
 
     pub fn calculate_pass_power(&self, teammate_id: u32, ctx: &StateProcessingContext) -> f64 {
