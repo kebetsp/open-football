@@ -89,7 +89,48 @@ impl Ball {
             .unwrap_or(0);
         self.record_touch(thrower_id, team_id, context.current_tick(), true);
 
+        // realism-bug (2026-07-18): previously the throw-in dead-ball
+        // window never set `dead_ball_retreat_active`, so the tick loop
+        // hit the total-freeze branch — no player AI, no movement, not
+        // even the thrower's teammates/opponents reacting. Every other
+        // restart (foul/corner/goal-kick) got a real retreat in §13.4;
+        // throw-ins were the one restart type left out. Fix: the same
+        // `pending_restart_teleports` -> `restart_retreat_target` ->
+        // `dead_ball_retreat_active` machinery, populated by a throw-in-
+        // specific (local, not full-formation) shape.
+        let shape = crate::r#match::engine::set_pieces::throw_in_shape_targets(
+            players,
+            throwing_side,
+            thrower_id,
+            throw_pos,
+            field_height,
+        );
+        crate::match_log_info!(
+            "THROWIN_SHAPE thrower={} side={:?} throw_x={:.1} throw_y={:.1} shaped={}",
+            thrower_id,
+            throwing_side,
+            throw_pos.x,
+            throw_pos.y,
+            shape.len()
+        );
+        for (player_id, pos) in &shape {
+            if let Some(p) = players.iter().find(|p| p.id == *player_id) {
+                crate::match_log_info!(
+                    "THROWIN_TARGET player={} from=({:.1},{:.1}) to=({:.1},{:.1}) dist_from_throw={:.1}",
+                    player_id,
+                    p.position.x,
+                    p.position.y,
+                    pos.x,
+                    pos.y,
+                    (pos - throw_pos).magnitude()
+                );
+            }
+        }
+        self.pending_restart_teleports.extend(shape);
+
+        context.dead_ball_min_ms = context.total_match_time + 300;
         context.dead_ball_until_ms = context.total_match_time + context.rng.range_u64(1, 3) * 1000;
+        context.dead_ball_retreat_active = true;
         self.pending_set_piece_teleport = Some((thrower_id, throw_pos));
         events.add_ball_event(BallEvent::Claimed(thrower_id));
     }

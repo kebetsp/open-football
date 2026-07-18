@@ -680,6 +680,135 @@ pub fn recovery_shape_targets(
         .collect()
 }
 
+/// Throw-in shape (realism-bug pass, 2026-07-18). Unlike a foul/corner/
+/// goal-kick — genuine team-wide stoppages that earned `recovery_shape_
+/// targets`'s full-formation recovery — a throw-in is a local, low-stakes
+/// restart: only the players already near the touchline react. Real
+/// doctrine: the nearest attacking teammate offers a close support angle
+/// a few yards infield, a second offers a deeper out-ball; the nearest
+/// defender closes down the thrower right up to the legal line, a second
+/// marks the close option. Everyone else holds their run of play — this
+/// deliberately does NOT touch the rest of either team, unlike the other
+/// restart shapes.
+///
+/// Sourced targets: IFAB Law 15 requires opponents to stand ≥2m (16u at
+/// 8u/m) from the throw point — `LAW15_MIN_DISTANCE` is a hard legal
+/// floor, not a tuned constant. Close-support positioning (~5 yards / 36u
+/// infield) and the 7-25 yard (51-183u) typical throw-in distance band
+/// are sourced from coaching guides (Soccer Coach Weekly / Coaching
+/// American Soccer) and American Soccer Analysis's throw-in distance
+/// data; the exact marking/press distances beyond the Law 15 floor are
+/// flagged estimates (no open dataset isolates throw-in marking distance)
+/// in the same spirit as §13.4's EARLY_RESTART_ROLL_PER_TICK.
+///
+/// Pure: returns `(player_id, target)` pairs for up to 4 players (2
+/// attacking supporters + up to 2 defenders). Callers queue them as
+/// `restart_retreat_target`s, same as every other restart shape — the
+/// dead-ball retreat tick walks the movement, never snaps it.
+pub fn throw_in_shape_targets(
+    players: &[crate::r#match::MatchPlayer],
+    throwing_side: crate::r#match::PlayerSide,
+    thrower_id: u32,
+    throw_pos: nalgebra::Vector3<f32>,
+    field_height: f32,
+) -> Vec<(u32, nalgebra::Vector3<f32>)> {
+    use crate::PlayerFieldPositionGroup;
+    use crate::r#match::PlayerSide;
+    use nalgebra::Vector3;
+
+    /// IFAB Law 15: opponents must stand ≥2m from the throw point.
+    const LAW15_MIN_DISTANCE: f32 = 16.0;
+    /// ~5 yards (4.5m) infield — sourced close-support positioning.
+    const CLOSE_SUPPORT_DIST: f32 = 36.0;
+    /// ~11 yards (10m) — mid-point of the sourced 7-25 yard typical
+    /// throw-in distance band, for the deeper out-ball option.
+    const DEEP_SUPPORT_DIST: f32 = 80.0;
+    /// Just outside the Law 15 floor — pressing but legal.
+    const PRESS_DIST: f32 = 20.0;
+    /// Tight man-marking offset, goal-side of the close-support option.
+    const MARK_DIST: f32 = 18.0;
+
+    let inward = if throw_pos.y < field_height * 0.5 {
+        1.0
+    } else {
+        -1.0
+    };
+    let forward = throwing_side.forward_dir_x();
+
+    let mut out: Vec<(u32, Vector3<f32>)> = Vec::with_capacity(4);
+
+    let mut mates: Vec<&crate::r#match::MatchPlayer> = players
+        .iter()
+        .filter(|p| {
+            p.side == Some(throwing_side)
+                && p.id != thrower_id
+                && !p.is_sent_off
+                && p.tactical_position.current_position.position_group()
+                    != PlayerFieldPositionGroup::Goalkeeper
+        })
+        .collect();
+    mates.sort_by(|a, b| {
+        let da = (a.position - throw_pos).magnitude_squared();
+        let db = (b.position - throw_pos).magnitude_squared();
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let close_target = throw_pos + Vector3::new(forward * 8.0, inward * CLOSE_SUPPORT_DIST, 0.0);
+    if let Some(close) = mates.first() {
+        out.push((close.id, close_target));
+    }
+    if let Some(deep) = mates.get(1) {
+        let target = throw_pos + Vector3::new(forward * 30.0, inward * DEEP_SUPPORT_DIST, 0.0);
+        out.push((deep.id, target));
+    }
+
+    let defending_side = match throwing_side {
+        PlayerSide::Left => PlayerSide::Right,
+        PlayerSide::Right => PlayerSide::Left,
+    };
+    let mut opps: Vec<&crate::r#match::MatchPlayer> = players
+        .iter()
+        .filter(|p| {
+            p.side == Some(defending_side)
+                && !p.is_sent_off
+                && p.tactical_position.current_position.position_group()
+                    != PlayerFieldPositionGroup::Goalkeeper
+        })
+        .collect();
+    opps.sort_by(|a, b| {
+        let da = (a.position - throw_pos).magnitude_squared();
+        let db = (b.position - throw_pos).magnitude_squared();
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if let Some(presser) = opps.first() {
+        let to_ball = throw_pos - presser.position;
+        let dist = to_ball.magnitude();
+        let dir = if dist > 0.5 {
+            to_ball / dist
+        } else {
+            Vector3::new(-forward, -inward, 0.0)
+        };
+        let target = throw_pos - dir * PRESS_DIST;
+        out.push((presser.id, target));
+    }
+    if let Some(marker) = opps.get(1) {
+        if !mates.is_empty() {
+            let candidate = close_target + Vector3::new(forward * MARK_DIST, 0.0, 0.0);
+            let from_throw = candidate - throw_pos;
+            let dist_from_throw = from_throw.magnitude();
+            let target = if dist_from_throw < LAW15_MIN_DISTANCE {
+                throw_pos + from_throw.normalize() * LAW15_MIN_DISTANCE
+            } else {
+                candidate
+            };
+            out.push((marker.id, target));
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
