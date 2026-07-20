@@ -280,8 +280,27 @@ pub struct MatchContext {
     ///     the original foul,
     ///   * the window expires without either → play continues, card
     ///     decision still applies (delayed booking).
-    /// `None` whenever no advantage is in play.
-    pub pending_advantage: Option<PendingAdvantage>,
+    /// Empty whenever no advantage is in play.
+    ///
+    /// 2026-07-19 realism-bug: was `Option<PendingAdvantage>`. A single
+    /// slot meant a second foul deferring to advantage while an earlier
+    /// one's ~0.8-1.8s window was still open silently overwrote (and
+    /// thus discarded) the first fouler's queued card decision — he
+    /// would never actually be sent off, matching a live report of a
+    /// red-carded player who stayed fully active after an
+    /// advantage-played foul. A `Vec` lets multiple concurrent advantage
+    /// windows resolve independently.
+    pub pending_advantage: Vec<PendingAdvantage>,
+
+    /// 2026-07-19 realism-bug: advantage windows that have expired
+    /// (advantage confirmed to have worked) but whose card hasn't been
+    /// applied yet because play hasn't stopped — a real referee waits
+    /// for the next natural stoppage before showing a delayed card and
+    /// sending the player off, not the instant the advantage window
+    /// times out mid-play. Drained by `run.rs`'s dead-ball entry point
+    /// the moment any real stoppage begins (foul restart, corner, goal
+    /// kick, throw-in, goal, half-time).
+    pub awaiting_stoppage: Vec<PendingAdvantage>,
 }
 
 /// Snapshot of a foul that the referee elected to let play continue
@@ -306,6 +325,15 @@ pub struct PendingAdvantage {
     /// penalty-box test) must use where the foul actually happened,
     /// not wherever the ball has since travelled to.
     pub foul_position: Vector3<f32>,
+    /// realism-bug (2026-07-21): the fouler's PlayerSide at the moment
+    /// of contact, snapshotted alongside `foul_position`. The engine
+    /// swaps every player's `.side` at halftime (`field.swap_squads()`)
+    /// — if the advantage window straddles that instant, re-deriving
+    /// the fouler's side at resolution time (instead of using this
+    /// snapshot) checks the WRONG penalty box against the (correctly
+    /// snapshotted) foul position, misclassifying penalties as free
+    /// kicks right around the halftime boundary.
+    pub fouler_side: PlayerSide,
     /// Severity of the original foul — drives the card decision.
     pub severity: FoulSeverity,
     /// Card decision pre-computed at foul time so referee bias /
@@ -417,7 +445,8 @@ impl MatchContext {
             skill_aggregates_dirty: true,
             rng: MatchRng::from_entropy(),
             today: Utc::now().naive_utc().date(),
-            pending_advantage: None,
+            pending_advantage: Vec::new(),
+            awaiting_stoppage: Vec::new(),
         }
     }
 

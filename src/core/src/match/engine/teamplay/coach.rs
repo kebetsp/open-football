@@ -387,11 +387,17 @@ impl MatchCoach {
         // football's core goal patterns (~4-6% of real goals).
         let shot_spaced =
             rebound_live || current_tick.saturating_sub(self.last_shot_tick) >= 750;
-        // Build-up gate: a team that just won possession can't fire
-        // within ~1 second. Real football: even elite counter-attacks
-        // need at least one progressive pass before a shot arrives.
-        let settled =
-            rebound_live || current_tick.saturating_sub(self.last_possession_gain_tick) >= 100;
+        // 2026-07-18: build-up "settled" gate REMOVED (test — see
+        // engine_lessons_directives memory / CLAUDE.md 2026-07-18 entry).
+        // It used a flat, position-blind 1s timer to solve what's really
+        // a spatial problem (a team can't have anyone in shooting range
+        // an instant after winning the ball deep, which distance/xG
+        // gates already enforce) — and in doing so it also blocked the
+        // one case where real players do NOT hesitate: a loose
+        // ball/knockdown/defensive error landing already inside shooting
+        // range. `shot_spaced` + `phase_allows` remain as the anti-spam
+        // gates; this line is intentionally simplified to test their
+        // sufficiency on their own.
         // Possession-phase shot cap: at most TWO shots per possession.
         // Real football: a possession typically produces ONE chance,
         // but rebounds (saved/blocked → ball comes back to attackers)
@@ -403,7 +409,22 @@ impl MatchCoach {
         // spam (4 shots in 2s) but unlocks the realistic "shoot →
         // parry → tap-in" pattern.
         let phase_allows = self.shots_this_possession < 2;
-        shot_spaced && settled && phase_allows
+        shot_spaced && phase_allows
+    }
+
+    /// Diagnostic-only twin of `can_shoot()` exposing the three
+    /// sub-gates plus raw ticks-since-possession-gain (2026-07-18
+    /// realism-bug investigation into "settled, clear chance, no shot"
+    /// reports — checking whether the build-up gate, not xG/clarity, is
+    /// the actual blocker right after a corner). Remove once concluded.
+    #[cfg(feature = "match-logs")]
+    pub fn can_shoot_debug(&self, current_tick: u64, rebound_live: bool) -> (bool, bool, bool, u64) {
+        let shot_spaced =
+            rebound_live || current_tick.saturating_sub(self.last_shot_tick) >= 750;
+        let ticks_since_gain = current_tick.saturating_sub(self.last_possession_gain_tick);
+        let settled = rebound_live || ticks_since_gain >= 100;
+        let phase_allows = self.shots_this_possession < 2;
+        (shot_spaced, settled, phase_allows, ticks_since_gain)
     }
 
     /// Record that this team just won possession. Starts the build-up

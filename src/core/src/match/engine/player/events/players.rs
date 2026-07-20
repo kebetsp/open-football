@@ -26,6 +26,30 @@ use crate::r#match::player::strategies::players::ops::forward_shot_decision::tim
 use log::debug;
 use nalgebra::Vector3;
 
+/// Dev testing knob (2026-07-19), companion to `GAFFER_FORCE_SECOND_YELLOW`
+/// in `engine/run.rs`. See `apply_card_decision` for where this is consumed.
+#[cfg(feature = "match-logs")]
+pub mod debug_force_red {
+    use std::cell::Cell;
+    thread_local! {
+        static ARMED: Cell<bool> = Cell::new(false);
+    }
+    pub fn arm_from_env() {
+        let want = std::env::var("GAFFER_FORCE_RED_CARD").is_ok();
+        ARMED.with(|a| a.set(want));
+    }
+    pub fn consume() -> bool {
+        ARMED.with(|a| {
+            if a.get() {
+                a.set(false);
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Save-accounting diagnostic counters. Trace each save event's credit pair
 // to find why `saves > shots_on_target` (the impossible 145% baseline).
@@ -365,71 +389,84 @@ impl FoulResolver {
         context: &mut MatchContext,
         events: &mut EventCollection,
     ) {
-        let adv = match context.pending_advantage {
-            Some(a) => a,
-            None => return,
-        };
+        if context.pending_advantage.is_empty() {
+            return;
+        }
         let now = context.current_tick();
         let owner_team = field
             .ball
             .current_owner
             .and_then(|id| field.players.iter().find(|p| p.id == id))
             .map(|p| p.team_id);
-        let possession_with_fouled = owner_team == Some(adv.fouled_team_id);
 
-        // Possession lost inside the window → pull play back.
-        if now < adv.expire_tick && !possession_with_fouled && owner_team.is_some() {
-            context.pending_advantage = None;
-            // Free-kick protection.
-            if field.ball.current_owner.is_some() {
-                field.ball.claim_cooldown = 150;
-                field.ball.flags.in_flight_state = 150;
-                field.ball.contested_claim_count = 0;
-            }
-            let restart = PlayerEventDispatcher::award_restart_for_foul(
-                adv.fouler_id,
-                adv.severity,
-                adv.foul_position,
-                field,
-                context,
-            );
-            if let Some(r) = restart {
-                events.add_player_event(if r.penalty {
-                    PlayerEvent::PenaltyAwarded(r.taker_id)
-                } else {
-                    PlayerEvent::FreeKickAwarded(r.taker_id)
-                });
-            }
-            let cards = PlayerEventDispatcher::apply_card_decision(
-                adv.fouler_id,
-                adv.severity,
-                adv.yellow_prob,
-                adv.red_prob,
-                field,
-                context,
-            );
-            Self::emit_card_events(adv.fouler_id, cards, events);
-            return;
-        }
+        // Drain every pending advantage and re-file whichever ones
+        // aren't ready to resolve yet this tick — each entry is judged
+        // independently against the live ball owner, so two overlapping
+        // advantage windows (e.g. a foul by each side within the same
+        // ~0.8-1.8s stretch) can never clobber one another.
+        let pending = std::mem::take(&mut context.pending_advantage);
+        let mut still_pending = Vec::with_capacity(pending.len());
+        for adv in pending {
+            let possession_with_fouled = owner_team == Some(adv.fouled_team_id);
 
-        // Window expired (advantage played) → just settle the card,
-        // play continues without restart.
-        if now >= adv.expire_tick {
-            context.pending_advantage = None;
-            let cards = PlayerEventDispatcher::apply_card_decision(
-                adv.fouler_id,
-                adv.severity,
-                adv.yellow_prob,
-                adv.red_prob,
-                field,
-                context,
-            );
-            Self::emit_card_events(adv.fouler_id, cards, events);
+            // Possession lost inside the window → pull play back.
+            if now < adv.expire_tick && !possession_with_fouled && owner_team.is_some() {
+                // Free-kick protection.
+                if field.ball.current_owner.is_some() {
+                    field.ball.claim_cooldown = 150;
+                    field.ball.flags.in_flight_state = 150;
+                    field.ball.contested_claim_count = 0;
+                }
+                let restart = PlayerEventDispatcher::award_restart_for_foul(
+                    adv.fouler_id,
+                    adv.severity,
+                    adv.foul_position,
+                    Some(adv.fouler_side),
+                    field,
+                    context,
+                );
+                if let Some(r) = restart {
+                    events.add_player_event(if r.penalty {
+                        PlayerEvent::PenaltyAwarded(r.taker_id)
+                    } else {
+                        PlayerEvent::FreeKickAwarded(r.taker_id)
+                    });
+                }
+                let cards = PlayerEventDispatcher::apply_card_decision(
+                    adv.fouler_id,
+                    adv.severity,
+                    adv.yellow_prob,
+                    adv.red_prob,
+                    field,
+                    context,
+                );
+                Self::emit_card_events(adv.fouler_id, cards, events);
+                continue;
+            }
+
+            // Window expired (advantage played) → the advantage has
+            // worked, but play is still live. 2026-07-19 realism-bug:
+            // real referees don't pull a player off mid-play for a
+            // delayed card — they wait for the game's next natural
+            // stoppage and show it then (IFAB Law 5: "the referee may
+            // sanction the original offence... at the next stoppage of
+            // play"). Queue it instead of applying now; `run.rs`'s
+            // dead-ball entry point drains `awaiting_stoppage` the
+            // moment any real stoppage begins.
+            if now >= adv.expire_tick {
+                context.awaiting_stoppage.push(adv);
+                continue;
+            }
+
+            // Still within its window, possession not yet lost — keep
+            // waiting.
+            still_pending.push(adv);
         }
+        context.pending_advantage = still_pending;
     }
 
     /// Push record-only card events for a settled card decision.
-    fn emit_card_events(fouler_id: u32, cards: CardsShown, events: &mut EventCollection) {
+    pub(crate) fn emit_card_events(fouler_id: u32, cards: CardsShown, events: &mut EventCollection) {
         if cards.yellow {
             events.add_player_event(PlayerEvent::YellowCard(fouler_id));
         }
@@ -2427,7 +2464,21 @@ impl PlayerEventDispatcher {
             .ball
             .previous_owner
             .and_then(|pid| field.players.iter().find(|p| p.id == pid))
-            .map(|p| p.team_id);
+            .map(|p| p.team_id)
+            // `previous_owner` is cleared mid-flight on any sufficiently
+            // long delivery (crosses, corners, long passes) well before
+            // landing, and also on a notified loose-ball claim — see
+            // `pass_origin_team`'s doc comment ("survives the in-flight
+            // previous_owner clearing"). Without this fallback, a player
+            // controlling their OWN team's cross/corner/long ball reads
+            // as "no previous owner" and gets misclassified as a genuine
+            // turnover, incorrectly resetting the build-up gate
+            // (`MatchCoach::can_shoot`'s `settled` check) even though the
+            // team never lost the ball — silently forcing a ~1s no-shoot
+            // window on a clean delivery reception, exactly when the
+            // chance is often best (2026-07-18 realism-bug investigation:
+            // "clear chance, settled, no shot fired" reports).
+            .or(field.ball.pass_origin_team);
         let switched = previous_team.map_or(true, |pt| pt != claimant_team);
         if switched {
             let tick = context.current_tick();
@@ -3558,12 +3609,40 @@ impl PlayerEventDispatcher {
         field: &mut MatchField,
         context: &mut MatchContext,
     ) -> FoulOutcome {
-        // §13.1: snapshot the ball position at the moment of contact —
-        // this is the true foul location. If advantage is played and
-        // later pulled back, the restart must use THIS position, not
-        // wherever the ball has travelled to by the time the whistle
-        // actually goes (§13.1's penalty-vs-free-kick misclassification).
-        let foul_position = field.ball.position;
+        // §13.1: snapshot the position at the moment of contact — this
+        // is the true foul location. If advantage is played and later
+        // pulled back, the restart must use THIS position, not wherever
+        // the ball has travelled to by the time the whistle actually
+        // goes (§13.1's penalty-vs-free-kick misclassification).
+        //
+        // realism-bug (2026-07-20): §13.1 fixed WHEN the snapshot is
+        // taken but not WHAT it snapshots — it used the ball's position,
+        // but the actual Law (IFAB 12/14) judges a penalty by where the
+        // OFFENCE (the illegal contact) occurred, not where the ball
+        // happened to be. Near a box boundary these can genuinely
+        // diverge — a defender's tackle can land inside his own box
+        // while his last touch has already sent the ball a yard or two
+        // outside it, or vice versa. Measured: 1/127 free kicks (0.8%)
+        // had the ball inside the box the TAKER's team was attacking —
+        // geometrically only reachable if the fouler's own in-box
+        // offence got misclassified as outside because the ball wasn't.
+        // The fouler's own position is the direct proxy for where his
+        // challenge/contact happened; falls back to the ball's position
+        // if the fouler can't be resolved (defensive only).
+        let fouler_snapshot = field.players.iter().find(|p| p.id == fouler_id);
+        let foul_position = fouler_snapshot
+            .map(|p| p.position)
+            .unwrap_or(field.ball.position);
+        // realism-bug (2026-07-21): snapshot the fouler's SIDE here too,
+        // at the exact moment of contact — `field.swap_squads()` flips
+        // every player's `.side` at halftime, so re-deriving it later
+        // (at restart resolution, which for advantage-played fouls can
+        // land after the swap) checks the wrong penalty box against a
+        // correctly-snapshotted `foul_position`. Falls back to a
+        // re-lookup inside `award_restart_for_foul` only if the fouler
+        // can't be resolved here (defensive only — matches the position
+        // fallback above).
+        let fouler_side_snapshot = fouler_snapshot.and_then(|p| p.side);
 
         // Referee marginal-call gate. The tackling code emits a foul
         // whenever a contact passes its `committed_foul` roll; the
@@ -3616,12 +3695,17 @@ impl PlayerEventDispatcher {
             ) {
                 let start_tick = context.current_tick();
                 let window = context.referee.advantage_window_ticks() as u64;
-                context.pending_advantage = Some(PendingAdvantage {
+                // Push, don't overwrite — an earlier still-unresolved
+                // advantage (from a foul moments before) must not be
+                // silently discarded by this one. See the 2026-07-19
+                // doc comment on `pending_advantage`'s type.
+                context.pending_advantage.push(PendingAdvantage {
                     fouler_id,
                     start_tick,
                     expire_tick: start_tick + window,
                     fouled_team_id,
                     foul_position,
+                    fouler_side: fouler_side_snapshot.unwrap_or(PlayerSide::Left),
                     severity,
                     yellow_prob: card_yellow_prob,
                     red_prob: card_red_prob,
@@ -3645,8 +3729,14 @@ impl PlayerEventDispatcher {
             field.ball.flags.in_flight_state = 150;
             field.ball.contested_claim_count = 0;
         }
-        let restart =
-            Self::award_restart_for_foul(fouler_id, severity, foul_position, field, context);
+        let restart = Self::award_restart_for_foul(
+            fouler_id,
+            severity,
+            foul_position,
+            fouler_side_snapshot,
+            field,
+            context,
+        );
 
         // Count the foul for the player (advantage path counted it above).
         if let Some(p) = field.get_player_mut(fouler_id) {
@@ -3797,8 +3887,29 @@ impl PlayerEventDispatcher {
         let roll_red = context.rng.unit_f32();
         let roll_yellow = context.rng.unit_f32();
 
-        let direct_red = roll_red < card_red_prob;
-        let got_yellow = !direct_red && roll_yellow < card_yellow_prob;
+        // Dev testing knob (2026-07-19), companion to
+        // `GAFFER_FORCE_SECOND_YELLOW` in `engine/run.rs`: forces the
+        // first card-eligible foul of the match to a direct red, since
+        // the natural rate (~0.15/match) is too rare to reliably test
+        // send-off behaviour by just playing matches. Opt-in,
+        // match-logs builds only, zero effect unless set.
+        #[cfg(feature = "match-logs")]
+        let forced_red = crate::r#match::engine::player::events::players::debug_force_red::consume();
+        #[cfg(not(feature = "match-logs"))]
+        let forced_red = false;
+
+        // Dev testing knob (2026-07-19), one-off: forces every
+        // card-eligible foul to at least a yellow, so a player who
+        // fouls twice (including once via advantage) reliably hits the
+        // second-yellow-to-red promotion path for verification. Opt-in,
+        // match-logs builds only.
+        #[cfg(feature = "match-logs")]
+        let forced_yellow = std::env::var("GAFFER_FORCE_YELLOW_CARD").is_ok();
+        #[cfg(not(feature = "match-logs"))]
+        let forced_yellow = false;
+
+        let direct_red = forced_red || roll_red < card_red_prob;
+        let got_yellow = !direct_red && (forced_yellow || roll_yellow < card_yellow_prob);
 
         if !direct_red && !got_yellow {
             return CardsShown::default();
@@ -4300,17 +4411,36 @@ impl PlayerEventDispatcher {
         fouler_id: u32,
         _severity: FoulSeverity,
         foul_pos: Vector3<f32>,
+        fouler_side_hint: Option<PlayerSide>,
         field: &mut MatchField,
         context: &mut MatchContext,
     ) -> Option<RestartAwarded> {
-        // Resolve fouler + side; the victim is everyone on the OTHER side.
-        let (fouler_side, fouler_team_id) = match field
+        // Resolve fouler team (doesn't change at halftime, safe to
+        // re-derive fresh). Side is different: realism-bug (2026-07-21)
+        // — `field.swap_squads()` flips every player's `.side` at
+        // halftime, so re-deriving it HERE (at restart resolution,
+        // which for advantage-played fouls can run after the swap)
+        // would check the wrong penalty box against a `foul_pos` that
+        // was correctly snapshotted at the moment of contact. Prefer
+        // the caller's snapshot (`fouler_side_hint`, captured alongside
+        // `foul_pos` in `handle_commit_foul_event`); only re-derive
+        // fresh as a defensive fallback if no snapshot was available.
+        let Some(fouler_team_id) = field
             .players
             .iter()
             .find(|p| p.id == fouler_id)
-            .and_then(|p| p.side.map(|s| (s, p.team_id)))
-        {
-            Some(x) => x,
+            .map(|p| p.team_id)
+        else {
+            return None;
+        };
+        let fouler_side = match fouler_side_hint.or_else(|| {
+            field
+                .players
+                .iter()
+                .find(|p| p.id == fouler_id)
+                .and_then(|p| p.side)
+        }) {
+            Some(s) => s,
             None => return None,
         };
         let victim_side = match fouler_side {
@@ -4527,6 +4657,29 @@ impl PlayerEventDispatcher {
                 let wall_center = restart_pos + dir * wall_dist;
                 let perp = Vector3::new(-dir.y, dir.x, 0.0);
 
+                // realism-bug (2026-07-20): a real wall isn't centred on
+                // the ball→goal-centre line — it's shifted to block the
+                // direct sight-line to the NEAR post (the "keeper sees
+                // the far post around the wall" rule), deliberately
+                // leaving the far post as the primary open target. The
+                // shift is continuous in how off-centre the foul is
+                // (dead-central fouls get ~no shift — there's no
+                // meaningful near/far post distinction to lean on), and
+                // saturates at the same 0.6 ratio `is_wide_angle` uses
+                // for the shot-eligibility cutoff, so it's at its
+                // strongest right up to the point a direct shot stops
+                // being attempted at all. `wall_half_spread`/
+                // `WALL_NEAR_SHIFT_FRACTION` are duplicated in
+                // `resolve_free_kick` (engine/tick.rs) and
+                // `calculate_optimal_position` (goalkeepers/standing) —
+                // all three must stay in sync or the aim gap, the wall
+                // it's aimed past, and the keeper's stance drift apart.
+                const WALL_NEAR_SHIFT_FRACTION: f32 = 0.7;
+                let wall_half_spread = (wall_n as f32 - 1.0) * 0.5 * 9.0;
+                let near_bias =
+                    ((restart_pos.y - mid_y) / (dist_goal.max(1.0) * 0.6)).clamp(-1.0, 1.0);
+                let wall_y_shift = near_bias * wall_half_spread * WALL_NEAR_SHIFT_FRACTION;
+
                 // Nearest defending outfield players form the wall.
                 let wall_ids: Vec<u32> = if form_wall {
                     let mut candidates: Vec<(f32, u32)> = field
@@ -4547,6 +4700,11 @@ impl PlayerEventDispatcher {
                 for (i, &pid) in wall_ids.iter().enumerate() {
                     let lateral = (i as f32 - (wall_n as f32 - 1.0) * 0.5) * 9.0;
                     let mut pos = wall_center + perp * lateral;
+                    // Shift in absolute Y (not along `perp`, whose sign
+                    // flips with `dir.x` between Left/Right takers) so
+                    // "toward the near post" means the same thing on
+                    // both sides of the pitch.
+                    pos.y += wall_y_shift;
                     pos.x = pos.x.clamp(2.0, field_w - 2.0);
                     pos.y = pos.y.clamp(2.0, field_h - 2.0);
                     teleports.push((pid, pos));
@@ -4675,6 +4833,55 @@ impl PlayerEventDispatcher {
                             teleports.push((pid, spot));
                         }
                     }
+                } else {
+                    // realism-bug (2026-07-20): deep restarts (>280u,
+                    // e.g. a foul at the centre circle) got zero
+                    // attacking-shape push — every player not staged in
+                    // the wall/box-clear above just recovers to plain
+                    // formation shape (§9.2.1 below), which for a team
+                    // that had just been defending looks exactly like
+                    // what was reported: nobody advances, front players
+                    // stay in their own half even though their team just
+                    // won the ball back. Real teams push a couple of
+                    // attacking players forward to offer a progressive
+                    // option immediately, not only once a restart is
+                    // already in crossable range. Advance the two most
+                    // advanced eligible outfield players (excluding the
+                    // taker) halfway toward the attacked goal, capped so
+                    // they never enter the 280u zone §11.7 already owns
+                    // — this shape and that one must not collide.
+                    let mut advancers: Vec<(f32, u32, Vector3<f32>)> = field
+                        .players
+                        .iter()
+                        .filter(|p| {
+                            p.side == Some(victim_side)
+                                && p.id != taker_id
+                                && !p.is_sent_off
+                                && !is_gk(p)
+                        })
+                        .map(|p| {
+                            let adv = if victim_side == PlayerSide::Left {
+                                p.position.x
+                            } else {
+                                -p.position.x
+                            };
+                            (adv, p.id, p.position)
+                        })
+                        .collect();
+                    advancers.sort_by(|a, b| {
+                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let goal_center = Vector3::new(goal_x, mid_y, 0.0);
+                    for &(_, pid, pos) in advancers.iter().take(2) {
+                        let to_goal = goal_center - pos;
+                        let dist_to_goal = (to_goal.x * to_goal.x + to_goal.y * to_goal.y).sqrt();
+                        let advance_dist =
+                            (dist_to_goal * 0.5).min((dist_to_goal - 280.0).max(0.0));
+                        if advance_dist > 1.0 && dist_to_goal > 1.0 {
+                            let dir = to_goal / dist_to_goal;
+                            teleports.push((pid, pos + dir * advance_dist));
+                        }
+                    }
                 }
             }
         }
@@ -4773,8 +4980,26 @@ impl PlayerEventDispatcher {
         victim_side: PlayerSide,
         restart_pos: Vector3<f32>,
     ) -> Option<u32> {
-        use crate::r#match::engine::set_pieces::{TakerScore, score_free_kick_taker};
-        field
+        use crate::r#match::engine::set_pieces::score_free_kick_taker;
+        // realism-bug (2026-07-20): a soft additive distance PENALTY
+        // (first attempt: 0.65 max, scaled over 400u) was measured, via
+        // the raw internal (id, dist, score) triples this function
+        // computes, to still lose to skill variance at moderate range —
+        // rank 4/6/7-by-distance candidates kept winning on a 40-match
+        // raw sample, because a genuine skill gap between a set-piece
+        // specialist and a non-specialist (routinely 0.2-0.4+ on the
+        // composite's 0-1 scale) can still exceed almost any penalty
+        // magnitude at non-extreme distances. Restructured to a hard
+        // proximity GATE instead of a soft penalty: only candidates
+        // within `PROXIMITY_WINDOW` of the single closest eligible
+        // player are even considered; skill only breaks ties among
+        // genuinely nearby options — matching how a real team actually
+        // decides (whoever's in the vicinity takes it; the specialist
+        // steps up only when multiple nearby players could plausibly
+        // do it). A structural cutoff can't be "not quite enough" the
+        // way a soft penalty's magnitude was.
+        const PROXIMITY_WINDOW: f32 = 70.0; // ~8.75m
+        let candidates: Vec<(u32, f32, f32)> = field
             .players
             .iter()
             .filter(|p| {
@@ -4787,9 +5012,6 @@ impl PlayerEventDispatcher {
                 let dx = p.position.x - restart_pos.x;
                 let dy = p.position.y - restart_pos.y;
                 let dist = (dx * dx + dy * dy).sqrt();
-                // Distance penalty: a player 200u away isn't realistically
-                // walking over to take a quick free kick.
-                let dist_penalty = (dist / 200.0).clamp(0.0, 1.0) * 0.20;
                 let base = score_free_kick_taker(
                     p.skills.technical.free_kicks,
                     p.skills.technical.technique,
@@ -4799,17 +5021,21 @@ impl PlayerEventDispatcher {
                     p.skills.mental.composure,
                     p.attributes.pressure,
                 );
-                TakerScore {
-                    player_id: p.id,
-                    score: base - dist_penalty,
-                }
+                (p.id, dist, base)
             })
+            .collect();
+        let min_dist = candidates
+            .iter()
+            .map(|&(_, d, _)| d)
+            .fold(f32::INFINITY, f32::min);
+        candidates
+            .iter()
+            .filter(|&&(_, d, _)| d <= min_dist + PROXIMITY_WINDOW)
             .max_by(|a, b| {
-                a.score
-                    .partial_cmp(&b.score)
+                a.2.partial_cmp(&b.2)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .map(|t| t.player_id)
+            .map(|&(id, _, _)| id)
     }
 }
 

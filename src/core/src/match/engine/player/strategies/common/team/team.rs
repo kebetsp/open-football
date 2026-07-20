@@ -263,6 +263,17 @@ impl<'b> TeamOperationsImpl<'b> {
         self.coach().can_shoot(current_tick, rebound_live)
     }
 
+    /// Diagnostic-only twin of `can_shoot()` — see `MatchCoach::can_shoot_debug`.
+    #[cfg(feature = "match-logs")]
+    pub fn can_shoot_debug(&self) -> (bool, bool, bool, u64) {
+        let current_tick = self.ctx.context.current_tick();
+        const REBOUND_WINDOW_TICKS: u64 = 300;
+        let rebound_tick = self.ctx.tick_context.ball.last_rebound_tick;
+        let rebound_live = rebound_tick > 0
+            && current_tick.saturating_sub(rebound_tick) < REBOUND_WINDOW_TICKS;
+        self.coach().can_shoot_debug(current_tick, rebound_live)
+    }
+
     /// Score difference from this team's perspective (positive =
     /// leading) — as BEHAVIOR is allowed to see it: level before
     /// score-reactive football engages (final ~28 min, see

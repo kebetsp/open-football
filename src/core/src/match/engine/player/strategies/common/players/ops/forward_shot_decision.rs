@@ -314,6 +314,31 @@ pub fn evaluate_forward_shot_decision(
     if !can_team || !can_player {
         #[cfg(feature = "match-logs")]
         helper_diag::HOLD_HARDGATE.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "match-logs")]
+        {
+            let dist = ctx.ball().distance_to_opponent_goal();
+            if (25.0..=75.0).contains(&dist) {
+                let ownership_ms = ctx.tick_context.ball.ownership_duration * 10;
+                if ownership_ms >= 300 {
+                    let (shot_spaced, settled, phase_allows, ticks_since_gain) =
+                        ctx.team().can_shoot_debug();
+                    log::info!(
+                        "SHOTDIAG_HARDGATE ms={} pid={} team={} dist={:.1} can_team={} can_player={} shot_spaced={} settled={} phase_allows={} ticks_since_gain={} owner_ms={}",
+                        ctx.context.total_match_time,
+                        ctx.player.id,
+                        if ctx.player.id < 200 { "home" } else { "away" },
+                        dist,
+                        can_team,
+                        can_player,
+                        shot_spaced,
+                        settled,
+                        phase_allows,
+                        ticks_since_gain,
+                        ownership_ms,
+                    );
+                }
+            }
+        }
         return ShotDecision::Hold;
     }
 
@@ -466,6 +491,8 @@ pub fn evaluate_forward_shot_decision(
     if !inside_six && xg < min_xg {
         #[cfg(feature = "match-logs")]
         helper_diag::HOLD_XG.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "match-logs")]
+        shotdiag_trace(ctx, distance, xg, min_xg, "HOLD_XG");
         // Inside the penalty area, the forward should lay off rather than
         // keep running toward the keeper — that's what causes the
         // "sprint straight into GK" bug. Pass lets the Passing state pick
@@ -491,6 +518,8 @@ pub fn evaluate_forward_shot_decision(
     if !ctx.player().has_clear_shot() && distance > 36.0 {
         #[cfg(feature = "match-logs")]
         helper_diag::HOLD_NO_CLEAR.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "match-logs")]
+        shotdiag_trace(ctx, distance, xg, min_xg, "HOLD_NO_CLEAR");
         return ShotDecision::Hold;
     }
 
@@ -832,10 +861,66 @@ pub fn evaluate_forward_shot_decision(
     if ctx.context.rng.unit_f32() < willingness {
         #[cfg(feature = "match-logs")]
         helper_diag::ROLL_PASSED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "match-logs")]
+        shotdiag_trace(ctx, distance, xg, min_xg, "ROLL_SHOOT");
         ShotDecision::Shoot { reason: tag }
     } else {
+        #[cfg(feature = "match-logs")]
+        shotdiag_trace(ctx, distance, xg, min_xg, "ROLL_FAIL_HOLD");
         ShotDecision::Hold
     }
+}
+
+/// 2026-07-18 realism-bug diagnostic: prints a structured trace line for
+/// shot-decision consults in the range a "settled, in-range, clear-chance"
+/// report would fall in (25-75u, ownership settled >=300ms). Parsed by a
+/// scratch analysis script, not consumed by any production code. Remove
+/// once the investigation concludes.
+#[cfg(feature = "match-logs")]
+fn shotdiag_trace(ctx: &StateProcessingContext, distance: f32, xg: f32, min_xg: f32, gate: &str) {
+    if !(25.0..=75.0).contains(&distance) {
+        return;
+    }
+    let ownership_ms = ctx.tick_context.ball.ownership_duration * 10;
+    if ownership_ms < 300 {
+        return;
+    }
+    let gk_dist = ctx
+        .players()
+        .opponents()
+        .goalkeeper()
+        .next()
+        .map(|g| (g.position - ctx.player.position).magnitude())
+        .unwrap_or(-1.0);
+    let (angle_c, pressure_c, corridor_c, clarity) = ctx.player().shot_clarity_debug();
+    let finishing = ctx.player.skills.technical.finishing / 20.0;
+    let composure = ctx.player.skills.mental.composure / 20.0;
+    let proximity = (1.0 - (distance / 90.0)).clamp(0.0, 1.0) * 0.15;
+    let threshold = (0.36 - finishing * 0.15 - composure * 0.03 - proximity).clamp(0.05, 0.36);
+    let has_clear = clarity >= threshold;
+    // 2026-07-18 team-settle-gate removal test: report ticks-since-last-
+    // possession-gain on every consult (not just hard-gate blocks) so a
+    // before/after batch can directly show the shift in how soon a team
+    // shoots after winning the ball — not just infer it from goal counts.
+    let (_, _, _, ticks_since_gain) = ctx.team().can_shoot_debug();
+    log::info!(
+        "SHOTDIAG ms={} pid={} team={} dist={:.1} gk_dist={:.1} angle_c={:.3} press_c={:.3} corr_c={:.3} clarity={:.3} thresh={:.3} clear={} xg={:.3} min_xg={:.3} gate={} ticks_since_gain={}",
+        ctx.context.total_match_time,
+        ctx.player.id,
+        if ctx.player.id < 200 { "home" } else { "away" },
+        distance,
+        gk_dist,
+        angle_c,
+        pressure_c,
+        corridor_c,
+        clarity,
+        threshold,
+        has_clear,
+        xg,
+        min_xg,
+        gate,
+        ticks_since_gain,
+    );
 }
 
 // ── Three-factor willingness helpers ─────────────────────────────────────

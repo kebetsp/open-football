@@ -1,3 +1,4 @@
+use crate::PlayerFieldPositionGroup;
 use crate::Tactics;
 use crate::club::staff::CoachMatchSnapshot;
 use crate::r#match::ball::Ball;
@@ -6,6 +7,7 @@ use crate::r#match::{
     PositionType,
 };
 use nalgebra::Vector3;
+use std::collections::{HashMap, HashSet};
 
 pub struct MatchField {
     pub size: MatchFieldSize,
@@ -95,9 +97,30 @@ impl MatchField {
         }
     }
 
+    /// 2026-07-19 realism-bug (red card consequences, second pass):
+    /// every restart (kickoff after a goal, half-time) called this on
+    /// ALL players unconditionally, teleporting a sent-off player back
+    /// onto the pitch at his normal formation slot — undoing the
+    /// off-pitch stash from `apply_card_decision` and making him a
+    /// stationary but fully valid teammate again for ball-ownership and
+    /// pass-target selection (`teammates_for_team`/`nearby` in
+    /// `common/players/teammates.rs` never check `is_sent_off` either,
+    /// but that only matters once he's back within passing range —
+    /// which this reset is what put him there). This is the actual
+    /// mechanism behind reports of a red-carded player still receiving
+    /// the ball and completing passes for the rest of the match: his
+    /// own AI/position-recording were correctly frozen the whole time
+    /// (`play_players`/`write_match_positions`), so the bug was
+    /// invisible in the exported replay stream and only showed up in
+    /// the underlying event log (`PassCompleted`/`ClaimBall` naming
+    /// him) — confirmed via raw event data across 9/12 forced-red
+    /// batch matches and one live browser match.
     pub fn reset_players_positions(&mut self) {
         let field_width = self.size.width as f32;
         self.players.iter_mut().for_each(|p| {
+            if p.is_sent_off {
+                return;
+            }
             p.position = clamp_restart_position(p.start_position, p.side, field_width);
             p.velocity = Vector3::zeros();
 
@@ -107,11 +130,23 @@ impl MatchField {
 
     /// Compact the remaining players of `team_id` after a red card.
     /// Squeezes each player's `start_position` ~15% toward the team's
-    /// own-goal line and narrows them laterally by ~10%. This is a
-    /// cheap proxy for dropping from 4-4-2 to 4-4-1 / 4-3-2: players
-    /// hold a lower, tighter shape. New positions apply from the
-    /// next reset/kickoff and feed the state machines' "return to
-    /// starting line" heuristics.
+    /// own-goal line (real doctrine: a team down a man sits deeper /
+    /// takes fewer risks). For the specific line(s) the dismissed
+    /// player(s) belonged to, the survivors' `start_position.y` is
+    /// re-partitioned to evenly span that line's original width —
+    /// closing the exact channel the departure vacated — instead of
+    /// each survivor holding their own pre-existing zone and leaving a
+    /// hole where the departed teammate used to stand. Other lines get
+    /// the older mild ~10%-toward-centre nudge, unchanged.
+    ///
+    /// 2026-07-19 realism-bug (red card consequences): raw match data
+    /// showed the previous uniform 10%-toward-centre nudge (applied to
+    /// every survivor regardless of line) only shrank the departed
+    /// player's own line's max internal gap by a few percent — nowhere
+    /// near enough to close a ~200+ unit hole, and it reverted toward
+    /// the original spacing within ~1-2 minutes as normal zone-band
+    /// pull took back over. This line-specific redistribution targets
+    /// that gap directly.
     pub fn compact_after_dismissal(&mut self, team_id: u32) {
         let field_width = self.size.width as f32;
         let field_height = self.size.height as f32;
@@ -136,16 +171,85 @@ impl MatchField {
             field_width
         };
 
+        // Which position groups (on this team) currently have at least
+        // one sent-off player — these are the lines with a vacated
+        // channel to close. Goalkeeper excluded: a keeper dismissal
+        // (extremely rare) would require an outfield player to go in
+        // goal, a much larger feature this fix does not attempt.
+        let affected_groups: HashSet<PlayerFieldPositionGroup> = self
+            .players
+            .iter()
+            .filter(|p| p.team_id == team_id && p.is_sent_off)
+            .map(|p| p.tactical_position.current_position.position_group())
+            .filter(|g| *g != PlayerFieldPositionGroup::Goalkeeper)
+            .collect();
+
+        // Compute new Y targets for each affected line up front (pure
+        // read pass) before mutating anything.
+        let mut new_y_by_id: HashMap<u32, f32> = HashMap::new();
+        for group in &affected_groups {
+            // Every player currently in this group on this team (both
+            // survivors and sent-off) — their start_position.y anchors
+            // define the line's original total width. Re-deriving this
+            // fresh on every dismissal (rather than caching the pristine
+            // XI) means a second dismissal in the same line correctly
+            // re-partitions across whatever span the line still has.
+            let group_ys: Vec<f32> = self
+                .players
+                .iter()
+                .filter(|p| {
+                    p.team_id == team_id
+                        && p.tactical_position.current_position.position_group() == *group
+                })
+                .map(|p| p.start_position.y)
+                .collect();
+            if group_ys.len() < 2 {
+                continue;
+            }
+            let orig_min = group_ys.iter().cloned().fold(f32::INFINITY, f32::min);
+            let orig_max = group_ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            if (orig_max - orig_min).abs() < 1.0 {
+                continue;
+            }
+
+            let mut survivors: Vec<(u32, f32)> = self
+                .players
+                .iter()
+                .filter(|p| {
+                    p.team_id == team_id
+                        && !p.is_sent_off
+                        && p.tactical_position.current_position.position_group() == *group
+                })
+                .map(|p| (p.id, p.start_position.y))
+                .collect();
+            // Preserve left-to-right identity: whoever was already
+            // widest-left stays leftmost in the redistributed line.
+            survivors.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let n = survivors.len();
+            if n == 0 {
+                continue;
+            }
+            for (i, (id, _)) in survivors.into_iter().enumerate() {
+                let new_y = orig_min + (i as f32 + 0.5) * (orig_max - orig_min) / n as f32;
+                new_y_by_id.insert(id, new_y);
+            }
+        }
+
         for p in self.players.iter_mut() {
             if p.team_id != team_id || p.is_sent_off {
                 continue;
             }
-            // Move start_position 15% of the way toward own goal X,
-            // and 10% toward the vertical center.
-            let new_x = p.start_position.x + (own_goal_x - p.start_position.x) * 0.15;
-            let new_y = p.start_position.y + (mid_y - p.start_position.y) * 0.10;
-            p.start_position.x = new_x;
-            p.start_position.y = new_y;
+            // Move start_position 15% of the way toward own goal X
+            // regardless of line (real doctrine: sit deeper down a man).
+            p.start_position.x += (own_goal_x - p.start_position.x) * 0.15;
+
+            if let Some(new_y) = new_y_by_id.get(&p.id) {
+                p.start_position.y = *new_y;
+            } else {
+                // Lines untouched by a dismissal keep the old mild
+                // 10%-toward-centre nudge.
+                p.start_position.y += (mid_y - p.start_position.y) * 0.10;
+            }
         }
     }
 

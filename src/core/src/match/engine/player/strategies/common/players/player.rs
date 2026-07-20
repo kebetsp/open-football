@@ -561,6 +561,87 @@ impl<'p> PlayerOperationsImpl<'p> {
         (angle_clarity * pressure_clarity * corridor_clarity).clamp(0.0, 1.0)
     }
 
+    /// Diagnostic-only twin of `shot_clarity()` that exposes the three
+    /// component multipliers separately (2026-07-18 realism-bug
+    /// investigation into "clear chance, settled, no shot fired" reports).
+    /// Pure duplication of the same math — never called from production
+    /// decision code, so it cannot change match behaviour. Remove once
+    /// the investigation concludes.
+    #[cfg(feature = "match-logs")]
+    pub fn shot_clarity_debug(&self) -> (f32, f32, f32, f32) {
+        let player_position = self.ctx.player.position;
+        let goal_position = self.opponent_goal_position();
+        let dir_2d = goal_position - player_position;
+        let dir_norm = dir_2d.norm();
+        if dir_norm < 1.0 {
+            return (1.0, 1.0, 1.0, 1.0);
+        }
+        let direction_to_goal = dir_2d / dir_norm;
+
+        const GOAL_HALF_WIDTH: f32 = 29.0;
+        let lateral_offset = (player_position.y - goal_position.y).abs();
+        let x_offset = dir_norm.max(1.0);
+        let near_post_offset = (lateral_offset - GOAL_HALF_WIDTH).max(0.0);
+        let far_post_offset = lateral_offset + GOAL_HALF_WIDTH;
+        let visible_opening =
+            (far_post_offset.atan2(x_offset) - near_post_offset.atan2(x_offset)).abs();
+        const ANGLE_REFERENCE_RAD: f32 = 1.31;
+        let angle_clarity = (visible_opening / ANGLE_REFERENCE_RAD).clamp(0.0, 1.0);
+        if visible_opening < 0.14 {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+
+        let mut closest_pressure = 0.0_f32;
+        for opp in self.ctx.players().opponents().nearby(12.0) {
+            if opp.tactical_positions.is_goalkeeper() {
+                continue;
+            }
+            let d = (opp.position - player_position).norm();
+            let p = (1.0 - (d / 12.0)).clamp(0.0, 1.0);
+            if p > closest_pressure {
+                closest_pressure = p;
+            }
+        }
+        let pressure_clarity = (1.0 - closest_pressure).clamp(0.0, 1.0);
+        if closest_pressure > 0.83 {
+            return (angle_clarity, 0.0, 0.0, 0.0);
+        }
+
+        let check_distance = (dir_norm * 0.80).min(60.0);
+        let mut corridor_blockage: f32 = 0.0;
+        for opp in self.ctx.players().opponents().all() {
+            if opp.tactical_positions.is_goalkeeper() {
+                continue;
+            }
+            let to_opp = opp.position - player_position;
+            let projection = to_opp.x * direction_to_goal.x + to_opp.y * direction_to_goal.y;
+            if projection < 3.0 || projection > check_distance {
+                continue;
+            }
+            let closest_point = player_position + direction_to_goal * projection;
+            let perp_distance = ((opp.position.x - closest_point.x).powi(2)
+                + (opp.position.y - closest_point.y).powi(2))
+            .sqrt();
+            let opp_skills = self.skills(opp.id);
+            let def_quality = (opp_skills.technical.marking
+                + opp_skills.technical.tackling
+                + opp_skills.mental.positioning)
+                / 60.0;
+            let corridor_half = 5.0 + def_quality * 6.0;
+            if perp_distance > corridor_half {
+                continue;
+            }
+            let perp_factor = 1.0 - (perp_distance / corridor_half);
+            let prox_factor = 1.0 - (projection / check_distance.max(1.0));
+            let block = perp_factor * (0.50 + 0.50 * prox_factor) * (0.50 + 0.50 * def_quality);
+            corridor_blockage = corridor_blockage + (1.0 - corridor_blockage) * block;
+        }
+        let corridor_clarity = (1.0 - corridor_blockage).clamp(0.0, 1.0);
+
+        let clarity = (angle_clarity * pressure_clarity * corridor_clarity).clamp(0.0, 1.0);
+        (angle_clarity, pressure_clarity, corridor_clarity, clarity)
+    }
+
     /// Boolean gate for shooting decisions. Built on top of
     /// `shot_clarity()` so the "is this a shot?" answer is consistent
     /// with the continuous clarity value used downstream.

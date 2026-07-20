@@ -1,9 +1,9 @@
 use crate::r#match::goalkeepers::states::common::{ActivityIntensity, GoalkeeperCondition};
 use crate::r#match::goalkeepers::states::state::GoalkeeperState;
 use crate::r#match::{
-    ConditionContext, MatchPlayerLite, PlayerDistanceFromStartPosition, PlayerSide,
-    StateChangeResult, StateProcessingContext, StateProcessingHandler, SteeringBehavior,
-    VectorExtensions,
+    ConditionContext, MatchPlayerLite, PassOriginRestart, PlayerDistanceFromStartPosition,
+    PlayerSide, StateChangeResult, StateProcessingContext, StateProcessingHandler,
+    SteeringBehavior, VectorExtensions,
 };
 use nalgebra::Vector3;
 
@@ -282,7 +282,28 @@ impl GoalkeeperStandingState {
 
             // Lateral adjustment for angle coverage
             let ball_y_offset = ball_position.y - goal_center.y;
-            let lateral_adjustment = ball_y_offset * 0.2 * positioning_skill;
+
+            // realism-bug (2026-07-20): during a live direct free kick
+            // with a formed wall (award_restart_for_foul, ≤280u), the
+            // generic "narrow the angle toward the ball" pull below is
+            // the wrong model — it leans toward the ball's own side,
+            // which is the NEAR post, exactly the side the wall (now
+            // asymmetric — see engine/tick.rs::resolve_free_kick) is
+            // shifted to cover most heavily. A real keeper instead
+            // favours the FAR post, trusting the wall for the direct
+            // near-post line. Same near_bias formula as the wall
+            // placement / aim-selection code — must stay in sync, or
+            // the keeper drifts toward a side that isn't actually open.
+            let is_direct_fk = ctx.tick_context.ball.pass_origin_restart
+                == PassOriginRestart::DirectFreeKick;
+            let lateral_adjustment = if is_direct_fk && distance_to_ball <= 280.0 {
+                const GK_FAR_POST_BIAS: f32 = 11.0;
+                let near_bias =
+                    (ball_y_offset / (distance_to_ball.max(1.0) * 0.6)).clamp(-1.0, 1.0);
+                -near_bias * GK_FAR_POST_BIAS
+            } else {
+                ball_y_offset * 0.2 * positioning_skill
+            };
             new_position.y += lateral_adjustment;
 
             // Keep within penalty area

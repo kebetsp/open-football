@@ -1,6 +1,8 @@
 use super::*;
 use crate::r#match::engine::context::MatchEngineConfig;
 use crate::r#match::engine::rating::{RatingExpectationContext, TeamRatingSummary};
+use crate::r#match::player::events::FoulResolver;
+use crate::r#match::player::events::players::PlayerEventDispatcher;
 
 impl<const W: usize, const H: usize> FootballEngine<W, H> {
     pub fn new() -> Self {
@@ -89,6 +91,26 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         };
 
         let mut field = MatchField::new(W, H, left_squad, right_squad);
+
+        // Dev testing knob (2026-07-19): red cards are naturally rare
+        // (~0.15/match), too rare to reliably test the send-off/restart
+        // fix by just playing matches. `GAFFER_FORCE_SECOND_YELLOW`
+        // presets every outfield player's yellow-card count to 1 at
+        // kickoff, so the first natural yellow anyone gets is a genuine
+        // second-yellow-to-red dismissal. Opt-in, match-logs builds
+        // only, zero effect unless the env var is set.
+        #[cfg(feature = "match-logs")]
+        if std::env::var("GAFFER_FORCE_SECOND_YELLOW").is_ok() {
+            for p in field.players.iter_mut() {
+                if p.tactical_position.current_position.position_group()
+                    != PlayerFieldPositionGroup::Goalkeeper
+                {
+                    p.yellow_cards = 1;
+                }
+            }
+        }
+        #[cfg(feature = "match-logs")]
+        crate::r#match::engine::player::events::players::debug_force_red::arm_from_env();
 
         let mut context = MatchContext::new_with_config(&field, players, score, &config);
         // Stash the starting tactics inside the context's match plan so
@@ -784,6 +806,32 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // is load-bearing (it consumed the post-goal hot window
             // that made goals beget goals).
             if context.total_match_time < context.dead_ball_until_ms {
+                // 2026-07-19 realism-bug: apply any card that was left
+                // waiting for the game to actually stop (an advantage
+                // that played out mid-play — see `awaiting_stoppage` on
+                // MatchContext). This is the first tick of ANY real
+                // stoppage (foul restart, corner, goal kick, throw-in,
+                // goal, half-time all route through this branch), so a
+                // delayed card is shown, and the player sent off,
+                // exactly when a real referee would: at the pause, not
+                // mid-play.
+                if !context.awaiting_stoppage.is_empty() {
+                    let awaiting = std::mem::take(&mut context.awaiting_stoppage);
+                    for adv in awaiting {
+                        let cards = PlayerEventDispatcher::apply_card_decision(
+                            adv.fouler_id,
+                            adv.severity,
+                            adv.yellow_prob,
+                            adv.red_prob,
+                            field,
+                            context,
+                        );
+                        FoulResolver::emit_card_events(adv.fouler_id, cards, &mut events);
+                    }
+                    if events.has_events() {
+                        EventDispatcher::dispatch(&mut events, field, context, match_data, true);
+                    }
+                }
                 // §13.4: foul/corner/goal-kick windows get a real retreat
                 // instead of a total freeze — `dead_ball_retreat_active`
                 // is never set for the post-goal kickoff freeze above, so
@@ -916,12 +964,29 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // dies the moment the taker releases the ball (any ownership
             // change, including the pass leaving the foot) or the tick
             // budget runs out. At most one player can hold a window.
+            // realism-bug (2026-07-19): throw_in_pass_pending follows the
+            // identical rule — same loop, same iteration, so the taker
+            // check isn't duplicated.
             for p in field.players.iter_mut() {
                 if p.kickoff_pass_pending > 0 {
                     if raw_owner != Some(p.id) {
                         p.kickoff_pass_pending = 0;
                     } else {
                         p.kickoff_pass_pending -= 1;
+                    }
+                }
+                if p.throw_in_pass_pending > 0 {
+                    if raw_owner != Some(p.id) {
+                        p.throw_in_pass_pending = 0;
+                    } else {
+                        p.throw_in_pass_pending -= 1;
+                    }
+                }
+                if p.free_kick_pass_pending > 0 {
+                    if raw_owner != Some(p.id) {
+                        p.free_kick_pass_pending = 0;
+                    } else {
+                        p.free_kick_pass_pending -= 1;
                     }
                 }
             }

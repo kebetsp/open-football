@@ -188,6 +188,33 @@ pub struct MatchPlayer {
     /// off on a solo carry. Cleared in the engine loop the moment the
     /// taker releases the ball or the budget runs out.
     pub kickoff_pass_pending: u16,
+    /// realism-bug (2026-07-19): throw-in taker's forced-release window,
+    /// in remaining ticks (0 = inactive). Same pattern as
+    /// `kickoff_pass_pending` — a throw-in is a single discrete motion
+    /// in real football (the ball leaves the hands immediately; Law 15
+    /// also bars the thrower touching it again until another player
+    /// does), but nothing previously stopped the thrower's normal
+    /// open-play state machine from dribbling him forward with the ball
+    /// for seconds after the restart. Set on the thrower when the
+    /// set-piece teleport applies; while active and he still owns the
+    /// ball, the state processor forces the role's Passing state.
+    /// Cleared the moment he releases the ball or the budget runs out.
+    pub throw_in_pass_pending: u16,
+    /// realism-bug (2026-07-20): free-kick taker's forced-release window,
+    /// in remaining ticks (0 = inactive). Same pattern as
+    /// `throw_in_pass_pending` above. Only armed for the outcomes that
+    /// leave the taker to his normal open-play state machine —
+    /// ShortRoutine/Recycle and the >280u "Deep" fallthrough in
+    /// `resolve_free_kick` — never for DirectShot/BoxDelivery, which
+    /// already dispatch a discrete Shoot/PassTo event immediately and
+    /// bypass his AI entirely. Without this, a deep or short-routine
+    /// free kick left the taker owning the ball like any open-play
+    /// possession, free to dribble forward solo — unrealistic for a
+    /// restart real teams take short and circulate, not a solo carry.
+    /// Set in `resolve_free_kick`; while active and he still owns the
+    /// ball, the state processor forces the role's Passing state.
+    /// Cleared the moment he releases the ball or the budget runs out.
+    pub free_kick_pass_pending: u16,
     /// "Link with X" pair preference (wishlist #5): passes toward this
     /// teammate get a success/EV bias in the pass evaluator, and the
     /// pair's chemistry is pinned high at kickoff. Set symmetrically on
@@ -419,6 +446,8 @@ impl MatchPlayer {
             mark_target: None,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
+            throw_in_pass_pending: 0,
+            free_kick_pass_pending: 0,
             link_target: None,
             intercept_target: None,
             supply_target: None,
@@ -495,6 +524,8 @@ impl MatchPlayer {
             mark_target: None,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
+            throw_in_pass_pending: 0,
+            free_kick_pass_pending: 0,
             link_target: None,
             intercept_target: None,
             supply_target: None,

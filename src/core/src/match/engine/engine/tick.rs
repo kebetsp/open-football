@@ -114,11 +114,20 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // (§9.4.1). Without this, a taker whose previous restart went
             // straight out of play stays barred from his own new kick.
             field.ball.restart_taker_lock = None;
+            // realism-bug (2026-07-19): a throw-in is a single discrete
+            // motion in real football — arm the taker's forced-release
+            // window here (mirrors §11.5's kickoff_pass_pending) so his
+            // state machine passes instead of dribbling him forward.
+            use crate::r#match::PassOriginRestart;
+            let is_throw_in = field.ball.pass_origin_restart == PassOriginRestart::ThrowIn;
             if let Some(idx) = field.player_index(player_id) {
                 let p = &mut field.players[idx];
                 p.position = ball_pos;
                 p.velocity = Vector3::zeros();
                 p.in_state_time = 0;
+                if is_throw_in {
+                    p.throw_in_pass_pending = 300;
+                }
             }
         }
 
@@ -252,6 +261,72 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         if (d.x * d.x + d.y * d.y).sqrt() > 6.0 {
             return;
         }
+
+        // realism-bug (2026-07-20): nothing previously verified the box
+        // was actually clear before the kick fired — this function only
+        // gated on the taker being staged. Other players' retreat to the
+        // box edge (`award_restart_for_foul`'s box-clear teleports) is a
+        // gradual WALK (§13.4's `restart_retreat_target`), which doesn't
+        // always finish before the taker gets staged. Measured: 2-4
+        // extra players (beyond the taker + defending GK) still inside
+        // the real box at kick time, in every one of 3 penalties
+        // checked. Hard-snap any straggler clear at the exact kick
+        // instant using the engine's real box (`context.penalty_area`,
+        // not the looser 165u/403u detection box the initial walk
+        // target uses) so legality holds regardless of whether the walk
+        // finished — this fires once, harmlessly, even when everyone's
+        // already legally placed (the common case).
+        let taker_side = taker.side;
+        {
+            use crate::PlayerFieldPositionGroup;
+            if let Some(defending_side) = taker_side.map(|s| match s {
+                PlayerSide::Left => PlayerSide::Right,
+                PlayerSide::Right => PlayerSide::Left,
+            }) {
+                let pa = context.penalty_area(defending_side == PlayerSide::Left);
+                let spot = field.ball.position;
+                let mut to_fix: Vec<(u32, Vector3<f32>)> = Vec::new();
+                for p in field.players.iter() {
+                    if p.id == taker_id || p.is_sent_off {
+                        continue;
+                    }
+                    let is_defending_gk = p.side == Some(defending_side)
+                        && p.tactical_position.current_position.position_group()
+                            == PlayerFieldPositionGroup::Goalkeeper;
+                    if is_defending_gk {
+                        continue;
+                    }
+                    let dv = p.position - spot;
+                    let dist = (dv.x * dv.x + dv.y * dv.y).sqrt();
+                    if pa.contains(&p.position) || dist < 73.0 {
+                        let dir = if dist > 0.5 {
+                            dv / dist
+                        } else {
+                            Vector3::new(
+                                if defending_side == PlayerSide::Left {
+                                    1.0
+                                } else {
+                                    -1.0
+                                },
+                                0.0,
+                                0.0,
+                            )
+                        };
+                        to_fix.push((p.id, spot + dir * 78.0));
+                    }
+                }
+                for (id, pos) in to_fix {
+                    if let Some(idx) = field.player_index(id) {
+                        field.players[idx].position = pos;
+                    }
+                }
+            }
+        }
+        // Re-borrow: the mutable box-clear pass above invalidates the
+        // original `taker` reference.
+        let Some(taker) = field.players.iter().find(|p| p.id == taker_id) else {
+            return;
+        };
 
         // Which goal: the nearer one (the ball sits on the penalty spot,
         // 88u from the goal line — always unambiguous).
@@ -466,7 +541,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         use crate::r#match::PassOriginRestart;
         use crate::r#match::engine::events::dispatcher::Event;
         use crate::r#match::engine::set_pieces::{
-            FreeKickBand, FreeKickChoice, score_free_kick_choices,
+            FreeKickBand, FreeKickChoice, score_free_kick_choices, wall_size_for,
         };
         use crate::r#match::player::events::{
             PassingEventContext, PlayerEvent, ShootingEventContext,
@@ -520,6 +595,15 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     "player",
                     format!("FreeKickPlan({}, Deep, {})", taker_id, dist_goal as u32),
                 );
+            }
+            // realism-bug (2026-07-20): a deep free kick falls through to
+            // the taker's normal open-play state machine below (there's
+            // nothing set-piece-specific to decide this far out) — arm
+            // the same forced-release window §11.5/throw-in already use
+            // so he releases a short pass instead of dribbling solo from
+            // his own half.
+            if let Some(idx) = field.player_index(taker_id) {
+                field.players[idx].free_kick_pass_pending = 600;
             }
             return;
         }
@@ -622,9 +706,66 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
 
         match choice {
             FreeKickChoice::DirectShot => {
-                // Aim inside a post (goal half-width 29u).
-                let aim_off = 8.0 + context.rng.unit_f32() * 14.0;
-                let aim_y = if context.rng.bernoulli(0.5) {
+                // Aim past the wall's outer edge, toward the gap near a
+                // post — the wall (award_restart_for_foul, §12.3) is a
+                // real physical block centred on the ball→goal-centre
+                // line, spread ±9u per member. Goal half-width is 29u
+                // (flow::goal::GOAL_WIDTH).
+                //
+                // realism-bug (2026-07-20): the wall itself is no longer
+                // symmetric — `award_restart_for_foul` now shifts it
+                // toward the near post by the same `near_bias` /
+                // `WALL_NEAR_SHIFT_FRACTION` formula duplicated here.
+                // That leaves a genuinely bigger gap on the far-post
+                // side and a genuinely tighter (sometimes non-existent)
+                // one on the near side, so aim-side selection is now
+                // weighted toward the far side rather than a flat 50/50
+                // — matching the real "shoot for the space the keeper
+                // is covering, not the space the wall is" decision. A
+                // dead-central foul (near_bias≈0) degrades back to the
+                // old symmetric 50/50, since there's no real near/far
+                // distinction to lean on there.
+                const GOAL_HALF_WIDTH: f32 = 29.0;
+                const WALL_NEAR_SHIFT_FRACTION: f32 = 0.7;
+                let wall_n = wall_size_for(band, is_wide_angle).clamp(2, 6) as f32;
+                let wall_half_spread = (wall_n - 1.0) * 0.5 * 9.0;
+                let near_bias =
+                    ((ball_pos.y - mid_y) / (dist_goal.max(1.0) * 0.6)).clamp(-1.0, 1.0);
+                let near_bias_mag = near_bias.abs();
+                let wall_edge_far =
+                    wall_half_spread * (1.0 - WALL_NEAR_SHIFT_FRACTION * near_bias_mag);
+                let wall_edge_near =
+                    wall_half_spread * (1.0 + WALL_NEAR_SHIFT_FRACTION * near_bias_mag);
+                let far_gap_min = (wall_edge_far + 3.0).min(GOAL_HALF_WIDTH - 4.0);
+                let far_gap_max = GOAL_HALF_WIDTH - 3.0;
+                let near_gap_min = wall_edge_near + 3.0;
+                let near_gap_max = GOAL_HALF_WIDTH - 3.0;
+                let near_side_open = near_gap_min < near_gap_max;
+                // Bias toward the far side as the foul gets more
+                // off-centre; force it entirely once the near side's
+                // gap has closed (the wall now overlaps that post).
+                let p_far: f32 = if near_side_open {
+                    (0.5 + near_bias_mag * 0.35).clamp(0.5, 0.85)
+                } else {
+                    1.0
+                };
+                let use_far_side = context.rng.bernoulli(p_far);
+                let aim_off = if use_far_side {
+                    far_gap_min + context.rng.unit_f32() * (far_gap_max - far_gap_min).max(1.0)
+                } else {
+                    near_gap_min + context.rng.unit_f32() * (near_gap_max - near_gap_min).max(1.0)
+                };
+                // near_bias > 0 means the ball sits toward the +y post
+                // (that's the near post); the far post is the opposite
+                // side. near_bias ≈ 0 (dead-central) has no real far
+                // side, so fall back to a coin flip.
+                let far_side_is_plus_y = near_bias < 0.0;
+                let aim_toward_plus_y = if near_bias_mag > 0.02 {
+                    use_far_side == far_side_is_plus_y
+                } else {
+                    context.rng.bernoulli(0.5)
+                };
+                let aim_y = if aim_toward_plus_y {
                     mid_y + aim_off
                 } else {
                     mid_y - aim_off
@@ -690,6 +831,12 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     })
                     .map(|p| (p.id, p.position));
                 let Some((receiver_id, receiver_pos)) = receiver else {
+                    // realism-bug (2026-07-20): no staged header in range
+                    // — same fallthrough-to-normal-AI risk as
+                    // ShortRoutine/Recycle below, needs the same guard.
+                    if let Some(idx) = field.player_index(taker_id) {
+                        field.players[idx].free_kick_pass_pending = 600;
+                    }
                     return;
                 };
                 // Pass power — same shape as `pass_teammate_power`.
@@ -716,7 +863,18 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 )));
                 EventDispatcher::dispatch(&mut evs, field, context, match_data, true);
             }
-            _ => {}
+            // ShortRoutine / Recycle: no set-piece-specific event —
+            // the taker's normal state machine plays it out. Realism-bug
+            // (2026-07-20): arm the same forced-release window used for
+            // the Deep/no-receiver cases above, so "the short pass IS
+            // the behaviour" (the original design intent, per the
+            // §12.2 comment on this match block) actually happens
+            // instead of leaving him free to dribble solo.
+            _ => {
+                if let Some(idx) = field.player_index(taker_id) {
+                    field.players[idx].free_kick_pass_pending = 600;
+                }
+            }
         }
     }
 

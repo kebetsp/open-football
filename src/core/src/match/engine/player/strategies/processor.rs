@@ -349,6 +349,24 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
+        // realism-bug (2026-07-20): the free-kick forced-Passing override
+        // (process(), below) makes the taker's STATE correct immediately,
+        // but the Passing state's own internal evaluation can still take
+        // several seconds to settle on a target — during which he was
+        // free to drift at full speed. Raw trace: a Deep free kick
+        // (armed at t, window 3s) didn't actually release the pass until
+        // t+3.84s — 840ms past the window's own expiry — covering 51u in
+        // that single window in one measured example (worse cases up to
+        // 320u+ in a 100-match batch). Real players stay close to the
+        // restart spot while deciding, not drifting a third of the pitch.
+        // Caps speed rather than freezing him (unlike the corner short-
+        // hold above) so a genuine small repositioning for a better
+        // passing angle still looks natural.
+        if let Some(velocity) = Self::free_kick_taker_hold_velocity(&processing_ctx, result.velocity)
+        {
+            result.velocity = Some(velocity);
+        }
+
         // common logic
         let complete_result = |state_results: StateChangeResult,
                                mut result: StateProcessingResult| {
@@ -381,6 +399,28 @@ impl<'p> StateProcessor<'p> {
             return complete_result(state_result, result);
         }
 
+        // realism-bug (2026-07-19): same pattern as the kickoff override
+        // directly above — the throw-in taker's first act must be a
+        // release, not a solo carry. Without this the thrower simply
+        // owns the ball like any open-play possession and his normal
+        // state machine dribbles him forward for seconds (measured 13-
+        // 54u of carry across 6/6 raw examples) before eventually
+        // passing, or in one case losing it to a challenge outright —
+        // both impossible for a real throw-in, which is a single
+        // discrete motion. Window cleared in the engine loop the moment
+        // the ball leaves his hands.
+        if let Some(state_result) = Self::throw_in_pass_override(&processing_ctx) {
+            return complete_result(state_result, result);
+        }
+
+        // realism-bug (2026-07-20): same pattern as the two overrides
+        // directly above — the free-kick taker's ShortRoutine/Recycle/
+        // Deep fallthrough must release quickly, not turn into a solo
+        // carry from a deep restart.
+        if let Some(state_result) = Self::free_kick_pass_override(&processing_ctx) {
+            return complete_result(state_result, result);
+        }
+
         if let Some(state_result) = handler.process(&processing_ctx) {
             return complete_result(state_result, result);
         }
@@ -406,6 +446,29 @@ impl<'p> StateProcessor<'p> {
         Some(Vector3::zeros())
     }
 
+    /// Speed cap for the free-kick taker while `free_kick_pass_pending`
+    /// is armed (realism-bug 2026-07-20). Scales the state's own computed
+    /// velocity down to a slow-walk magnitude rather than replacing it
+    /// outright, so a genuine small reposition for a better passing
+    /// angle still looks natural — it just can't cover real ground
+    /// while the Passing state's evaluation takes its time.
+    fn free_kick_taker_hold_velocity(
+        ctx: &StateProcessingContext,
+        current: Option<Vector3<f32>>,
+    ) -> Option<Vector3<f32>> {
+        if ctx.player.free_kick_pass_pending == 0 || !ctx.player.has_ball(ctx) {
+            return None;
+        }
+        const MAX_HOLD_SPEED: f32 = 0.12;
+        let v = current.unwrap_or_else(Vector3::zeros);
+        let mag = v.norm();
+        if mag > MAX_HOLD_SPEED {
+            Some(v * (MAX_HOLD_SPEED / mag))
+        } else {
+            Some(v)
+        }
+    }
+
     /// Forced Passing-state transition for the kickoff taker (§11.5).
     /// Active only while `kickoff_pass_pending` > 0 AND the player owns
     /// the ball; a no-op when already in a Passing state so the pass
@@ -426,6 +489,58 @@ impl<'p> StateProcessor<'p> {
                 DefenderState::Passing,
             )),
             // assign_kickoff never picks the goalkeeper; an injured
+            // taker has bigger problems than pass selection.
+            Goalkeeper(_) | PlayerState::Injured => None,
+        }
+    }
+
+    /// Forced Passing-state transition for the throw-in taker
+    /// (realism-bug 2026-07-19). Active only while `throw_in_pass_pending`
+    /// > 0 AND the player owns the ball; a no-op when already in a
+    /// Passing state so the pass evaluation isn't restarted every tick.
+    /// Identical shape to `kickoff_pass_override` above.
+    fn throw_in_pass_override(ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        if ctx.player.throw_in_pass_pending == 0 || !ctx.player.has_ball(ctx) {
+            return None;
+        }
+        match ctx.player.state {
+            Forward(ForwardState::Passing)
+            | Midfielder(MidfielderState::Passing)
+            | Defender(DefenderState::Passing) => None,
+            Forward(_) => Some(StateChangeResult::with_forward_state(ForwardState::Passing)),
+            Midfielder(_) => Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Passing,
+            )),
+            Defender(_) => Some(StateChangeResult::with_defender_state(
+                DefenderState::Passing,
+            )),
+            // pick_thrower excludes goalkeepers; an injured taker has
+            // bigger problems than pass selection.
+            Goalkeeper(_) | PlayerState::Injured => None,
+        }
+    }
+
+    /// Forced Passing-state transition for the free-kick taker
+    /// (realism-bug 2026-07-20). Active only while `free_kick_pass_pending`
+    /// > 0 AND the player owns the ball; a no-op when already in a
+    /// Passing state so the pass evaluation isn't restarted every tick.
+    /// Identical shape to `throw_in_pass_override` above.
+    fn free_kick_pass_override(ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        if ctx.player.free_kick_pass_pending == 0 || !ctx.player.has_ball(ctx) {
+            return None;
+        }
+        match ctx.player.state {
+            Forward(ForwardState::Passing)
+            | Midfielder(MidfielderState::Passing)
+            | Defender(DefenderState::Passing) => None,
+            Forward(_) => Some(StateChangeResult::with_forward_state(ForwardState::Passing)),
+            Midfielder(_) => Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Passing,
+            )),
+            Defender(_) => Some(StateChangeResult::with_defender_state(
+                DefenderState::Passing,
+            )),
+            // pick_free_kick_taker excludes goalkeepers; an injured
             // taker has bigger problems than pass selection.
             Goalkeeper(_) | PlayerState::Injured => None,
         }
