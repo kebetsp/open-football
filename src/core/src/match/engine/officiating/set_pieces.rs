@@ -656,6 +656,46 @@ pub fn recovery_shape_targets(
                     PlayerFieldPositionGroup::Goalkeeper => target.x,
                 };
             }
+            // realism-bug (2026-07-21): the KICKING team previously got
+            // no treatment at all here — target stayed exactly at
+            // `start_position`, a static formation anchor with zero
+            // awareness that this team currently has the ball. A first
+            // attempt (advance the 2 most advanced eligible players by
+            // a fixed formula, in award_restart_for_foul) was correctly
+            // called out as not real football: it just produced "2
+            // players moved" rather than a team shape. Real doctrine
+            // (no stats dataset exists for this specific dimension —
+            // reasoned from general buildup/possession-retention
+            // principles): a team in possession shifts its WHOLE block
+            // toward the ball, graduated by role — defenders push up
+            // least (they hold defensive cover even in possession),
+            // midfielders more (they're the progression options),
+            // forwards most (they stretch the last line) — not a flat
+            // push of an arbitrary headcount. Mirrors the same "team
+            // block shifts with the ball" concept this engine already
+            // uses in open play (dynamic midfielder shape anchors).
+            // Only shifts toward the attacked goal (never backward —
+            // a deep restart shouldn't drag a player who's already
+            // advanced back down), and scales with how far behind the
+            // restart a player currently is, so relative role tiering
+            // (defenders deepest, forwards highest) is preserved
+            // instead of collapsing everyone onto one line.
+            if is_kicking {
+                let attack_dir: f32 = match kicking_side {
+                    crate::r#match::PlayerSide::Left => 1.0,
+                    crate::r#match::PlayerSide::Right => -1.0,
+                };
+                let role_factor = match group {
+                    PlayerFieldPositionGroup::Forward => 0.35,
+                    PlayerFieldPositionGroup::Midfielder => 0.25,
+                    PlayerFieldPositionGroup::Defender => 0.12,
+                    PlayerFieldPositionGroup::Goalkeeper => 0.0,
+                };
+                let gap = (restart_pos.x - target.x) * attack_dir;
+                if gap > 0.0 {
+                    target.x += attack_dir * gap * role_factor;
+                }
+            }
             if !is_kicking {
                 // Legal retreat: the non-kicking team stays ≥73u off the
                 // restart spot.

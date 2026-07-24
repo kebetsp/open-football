@@ -347,7 +347,18 @@ impl MidfielderPassingState {
         let target_skills = player.skills(teammate.id);
         let finishing_skill = target_skills.technical.finishing / 20.0;
 
-        let base = (goal_distance_value * 0.5) + (space_value * 0.3) + (finishing_skill * 0.2);
+        // Option B / B3: Component C folded in as a 4th weighted term,
+        // rebalanced (not simply added on top) so the total stays in
+        // this function's existing ~0-1 scale rather than inflating it —
+        // 0.5/0.3/0.2 -> 0.35/0.25/0.15/0.25. This is the midfielder
+        // "breakthrough" path CLAUDE.md's own Phase 7 lesson flags as the
+        // single biggest source of striker supply, so keeping the scale
+        // stable here matters more than at the other two call sites.
+        let promoted_pass_value = crate::r#match::player::strategies::common::players::ops::on_ball_value::pass_value(ctx, teammate);
+        let base = (goal_distance_value * 0.35)
+            + (space_value * 0.25)
+            + (finishing_skill * 0.15)
+            + (promoted_pass_value * 0.25);
 
         // Manager pass-preference assignments also apply on the
         // breakthrough path — midfielders try this BEFORE the central

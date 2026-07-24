@@ -4,6 +4,7 @@ use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondi
 use crate::r#match::player::strategies::common::players::ops::forward_shot_decision::{
     ShotDecision, evaluate_forward_shot_decision,
 };
+use crate::r#match::player::strategies::common::players::ops::on_ball_value;
 use crate::r#match::{
     ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
     SteeringBehavior,
@@ -202,10 +203,31 @@ impl StateProcessingHandler for ForwardDribblingState {
             }
         }
 
+        // Option B / B1: carry-target selection via the shared on-ball
+        // value function instead of a fixed goal-centre target. This is
+        // the fix for the reported 2v1 (the carrier no longer runs
+        // straight at the keeper) — see docs/on-ball-decision-logic-spec-
+        // optionB.md. `goal` above is still used by the directive/GK
+        // branches; only the generic fallback target changes.
+        let (carry_target, _value) = on_ball_value::carry_candidates(ctx);
+        let dist = (carry_target - ctx.player.position).magnitude();
+        if dist < 6.0 {
+            // Best candidate is roughly where we already are — the
+            // spec's "hold falls out naturally" case. Still drift gently
+            // toward goal so the player doesn't freeze mid-pitch.
+            return Some(
+                SteeringBehavior::Arrive {
+                    target: goal,
+                    slowing_distance: 150.0,
+                }
+                .calculate(ctx.player)
+                .velocity,
+            );
+        }
         Some(
             SteeringBehavior::Arrive {
-                target: goal,
-                slowing_distance: 150.0,
+                target: carry_target,
+                slowing_distance: 20.0,
             }
             .calculate(ctx.player)
             .velocity,

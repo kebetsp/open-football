@@ -58,7 +58,7 @@ impl MatchEngineConfig {
 use crate::r#match::{
     GameState, GoalDetail, GoalPosition, MATCH_EXTRA_TIME_MS, MATCH_HALF_TIME_MS, MatchCoach,
     MatchField, MatchFieldSize, MatchPlayerCollection, MatchState, MatchTime, PlayerSide, Score,
-    TeamSkillAggregates, TeamTacticalState, TeamsTactics,
+    TeamSkillAggregates, TeamTacticalState, TeamsTactics, football_minute_from_ms,
 };
 use nalgebra::Vector3;
 
@@ -601,7 +601,13 @@ impl MatchContext {
         if Self::score_blind() {
             return false;
         }
-        (self.total_match_time / 60_000) as u32 >= Self::SCORE_REACTION_FROM_MINUTE
+        // `total_match_time` is raw engine ms (capped near `MATCH_TIME_MS`,
+        // ~10 real minutes) — it must go through `football_minute_from_ms`
+        // to become the real football-minute-equivalent this threshold is
+        // calibrated against. A raw `/60_000` comparison here can never
+        // reach 62 and silently disables every score-reactive behavior
+        // this gate protects.
+        football_minute_from_ms(self.total_match_time) >= Self::SCORE_REACTION_FROM_MINUTE as f64
     }
 
     pub fn can_shoot_after_goal(&self) -> bool {

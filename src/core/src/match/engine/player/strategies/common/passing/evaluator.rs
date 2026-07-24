@@ -724,6 +724,48 @@ impl PassEvaluator {
             0.0
         };
 
+        // === STALLED-ATTACK RECYCLING BONUS (Milestone 11) ===
+        // `build_up_recycle_bonus` above only fires in `BuildUp` — deep
+        // in our own third. Real teams also deliberately reset through
+        // the back four / keeper from much higher up, when a genuinely
+        // long possession spell (Progression/Attack — we've been
+        // probing, not just settling in) hasn't broken through. Without
+        // this, backward recycling from advanced positions only ever
+        // happens as a leftover "nothing forward scored higher" default,
+        // never as a positively-valued choice in its own right.
+        //
+        // STALLED_POSSESSION_TICKS: a reasoned ~20 real-world seconds of
+        // continuous possession before a genuine reset becomes the
+        // doctrinally-expected response (no public dataset isolates this
+        // exact threshold — flagged as an estimate, not a sourced stat),
+        // converted through the engine's own ~9x match-time compression
+        // (`football_minute_from_ms`, established this session): 20s / 9
+        // ≈ 2.2 engine-seconds ≈ 220 ticks @ 10ms/tick.
+        const STALLED_POSSESSION_TICKS: u32 = 220;
+        let stalled_recycle_bonus = if matches!(phase, GamePhase::Progression | GamePhase::Attack)
+            && ctx.team().possession_ticks() >= STALLED_POSSESSION_TICKS
+            && pass_distance >= 12.0
+            && pass_distance <= 100.0
+            && receiver_is_recycle_target
+        {
+            let under_press = ctx.players().opponents().nearby(12.0).next().is_some();
+            let overtime_ticks =
+                (ctx.team().possession_ticks() - STALLED_POSSESSION_TICKS) as f32;
+            // Grows from the moment the stall threshold is crossed,
+            // saturating ~10 further engine-seconds (≈90 real seconds)
+            // later — long enough to keep rising through a genuinely
+            // prolonged siege without ever exceeding the build-up
+            // bonus's own ceiling.
+            let overtime_factor = (overtime_ticks / 1000.0).min(1.0);
+            let mut bonus: f32 = 0.12 + overtime_factor * 0.13;
+            if under_press {
+                bonus += 0.10;
+            }
+            bonus.clamp(0.12, 0.35)
+        } else {
+            0.0
+        };
+
         // === COUNTER-PRESS DIRECT-FIRST-PASS BONUS ===
         // After winning the ball back, the first pass should be direct
         // — feed a forward making a run. Gated additionally on the
@@ -800,12 +842,51 @@ impl PassEvaluator {
         let underload_switch_bonus =
             Self::underload_switch_bonus(crosses_sides, receiver_side_density, vision);
 
+        // Milestone 8 (possession-decision-intelligence PRD) — genuine
+        // numerical overload/isolation: `same_side_density_penalty`/
+        // `underload_switch_bonus` above only ever read OUR OWN side
+        // density, never the opponent's, so they can't distinguish a
+        // real 4v2 overload from a genuinely even 4v4 in the same zone.
+        // `TeamTacticalState.side_density_*` is already computed for
+        // BOTH teams (same absolute-Y `BallSideZone` classification), so
+        // the opponent's count is a free read, not a new scan.
+        let opp_team_id = if ctx.player.team_id == ctx.context.field_home_team_id {
+            ctx.context.field_away_team_id
+        } else {
+            ctx.context.field_home_team_id
+        };
+        let opp_state = ctx.context.tactical_for_team(opp_team_id);
+        let opp_side_density = match receiver_side_zone {
+            BallSideZone::Left => opp_state.side_density_left,
+            BallSideZone::Center => opp_state.side_density_center,
+            BallSideZone::Right => opp_state.side_density_right,
+        };
+        let overload_advantage = receiver_side_density as f32 - opp_side_density as f32;
+        let overload_bonus = Self::overload_bonus(crosses_sides, overload_advantage);
+
         // Cap the combined "switch reward" so a wide-vision playmaker
         // doesn't double-dip the classic switch_play_bonus and the
         // density-driven underload_switch_bonus. Polish spec: total
         // switch reward ≤ 0.45. Applied flat (not re-weighted): that
         // ceiling is the absolute contribution to tactical_value.
-        let switch_total = (switch_play_bonus + underload_switch_bonus).min(0.45);
+        // Milestone 8's overload_bonus is composed INTO this same capped
+        // sum (not stacked as a separate uncapped term) since it's the
+        // same "reward for moving the ball to the better flank" concept.
+        let switch_total = (switch_play_bonus + underload_switch_bonus + overload_bonus).min(0.45);
+
+        // Option B / B3: Component C, promoted from tie-breaker toward a
+        // primary term. Reuses the shared time-to-intercept primitive
+        // (pass-lane contest + receiver terminal value) rather than
+        // `danger_value`'s plain distance/space proxy. Weight 0.15 is
+        // deliberately more than `danger_value`'s 0.06 (a genuine
+        // promotion) but still one term among ~13 in this sum, not
+        // dominant — CLAUDE.md's own Phase 12 lesson: a broad
+        // forward-passing reward both inflates goals and dilutes the
+        // surgically-tuned link/supply/intercept features if it's not
+        // kept tightly scoped. Added alongside `danger_value` (not
+        // replacing it) — the lower-risk choice, since `danger_value`'s
+        // own weight/interactions are already calibrated elsewhere.
+        let promoted_pass_value = crate::r#match::player::strategies::common::players::ops::on_ball_value::pass_value(ctx, receiver);
 
         // Weighted combination - includes width and switching bonuses.
         // Phase-aware bonuses (cutback, build-up recycle, counter first
@@ -819,10 +900,12 @@ impl PassEvaluator {
             long_pass_bonus * 0.05 +
             width_bonus * 0.22 +
             danger_value * 0.06 +            // §12.6: resulting scoring danger (tie-breaker)
+            promoted_pass_value * 0.15 +     // B3: Component C, promoted term
             switch_total +                   // Capped flat: classic + underload ≤ 0.45
             cutback_bonus +
             arriving_runner_bonus +
             build_up_recycle_bonus +
+            stalled_recycle_bonus +
             counter_first_pass_bonus +
             same_side_density_penalty +
             sideways_penalty;
@@ -1631,6 +1714,26 @@ impl PassEvaluator {
         } else {
             0.0
         }
+    }
+
+    /// Milestone 8 (possession-decision-intelligence PRD) — genuine
+    /// numerical overload/isolation, unlike `underload_switch_bonus`
+    /// above (which only reads OUR OWN side density, never the
+    /// opponent's). `advantage` is `own_side_density - opponent_side_
+    /// density` in the RECEIVER's zone — positive means we genuinely
+    /// outnumber them there, negative means switching there would
+    /// isolate the receiver against more defenders than we have
+    /// attackers. Gated on `crosses_sides` so this specifically rewards
+    /// SWITCHING the point of attack (the milestone's own phrase), not
+    /// merely passing within an already-advantaged zone. Allowed to go
+    /// negative — a switch into a zone where we're actually outnumbered
+    /// is penalised, not just under-rewarded, which is the "isolation"
+    /// half of the milestone.
+    pub fn overload_bonus(crosses_sides: bool, advantage: f32) -> f32 {
+        if !crosses_sides {
+            return 0.0;
+        }
+        (advantage / 3.0).clamp(-1.0, 1.0) * 0.08
     }
 }
 

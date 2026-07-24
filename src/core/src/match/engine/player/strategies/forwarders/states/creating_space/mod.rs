@@ -1,5 +1,6 @@
 use crate::TacticalStyle;
 use crate::r#match::forwarders::states::ForwardState;
+use crate::r#match::player::strategies::common::players::ops::on_ball_value;
 use crate::r#match::player::strategies::spacing;
 use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondition};
 use crate::r#match::player::strategies::players::skills::SkillCurve;
@@ -302,6 +303,34 @@ impl ForwardCreatingSpaceState {
             (100.0 - distance_to_goal).max(0.0) / 20.0
         };
         score += goal_threat * 6.0;
+
+        // PRD: attacker-angle-seeking-and-gk-drag (Option B completion,
+        // Milestone 2). Real occluded-angle geometry — same
+        // `effective_open_angle` the carrier's own shot decision and
+        // carry-value already use — instead of the goal-threat/channel
+        // terms above, which are pure distance/central-corridor proxies
+        // with no angle awareness at all. Additive, not a replacement:
+        // this project's calibration history (§10.3/§11.9/GK-proximity
+        // tuning already baked into this same function) makes deleting
+        // or down-weighting the existing terms a real regression risk,
+        // so a genuinely wide, angle-exploiting position now competes
+        // for the argmax rather than being silently outscored by the
+        // central-channel bonus in every case. Scaled to ~0-25, the same
+        // order of magnitude as the channel/width bonuses it competes
+        // against. Uses the keeper's actual (not projected) position —
+        // this is "how good is standing here right now", not the
+        // carrier's own forward-looking carry decision.
+        if distance_to_goal < 250.0 {
+            let gk_pos = ctx
+                .players()
+                .opponents()
+                .goalkeeper()
+                .next()
+                .map(|g| g.position);
+            let angle_score =
+                (on_ball_value::effective_open_angle(ctx, position, gk_pos) / 1.31).clamp(0.0, 1.0);
+            score += angle_score * 25.0;
+        }
 
         // Box area bonus
         if distance_to_goal < 180.0 {

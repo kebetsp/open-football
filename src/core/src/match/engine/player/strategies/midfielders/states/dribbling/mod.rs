@@ -5,6 +5,7 @@ use crate::r#match::player::strategies::common::players::ops::forward_shot_decis
     ShotDecision, evaluate_forward_shot_decision,
 };
 use crate::r#match::player::strategies::common::players::ops::midfielder_skill::MidfielderSkillProfile;
+use crate::r#match::player::strategies::common::players::ops::on_ball_value;
 use crate::r#match::{
     ConditionContext, MatchPlayerLite, PassEvaluator, StateChangeResult, StateProcessingContext,
     StateProcessingHandler,
@@ -175,10 +176,11 @@ impl StateProcessingHandler for MidfielderDribblingState {
         // — dribble target is the byline at the player's own channel, not
         // the goal centre. The evasion blending below then dodges
         // defenders while still tracking the touchline route.
-        if matches!(
+        let has_wide_directive = matches!(
             ctx.player.behavioral_directive,
             Some(BehavioralDirective::BylineAndCross | BehavioralDirective::StayWideNoCutInside)
-        ) {
+        );
+        if has_wide_directive {
             let field_h = ctx.context.field_size.height as f32;
             let start_y = ctx.player.start_position.y;
             let y = ctx.player.position.y;
@@ -186,6 +188,18 @@ impl StateProcessingHandler for MidfielderDribblingState {
             let currently_wide = y < field_h * 0.30 || y > field_h * 0.70;
             if channel_wide || currently_wide {
                 goal_pos.y = if channel_wide { start_y } else { y };
+            }
+        } else {
+            // Milestone 4 (possession-decision-intelligence PRD): generic
+            // (non-directive) fallback target now comes from the same
+            // shared on-ball value function forwards already use
+            // (`ForwardDribblingState::velocity()`), not a fixed
+            // goal-centre point — this is what lets an uninstructed wide
+            // midfielder get pulled toward the byline by a genuinely open
+            // crossing teammate, the same way a forward already can.
+            let (carry_target, _value) = on_ball_value::carry_candidates(ctx);
+            if (carry_target - ctx.player.position).magnitude() >= 6.0 {
+                goal_pos = carry_target;
             }
         }
         let player_pos = ctx.player.position;

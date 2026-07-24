@@ -161,6 +161,24 @@ pub const MATCH_HALF_TIME_MS: u64 = 5 * 60 * 1000;
 pub const MATCH_TIME_MS: u64 = MATCH_HALF_TIME_MS * 2;
 pub const MATCH_EXTRA_TIME_MS: u64 = 1 * 60 * 1000;
 
+/// Real football minutes (0..90) that a full `MATCH_TIME_MS` of engine
+/// time represents. The engine compresses a 90-minute match into
+/// `MATCH_TIME_MS` (10 real minutes) — score-reactive tuning (game
+/// management, risk appetite, rest-defense ramps, `behavioral_score_visible`)
+/// is calibrated against real football minutes ("minute 60", "minute 75")
+/// and MUST convert through `football_minute_from_ms`, never divide raw
+/// milliseconds by 60_000 directly — that yields the engine's own
+/// compressed clock (max ~10), which those thresholds can never reach.
+pub const FOOTBALL_MATCH_MINUTES: f64 = 90.0;
+
+/// Convert raw engine milliseconds (e.g. `MatchContext::total_match_time`,
+/// capped near `MATCH_TIME_MS`) into the football-minute-equivalent
+/// (0..90) that score-reactive tuning is calibrated against.
+#[inline]
+pub fn football_minute_from_ms(total_ms: u64) -> f64 {
+    (total_ms as f64 / MATCH_TIME_MS as f64) * FOOTBALL_MATCH_MINUTES
+}
+
 pub struct MatchTime {
     pub time: u64,
 }

@@ -401,6 +401,18 @@ pub fn evaluate_forward_shot_decision(
     // attempts are rejected outright; the inside-six bypass below
     // applies a skill-graded floor instead of letting any tap-in pass.
     let mut xg = profile.expected_xg(distance, ctx.player().has_clear_shot());
+    // Option B / B2: occluded-open-angle correction (Component A, see
+    // docs/on-ball-decision-logic-spec-optionB.md). `expected_xg` above
+    // is a pure, Opta-calibrated distance curve with no angle term at
+    // all — a dead-centre shot and a wide-angle shot at the same
+    // distance get identical xG today, which is the mechanical reason a
+    // correctly-positioned keeper (who occludes the centre most) never
+    // discouraged shooting straight at him. This nudges that calibrated
+    // curve by how open THIS position's angle actually is relative to a
+    // straight-on shot at the same depth against the same keeper —
+    // clamped to [0.5, 1.6] so the real, sourced distance calibration
+    // stays dominant.
+    xg *= crate::r#match::player::strategies::common::players::ops::on_ball_value::angle_xg_correction(ctx);
     // Wishlist #19: first-touch strikes are possible but rarer and worse.
     // An unsettled ball (owned < 300ms) takes a 0.65 xG haircut instead of
     // the old hard settle gate in Priority 0.5 — snap-shots now happen

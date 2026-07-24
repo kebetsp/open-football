@@ -257,6 +257,17 @@ impl ForwardPassingState {
             score += 25.0 * space_multiplier;
         }
 
+        // Option B / B3: Component C, added at a scale comparable to
+        // this scorer's own smaller continuous bonuses (receiver_space*15,
+        // pass_streak up to 10) — deliberately smaller than the large
+        // binary bonuses above (through-ball +25, clear-shot +25) so it
+        // refines ranking among viable options rather than competing
+        // with them. `score` here is dominated by additive point bonuses
+        // (10-25 range), not `base_score.expected_value`'s own 0-2
+        // scale — a flat weight tuned to evaluator.rs's [-0.5,1.8]
+        // tactical_value range would be invisible at this scorer's scale.
+        score += crate::r#match::player::strategies::common::players::ops::on_ball_value::pass_value(ctx, teammate) * 15.0 * space_multiplier;
+
         // Through-ball detection: teammate running toward goal with space ahead
         let teammate_velocity = teammate.velocity(ctx);
         let to_goal = (ctx.player().opponent_goal_position() - teammate.position).normalize();

@@ -9,8 +9,82 @@
 //! role-neutral form; the caller's heuristic target anchors the search so
 //! each role's zone discipline and tactical intent stay intact.
 
-use crate::r#match::{MatchPlayerLite, StateProcessingContext};
+use crate::PlayerPositionType;
+use crate::r#match::player::strategies::common::players::ops::on_ball_value;
+use crate::r#match::{BallSideZone, MatchPlayerLite, StateProcessingContext};
 use nalgebra::Vector3;
+
+/// Milestone 7 (possession-decision-intelligence PRD) — which flank a
+/// wide-slotted role belongs to. Central roles (including GK/sweeper/
+/// defensive mid) return `None` — they don't participate in flank
+/// rotation, only genuinely wide-slotted positions do.
+#[derive(PartialEq, Clone, Copy)]
+enum Side {
+    Left,
+    Right,
+}
+
+fn flank_side(pt: PlayerPositionType) -> Option<Side> {
+    match pt {
+        PlayerPositionType::DefenderLeft
+        | PlayerPositionType::MidfielderLeft
+        | PlayerPositionType::AttackingMidfielderLeft
+        | PlayerPositionType::WingbackLeft
+        | PlayerPositionType::ForwardLeft => Some(Side::Left),
+        PlayerPositionType::DefenderRight
+        | PlayerPositionType::MidfielderRight
+        | PlayerPositionType::AttackingMidfielderRight
+        | PlayerPositionType::WingbackRight
+        | PlayerPositionType::ForwardRight => Some(Side::Right),
+        _ => None,
+    }
+}
+
+/// The teammate who shares my flank (e.g. the winger ahead of a wide
+/// fullback, or vice versa) — `None` if I'm not in a wide-slotted role
+/// myself, or if nobody else on the team is on the same flank. Nearest
+/// by distance is the tie-break when a formation happens to have more
+/// than one same-side wide role.
+fn flank_partner(ctx: &StateProcessingContext) -> Option<MatchPlayerLite> {
+    let my_side = flank_side(ctx.player.tactical_position.current_position)?;
+    ctx.players()
+        .teammates()
+        .all()
+        .filter(|t| t.id != ctx.player.id)
+        .filter(|t| flank_side(t.tactical_positions) == Some(my_side))
+        .min_by(|a, b| {
+            let da = (a.position - ctx.player.position).magnitude();
+            let db = (b.position - ctx.player.position).magnitude();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+/// Milestone 5 (possession-decision-intelligence PRD) — weight for the
+/// reachability term in `score_candidate`. `pass_value_from`'s documented
+/// ~[0,1.2] range times this weight lands in the same tens-scale ballpark
+/// as the existing lane-clearance-plus-progress combination it
+/// complements (~[-10,+35]) — a reasoned starting estimate, calibrated
+/// against real match-logs traces before trusting it, same discipline as
+/// every other unsourced weight in this file.
+const REACHABILITY_WEIGHT: f32 = 40.0;
+
+/// Milestone 6 — weight for the decoy-value term. `danger * marking_pressure`
+/// is already a product of two [0,1] terms (typically smaller than
+/// reachability alone), so this starts at the same tens-scale target.
+const DECOY_WEIGHT: f32 = 35.0;
+
+/// Milestone 7 — weight for the flank-rotation term: same tens-scale
+/// target as Milestones 5/6's new terms. The "take the vacant wide role"
+/// bonus is deliberately half this magnitude (a nudge, not a mandate) —
+/// see `rotation_adjustment`.
+const ROTATION_WEIGHT: f32 = 20.0;
+
+/// Milestone 12 — weight for weak-side width-alignment. Smaller than
+/// reachability/decoy (this is a positioning-readiness nudge, not a
+/// primary value term) but still large enough to matter against the
+/// tether/repulsion terms it competes with — same tens-scale reasoning
+/// as the other milestone weights in this file.
+const WEAK_SIDE_PATIENCE_WEIGHT: f32 = 18.0;
 
 /// Radius inside which a candidate is penalised per nearby teammate —
 /// same 90u repulsion radius the forward zone scorer uses.
@@ -277,7 +351,7 @@ pub fn refine_support_position(
             0.0,
         );
         let score = score_candidate(
-            clamped, proposed, &holder, goal_pos, &opponents, &teammates,
+            ctx, clamped, proposed, &holder, goal_pos, &opponents, &teammates,
         );
         if score > best_any_score {
             best_any_score = score;
@@ -303,6 +377,7 @@ pub fn refine_support_position(
 }
 
 fn score_candidate(
+    ctx: &StateProcessingContext,
     position: Vector3<f32>,
     proposed: Vector3<f32>,
     holder: &Option<MatchPlayerLite>,
@@ -377,10 +452,138 @@ fn score_candidate(
         }
     }
 
+    // Milestone 5 (possession-decision-intelligence PRD) — reachability:
+    // would the ACTUAL current ball holder's pass to a receiver AT THIS
+    // POSITION genuinely be a good option, using the real completion-
+    // probability-and-terminal-value reasoning from `on_ball_value`
+    // (Milestone 3) rather than the binary 4u-corridor check above. This
+    // is additive alongside that check, not a replacement — the corridor
+    // check stays as a cheap hard signal, this adds the real probabilistic
+    // one on top.
+    if let Some(h) = holder {
+        let hypothetical = MatchPlayerLite {
+            id: ctx.player.id,
+            position,
+            tactical_positions: ctx.player.tactical_position.current_position,
+        };
+        let reachability = on_ball_value::pass_value_from(ctx, h.position, &hypothetical);
+        score += reachability * REACHABILITY_WEIGHT;
+    }
+
+    // Milestone 6 — decoy value: credits a position for being a genuine
+    // attacking threat that would force a nearby opponent to engage,
+    // INDEPENDENT of whether a pass here is realistic right now (the
+    // reachability term above) — "drag a defender away, even though I
+    // won't receive it" as a legitimate value in its own right. Summed
+    // into `score`, never gated by reachability, so a position with
+    // near-zero reachability but genuine danger + marking pressure still
+    // gets its full decoy contribution — this is deliberately the
+    // opposite construction from `carry_value`'s MAX-not-SUM (Milestone
+    // 3): here the two terms must NOT gate each other, or shipping
+    // reachability scoring would mechanically zero out decoy-run value,
+    // which is exactly the risk the PRD calls out.
+    let gk_pos = ctx
+        .players()
+        .opponents()
+        .goalkeeper()
+        .next()
+        .map(|g| g.position);
+    let danger = (on_ball_value::effective_open_angle(ctx, position, gk_pos) / 1.31).clamp(0.0, 1.0);
+    let marking_pressure =
+        (on_ball_value::congestion_risk(ctx, position) / on_ball_value::CONGESTION_CAP).clamp(0.0, 1.0);
+    score += danger * marking_pressure * DECOY_WEIGHT;
+
+    // Milestone 7 — flank rotation: two teammates on the same flank (e.g.
+    // a wide fullback and the winger ahead of him) should recognise which
+    // of them currently holds the wide role, rather than both
+    // independently reacting to ball-side and potentially stacking on the
+    // same touchline. Scoped to genuinely wide candidates only — this is
+    // purely about the wide-vs-tuck decision, not overall shape.
+    score += rotation_adjustment(ctx, position);
+
+    // Milestone 12 — weak-side off-ball patience: a candidate on the
+    // opposite lateral side from the ball isn't judged on immediate
+    // reachability (already near-zero there via the Milestone 5 term
+    // above); its job is positioning for a LATER switch of play.
+    score += weak_side_patience_adjustment(ctx, position);
+
     // Tether: stay recognisably within the caller's tactical intent.
     score -= (position - proposed).magnitude() * TETHER_WEIGHT;
 
     score
+}
+
+/// Milestone 7 — see `score_candidate`'s own call-site comment. `0.0` when
+/// `candidate` isn't in the wide band (Milestone 4's established
+/// `field_h*0.30/0.70` threshold), when the player has no flank partner,
+/// or when the partner is on the opposite half of the pitch (a
+/// side-mismatch guard — rotation only makes sense between two players
+/// genuinely sharing the same flank). Otherwise: the partner already
+/// holding width there is a real penalty (don't stack); the partner
+/// having tucked in is a smaller bonus (a nudge to take the vacant wide
+/// role, not a mandate — the existing width/repulsion terms still decide
+/// the rest).
+fn rotation_adjustment(ctx: &StateProcessingContext, candidate: Vector3<f32>) -> f32 {
+    let field_h = ctx.context.field_size.height as f32;
+    let is_wide_candidate = candidate.y < field_h * 0.30 || candidate.y > field_h * 0.70;
+    if !is_wide_candidate {
+        return 0.0;
+    }
+    let Some(partner) = flank_partner(ctx) else {
+        return 0.0;
+    };
+    let candidate_left = candidate.y < field_h * 0.5;
+    let partner_left = partner.position.y < field_h * 0.5;
+    if candidate_left != partner_left {
+        return 0.0; // partner is on the opposite flank right now — not a rotation conflict
+    }
+    let partner_is_wide = partner.position.y < field_h * 0.30 || partner.position.y > field_h * 0.70;
+    if partner_is_wide {
+        -ROTATION_WEIGHT
+    } else {
+        ROTATION_WEIGHT * 0.5
+    }
+}
+
+/// Milestone 12 (possession-decision-intelligence PRD) — weak-side
+/// off-ball patience. A player positioned on the opposite lateral side
+/// from the ball ("weak side") is, by construction, rarely a genuine
+/// pass option right now — Milestone 5's reachability term already and
+/// correctly scores that near zero at this range. Their real job in
+/// real football is positioning for a LATER switch of play: hold
+/// genuine width if the team wants a stretched picture for a diagonal
+/// switch, or stay compact and ready to combine quickly if not —
+/// following the team's own already-computed `team_width_target`
+/// (0 = narrow, 1 = full width) rather than a fixed universal
+/// preference. Returns `0.0` when the ball is central (no meaningful
+/// "weak side" exists) or the candidate is on the ball's own side —
+/// strong-side positioning is already densely handled by the
+/// reachability/decoy/rotation terms above; this is additive, not a
+/// replacement for any of them.
+fn weak_side_patience_adjustment(ctx: &StateProcessingContext, candidate: Vector3<f32>) -> f32 {
+    let field_h = ctx.context.field_size.height as f32;
+    let ball_side = ctx.team().tactical().ball_side;
+    if matches!(ball_side, BallSideZone::Center) {
+        return 0.0;
+    }
+    let candidate_side = BallSideZone::for_y(field_h, candidate.y);
+    let is_weak_side = matches!(
+        (ball_side, candidate_side),
+        (BallSideZone::Left, BallSideZone::Right) | (BallSideZone::Right, BallSideZone::Left)
+    );
+    if !is_weak_side {
+        return 0.0;
+    }
+
+    let width_target = ctx.team().tactical().team_width_target.clamp(0.0, 1.0);
+    let center_y = field_h / 2.0;
+    let half_h = field_h / 2.0;
+    let dist_from_center = ((candidate.y - center_y).abs() / half_h).clamp(0.0, 1.0);
+    // How well this candidate's width matches the team's current width
+    // preference — a wide candidate scores when width_target is high, a
+    // central one scores when it's low.
+    let alignment = (1.0 - (dist_from_center - width_target).abs()).max(0.0);
+    alignment * WEAK_SIDE_PATIENCE_WEIGHT
 }
 
 fn ball_holder(ctx: &StateProcessingContext) -> Option<MatchPlayerLite> {

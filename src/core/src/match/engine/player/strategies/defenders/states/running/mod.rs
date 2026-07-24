@@ -3,6 +3,7 @@ use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondi
 use crate::r#match::events::Event;
 use crate::r#match::player::events::{PassingEventContext, PlayerEvent};
 use crate::r#match::player::strategies::common::players::ops::defender_skill::DefenderSkillProfile;
+use crate::r#match::player::strategies::common::players::ops::on_ball_value;
 use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::{
@@ -364,10 +365,29 @@ impl StateProcessingHandler for DefenderRunningState {
         }
 
         if ctx.player.has_ball(ctx) {
-            // With ball: move toward opponent goal, separation matters
+            // Milestone 4 (possession-decision-intelligence PRD): carry
+            // target now comes from the same shared on-ball value
+            // function forwards already use (`ForwardDribblingState::
+            // velocity()`), not a flat goal-centre `Arrive` — this is
+            // what lets a wide fullback/wingback carrying forward get
+            // pulled toward a genuinely open crossing teammate, the same
+            // way a forward already can. `should_carry_ball()` (this
+            // state's `process()`) is the separate, untouched gate for
+            // WHETHER a defender carries at all; this only changes WHERE
+            // he steers while doing so.
+            let (carry_target, _value) = on_ball_value::carry_candidates(ctx);
+            let dist = (carry_target - ctx.player.position).magnitude();
+            let target = if dist < 6.0 {
+                // Best candidate is roughly where we already are — drift
+                // gently toward goal instead of freezing mid-pitch, same
+                // hold-case handling as the forward twin.
+                ctx.player().opponent_goal_position()
+            } else {
+                carry_target
+            };
             Some(
                 SteeringBehavior::Arrive {
-                    target: ctx.player().opponent_goal_position(),
+                    target,
                     slowing_distance: 100.0,
                 }
                 .calculate(ctx.player)
@@ -576,23 +596,22 @@ impl DefenderRunningState {
             return false;
         }
 
-        // No opponent within moderate range — safe to carry
-        let has_space_ahead = !ctx.players().opponents().exists(25.0);
+        // Milestone 9 (possession-decision-intelligence PRD): the
+        // whether-to-carry decision, upstream of Milestone 4's
+        // carry_candidates (which only ever picked WHERE to carry once
+        // this gate had already said yes). Replaces the old flat
+        // skill/space threshold with a genuine value comparison: carry
+        // only when it's actually better than the best pass available
+        // right now, with the margin widening under real pressure — a
+        // real defender doesn't gamble a marginal carry advantage away
+        // from goal against a genuine closing press, but a clearly open
+        // lane should win on its own merits even at low pressure.
+        let (_, carry_val) = on_ball_value::carry_candidates(ctx);
+        let pass_val = on_ball_value::best_pass_value_from(ctx, ctx.player.position);
+        let pressure = ctx.player().pressure().pressure_intensity();
+        let margin = 0.05 + pressure * 0.25;
 
-        // Dribbling skill threshold — even average defenders can carry when safe.
-        // Routed through `dribble_attack` so fatigue + late-game
-        // mental drift dampen a tired CB's willingness to carry. The
-        // 0.55 threshold preserves the pre-composite calibration; the
-        // composite floor (~0.05) keeps the decision well-defined for
-        // weak carriers.
-        let minute = sc::minute_from_ms(ctx.context.total_match_time);
-        let carry_ability = sc::dribble_attack(ctx.player, minute);
-
-        if has_space_ahead && carry_ability > 0.55 {
-            return true;
-        }
-
-        false
+        carry_val > pass_val + margin
     }
 
     pub fn should_clear(&self, ctx: &StateProcessingContext) -> bool {

@@ -4833,56 +4833,20 @@ impl PlayerEventDispatcher {
                             teleports.push((pid, spot));
                         }
                     }
-                } else {
-                    // realism-bug (2026-07-20): deep restarts (>280u,
-                    // e.g. a foul at the centre circle) got zero
-                    // attacking-shape push — every player not staged in
-                    // the wall/box-clear above just recovers to plain
-                    // formation shape (§9.2.1 below), which for a team
-                    // that had just been defending looks exactly like
-                    // what was reported: nobody advances, front players
-                    // stay in their own half even though their team just
-                    // won the ball back. Real teams push a couple of
-                    // attacking players forward to offer a progressive
-                    // option immediately, not only once a restart is
-                    // already in crossable range. Advance the two most
-                    // advanced eligible outfield players (excluding the
-                    // taker) halfway toward the attacked goal, capped so
-                    // they never enter the 280u zone §11.7 already owns
-                    // — this shape and that one must not collide.
-                    let mut advancers: Vec<(f32, u32, Vector3<f32>)> = field
-                        .players
-                        .iter()
-                        .filter(|p| {
-                            p.side == Some(victim_side)
-                                && p.id != taker_id
-                                && !p.is_sent_off
-                                && !is_gk(p)
-                        })
-                        .map(|p| {
-                            let adv = if victim_side == PlayerSide::Left {
-                                p.position.x
-                            } else {
-                                -p.position.x
-                            };
-                            (adv, p.id, p.position)
-                        })
-                        .collect();
-                    advancers.sort_by(|a, b| {
-                        b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                    let goal_center = Vector3::new(goal_x, mid_y, 0.0);
-                    for &(_, pid, pos) in advancers.iter().take(2) {
-                        let to_goal = goal_center - pos;
-                        let dist_to_goal = (to_goal.x * to_goal.x + to_goal.y * to_goal.y).sqrt();
-                        let advance_dist =
-                            (dist_to_goal * 0.5).min((dist_to_goal - 280.0).max(0.0));
-                        if advance_dist > 1.0 && dist_to_goal > 1.0 {
-                            let dir = to_goal / dist_to_goal;
-                            teleports.push((pid, pos + dir * advance_dist));
-                        }
-                    }
                 }
+                // realism-bug (2026-07-21): deep restarts (>280u, e.g. a
+                // foul at the centre circle) used to get zero attacking-
+                // shape push at all. A first attempt here (advance the 2
+                // most advanced eligible players by a fixed formula) was
+                // correctly called out as not real football — it just
+                // produced "2 players moved forward," not a team shape.
+                // Removed in favour of a whole-team, role-graduated shift
+                // toward the ball for the WHOLE kicking side, now built
+                // into `recovery_shape_targets` itself (which every
+                // non-staged kicking-team player already routes through
+                // below) — defenders shift least, midfielders more,
+                // forwards most, matching real buildup/possession-
+                // retention doctrine instead of an arbitrary headcount.
             }
         }
         // §13.4: the wall / box-clear get a genuine retreat target (same

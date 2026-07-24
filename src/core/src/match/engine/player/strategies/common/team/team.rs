@@ -215,6 +215,17 @@ impl<'b> TeamOperationsImpl<'b> {
         self.tactical().build_up_patience
     }
 
+    /// How many ticks the CURRENT unbroken possession has lasted (0 if
+    /// we don't have the ball). Spans phase transitions within one
+    /// possession (BuildUp → Progression → Attack), so a long value
+    /// read during `Attack`/`Progression` is a genuine "this spell has
+    /// gone on a while" signal, not just time-in-the-final-third. Used
+    /// to detect a stalled attack (possession-decision-intelligence
+    /// Milestone 11).
+    pub fn possession_ticks(&self) -> u32 {
+        self.tactical().possession_ticks
+    }
+
     /// Press intensity — how aggressively the team hunts the ball when
     /// out of possession. Used by defenders / midfielders to decide
     /// step-up vs drop-off.

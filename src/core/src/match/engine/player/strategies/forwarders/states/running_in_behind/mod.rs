@@ -3,6 +3,7 @@ use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondi
 use crate::r#match::player::strategies::common::players::ops::forward_shot_decision::{
     ShotDecision, evaluate_forward_shot_decision,
 };
+use crate::r#match::player::strategies::common::players::ops::on_ball_value;
 use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
     ConditionContext, PlayerSide, StateChangeResult, StateProcessingContext,
@@ -81,15 +82,23 @@ impl StateProcessingHandler for ForwardRunningInBehindState {
         let opponent_goal = ctx.ball().direction_to_opponent_goal();
         let current_position = ctx.player.position;
 
-        // Channel-aware target: advance to the goal line but stay in the player's
-        // assigned lateral channel. A winger with start_y near the touchline runs
-        // into their flank corridor (where CrossingState takes over at the byline);
-        // a central striker with start_y near 272 runs toward goal centre as before.
-        let mut run_target = Vector3::new(
-            opponent_goal.x,
-            ctx.player.start_position.y,
-            0.0,
-        );
+        // Option B / B1: channel selection via the shared on-ball value
+        // function instead of a fixed start_position.y channel. The run's
+        // ultimate destination is still the goal line in x (a run in
+        // behind targets the byline, not a 50u-out stopping point — the
+        // carry-candidate reach horizon isn't the right scale for that),
+        // but which lateral channel to sprint into now responds to
+        // control_prob (how open that lane actually is) rather than a
+        // fixed formation slot. Falls back to the old fixed channel if
+        // the value function can't beat holding still (e.g. no clear
+        // channel yet) so the run doesn't degenerate to zero movement.
+        let (carry_target, carry_value) = on_ball_value::carry_candidates(ctx);
+        let channel_y = if carry_value > f32::MIN {
+            carry_target.y
+        } else {
+            ctx.player.start_position.y
+        };
+        let mut run_target = Vector3::new(opponent_goal.x, channel_y, 0.0);
 
         // Offside discipline: while a teammate is still ON the ball (the
         // through-pass hasn't been released), hold the run at the shoulder

@@ -341,6 +341,17 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
+        // Milestone 13 (possession-decision-intelligence PRD) —
+        // event-triggered reaction to a loose ball after a block/parry/
+        // deflection. Applied AFTER the assignment override so an
+        // explicit press/mark target still wins outright (checked again
+        // inside the function itself, matching the same priority
+        // convention as the block above).
+        if let Some(velocity) = Self::rebound_crash_velocity(&processing_ctx) {
+            let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
+            result.velocity = Some(velocity * tempo);
+        }
+
         // §12.4: the staged short-corner option holds his spot until the
         // corner is struck — without this his state machine runs him back
         // toward his anchor and the delivery picker's "genuinely
@@ -692,6 +703,64 @@ impl<'p> StateProcessor<'p> {
         }
 
         None
+    }
+
+    /// Milestone 13 (possession-decision-intelligence PRD) —
+    /// event-triggered reaction to a loose ball after a block, parry, or
+    /// deflection. Architecturally different from every other milestone
+    /// in this PRD: a direct reaction to a discrete engine EVENT
+    /// (`Ball.last_rebound_tick`, already armed by three real loose-ball
+    /// mechanisms — a blocked-shot central spill, an unlucky deflection
+    /// that stays live, and a dangerous keeper parry — see
+    /// `ball/interactions.rs`), not an extension of the carrier/off-ball
+    /// VALUE functions every other milestone shares. Real forwards and
+    /// attacking midfielders crash toward a genuine second ball near the
+    /// box; defenders and deeper midfielders hold shape instead — scoped
+    /// to attacking positions only.
+    ///
+    /// `REBOUND_WINDOW_TICKS` mirrors the window `team.rs`'s
+    /// `can_shoot_debug`/`shot_clarity_debug` already use for the
+    /// identical "is this rebound situation still live" question — reused
+    /// rather than re-derived so both consumers of the same underlying
+    /// event agree on how long it stays live.
+    fn rebound_crash_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None; // an explicit assignment always wins
+        }
+        let pos_type = player.tactical_position.current_position;
+        if pos_type.is_goalkeeper() {
+            return None;
+        }
+        if !(pos_type.is_forward() || pos_type.is_attacking_midfielder()) {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None; // already on it — normal state machine drives him
+        }
+        if ctx.team().is_control_ball() {
+            return None; // ball isn't loose, our own team already controls it
+        }
+
+        const REBOUND_WINDOW_TICKS: u64 = 300;
+        let rebound_tick = ctx.tick_context.ball.last_rebound_tick;
+        if rebound_tick == 0 {
+            return None;
+        }
+        let current_tick = ctx.context.current_tick();
+        if current_tick.saturating_sub(rebound_tick) >= REBOUND_WINDOW_TICKS {
+            return None;
+        }
+
+        let ball_pos = ctx.tick_context.positions.ball.position;
+        let to_ball = ball_pos - player.position;
+        let dist = to_ball.magnitude();
+        // Only crash from realistic range — a striker already up near
+        // the box, not one dragged in from the halfway line.
+        if dist > 220.0 || dist < 2.0 {
+            return None;
+        }
+        Some(to_ball.normalize() * player.skills.physical.pace)
     }
 }
 

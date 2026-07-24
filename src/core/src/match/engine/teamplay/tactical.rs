@@ -400,7 +400,12 @@ impl TeamTacticalState {
         // depend on score / time / ability / tactic — none of them on
         // phase. Compute them up-front so the phase decision can use
         // build_up_patience to size its transition window.
-        let minute = (inputs.match_time_ms as f32) / 60_000.0;
+        // `inputs.match_time_ms` is raw engine ms (capped near
+        // `MATCH_TIME_MS`, ~10 real minutes for a full match) — the
+        // score/time thresholds below (45/60/75/90) are calibrated
+        // against real football minutes, so this MUST go through
+        // `football_minute_from_ms`, not a raw `/60_000.0` divide.
+        let minute = crate::r#match::football_minute_from_ms(inputs.match_time_ms) as f32;
         home.game_management_intensity = Self::compute_game_management_intensity(
             inputs.home_score_diff,
             minute,
