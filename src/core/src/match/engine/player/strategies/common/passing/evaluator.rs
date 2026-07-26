@@ -471,7 +471,7 @@ impl PassEvaluator {
         let risk_forward_bias = 0.7 + risk_appetite * 0.6; // 0.7..1.3
         let risk_backward_bias = 1.4 - risk_appetite * 0.8; // 1.4..0.6
 
-        let forward_value = if forward_progress < 0.0 {
+        let mut forward_value = if forward_progress < 0.0 {
             // Backward pass - penalty, but softened by phase + risk.
             let composure_reduction = (ctx.player.skills.mental.composure / 20.0) * 0.3;
             let base_penalty = forward_progress * 3.0 * (1.0 - composure_reduction).max(0.5);
@@ -920,7 +920,7 @@ impl PassEvaluator {
         let recv_goal_dist = ((receiver_position.x - attack_goal_x).powi(2)
             + (receiver_position.y - field_center_y).powi(2))
         .sqrt();
-        let danger_value = {
+        let mut danger_value = {
             let dist01 = (1.0 - recv_goal_dist / 320.0).clamp(0.0, 1.0);
             let central01 = 1.0 - (receiver_y_offset / (field_height * 0.5)).clamp(0.0, 1.0);
             let recv_opps = ctx.tick_context.grid.opponents(receiver.id, 15.0).count();
@@ -1001,7 +1001,43 @@ impl PassEvaluator {
         // kept tightly scoped. Added alongside `danger_value` (not
         // replacing it) — the lower-risk choice, since `danger_value`'s
         // own weight/interactions are already calibrated elsewhere.
-        let promoted_pass_value = crate::r#match::player::strategies::common::players::ops::on_ball_value::pass_value(ctx, receiver);
+        let mut promoted_pass_value = crate::r#match::player::strategies::common::players::ops::on_ball_value::pass_value(ctx, receiver);
+
+        // /goal 2026-07-26 (passing realism, larger structural rework):
+        // six narrow additive counterweights (across two sessions)
+        // failed to meaningfully shift CB forward-share (stuck ~90% vs
+        // real 62.8%) or FW center-destination (stuck ~70% vs real
+        // 20.8%) — diagnosed as a limitation of the formula's purely
+        // additive structure: a strongly-central AND strongly-forward
+        // option collects full credit on BOTH axes independently, with
+        // no representation of the real football principle that the
+        // genuinely risky pattern is specifically the COMBINATION —
+        // "a blind ball into the packed central channel from the back,"
+        // not central alone (patient recycling through the pivot is a
+        // real, common, healthy pattern) and not forward alone (breaking
+        // the line out wide is fine). `cutback_bonus`/`arriving_runner_
+        // bonus` already correctly reward the SPECIFIC, earned central
+        // combinations (a byline cutback, a box-arriving runner) — this
+        // dampener is scoped to fire only when NEITHER already justifies
+        // the central option, so it targets the generic/unearned case
+        // exclusively and never fights the two mechanisms that are
+        // already working correctly.
+        let has_specific_central_opportunity = cutback_bonus > 0.0 || arriving_runner_bonus > 0.0;
+        let is_blind_central = receiver_width_ratio < 0.3 && !has_specific_central_opportunity;
+        if is_defender && is_blind_central && forward_progress > 0.0 {
+            // The specific "hopeful ball into the middle from the back"
+            // pattern — dampens the forward reward for THIS combination
+            // only; a defender's line-breaking pass out wide, or into an
+            // earned central chance, is untouched.
+            forward_value *= 0.55;
+        }
+        if is_forward && is_blind_central {
+            // A forward defaulting to "nearest central teammate" with no
+            // earned opportunity — dampens the central-proximity reward
+            // specifically, not central combination play in general.
+            danger_value *= 0.5;
+            promoted_pass_value *= 0.5;
+        }
 
         // Weighted combination - includes width and switching bonuses.
         // Phase-aware bonuses (cutback, build-up recycle, counter first
