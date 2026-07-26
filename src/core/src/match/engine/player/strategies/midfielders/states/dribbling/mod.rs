@@ -118,15 +118,68 @@ impl StateProcessingHandler for MidfielderDribblingState {
             }
         }
 
-        // Carry budget scaled by carry_selection (skill-blended) instead
-        // of raw dribbling — a poor dribbler with high decisions still
-        // gets some carry tolerance via composure / decisions weighting.
+        // realism-bug (2026-07-25): opportunistic byline-run commitment
+        // (`/goal`: >=3 genuine byline-style runs/match). Same fix as the
+        // forward-state twin — superseded a first attempt that
+        // recomputed "is this the best candidate right now" every tick
+        // via `carry_candidates` (too fragile to sustain a real run) with
+        // a PERSISTENT `byline_commitment_ticks` field armed
+        // probabilistically on fresh wide possession (`run.rs`).
+        let committing_to_byline = ctx.player.byline_commitment_ticks > 0;
+
+        // Release once past the penalty spot (88u = 11m*8u/m; 100u used
+        // for a small margin) while still wide-ish — matches the /goal
+        // spec exactly ("a cross attempt or a pass somewhere from a
+        // point after the penalty spot," not literal byline arrival).
+        if committing_to_byline {
+            let field_h = ctx.context.field_size.height as f32;
+            let y = ctx.player.position.y;
+            let currently_wide = y < field_h * 0.38 || y > field_h * 0.62;
+            // realism-bug (2026-07-26): same fix as the forward-state
+            // twin — `distance_to_goal` is Euclidean distance to the
+            // goal CENTRE, structurally too large for a genuinely wide
+            // player regardless of how close he is to the goal line.
+            // Fixed to real depth (x-distance to the goal line).
+            let goal_x = ctx.player().opponent_goal_position().x;
+            let depth = (goal_x - ctx.player.position.x).abs();
+            if currently_wide && depth <= 100.0 {
+                return Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::Crossing,
+                ));
+            }
+        }
+
+        // Carry budget scaled by carry_selection (25-80 ticks, 250-800ms)
+        // — shorter than the candidate-generation reach horizon itself
+        // (REACH_TICKS=90, 0.6-1.2s), so a real committed run would get
+        // cut off before it could ever complete. Extended, not removed,
+        // when genuinely committing to a byline run.
+        // SKIPPED (set high, not just extended) while committing to a
+        // byline run — realistic dribble speed is ~0.4-0.6u/tick, so even
+        // a 100-tick extension only covered ~40-60u, nowhere near the
+        // 150-420u a genuine run needs. The outer `byline_commitment_
+        // ticks` budget (`run.rs`) is the real bound here.
         let max_dribble_ticks = (25.0 + mid_profile.carry_selection * 55.0) as u64;
+        let max_dribble_ticks = if committing_to_byline {
+            900
+        } else {
+            max_dribble_ticks
+        };
 
         // Under heavy pressure — defer to press_resistance: high
         // resistance lets us shield/pass cleanly, low resistance forces
-        // a hurried release.
-        let close_opponents = ctx.players().opponents().nearby(15.0).count();
+        // a hurried release. Always active, even when committing to a
+        // byline run — a genuine two-man press is exactly the condition
+        // the BylineAndCross directive itself bails out under too.
+        // Radius tightened to 8u (matching the forward-state twin, and
+        // the directive's own 8u) while committed — measured that
+        // increasing the arm rate 4x barely moved completions, meaning
+        // this exit (firing on any 2 opponents within a genuinely loose
+        // 15u, common in a compact midfield even without real double-
+        // teaming) was the dominant remaining bottleneck throughout the
+        // run, not just at the start.
+        let press_radius = if committing_to_byline { 8.0 } else { 15.0 };
+        let close_opponents = ctx.players().opponents().nearby(press_radius).count();
         if close_opponents >= 2 {
             if distance_to_goal < 32.0 && has_clear_shot && mid_profile.mid_shot_selection >= 0.42 {
                 return Some(
@@ -176,10 +229,19 @@ impl StateProcessingHandler for MidfielderDribblingState {
         // — dribble target is the byline at the player's own channel, not
         // the goal centre. The evasion blending below then dodges
         // defenders while still tracking the touchline route.
+        //
+        // realism-bug (2026-07-26): same fix as the forward-state twin —
+        // `byline_commitment_ticks` (undirected commitment) governed
+        // process()'s decisions but was never checked here, so a
+        // "committed" midfielder's real movement still came from
+        // `carry_candidates` below and could legitimately cut inside.
+        // Measured directly: only 39.6% of decided runs ended in a cross
+        // vs 35.7% shots + 24.7% expired-without-releasing. Folded into
+        // the same channel-lock condition the directive already uses.
         let has_wide_directive = matches!(
             ctx.player.behavioral_directive,
             Some(BehavioralDirective::BylineAndCross | BehavioralDirective::StayWideNoCutInside)
-        );
+        ) || ctx.player.byline_commitment_ticks > 0;
         if has_wide_directive {
             let field_h = ctx.context.field_size.height as f32;
             let start_y = ctx.player.start_position.y;

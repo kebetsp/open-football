@@ -1696,6 +1696,25 @@ impl PlayerEventDispatcher {
             (velocity_along_pass * lead_ticks).min(pass_distance_est * 0.40);
         let ideal_target = receiver_pos + pass_direction * lead_displacement;
 
+        // Realism-bug 2026-07-26 (passing follow-up): tell the RECEIVER
+        // where this pass is actually headed, closing the coordination
+        // gap a full-tree grep confirmed existed (nothing previously
+        // read `Ball.pending_pass_target` from inside a receiving
+        // player's own movement code — their run during the ball's
+        // flight was entirely independent of the ball's actual target).
+        // Uses the exact same `ideal_target` the ball itself is aimed
+        // at, so the receiver reacts to the truth, not a guess.
+        // `incoming_pass_awareness_velocity` (processor.rs) reads this
+        // as a blended nudge, not a hard override.
+        if let Some(receiver) = field.get_player_mut(event_model.to_player_id) {
+            receiver.incoming_pass_target = Some(ideal_target);
+            // Budget = the same flight-time estimate the lead itself
+            // used, plus margin for a slow/mis-hit ball — self-clears
+            // via the standard per-tick decrement loop (run.rs) even if
+            // nothing else resolves the pass first.
+            receiver.incoming_pass_ticks = (flight_time_est + 30.0).clamp(8.0, 140.0) as u16;
+        }
+
         // Always use passer's position as pass origin — ball position may lag behind
         let pass_origin = passer_position;
         let ideal_pass_vector = ideal_target - pass_origin;
@@ -2816,8 +2835,13 @@ impl PlayerEventDispatcher {
             }
         }
 
-        // Distance to opposing GK (any opponent goalkeeper).
-        let gk_distance = field
+        // Distance to opposing GK (any opponent goalkeeper). Also keep
+        // the keeper's live position + real max speed — needed below to
+        // bias shot AIM toward whichever side he's actually drifted
+        // away from, PROJECTED forward to shot-arrival time (see the
+        // keeper_bias comment further down for why the raw current
+        // position isn't good enough).
+        let defending_gk = field
             .players
             .iter()
             .filter(|p| p.side != shooter_side)
@@ -2826,8 +2850,14 @@ impl PlayerEventDispatcher {
                     p.tactical_position.current_position.position_group(),
                     PlayerFieldPositionGroup::Goalkeeper
                 )
-            })
-            .map(|gk| (gk.position - shooter_position).magnitude());
+            });
+        let defending_gk_position = defending_gk.map(|gk| gk.position);
+        let defending_gk_max_speed = defending_gk.map(|gk| {
+            gk.skills
+                .max_speed_with_condition(gk.player_attributes.condition)
+        });
+        let gk_distance =
+            defending_gk_position.map(|gk_pos| (gk_pos - shooter_position).magnitude());
 
         let inputs = ShotSkillInputs {
             distance: pre_distance,
@@ -2903,7 +2933,66 @@ impl PlayerEventDispatcher {
         let side_rate = (1.0 - central_rate) * 0.5;
         let target_preference = rng.random_range(0.0..1.0);
         let corner_reach = GOAL_WIDTH * (0.42 + placement_skill * 0.48);
-        let ideal_y_target = if target_preference < side_rate {
+
+        // realism-bug (2026-07-25): aim was entirely blind to the
+        // keeper's actual position — `gk_distance` only fed the
+        // pre-shot willingness-to-shoot decision, never WHICH side to
+        // place the ball. Wires aim to the same "doctrine keeper"
+        // concept already established for the carry/shot DECISION
+        // value function (`on_ball_value::angle_xg_correction` /
+        // `projected_gk_position`, PRD
+        // docs/attacker-angle-seeking-and-gk-drag): a doctrine keeper
+        // stands on the shooter-to-goal-centre bisector at the real
+        // keeper's own depth (x); `keeper_bias` > 0 means the real
+        // keeper has drifted beyond that line toward the +y side,
+        // leaving the -y corner genuinely more open. Can't call that
+        // function directly — this event-application layer has no
+        // StateProcessingContext, the same constraint already
+        // documented on that PRD — so the doctrine-line formula is
+        // replicated self-contained here instead.
+        //
+        // First cut biased against the keeper's RAW CURRENT position
+        // and regressed goals/match to 2.67-2.70 (below the 3.0-4.5
+        // band) only in combination with this same session's GK
+        // lateral-tracking fix — isolated stash testing confirmed
+        // each fix alone was fine (3.10-3.37) but the pair together
+        // consistently failed. Root cause: the improved keeper now
+        // recovers much faster toward the doctrine line, so by the
+        // time the shot actually arrives he has often closed most of
+        // the gap this bias was computed against — "aim away from
+        // where he IS" increasingly aims at where he's ABOUT TO BE.
+        // Fixed the same way `on_ball_value::projected_gk_position`
+        // already does it for the carry-decision value function:
+        // project the keeper forward from his current position toward
+        // the doctrine line by however far he can cover, at his own
+        // real max speed, in the shot's actual flight time — never
+        // past the doctrine point, so a slow keeper is still genuinely
+        // caught out and a fast one is correctly credited with
+        // recovering. Scaled by `placement_skill` (composed finishers
+        // read the keeper; poor ones don't) and capped at a modest
+        // shift so it nudges the corner split rather than dictating it.
+        let keeper_bias = match (defending_gk_position, defending_gk_max_speed) {
+            (Some(gk_pos), Some(gk_speed)) => {
+                let dx = goal_center.x - shooter_position.x;
+                let t = if dx.abs() > 1.0 {
+                    (gk_pos.x - shooter_position.x) / dx
+                } else {
+                    1.0
+                };
+                let doctrine_y = shooter_position.y + t * (goal_center.y - shooter_position.y);
+                let to_doctrine_y = doctrine_y - gk_pos.y;
+                let flight_ticks = (horizontal_distance / MAX_SHOT_VELOCITY).max(1.0);
+                let reach = (gk_speed * flight_ticks).min(to_doctrine_y.abs());
+                let projected_gk_y = gk_pos.y + to_doctrine_y.signum() * reach;
+                ((projected_gk_y - doctrine_y) / GOAL_WIDTH).clamp(-1.0, 1.0)
+            }
+            _ => 0.0,
+        };
+        const MAX_EXPLOIT_SHIFT: f32 = 0.20;
+        let exploit_shift = keeper_bias * MAX_EXPLOIT_SHIFT * placement_skill;
+        let minus_share = (0.5 + exploit_shift).clamp(0.05, 0.95);
+
+        let ideal_y_target = if target_preference < side_rate * 2.0 * minus_share {
             goal_center.y - corner_reach
         } else if target_preference < side_rate * 2.0 {
             goal_center.y + corner_reach

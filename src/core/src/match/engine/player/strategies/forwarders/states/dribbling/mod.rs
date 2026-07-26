@@ -103,8 +103,60 @@ impl StateProcessingHandler for ForwardDribblingState {
             }
         }
 
+        // realism-bug (2026-07-25): opportunistic byline-run commitment
+        // (`/goal`: >=3 genuine byline-style runs/match — a run toward
+        // the byline ending in a cross/pass from past the penalty spot,
+        // not necessarily reaching the actual line). Superseded a first
+        // attempt that recomputed "is this the best candidate right now"
+        // every tick via `carry_candidates` — that was too fragile to
+        // sustain a real run (a small geometry shift flips the winner)
+        // and barely moved the measured external rate. Now driven by
+        // `byline_commitment_ticks`, a PERSISTENT per-player field armed
+        // probabilistically on fresh wide possession (`run.rs`) — the
+        // same "temporary override that survives across ticks/states"
+        // pattern already proven for kickoff/throw-in/free-kick takers.
+        let committing_to_byline = ctx.player.byline_commitment_ticks > 0;
+
+        // Release once past the penalty spot (88u = 11m*8u/m; 100u used
+        // for a small margin) while still wide-ish — matches the /goal
+        // spec exactly ("a cross attempt or a pass somewhere from a
+        // point after the penalty spot," not literal byline arrival).
+        // Checked BEFORE the generic exits below so a committed run
+        // releases cleanly on arrival instead of running past its own
+        // target and hitting the dribble timeout instead.
+        if committing_to_byline {
+            let field_h = ctx.context.field_size.height as f32;
+            let y = ctx.player.position.y;
+            let currently_wide = y < field_h * 0.38 || y > field_h * 0.62;
+            // realism-bug (2026-07-26): `distance_to_goal` is Euclidean
+            // distance to the goal CENTRE, not depth to the goal LINE —
+            // for a genuinely wide player that distance stays large from
+            // the y-offset alone (e.g. y=50 vs a ~272 goal-centre y is
+            // already 222u away, before x is even considered), so this
+            // check could never fire once the velocity() steering fix
+            // (above/below) actually kept him wide instead of drifting
+            // central. Fixed to real depth — x-distance to the goal
+            // line — the same measure `run.rs`'s arm logic already uses.
+            let goal_x = ctx.player().opponent_goal_position().x;
+            let depth = (goal_x - ctx.player.position.x).abs();
+            if currently_wide && depth <= 100.0 {
+                return Some(StateChangeResult::with_forward_state(
+                    ForwardState::Crossing,
+                ));
+            }
+        }
+
         // Prevent infinite dribbling - timeout after 40 ticks to reassess.
-        if ctx.in_state_time > 40 {
+        // SKIPPED entirely while committing to a byline run — realistic
+        // dribble speed is ~0.4-0.6u/tick (CLAUDE.md), so even the first
+        // attempt's 100-tick extension only covered ~40-60u, nowhere near
+        // the 150-420u a genuine run needs to reach the release point.
+        // The outer `byline_commitment_ticks` budget (`run.rs`, sized for
+        // the full trigger distance at realistic speed) is the real
+        // bound here — this per-entry state timeout would just cut the
+        // run short well before that budget, or before the explicit
+        // release check above ever gets a chance to fire.
+        if !committing_to_byline && ctx.in_state_time > 40 {
             if can_shoot && distance_to_goal < 60.0 && ctx.player().has_clear_shot() {
                 if let Some(result) = dispatch_shot(ctx, "FWD_DRIB_TIMEOUT") {
                     return Some(result);
@@ -119,7 +171,10 @@ impl StateProcessingHandler for ForwardDribblingState {
         // within 20u → back to Dribbling" rule, so a lone chaser at
         // 17u produced Dribbling → Passing → Dribbling every few
         // ticks. Now we require two real pressers OR a long commit
-        // window before abandoning the dribble.
+        // window before abandoning the dribble. Always active, even
+        // when committing to a byline run — a genuine two-man press is
+        // exactly the condition the BylineAndCross directive itself
+        // bails out under too.
         let close_defenders = ctx.players().opponents().nearby(8.0).count();
         if close_defenders >= 2 {
             return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
@@ -129,12 +184,25 @@ impl StateProcessingHandler for ForwardDribblingState {
         // opponent within 10u AND we've been dribbling long enough to
         // commit to the decision (≥15 ticks). The old `has_space_to_dribble`
         // (15u threshold) fired too eagerly against a single chaser.
-        if ctx.in_state_time >= 15 && ctx.players().opponents().nearby(10.0).next().is_some() {
+        // Skipped when undirected byline commitment is active — a single
+        // marker tracking a winger's touchline run is normal defending,
+        // not being boxed in; real wingers keep going against exactly
+        // this until a second defender arrives (see close_defenders
+        // above), matching the existing directive's own rule.
+        if !committing_to_byline
+            && ctx.in_state_time >= 15
+            && ctx.players().opponents().nearby(10.0).next().is_some()
+        {
             return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
         }
 
-        // Cross from wide position in attacking third
-        if self.should_cross(ctx) {
+        // Cross from wide position in attacking third. Skipped when
+        // genuinely committing to a byline run — the explicit release
+        // check above already owns that decision for the committed
+        // case; `should_cross` allows a cross from up to 300u out (most
+        // of the attacking half), which would otherwise second-guess
+        // and cut short a run before it reaches the intended depth.
+        if !committing_to_byline && self.should_cross(ctx) {
             return Some(StateChangeResult::with_forward_state(
                 ForwardState::Crossing,
             ));
@@ -152,10 +220,30 @@ impl StateProcessingHandler for ForwardDribblingState {
         // channel when the player's slot is a wide one; otherwise holds
         // the current wide lane. (StayWide shapes only the carry route;
         // BylineAndCross additionally bypasses the pass tree in process().)
+        //
+        // realism-bug (2026-07-26): the undirected `byline_commitment_
+        // ticks` mechanism (`process()`, above) stopped the state machine
+        // from INTERRUPTING a committed run, but this function — the
+        // thing that actually decides which way the player moves — never
+        // checked it, only the explicit directive. So a "committed"
+        // player's decision-making correctly waited for the byline, but
+        // his real movement was still picked fresh every tick by
+        // `carry_candidates` below, which can legitimately favour cutting
+        // inside. Measured directly (a temporary outcome-tagged
+        // diagnostic across 30 matches): of runs that reached a genuine
+        // decision, only 39.6% ended in a cross, 35.7% in a shot, and
+        // 24.7% just expired (the run having drifted off the byline
+        // entirely) — exactly the "I see shots and cuts inside" pattern
+        // reported. Fixed by folding `byline_commitment_ticks > 0` into
+        // the same channel-steering branch the directive already uses —
+        // current position as the channel (there's no fixed start-
+        // position channel concept for undirected play, unlike the
+        // directive's own wide-slot assumption).
         if matches!(
             ctx.player.behavioral_directive,
             Some(BehavioralDirective::BylineAndCross | BehavioralDirective::StayWideNoCutInside)
-        ) {
+        ) || ctx.player.byline_commitment_ticks > 0
+        {
             let field_h = ctx.context.field_size.height as f32;
             let start_y = ctx.player.start_position.y;
             let y = ctx.player.position.y;

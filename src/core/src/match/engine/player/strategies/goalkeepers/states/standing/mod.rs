@@ -258,15 +258,31 @@ impl GoalkeeperStandingState {
         let distance_to_ball = goal_to_ball.magnitude();
 
         // Base distance from goal line (in meters/units)
-        let mut optimal_distance_from_goal = 10.0; // Start about 10 units from goal line
+        let mut optimal_distance_from_goal = 12.0; // Start about 12 units from goal line
 
         // Adjust based on ball position
         if ctx.ball().on_own_side() {
             // Ball on defensive half - position based on threat level
             let threat_distance = distance_to_ball.min(300.0) / 300.0; // Normalize to 0-1
 
-            // Closer ball = come out more (but not too far)
-            optimal_distance_from_goal += (1.0 - threat_distance) * 20.0 * command_of_area;
+            // realism-bug (2026-07-26): sourced GK sweeping doctrine
+            // (FBref "Sweeper" stats — themastermindsite.com's 2022-23
+            // ranking) puts elite sweeper-keepers' defensive actions at
+            // 15-20 yards (110-146u at this engine's 8u/m scale) from
+            // goal, shot-stoppers below ~15.5yd (113u); this coefficient
+            // was 20.0, capping even a max-skill keeper at ~30-43u total
+            // (measured: 0.00% of GK position samples across 30 fresh
+            // matches ever exceeded 100u, corner/FK/long-delivery
+            // response-window peaks averaged only 16-39u — see CLAUDE.md
+            // decisions log 2026-07-26). Raised to 100.0 so a genuinely
+            // close threat (a corner/cross/FK arriving in the box) lets
+            // a good keeper's rest position climb into the real 75-130u
+            // range instead of being structurally capped regardless of
+            // skill or threat. `clamp_to_penalty_area` below still
+            // hard-bounds this to the real box, so a weak keeper (low
+            // command_of_area/positioning) still stays correctly
+            // shallow — only the achievable CEILING moved.
+            optimal_distance_from_goal += (1.0 - threat_distance) * 100.0 * command_of_area;
 
             // Better positioning = more accurate placement
             optimal_distance_from_goal *= 0.8 + positioning_skill * 0.4;
@@ -296,15 +312,43 @@ impl GoalkeeperStandingState {
             // the keeper drifts toward a side that isn't actually open.
             let is_direct_fk = ctx.tick_context.ball.pass_origin_restart
                 == PassOriginRestart::DirectFreeKick;
-            let lateral_adjustment = if is_direct_fk && distance_to_ball <= 280.0 {
+            if is_direct_fk && distance_to_ball <= 280.0 {
                 const GK_FAR_POST_BIAS: f32 = 11.0;
                 let near_bias =
                     (ball_y_offset / (distance_to_ball.max(1.0) * 0.6)).clamp(-1.0, 1.0);
-                -near_bias * GK_FAR_POST_BIAS
+                new_position.y += -near_bias * GK_FAR_POST_BIAS;
             } else {
-                ball_y_offset * 0.2 * positioning_skill
-            };
-            new_position.y += lateral_adjustment;
+                // realism-bug (2026-07-25): sourced coaching doctrine
+                // (angle-bisection — "a line from the ball, through the
+                // keeper, to the centre of the goal") says the keeper's
+                // lateral offset should track the ANGLE from goal-centre
+                // to the ball, not a flat fraction of the ball's raw
+                // y-offset. `direction_to_ball.y` already IS that
+                // bisector angle (normalized) — the bug was applying a
+                // second, redundant, badly-scaled flat-offset term on
+                // top of it instead of using it directly. Measured
+                // baseline (25-match external position check): mean
+                // lateral deviation from centre only ~8-9 units (~1.1m)
+                // even with the ball well into the defensive third,
+                // because `optimal_distance_from_goal` (the OLD flat
+                // term's only real lever, via `positioning_skill`)
+                // collapses to a small base value except when the ball
+                // is genuinely close — so the flat term dominated and
+                // stayed tiny for most of a match. Fix: derive the
+                // lateral offset from `direction_to_ball.y` (the real
+                // bisector angle) at a fixed ANGLE_COVERAGE_DEPTH
+                // standing depth (100u, recalibrated from an initial 44u
+                // six-yard-box-equivalent value that externally measured
+                // as barely moving the realized lateral slope — see the
+                // decisions log entry for both calibration attempts),
+                // decoupled from the small, separately-threat-gated
+                // `optimal_distance_from_goal` used for forward
+                // advancement. Skill still modulates it (a poorly
+                // positioned keeper narrows the angle less precisely).
+                const ANGLE_COVERAGE_DEPTH: f32 = 100.0;
+                let skill_factor = 0.6 + positioning_skill * 0.4;
+                new_position.y = goal_center.y + direction_to_ball.y * ANGLE_COVERAGE_DEPTH * skill_factor;
+            }
 
             // Keep within penalty area
             self.clamp_to_penalty_area(ctx, new_position)

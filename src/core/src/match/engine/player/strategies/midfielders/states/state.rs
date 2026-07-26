@@ -1,11 +1,11 @@
 use crate::r#match::midfielders::states::{
     MidfielderAttackSupportingState, MidfielderCornerRunState, MidfielderCreatingSpaceState,
     MidfielderCrossingState, MidfielderDistanceShootingState, MidfielderDistributingState,
-    MidfielderDribblingState, MidfielderGuardingState, MidfielderInterceptingState,
-    MidfielderPassingState, MidfielderPressingState, MidfielderRestingState,
-    MidfielderReturningState, MidfielderRunningState, MidfielderShootingState,
-    MidfielderStandingState, MidfielderSwitchingPlayState, MidfielderTacklingState,
-    MidfielderTakeBallState, MidfielderWalkingState,
+    MidfielderDribblingState, MidfielderGuardingState, MidfielderHeadingState,
+    MidfielderInterceptingState, MidfielderPassingState, MidfielderPressingState,
+    MidfielderRestingState, MidfielderReturningState, MidfielderRunningState,
+    MidfielderShootingState, MidfielderStandingState, MidfielderSwitchingPlayState,
+    MidfielderTacklingState, MidfielderTakeBallState, MidfielderWalkingState,
 };
 use crate::r#match::{StateProcessingResult, StateProcessor};
 use std::fmt::Result;
@@ -33,6 +33,7 @@ pub enum MidfielderState {
     CreatingSpace,    // Creating space for teammates
     Guarding,         // Guarding an attacker — denying space and preventing them from getting open
     CornerRun,        // Running to an assigned zone during a corner set-piece
+    Heading,          // Heading the ball, from a corner/cross/FK-cross/long-ball aerial contest
 }
 
 pub struct MidfielderStrategies {}
@@ -95,6 +96,9 @@ impl MidfielderStrategies {
             MidfielderState::CornerRun => {
                 state_processor.process(MidfielderCornerRunState::default())
             }
+            MidfielderState::Heading => {
+                state_processor.process(MidfielderHeadingState::default())
+            }
         }
     }
 }
@@ -122,6 +126,7 @@ impl Display for MidfielderState {
             MidfielderState::CreatingSpace => write!(f, "Creating Space"),
             MidfielderState::Guarding => write!(f, "Guarding"),
             MidfielderState::CornerRun => write!(f, "Corner Run"),
+            MidfielderState::Heading => write!(f, "Heading"),
         }
     }
 }

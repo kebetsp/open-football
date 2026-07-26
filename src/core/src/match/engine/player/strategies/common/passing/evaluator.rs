@@ -477,18 +477,61 @@ impl PassEvaluator {
             let base_penalty = forward_progress * 3.0 * (1.0 - composure_reduction).max(0.5);
             let phase_adjusted = base_penalty * phase_backward_mult * risk_backward_bias;
             if is_defender {
-                // Defenders: residual backward penalty — even in build-up
-                // we don't want CBs hoof-ing back into pressure for fun.
-                // The phase factor already eased the penalty, so the 1.5x
-                // multiplier still holds shape but on a softer base.
-                phase_adjusted * 1.5
+                // Realism-bug 2026-07-26 (passing follow-up): this ×1.5
+                // previously applied UNCONDITIONALLY — but its own
+                // comment's stated intent ("we don't want CBs hoof-ing
+                // back into pressure for fun") is specifically about a
+                // pressured backward hoof, not calm circulation among an
+                // unpressed back four, which real CBs do constantly.
+                // Measured against real StatsBomb data: CB forward-share
+                // ran 89-91% engine vs a real 62.8% — this unconditional
+                // penalty (stacked with the forward side's own 3.0x
+                // multiplier above) is a plausible direct contributor,
+                // since it made ANY backward option score worse than a
+                // pressured-hoof would deserve even when nothing forced
+                // it. Gated on genuine nearby pressure so the original
+                // intent still holds under press; a calm, unpressed
+                // sideways/backward circulation pass no longer pays the
+                // extra penalty on top of the base backward penalty
+                // every position already carries.
+                let under_press = ctx.players().opponents().nearby(15.0).next().is_some();
+                if under_press {
+                    phase_adjusted * 1.5
+                } else {
+                    phase_adjusted
+                }
             } else {
                 phase_adjusted
             }
         } else {
             // Forward pass - strong reward, especially in transition.
+            // /goal 2026-07-26 (passing realism, full-latitude experiment):
+            // three independent narrow, additive levers (pressure-gated
+            // backward penalty, forward_width_bonus at two magnitudes,
+            // turnover-risk-by-location) each measured a limited-to-zero
+            // effect on CB forward-share (stuck 87-91% vs a real 62.8%)
+            // — diagnosed as structural: those fixes all landed inside
+            // WEIGHTED terms (width_bonus*0.22, promoted_pass_value*0.15)
+            // while this 3.0x multiplier competes directly against them
+            // unweighted-equivalent at the top of the sum. Reduced to 2.6
+            // — still a genuine premium over the non-defender 2.5 (a
+            // real defender's progressive pass IS somewhat more valued
+            // than a winger's routine one), but no longer the dominant,
+            // hard-to-outweigh term it was at 3.0. Explicit Pavel sign-off
+            // to touch this shared constant this session, unlike the
+            // additive-only fixes earlier.
             if is_defender {
-                forward_progress * 3.0 * phase_forward_mult * risk_forward_bias
+                // /goal 2026-07-26: a further push to 2.2 (from 2.6) +
+                // larger width bonuses (below) was tried and REVERTED —
+                // measured CB center-destination move the WRONG way
+                // (44%→51%), contradicting the expected direction. Given
+                // the ~550-sample-per-position batch size implies a ~7pp
+                // standard error at this proportion, that regression is
+                // not clearly distinguishable from noise either way —
+                // logged honestly rather than chased further with more
+                // expensive re-batching. Held at 2.6, the last value with
+                // a consistent (if partial) measured improvement.
+                forward_progress * 2.6 * phase_forward_mult * risk_forward_bias
             } else {
                 forward_progress * 2.5 * phase_forward_mult * risk_forward_bias
             }
@@ -552,6 +595,46 @@ impl PassEvaluator {
             0.0
         };
 
+        // Realism-bug 2026-07-26 (passing follow-up), REWRITTEN under
+        // /goal full-latitude experiment: `defender_width_bonus` and
+        // `forward_width_bonus` originally lived inside `width_bonus`
+        // (routed through this term's own outer ×0.22 weight below) —
+        // measured as too diluted to matter: a 0.15 raw bonus nets only
+        // ~0.033 of actual tactical_value, while the UNWEIGHTED central-
+        // pull terms these positions actually compete against
+        // (`cutback_bonus` 0.30-0.50, the defender forward multiplier
+        // above) operate at 10-15× that scale. Rather than keep raising
+        // a diluted term, these two are now computed here but added
+        // DIRECTLY to `tactical_value` (below, alongside cutback_bonus/
+        // arriving_runner_bonus) at a magnitude in that same unweighted
+        // family — a fair fight instead of a diluted one.
+        // `midfielder_width_bonus` above is deliberately left as-is
+        // inside `width_bonus` — CM/WIDE already matched real StatsBomb
+        // data closely at that magnitude, so it isn't touched.
+        // /goal 2026-07-26: a push to 0.42 (from 0.28) was tried
+        // alongside the multiplier change above and reverted together —
+        // see that comment for the measured (noise-level, wrong-
+        // direction) result. Held at 0.28, the last value with a
+        // consistent measured improvement.
+        let defender_width_bonus_unweighted = if is_defender && receiver_width_ratio > 0.4 {
+            0.28
+        } else {
+            0.0
+        };
+        let is_forward = ctx
+            .player
+            .tactical_position
+            .current_position
+            .position_group()
+            == PlayerFieldPositionGroup::Forward;
+        // /goal 2026-07-26: a push to 0.38 (from 0.28) was tried and
+        // reverted alongside the two changes above — held at 0.28.
+        let forward_width_bonus_unweighted = if is_forward && receiver_width_ratio > 0.4 {
+            0.28
+        } else {
+            0.0
+        };
+
         let width_bonus = if receiver_width_ratio > 0.7 {
             // Very wide (near touchline) - excellent for stretching play
             0.5 + spreading_play_bonus + midfielder_width_bonus
@@ -567,9 +650,26 @@ impl PassEvaluator {
         };
 
         // === SWITCHING PLAY BONUS ===
-        // Reward passes that switch the play from one side to the other
+        // Reward passes that switch the play from one side to the other.
+        // /goal 2026-07-26 (passing realism, full-latitude experiment):
+        // found while chasing the CB center-destination gap. This only
+        // ever checked the MAGNITUDE of lateral displacement from the
+        // PASSER's own position — a CB standing wide-right passing to a
+        // dead-CENTRAL midfielder far in y from the CB's own position
+        // satisfied `lateral_change > field_height*0.3` and collected
+        // this bonus (up to 0.70 raw, capped into switch_total at 0.45
+        // — bigger than `defender_width_bonus_unweighted`'s 0.28) even
+        // though the pass didn't switch the play to a wide area at all;
+        // it just moved centrally from a wide starting point. A genuine
+        // "switch of play" changes which SIDE the ball is on — it
+        // requires the ball to actually END UP wide, not merely to have
+        // travelled far in y. Added `receiver_width_ratio > 0.5` (the
+        // same "wide areas" threshold `width_bonus` itself already uses
+        // two tiers up) so this only fires for an actual switch, not any
+        // large central recycle from a wide starting position.
         let lateral_change = (receiver_position.y - passer_position.y).abs();
-        let is_switching_play = lateral_change > field_height * 0.3; // Significant lateral movement
+        let is_switching_play =
+            lateral_change > field_height * 0.3 && receiver_width_ratio > 0.5;
 
         let switch_play_bonus = if is_switching_play {
             let vision_skill = ctx.player.skills.mental.vision / 20.0;
@@ -701,25 +801,40 @@ impl PassEvaluator {
                 receiver.tactical_positions.position_group(),
                 PlayerFieldPositionGroup::Goalkeeper
             );
-        let build_up_recycle_bonus = if matches!(phase, GamePhase::BuildUp)
+        // /goal 2026-07-26 (passing realism, full-latitude experiment):
+        // this bonus previously required `under_press || patient` to
+        // fire AT ALL — meaning a perfectly normal, calm CB-to-CB or
+        // CB-to-DM square ball (holding shape, no panic, no explicit
+        // "patient" flag) earned ZERO positive credit, only whatever
+        // was left after the backward-pass penalty. Measured effect:
+        // even with that penalty pressure-gated (2026-07-26 fix above)
+        // and defenders given their own width incentive, CB forward-
+        // share stayed stuck at 87-92% against a real 62.8% — real
+        // defensive circulation needed its OWN positive value, not
+        // just a smaller penalty. Two changes: (1) phase gate widened
+        // to also cover `Progression` — real backline circulation is
+        // not exclusive to the engine's narrow `BuildUp` classification;
+        // (2) the `under_press || patient` requirement now only decides
+        // the BONUS on top of a 0.12 floor that always applies to a
+        // genuine short recycle pass to a defensive outlet, matching
+        // this bonus's own comment ("a healthy modern pattern, not a
+        // panic option") — panic-free circulation shouldn't need to be
+        // flagged "patient" or "under press" to be worth anything.
+        let build_up_recycle_bonus = if matches!(phase, GamePhase::BuildUp | GamePhase::Progression)
             && pass_distance >= 12.0
             && pass_distance <= 65.0
             && receiver_is_recycle_target
         {
             let under_press = ctx.players().opponents().nearby(12.0).next().is_some();
             let patient = ctx.team().build_up_patience() > 0.65;
-            if under_press || patient {
-                let mut bonus: f32 = 0.15;
-                if under_press {
-                    bonus += 0.15;
-                }
-                if patient {
-                    bonus += 0.10;
-                }
-                bonus.clamp(0.15, 0.40)
-            } else {
-                0.0
+            let mut bonus: f32 = 0.12;
+            if under_press {
+                bonus += 0.15;
             }
+            if patient {
+                bonus += 0.10;
+            }
+            bonus.clamp(0.12, 0.40)
         } else {
             0.0
         };
@@ -904,6 +1019,8 @@ impl PassEvaluator {
             switch_total +                   // Capped flat: classic + underload ≤ 0.45
             cutback_bonus +
             arriving_runner_bonus +
+            defender_width_bonus_unweighted + // /goal 2026-07-26: flat, same family as cutback_bonus
+            forward_width_bonus_unweighted +  // /goal 2026-07-26: flat, same family as cutback_bonus
             build_up_recycle_bonus +
             stalled_recycle_bonus +
             counter_first_pass_bonus +

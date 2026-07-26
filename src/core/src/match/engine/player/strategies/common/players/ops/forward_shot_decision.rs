@@ -87,6 +87,26 @@ pub mod mid_run_diag {
     /// was dropped on their head. WON>0 + DEF_CORNER_HEADER=0 ⇒ the winner
     /// isn't heading the planted ball.
     pub static CORNER_CONTEST_WON: AtomicU64 = AtomicU64::new(0);
+    /// Realism-bug 2026-07-26: corner-contest wins by position category —
+    /// checks whether the winner's own state machine can actually strike
+    /// a dropped aerial ball (Forward: ForwardHeadingState exists;
+    /// Defender: DefenderState::AttackingCorner exists; Midfielder: NO
+    /// heading state exists in MidfielderState at all).
+    pub static CORNER_WINNER_FWD: AtomicU64 = AtomicU64::new(0);
+    pub static CORNER_WINNER_MID: AtomicU64 = AtomicU64::new(0);
+    pub static CORNER_WINNER_DEF: AtomicU64 = AtomicU64::new(0);
+    /// Follow-up 2026-07-26: does the corner-header fix's underlying
+    /// problem (state machine never notices a dropped/incoming aerial
+    /// ball) also affect OPEN-PLAY crosses, which never touch
+    /// `resolve_corner_contest` at all (corner-only gated)? Splits every
+    /// `FWD_HEADING_ON_GOAL` header shot by which `ForwardHeadingState`
+    /// branch fired it.
+    pub static FWD_HEADING_CORNER_BRANCH: AtomicU64 = AtomicU64::new(0);
+    pub static FWD_HEADING_OPENPLAY_BRANCH: AtomicU64 = AtomicU64::new(0);
+    /// Every tick `ForwardHeadingState::process` runs at all (any entry,
+    /// corner or open-play, any outcome) — tells us whether forwards ever
+    /// even reach the heading state during open-play crosses.
+    pub static FWD_HEADING_STATE_ENTRIES: AtomicU64 = AtomicU64::new(0);
     /// Times the shot-BLOCK "deflect out for a corner" branch fired.
     pub static BLOCK_CORNER_FIRED: AtomicU64 = AtomicU64::new(0);
     /// Times the keeper SAFE-PARRY "palm wide for a corner" branch fired.
@@ -112,6 +132,12 @@ pub mod mid_run_diag {
             &CORNER_CONTEST_SEEN,
             &CORNER_CONTEST_FIRED,
             &CORNER_CONTEST_WON,
+            &CORNER_WINNER_FWD,
+            &CORNER_WINNER_MID,
+            &CORNER_WINNER_DEF,
+            &FWD_HEADING_CORNER_BRANCH,
+            &FWD_HEADING_OPENPLAY_BRANCH,
+            &FWD_HEADING_STATE_ENTRIES,
             &BLOCK_CORNER_FIRED,
             &SAVE_PARRY_FIRED,
             &PENALTY_AWARDED,

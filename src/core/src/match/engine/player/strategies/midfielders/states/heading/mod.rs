@@ -1,6 +1,6 @@
 use crate::r#match::events::Event;
-use crate::r#match::forwarders::states::ForwardState;
-use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondition};
+use crate::r#match::midfielders::states::MidfielderState;
+use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
 use crate::r#match::player::events::{PlayerEvent, ShootingEventContext};
 use crate::r#match::player::strategies::common::passing::resolve_aerial_duel;
 use crate::r#match::player::strategies::players::ShotType;
@@ -14,70 +14,59 @@ use std::cmp::Ordering;
 const HEADING_HEIGHT_THRESHOLD: f32 = 1.5;
 const HEADING_DISTANCE_THRESHOLD: f32 = 4.0;
 
+/// Realism-bug 2026-07-26 follow-up: midfielders had no heading state at
+/// all — a midfielder who won an aerial duel (corner, cross, free-kick
+/// cross, long ball) had no code path to strike the ball, so it fell
+/// through to ordinary grounded possession logic instead ("controls the
+/// ball instead of heading it" on a ball that structurally can't be
+/// controlled). This mirrors `ForwardHeadingState` — same skills-driven
+/// duel + contact model, same corner-contest carve-out.
 #[derive(Default, Clone)]
-pub struct ForwardHeadingState {}
+pub struct MidfielderHeadingState {}
 
-impl StateProcessingHandler for ForwardHeadingState {
+impl StateProcessingHandler for MidfielderHeadingState {
     fn process(&self, ctx: &StateProcessingContext) -> Option<StateChangeResult> {
-        #[cfg(feature = "match-logs")]
-        {
-            use crate::r#match::player::strategies::players::ops::forward_shot_decision::mid_run_diag::FWD_HEADING_STATE_ENTRIES;
-            use std::sync::atomic::Ordering;
-            FWD_HEADING_STATE_ENTRIES.fetch_add(1, Ordering::Relaxed);
-        }
         let ball_position = ctx.tick_context.positions.ball.position;
 
-        // Ball too far — transition back to running
         if ctx.ball().distance() > HEADING_DISTANCE_THRESHOLD {
-            return Some(StateChangeResult::with_forward_state(ForwardState::Running));
+            return Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Running,
+            ));
         }
 
-        // Ball too low to head — transition to running
         if ball_position.z < HEADING_HEIGHT_THRESHOLD {
-            return Some(StateChangeResult::with_forward_state(ForwardState::Running));
+            return Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Running,
+            ));
         }
 
-        // Corner-contest carve-out: when the discrete corner aerial
-        // contest (engine `resolve_corner_contest`) has ALREADY decided
-        // this player won the jump and dropped the ball on their head,
-        // rolling a second full aerial duel here is double jeopardy —
-        // the same bug the CB AttackingCorner state documents and fixes
-        // with a clean-contact floor (0.62-0.95). Mirror that fix:
-        // contact-only roll, with the header's accuracy still graded by
-        // the shooting pipeline. Open-play crosses (no corner origin)
-        // keep the full duel below — there, no upstream contest decided
-        // anything.
+        // Discrete aerial-contest carve-out (corner or the general
+        // cross/FK-cross/long-ball resolver): the contest already
+        // decided this player won the jump — a clean-contact-only roll,
+        // same formula as the forward/defender equivalents.
         if ctx.ball().is_team_attacking_corner() || ctx.player.aerial_contest_won > 0 {
             let heading = ctx.player.skills.technical.heading / 20.0;
             let jumping = ctx.player.skills.physical.jumping / 20.0;
             let p = (0.62 + (heading + jumping) * 0.5 * 0.30).clamp(0.55, 0.95);
             return if ctx.context.rng.unit_f32() < p {
-                #[cfg(feature = "match-logs")]
-                {
-                    use crate::r#match::player::strategies::players::ops::forward_shot_decision::mid_run_diag::FWD_HEADING_CORNER_BRANCH;
-                    use std::sync::atomic::Ordering;
-                    FWD_HEADING_CORNER_BRANCH.fetch_add(1, Ordering::Relaxed);
-                }
-                Some(StateChangeResult::with_forward_state_and_event(
-                    ForwardState::Running,
+                Some(StateChangeResult::with_midfielder_state_and_event(
+                    MidfielderState::Running,
                     Event::PlayerEvent(PlayerEvent::Shoot(
                         ShootingEventContext::new()
                             .with_player_id(ctx.player.id)
                             .with_target(ctx.player().shooting_direction())
-                            .with_reason("FWD_HEADING_ON_GOAL")
+                            .with_reason("MID_HEADING_ON_GOAL")
                             .with_shot_type(ShotType::Header)
                             .build(ctx),
                     )),
                 ))
             } else {
-                Some(StateChangeResult::with_forward_state(ForwardState::Running))
+                Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::Running,
+                ))
             };
         }
 
-        // Aerial duel against the closest defender first — losing the
-        // duel means no header attempt at all. Goalkeepers handle their
-        // own claim/punch in the GK state machine; we only resolve
-        // outfield markers here.
         let attacker_full = ctx.context.players.by_id(ctx.player.id);
         let defender_full = ctx
             .players()
@@ -104,33 +93,27 @@ impl StateProcessingHandler for ForwardHeadingState {
         };
 
         if !won_duel {
-            return Some(StateChangeResult::with_forward_state(ForwardState::Running));
+            return Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Running,
+            ));
         }
 
-        // Attempt the header — combine duel win with skill execution.
         if self.attempt_heading(ctx) {
-            // Success — shoot toward opponent goal, marked as a Header
-            // for downstream xG.
-            #[cfg(feature = "match-logs")]
-            {
-                use crate::r#match::player::strategies::players::ops::forward_shot_decision::mid_run_diag::FWD_HEADING_OPENPLAY_BRANCH;
-                use std::sync::atomic::Ordering;
-                FWD_HEADING_OPENPLAY_BRANCH.fetch_add(1, Ordering::Relaxed);
-            }
-            Some(StateChangeResult::with_forward_state_and_event(
-                ForwardState::Running,
+            Some(StateChangeResult::with_midfielder_state_and_event(
+                MidfielderState::Running,
                 Event::PlayerEvent(PlayerEvent::Shoot(
                     ShootingEventContext::new()
                         .with_player_id(ctx.player.id)
                         .with_target(ctx.player().shooting_direction())
-                        .with_reason("FWD_HEADING_ON_GOAL")
+                        .with_reason("MID_HEADING_ON_GOAL")
                         .with_shot_type(ShotType::Header)
                         .build(ctx),
                 )),
             ))
         } else {
-            // Failed header — transition to running
-            Some(StateChangeResult::with_forward_state(ForwardState::Running))
+            Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Running,
+            ))
         }
     }
 
@@ -147,13 +130,11 @@ impl StateProcessingHandler for ForwardHeadingState {
     }
 
     fn process_conditions(&self, ctx: ConditionContext) {
-        // Heading is very high intensity - explosive jumping action
-        ForwardCondition::new(ActivityIntensity::VeryHigh).process(ctx);
+        MidfielderCondition::new(ActivityIntensity::VeryHigh).process(ctx);
     }
 }
 
-impl ForwardHeadingState {
-    /// Determines if the forward successfully heads the ball based on skills and random chance.
+impl MidfielderHeadingState {
     fn attempt_heading(&self, ctx: &StateProcessingContext) -> bool {
         let heading_skill = ctx.player.skills.technical.heading / 20.0;
         let jumping_skill = ctx.player.skills.physical.jumping / 20.0;

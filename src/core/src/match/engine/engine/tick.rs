@@ -83,6 +83,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         Self::resolve_penalty_kick(field, context);
         Self::resolve_free_kick(field, context, match_data);
         Self::resolve_corner_contest(field, context);
+        Self::resolve_aerial_contest(field, context);
         // Resolve any deferred-foul / advantage state. Cheap (one
         // Option read in the dominant no-advantage case) so we run it
         // every full tick rather than waiting for the next event.
@@ -938,9 +939,12 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             }
             let is_gk = p.tactical_position.current_position.is_goalkeeper();
             if p.team_id == att_team {
-                if is_gk {
-                    continue;
-                }
+                // Realism-bug 2026-07-26: a GK genuinely pushed forward
+                // for a late corner (gk_up_after_minute) is a real, if
+                // rare, candidate — don't exclude by role. His own
+                // heading/jumping skills are typically low, so
+                // `aerial_outfield_attacker` naturally scores him behind
+                // any genuine outfield attacker without special-casing.
                 let s = sc::aerial_outfield_attacker(p, minute);
                 if best_att.map_or(true, |(_, bs)| s > bs) {
                     best_att = Some((i, s));
@@ -971,6 +975,83 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         if context.rng.bernoulli(att_win) {
             #[cfg(feature = "match-logs")]
             crate::mid_run_diag::CORNER_CONTEST_WON.fetch_add(1, Ordering::Relaxed);
+            // Realism-bug 2026-07-26: classify the winner by position group.
+            // MidfielderState has no Heading variant at all (confirmed by
+            // reading the enum) — if a midfielder wins here, the dropped
+            // ball has no state-machine path to a header.
+            #[cfg(feature = "match-logs")]
+            {
+                use crate::club::player::ability::position::PlayerFieldPositionGroup;
+                let winner = &field.players[att_idx];
+                match winner.tactical_position.current_position.position_group() {
+                    PlayerFieldPositionGroup::Forward => {
+                        crate::mid_run_diag::CORNER_WINNER_FWD.fetch_add(1, Ordering::Relaxed);
+                    }
+                    PlayerFieldPositionGroup::Midfielder => {
+                        crate::mid_run_diag::CORNER_WINNER_MID.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {
+                        crate::mid_run_diag::CORNER_WINNER_DEF.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+            // Realism-bug 2026-07-26 (one-touch shots / corner headers):
+            // measured 0/389 header shots fired across a 15-match sample
+            // despite 24 contest wins over 41 matches — the winner's
+            // ambient state (ForwardCornerRunState has no exit into
+            // Heading at all; a defender may not yet be in
+            // AttackingCorner) routinely never notices the dropped ball
+            // before it's picked up as an ordinary loose-ball claim,
+            // which then runs through the full grounded on-ball
+            // shot-decision waterfall instead of heading it — exactly
+            // "tries to control the ball instead of shooting" on a ball
+            // that structurally cannot be controlled. The contest has
+            // ALREADY decided this player wins the header; force the
+            // state transition directly instead of hoping the per-tick
+            // priority ordering picks it up before the ball drifts.
+            // Follow-up (same day): "any player including GK" — midfielders
+            // now have a real `MidfielderState::Heading` (mirrors the
+            // forward's), and a GK genuinely pushed up for a late corner
+            // (gk_up_after_minute) reuses the already-existing
+            // `GoalkeeperState::Shooting` (fires on `has_ball`, no header
+            // duel of its own) by handing him direct ownership for this
+            // one synthetic contact — the contest has already decided he
+            // won it, so there is no separate GK aerial-duel model to
+            // reuse the way Forward/Defender/Midfielder have one.
+            {
+                use crate::club::player::ability::position::PlayerFieldPositionGroup;
+                use crate::r#match::defenders::states::DefenderState;
+                use crate::r#match::forwarders::states::ForwardState;
+                use crate::r#match::goalkeepers::states::state::GoalkeeperState;
+                use crate::r#match::midfielders::states::MidfielderState;
+                use crate::r#match::player::state::PlayerState;
+                let winner_pos = field.players[att_idx].position;
+                let winner_id = field.players[att_idx].id;
+                let winner = &mut field.players[att_idx];
+                match winner
+                    .tactical_position
+                    .current_position
+                    .position_group()
+                {
+                    PlayerFieldPositionGroup::Forward => {
+                        winner.state = PlayerState::Forward(ForwardState::Heading);
+                    }
+                    PlayerFieldPositionGroup::Midfielder => {
+                        winner.state = PlayerState::Midfielder(MidfielderState::Heading);
+                    }
+                    PlayerFieldPositionGroup::Defender => {
+                        winner.state = PlayerState::Defender(DefenderState::AttackingCorner);
+                    }
+                    PlayerFieldPositionGroup::Goalkeeper => {
+                        winner.state = PlayerState::Goalkeeper(GoalkeeperState::Shooting);
+                        field.ball.position =
+                            Vector3::new(winner_pos.x, winner_pos.y, 0.3);
+                        field.ball.velocity = Vector3::zeros();
+                        field.ball.current_owner = Some(winner_id);
+                        field.ball.flags.in_flight_state = 0;
+                    }
+                }
+            }
             // Attacker wins: drop the ball just behind them at head height,
             // moving goalward, so it reads as an incoming header to their
             // state (the CB's AttackingCorner, or a forward's run→heading).
@@ -1036,6 +1117,178 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         }
 
         field.ball.corner_contest_resolved = true;
+    }
+
+    /// Realism-bug 2026-07-26 follow-up: generalizes `resolve_corner_contest`
+    /// to every OTHER airborne delivery into a box — open-play crosses,
+    /// free-kick crosses, long high passes, goal-kick punts. Corners keep
+    /// their own dedicated resolver above (proven, untouched); this one
+    /// explicitly skips corner deliveries to avoid double-firing on the
+    /// same ball. Same skill-weighted contest as the corner version, same
+    /// "force the winner's state directly" fix — the root cause measured
+    /// for corners (0/389 header shots despite 24 contest wins: the
+    /// receiver's ambient state never notices a dropped aerial ball) is
+    /// not corner-specific machinery, it's true of every position's
+    /// state machine for any aerial delivery.
+    pub(super) fn resolve_aerial_contest(field: &mut MatchField, context: &mut MatchContext) {
+        use crate::club::player::ability::position::PlayerFieldPositionGroup;
+        use crate::r#match::PassOriginRestart;
+        use crate::r#match::defenders::states::DefenderState;
+        use crate::r#match::forwarders::states::ForwardState;
+        use crate::r#match::goalkeepers::states::state::GoalkeeperState;
+        use crate::r#match::midfielders::states::MidfielderState;
+        use crate::r#match::player::state::PlayerState;
+        use crate::r#match::PlayerSide;
+        use nalgebra::Vector3;
+
+        const COOLDOWN_TICKS: u64 = 60; // ~600ms — one contest per genuine delivery
+        const CONTEST_RADIUS: f32 = 135.0; // same box-radius as the corner resolver
+
+        let ball = &field.ball;
+        // Corners have their own dedicated resolver — don't double-fire.
+        if ball.pass_origin_restart == PassOriginRestart::Corner {
+            return;
+        }
+        if ball.current_owner.is_some() || ball.position.z < 2.0 {
+            return;
+        }
+        let tick = context.current_tick();
+        if tick.saturating_sub(ball.last_aerial_contest_tick) < COOLDOWN_TICKS {
+            return;
+        }
+
+        // Attacking team = whoever delivered the ball. `previous_owner` is
+        // cleared mid-flight on long deliveries — fall back to
+        // `pass_origin_team`, same reasoning as `record_team_possession_if_switch`.
+        let deliverer = ball
+            .previous_owner
+            .and_then(|pid| field.players.iter().find(|p| p.id == pid))
+            .or_else(|| {
+                ball.pass_origin_team
+                    .and_then(|team| field.players.iter().find(|p| p.team_id == team))
+            });
+        let (att_team, att_side) = match deliverer {
+            Some(p) => (p.team_id, p.side),
+            None => {
+                field.ball.last_aerial_contest_tick = tick;
+                return;
+            }
+        };
+
+        // The goal the DELIVERING team attacks — NOT "whichever goal is
+        // geometrically nearest the ball right now". A goal kick or a
+        // defensive clearance is also airborne, but near the KICKING
+        // team's OWN goal; using nearest-goal-to-ball there would treat
+        // the kicking team (their own GK included) as "attacking" their
+        // own box. Corners are exempt from this bug (the corner resolver
+        // above already only ever fires right next to the actual
+        // attacked goal by construction of the restart itself), but this
+        // general resolver covers every airborne ball on the pitch and
+        // needs the real attacking-direction check.
+        let attacked_goal = match att_side {
+            Some(PlayerSide::Left) => context.goal_positions.right,
+            Some(PlayerSide::Right) => context.goal_positions.left,
+            None => return,
+        };
+        let ball_pos = ball.position;
+        // Only contest deliveries genuinely near the goal being attacked
+        // — a routine long pass at midfield, or a goal kick played out of
+        // the kicker's own box, isn't a heading duel.
+        if (ball_pos - attacked_goal).magnitude() > CONTEST_RADIUS {
+            return;
+        }
+
+        let minute = (context.total_match_time / 60_000) as u32;
+        let mut best_att: Option<(usize, f32)> = None;
+        let mut best_def_score = 0.40_f32;
+        let mut gk_command = 0.35_f32;
+        for (i, p) in field.players.iter().enumerate() {
+            if (p.position - attacked_goal).magnitude() > CONTEST_RADIUS {
+                continue;
+            }
+            let is_gk = p.tactical_position.current_position.is_goalkeeper();
+            if p.team_id == att_team {
+                let s = sc::aerial_outfield_attacker(p, minute);
+                if best_att.map_or(true, |(_, bs)| s > bs) {
+                    best_att = Some((i, s));
+                }
+            } else if is_gk {
+                gk_command = (p.skills.goalkeeping.command_of_area * 0.6
+                    + p.skills.goalkeeping.aerial_reach * 0.4)
+                    / 20.0;
+            } else {
+                let s = sc::aerial_outfield_defender(p, minute);
+                if s > best_def_score {
+                    best_def_score = s;
+                }
+            }
+        }
+
+        field.ball.last_aerial_contest_tick = tick;
+
+        let (att_idx, att_score) = match best_att {
+            Some(v) => v,
+            None => return,
+        };
+
+        let att_win =
+            (0.36 + (att_score - best_def_score) * 0.50 - gk_command * 0.18).clamp(0.10, 0.62);
+
+        if !context.rng.bernoulli(att_win) {
+            // Keeper claims / defender clears — the realistic majority.
+            return;
+        }
+
+        let winner_pos = field.players[att_idx].position;
+        let winner_id = field.players[att_idx].id;
+        let to_goal = attacked_goal - winner_pos;
+        let dir = if to_goal.magnitude() > 0.01 {
+            to_goal.normalize()
+        } else {
+            Vector3::new(1.0, 0.0, 0.0)
+        };
+
+        let group = field.players[att_idx]
+            .tactical_position
+            .current_position
+            .position_group();
+        match group {
+            PlayerFieldPositionGroup::Goalkeeper => {
+                field.players[att_idx].state = PlayerState::Goalkeeper(GoalkeeperState::Shooting);
+                field.ball.position = Vector3::new(winner_pos.x, winner_pos.y, 0.3);
+                field.ball.velocity = Vector3::zeros();
+                field.ball.current_owner = Some(winner_id);
+                field.ball.flags.in_flight_state = 0;
+            }
+            _ => {
+                // Drop the ball at head height (same kinematics as the
+                // corner resolver) and mark the win so the receiving
+                // state's carve-out fires a contact-only roll instead of
+                // re-running a full duel.
+                field.ball.position =
+                    Vector3::new(winner_pos.x - dir.x * 2.0, winner_pos.y - dir.y * 2.0, 2.55);
+                field.ball.velocity = Vector3::new(dir.x * 1.8, dir.y * 1.8, -0.35);
+                field.ball.current_owner = None;
+                field.ball.previous_owner = Some(winner_id);
+                field.ball.flags.in_flight_state = 1;
+                let winner = &mut field.players[att_idx];
+                winner.aerial_contest_won = 5; // ~50ms window, consumed same/next tick
+                match group {
+                    PlayerFieldPositionGroup::Forward => {
+                        winner.state = PlayerState::Forward(ForwardState::Heading);
+                    }
+                    PlayerFieldPositionGroup::Midfielder => {
+                        winner.state = PlayerState::Midfielder(MidfielderState::Heading);
+                    }
+                    PlayerFieldPositionGroup::Defender => {
+                        winner.state = PlayerState::Defender(DefenderState::AttackingCorner);
+                    }
+                    PlayerFieldPositionGroup::Goalkeeper => unreachable!(),
+                }
+            }
+        }
+        field.ball.pass_target_player_id = None;
+        field.ball.clear_pending_pass_metadata();
     }
 
     /// Consume `Ball::pending_save_credit` left behind by the physics

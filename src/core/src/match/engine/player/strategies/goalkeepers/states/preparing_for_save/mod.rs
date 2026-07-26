@@ -133,10 +133,42 @@ impl StateProcessingHandler for GoalkeeperPreparingForSaveState {
         let prediction_time = 0.2 + prof.shot_stopping * 0.4;
         let predicted_ball = ball_position + ball_velocity * prediction_time;
         let goal_to_predicted = predicted_ball - goal_pos;
+        // realism-bug (2026-07-26): this is the REAL mechanism behind
+        // "GK stays on his line for crosses/corners/FKs/long balls" —
+        // raw match-log tracing (GKSTATEDIAG state-entry diagnostic)
+        // showed the GK enters PreparingForSave (not Standing) within
+        // one tick of almost any airborne delivery arcing generally
+        // toward goal (is_ball_toward_goal's dot>0.5 gate), and — since
+        // a cross/corner/long-ball is dispatched as a PassTo, never a
+        // Shoot — `cached_shot_target` is None, routing every one of
+        // them through THIS fallback branch, whose own comment already
+        // says it covers "slow ball / through ball / loose ball". The
+        // old ceiling (max ~21-32u) was calibrated for genuine
+        // shot-stopping (narrow the angle, stay close), not for a
+        // lofted delivery landing 80-130u out (sourced FBref sweeper
+        // doctrine, see the Standing-state fix's comment for citations
+        // and the 30-match baseline: 0.00% of GK samples ever exceeded
+        // 100u). Raised so a good keeper can close on a genuinely
+        // distant delivery; `.min(ball_distance * 0.5)` below is the
+        // existing safety valve — it still clamps hard when the ball
+        // is genuinely close (real shot-stopping range), since a small
+        // ball_distance makes that term the binding constraint
+        // regardless of this ceiling.
+        // realism-bug (2026-07-26) recalibration: the first pass above
+        // assumed shot_stopping/dive_reach commonly reach toward 1.0,
+        // but a raw PFSDIAG trace (ball_dist/intercept_dist/target_depth
+        // logged directly) showed real generated keepers typically sit
+        // at shot_stopping~0.05-0.52, dive_reach~0.26-0.53 — the old
+        // 70/25 (fast) and 80/30 (slow) coefficients therefore produced
+        // a ceiling of only ~25-78u even for the better-skilled keepers
+        // observed, still short of the sourced 75-130u target. Rescaled
+        // so a decent keeper (ss/dr~0.5, near the top of what's actually
+        // generated) reaches ~110-140u, while a weak keeper (~0.1) still
+        // shows modest, non-zero engagement (~40-50u) rather than none.
         let intercept_distance = if ball_speed > 1.2 {
-            10.0 + prof.shot_stopping * 8.0 + prof.dive_reach * 3.0
+            20.0 + prof.shot_stopping * 140.0 + prof.dive_reach * 60.0
         } else {
-            18.0 + prof.shot_stopping * 10.0 + prof.dive_reach * 4.0
+            25.0 + prof.shot_stopping * 160.0 + prof.dive_reach * 70.0
         };
         let target = if goal_to_predicted.norm() > 1.0 {
             goal_pos + goal_to_predicted.normalize() * intercept_distance.min(ball_distance * 0.5)

@@ -387,12 +387,51 @@ pub fn carry_candidates(ctx: &StateProcessingContext) -> (Vector3<f32>, f32) {
     let field_width = ctx.context.field_size.width as f32;
     let field_height = ctx.context.field_size.height as f32;
 
-    let mut candidates: Vec<Vector3<f32>> = Vec::with_capacity(16);
+    let mut candidates: Vec<Vector3<f32>> = Vec::with_capacity(18);
     candidates.push(player_pos); // "hold" candidate — current position
     for &fwd_frac in &[0.3, 0.6, 1.0] {
         for &lat_frac in &[-1.0, -0.5, 0.0, 0.5, 1.0] {
             let candidate = player_pos + forward * (reach * fwd_frac) + lateral * (reach * lat_frac);
             candidates.push(candidate);
+        }
+    }
+
+    // realism-bug (2026-07-25): `forward` points at the OPPONENT GOAL
+    // CENTER, so for a wide-channel carrier every candidate above is
+    // biased toward cutting infield (`forward` itself pulls diagonally
+    // inward for anyone starting wide) — there was never a candidate
+    // representing "keep hugging the touchline and advance straight
+    // toward the byline/corner," the actual real-football pattern this
+    // was supposed to enable. Measured baseline (25-match external
+    // position check): ~0.04 genuine byline-reaching carries per match
+    // in default/undirected play. Sourced target: no public stat
+    // isolates "byline-run rate" specifically (flagged as an open gap
+    // during research), but open-play crosses run ~19-24/team/match in
+    // top leagues (Soccerment/Premier League-Opta data) — even a
+    // conservative fraction of those genuinely originating from a
+    // byline carry implies a per-match rate far above the measured
+    // ~0.04. Fix: for a carrier already in a wide channel (the same
+    // 0.30/0.70 field-height band this codebase already uses for wide
+    // classification elsewhere — Milestone 4/7), add explicit
+    // byline-directed candidates — straight toward the goal LINE
+    // (x-axis only, preserving the carrier's own y so he stays in his
+    // channel), not toward goal centre — so the existing scoring
+    // (`carry_value`, already correctly rewarding a genuine cutback via
+    // `best_pass_value_from`) actually gets the option to select this
+    // pattern instead of it being structurally absent from the
+    // candidate set.
+    let is_wide_channel = player_pos.y < field_height * 0.30 || player_pos.y > field_height * 0.70;
+    let mut byline_candidate_points: Vec<Vector3<f32>> = Vec::new();
+    if is_wide_channel {
+        let byline_x = if forward.x >= 0.0 { field_width } else { 0.0 };
+        let to_byline = Vector3::new(byline_x - player_pos.x, 0.0, 0.0);
+        if to_byline.magnitude() > 1.0 {
+            let byline_dir = to_byline.normalize();
+            for &frac in &[0.5, 1.0] {
+                let c = player_pos + byline_dir * (reach * frac);
+                candidates.push(c);
+                byline_candidate_points.push(c);
+            }
         }
     }
 
@@ -413,7 +452,13 @@ pub fn carry_candidates(ctx: &StateProcessingContext) -> (Vector3<f32>, f32) {
             candidate.y.clamp(15.0, field_height - 15.0),
             0.0,
         );
-        let value = carry_value(ctx, clamped);
+        let mut value = carry_value(ctx, clamped);
+        if byline_candidate_points
+            .iter()
+            .any(|c| (c - candidate).magnitude() < 1.0)
+        {
+            value += byline_isolation_bonus(ctx, clamped) + momentum_bonus(ctx, player_pos, clamped);
+        }
         if value > best_any_value {
             best_any_value = value;
             best_any_point = clamped;
@@ -434,6 +479,80 @@ pub fn carry_candidates(ctx: &StateProcessingContext) -> (Vector3<f32>, f32) {
     } else {
         (best_point, best_value)
     }
+}
+
+/// realism-bug (2026-07-25), byline-run frequency follow-up. The
+/// byline-directed candidates added above only won `carry_candidates`'s
+/// argmax 5.9% of the time even when eligible (measured, internal
+/// diagnostic) — the real-football trigger for a winger actually
+/// committing to a byline run is genuine separation from his direct
+/// marker (the classic winger-vs-isolated-fullback 1v1), and the run's
+/// payoff is largely what it creates a few seconds later (a cutback, a
+/// corner, forcing the back line deep) — value a single-tick lookahead
+/// scorer structurally can't see. Modeled as an explicit doctrine
+/// credit on the byline candidates specifically (not general carry
+/// candidates, which already have their own geometry-driven value): the
+/// fewer opponents near the candidate point, the stronger the bonus.
+/// Magnitude (0.12 max) is sized against the measured mean value gap
+/// (0.098) when the byline candidate lost — enough to flip genuinely
+/// isolated cases without overriding a clearly-better central option.
+/// Trimmed 0.12 → 0.08 after a first cut (combined with the momentum
+/// bonus below) pushed the per-tick byline win rate to 81.6% — far
+/// stronger than intended — and a fresh regression batch measured
+/// 2.67-2.38 goals/match, below the 3.0-4.5 band the possession-
+/// decision-intelligence work established. See the momentum-bonus
+/// scoping note below for the larger contributor.
+fn byline_isolation_bonus(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
+    const ISOLATION_RADIUS_MIN: f32 = 10.0;
+    const ISOLATION_RADIUS_MAX: f32 = 40.0;
+    const MAX_BONUS: f32 = 0.08;
+    let nearest = ctx
+        .players()
+        .opponents()
+        .nearby_at(point, ISOLATION_RADIUS_MAX)
+        .map(|o| (o.position - point).magnitude())
+        .fold(f32::MAX, f32::min);
+    let frac = ((nearest - ISOLATION_RADIUS_MIN) / (ISOLATION_RADIUS_MAX - ISOLATION_RADIUS_MIN))
+        .clamp(0.0, 1.0);
+    frac * MAX_BONUS
+}
+
+/// realism-bug (2026-07-25), byline-run frequency follow-up. `carry_
+/// candidates` re-evaluates from scratch on effectively every tick a
+/// player is on the ball, so a candidate that wins by a small margin
+/// one tick can lose to a different candidate the next as the geometry
+/// shifts by a few units — aborting a run before it completes. Real
+/// players don't flip-flop like this; once committed to a direction
+/// they hold it unless the alternative becomes clearly better.
+///
+/// Originally applied to EVERY carry candidate (any defender/
+/// midfielder/forward carry, not just byline runs) — measured as the
+/// larger contributor to a real regression: applying it universally
+/// creates a self-reinforcing feedback loop (winning a tick means
+/// moving that way, which earns MORE momentum bonus next tick), which
+/// pushed the byline candidates' per-tick win rate to 81.6% and,
+/// applied everywhere, made carry decisions broadly stickier than
+/// intended — a regression batch measured 2.67-2.38 goals/match,
+/// below the 3.0-4.5 band. Rescoped to the byline candidates only
+/// (alongside `byline_isolation_bonus`, same call site) — the same
+/// "don't reverse for a marginal EV difference" principle, but
+/// confined to the actual mechanism being fixed instead of touching
+/// every carry decision in the match.
+fn momentum_bonus(ctx: &StateProcessingContext, from: Vector3<f32>, candidate: Vector3<f32>) -> f32 {
+    const MAX_BONUS: f32 = 0.04;
+    const MIN_SPEED: f32 = 0.5;
+    let velocity = ctx.player.velocity;
+    let speed = velocity.magnitude();
+    if speed < MIN_SPEED {
+        return 0.0;
+    }
+    let to_candidate = candidate - from;
+    let dist = to_candidate.magnitude();
+    if dist < 1.0 {
+        return 0.0;
+    }
+    let alignment = (velocity.normalize().dot(&to_candidate.normalize())).max(0.0);
+    alignment * MAX_BONUS
 }
 
 /// Shared lane-contest completion-probability estimate: the minimum
@@ -601,8 +720,35 @@ pub fn pass_value_from(
     );
     let passer_own_goal_dist = (own_goal_position - passer_pos).magnitude();
     let base_turnover_risk = (1.0 - passer_own_goal_dist / 500.0).clamp(0.10, 0.60);
-    let turnover_risk =
-        (base_turnover_risk + congestion_risk(ctx, passer_pos) * 0.5).clamp(0.10, 0.60);
+
+    // Realism-bug 2026-07-26 (passing follow-up, turnover-risk-by-
+    // location): a real central turnover hands the opponent a direct
+    // transitional lane toward goal; a wide turnover forces them to
+    // work the ball inside first, buying the defence time to
+    // reorganise — real transition doctrine (unlike a central-lane
+    // INTERCEPTION penalty, which a same-day measurement pass ruled
+    // out: central-destination passes did NOT face more opponents in
+    // the direct passing corridor than wide ones, 2026-07-26 investig-
+    // ation — this term is about the COST of losing the ball, not the
+    // PROBABILITY, so it doesn't duplicate or contradict that finding).
+    // Scoped to the receiver's lateral position (where a completed-
+    // looking pass is actually heading, i.e. the type of pass being
+    // made) rather than the passer's, since `base_turnover_risk` above
+    // already covers the passer's own exposure. Capped at the same
+    // order of magnitude as the existing `congestion_risk` term (max
+    // +0.15) so it nudges the already-clamped 0.10-0.60 band rather
+    // than dominating it.
+    let field_height = ctx.context.field_size.height as f32;
+    let lateral_center = field_height / 2.0;
+    let receiver_width_ratio =
+        ((receiver_pos.y - lateral_center).abs() / (field_height / 2.0)).clamp(0.0, 1.0);
+    let receiver_centrality = 1.0 - receiver_width_ratio; // 1.0 dead-center, 0.0 touchline
+    let lateral_turnover_bonus = receiver_centrality * 0.15;
+
+    let turnover_risk = (base_turnover_risk
+        + congestion_risk(ctx, passer_pos) * 0.5
+        + lateral_turnover_bonus)
+        .clamp(0.10, 0.60);
 
     (completion_prob * terminal_value - (1.0 - completion_prob) * turnover_risk).max(0.0)
 }

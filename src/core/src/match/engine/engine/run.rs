@@ -1,5 +1,6 @@
 use super::*;
 use crate::r#match::engine::context::MatchEngineConfig;
+use nalgebra::Vector3;
 use crate::r#match::engine::rating::{RatingExpectationContext, TeamRatingSummary};
 use crate::r#match::player::events::FoulResolver;
 use crate::r#match::player::events::players::PlayerEventDispatcher;
@@ -988,6 +989,130 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     } else {
                         p.free_kick_pass_pending -= 1;
                     }
+                }
+                if p.aerial_contest_won > 0 {
+                    p.aerial_contest_won -= 1;
+                }
+                // Realism-bug 2026-07-26 (passing follow-up): self-clear
+                // the incoming-pass-awareness target. Cleared immediately
+                // once this player actually owns the ball (the "incoming"
+                // state is over, their own on-ball logic takes over) —
+                // otherwise decrements toward the same flight-time budget
+                // `handle_pass_to_event` armed it with, so a pass that
+                // gets intercepted before arrival still expires on its
+                // own instead of lingering.
+                if p.incoming_pass_ticks > 0 {
+                    if raw_owner == Some(p.id) {
+                        p.incoming_pass_ticks = 0;
+                        p.incoming_pass_target = None;
+                    } else {
+                        p.incoming_pass_ticks -= 1;
+                        if p.incoming_pass_ticks == 0 {
+                            p.incoming_pass_target = None;
+                        }
+                    }
+                }
+            }
+
+            // realism-bug (2026-07-25): opportunistic byline-run
+            // commitment, armed here — this loop already has &mut
+            // field.players + raw_owner (state handlers only ever see
+            // &MatchPlayer, so this per-tick loop is the earliest
+            // mutation-capable point after ownership resolves). Traced
+            // via raw carry-trajectory data that a per-tick-recomputed
+            // "is this the best candidate right now" check was too
+            // fragile to sustain a real run — a small geometry shift
+            // could flip the winner before the run developed. A
+            // persistent, ticks-based commitment (same pattern as
+            // kickoff/throw-in/free-kick above) survives exactly that.
+            // Fresh possession (ownership_duration<=3, i.e. within the
+            // first few ticks of receiving/winning the ball — the real
+            // moment a winger decides whether to commit), wide channel,
+            // and enough room ahead to make a run worthwhile (150-300u
+            // from goal — not already in the box, not literally starting
+            // from the halfway line; narrowed from an original 420u
+            // ceiling after measuring that most armed commitments died
+            // long before covering that much ground). Skill-scaled
+            // probability: paced, good dribblers commit more often,
+            // matching real doctrine.
+            //
+            // realism-bug follow-up: 28.6% of armed commitments died
+            // within 100ms (measured) — almost certainly arming in
+            // situations with no real space, e.g. a marker already
+            // adjacent at the moment of reception. A real winger doesn't
+            // decide to commit to a sprint down the line if he's already
+            // being touch-tight marked; a snapshot of opponent positions
+            // taken before this loop (can't borrow field.players
+            // immutably while iterating it mutably) lets the arm gate
+            // require genuine room to start the move.
+            let opponent_positions: Vec<(u32, Vector3<f32>)> = field
+                .players
+                .iter()
+                .map(|p| (p.team_id, p.position))
+                .collect();
+            for p in field.players.iter_mut() {
+                if p.byline_commitment_ticks > 0 {
+                    if raw_owner != Some(p.id) {
+                        p.byline_commitment_ticks = 0;
+                    } else {
+                        p.byline_commitment_ticks -= 1;
+                    }
+                    continue;
+                }
+                // realism-bug: arming at ownership_duration<=3 (within
+                // 30ms of reception) meant committing before the ball is
+                // genuinely settled — this engine's own shot logic treats
+                // <300ms possession as "unsettled" for the same reason
+                // (§12.6-adjacent has_settled gate). Measured many
+                // commitments dying within 10 ticks regardless of arm-
+                // rate/press-radius tuning, consistent with arming during
+                // a volatile just-received moment rather than after the
+                // carrier has actually secured it. Widened to 20-150
+                // ticks (200ms-1.5s) — settled, but still an early
+                // decision point in the possession.
+                if raw_owner != Some(p.id)
+                    || !(20..150).contains(&field.ball.ownership_duration)
+                {
+                    continue;
+                }
+                let group = p.tactical_position.current_position.position_group();
+                if !matches!(
+                    group,
+                    crate::PlayerFieldPositionGroup::Forward
+                        | crate::PlayerFieldPositionGroup::Midfielder
+                ) {
+                    continue;
+                }
+                let h = context.field_size.height as f32;
+                let y = p.position.y;
+                let wide = y < h * 0.38 || y > h * 0.62;
+                if !wide {
+                    continue;
+                }
+                let goal_x = match p.side {
+                    Some(PlayerSide::Left) => context.field_size.width as f32,
+                    _ => 0.0,
+                };
+                let depth = (goal_x - p.position.x).abs();
+                if !(130.0..380.0).contains(&depth) {
+                    continue;
+                }
+                let has_room = !opponent_positions.iter().any(|(team_id, pos)| {
+                    *team_id != p.team_id && (*pos - p.position).magnitude() < 9.0
+                });
+                if !has_room {
+                    continue;
+                }
+                let pace01 = ((p.skills.physical.pace - 1.0) / 19.0).clamp(0.0, 1.0);
+                let dribble01 = ((p.skills.technical.dribbling - 1.0) / 19.0).clamp(0.0, 1.0);
+                let prob = (0.88 + pace01 * 0.08 + dribble01 * 0.08).clamp(0.88, 1.0);
+                if context.rng.range_u64(0, 10000) < (prob * 10000.0) as u64 {
+                    // 1200 ticks (12s) — realistic dribble speed is
+                    // ~0.4-0.6u/tick, so covering the full 380u worst-
+                    // case trigger distance needs real time; the state-
+                    // level timeouts are skipped while committed (see
+                    // the dribbling states), so this is the actual bound.
+                    p.byline_commitment_ticks = 1200;
                 }
             }
 

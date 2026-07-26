@@ -10,8 +10,11 @@ use crate::r#match::player::state::PlayerState;
 use crate::r#match::player::state::PlayerState::{Defender, Forward, Goalkeeper, Midfielder};
 use crate::r#match::player::strategies::common::PlayerOperationsImpl;
 use crate::r#match::player::strategies::common::PlayersOperationsImpl;
+use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::team::TeamOperationsImpl;
-use crate::r#match::{BallOperationsImpl, GameTickContext, MatchContext, MatchPlayer};
+use crate::r#match::{
+    BallOperationsImpl, GameTickContext, MatchContext, MatchPlayer, SteeringBehavior,
+};
 use log::debug;
 use nalgebra::Vector3;
 
@@ -331,6 +334,21 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(base * (1.0 - w) + separation * w);
         }
 
+        // Realism-bug 2026-07-26 (passing follow-up): blend the
+        // receiver's own movement toward an incoming pass's actual aim
+        // point. A full-tree grep confirmed nothing previously read
+        // `Ball.pending_pass_target` from inside any receiving player's
+        // own movement code — a receiver's run during the ball's flight
+        // was entirely decoupled from where the ball was actually
+        // headed. Applied BEFORE the press/mark override so an explicit
+        // man-assignment still wins outright (same priority position as
+        // `separation_nudge`/`gk_possession_recovery_velocity` above).
+        if let Some((nudge, w)) = Self::incoming_pass_awareness_velocity(&processing_ctx) {
+            let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
+            let base = result.velocity.unwrap_or_else(Vector3::zeros);
+            result.velocity = Some(base * (1.0 - w) + nudge * tempo * w);
+        }
+
         // Cross-player assignment overrides (press / mark). Applied AFTER
         // the state handler so the manager's man-assignment wins over
         // normal state movement, regardless of which state the player is
@@ -637,6 +655,60 @@ impl<'p> StateProcessor<'p> {
         // Jog, not sprint: recovery under no direct pressure. Half the
         // press-chase magnitude convention (direction × pace).
         Some(to_anchor.normalize() * player.skills.physical.pace * 0.5)
+    }
+
+    /// Realism-bug 2026-07-26 (passing follow-up): a BLENDED nudge (not
+    /// a hard override, matching `separation_nudge`'s idiom) toward the
+    /// lead-adjusted aim point of a pass currently in flight to this
+    /// player (`incoming_pass_target`, set by `handle_pass_to_event` at
+    /// dispatch time). Returns `(direction*speed, blend_weight)` so a
+    /// low off-ball player still mostly follows their own state's
+    /// movement while a sharp one commits harder to meeting the ball —
+    /// weighted by the SAME `off_ball_attack` composite
+    /// (off_the_ball/anticipation/decisions/pace/teamwork/bravery)
+    /// `receiver_positioning` already uses elsewhere in the pass
+    /// evaluator, so this doesn't invent a new skill axis, it reuses the
+    /// one already governing off-ball quality. Deliberately excludes
+    /// goalkeepers — GK positioning is separately, extensively tuned
+    /// elsewhere in this engine and touching it here would be
+    /// unrelated blast radius for this fix.
+    fn incoming_pass_awareness_velocity(
+        ctx: &StateProcessingContext,
+    ) -> Option<(Vector3<f32>, f32)> {
+        let player = ctx.player;
+        if player.incoming_pass_ticks == 0 {
+            return None;
+        }
+        let target = player.incoming_pass_target?;
+        if player.tactical_position.current_position.is_goalkeeper() {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None; // pass has arrived — this is no longer relevant
+        }
+
+        let to_target = target - player.position;
+        if to_target.magnitude() < 3.0 {
+            return None; // already there; let normal movement settle it
+        }
+
+        let minute = sc::minute_from_ms(ctx.context.total_match_time);
+        let reactiveness = sc::off_ball_attack(player, minute);
+        // Even a poor off-ball mover gets SOME pull (the ball is
+        // visibly there) but a sharp one nearly fully commits — the
+        // spread that keeps a good player's leading pass genuinely
+        // better-received than an average one, rather than flattening
+        // every receiver into an equally good one.
+        let weight = (0.25 + reactiveness * 0.55).clamp(0.25, 0.80);
+
+        let steer = SteeringBehavior::Arrive {
+            target,
+            slowing_distance: 8.0,
+        }
+        .calculate(player)
+        .velocity;
+
+        Some((steer, weight))
     }
 
     /// PRESS (`press_target`): whenever the assigned opponent has the

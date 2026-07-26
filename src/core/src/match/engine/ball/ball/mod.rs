@@ -196,6 +196,16 @@ pub struct Ball {
     /// on goal. False = armed (a corner has been awarded, not yet resolved);
     /// true = nothing to resolve.
     pub corner_contest_resolved: bool,
+    /// Realism-bug 2026-07-26 follow-up: the same discrete aerial-contest
+    /// mechanism as `corner_contest_resolved`, generalized to open-play
+    /// crosses / free-kick crosses / long high passes / goal-kick punts
+    /// (anything airborne near a box that isn't a corner, which keeps its
+    /// own dedicated resolver/flag). No single per-restart lifecycle
+    /// exists for these, so this is a plain tick-cooldown instead of a
+    /// bool: `resolve_aerial_contest` only fires once every
+    /// `AERIAL_CONTEST_COOLDOWN_TICKS` to avoid re-resolving the same
+    /// delivery every tick while the ball is airborne.
+    pub last_aerial_contest_tick: u64,
     /// Corner routine picked by `pick_corner_routine` at corner setup.
     /// Lets the corner aerial-contest in `resolve_corner_contest` and
     /// downstream xG accounting know whether the delivery is targeting
@@ -463,6 +473,7 @@ impl Ball {
             pending_restart_teleports: Vec::new(),
             direct_fk_shot_in_flight: false,
             corner_contest_resolved: true,
+            last_aerial_contest_tick: 0,
             pending_corner_routine: None,
             owned_stuck_ticks: 0,
             owned_stuck_logged: false,

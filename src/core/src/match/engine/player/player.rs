@@ -188,6 +188,22 @@ pub struct MatchPlayer {
     /// off on a solo carry. Cleared in the engine loop the moment the
     /// taker releases the ball or the budget runs out.
     pub kickoff_pass_pending: u16,
+    /// realism-bug (2026-07-25): opportunistic byline-run commitment, in
+    /// remaining ticks (0 = inactive). Armed probabilistically (see
+    /// `run.rs`) when a player gains fresh possession in a wide channel
+    /// with room to advance — real football's winger-vs-isolated-back
+    /// trigger, not something a single-tick value comparison could
+    /// reliably sustain (the value function's own per-tick winner
+    /// (`carry_candidates`) proved too fragile — a small geometry shift
+    /// could flip it before a run ever developed). While active, the
+    /// forward/midfielder Dribbling states bypass the generic exits that
+    /// would otherwise cancel a genuine wide duel (dribble timeout,
+    /// single-marker pass-out, premature should_cross) — mirroring the
+    /// BylineAndCross DIRECTIVE's own already-proven bypass, just
+    /// triggered for undirected play instead of an explicit instruction.
+    /// Cleared on ball release, genuine two-man pressure, or budget
+    /// expiry (engine loop, same pattern as the three fields above).
+    pub byline_commitment_ticks: u16,
     /// realism-bug (2026-07-19): throw-in taker's forced-release window,
     /// in remaining ticks (0 = inactive). Same pattern as
     /// `kickoff_pass_pending` — a throw-in is a single discrete motion
@@ -215,6 +231,44 @@ pub struct MatchPlayer {
     /// ball, the state processor forces the role's Passing state.
     /// Cleared the moment he releases the ball or the budget runs out.
     pub free_kick_pass_pending: u16,
+    /// Realism-bug 2026-07-26: set by the general (non-corner) aerial
+    /// contest resolver — cross / free-kick cross / long high pass — the
+    /// instant it decides this player won the header. Consumed by
+    /// `ForwardHeadingState`/`MidfielderHeadingState`/`DefenderState`'s
+    /// header carve-out (same clean-contact-only roll the corner-contest
+    /// carve-out already uses via `is_team_attacking_corner()`) so the
+    /// discretely-decided win isn't re-rolled as a second full duel.
+    /// Ticks-remaining counter (not a plain bool) so it self-clears via
+    /// the same per-tick decrement loop as `kickoff_pass_pending` et al.
+    /// instead of needing bespoke reset logic.
+    pub aerial_contest_won: u8,
+    /// Realism-bug 2026-07-26 (passing follow-up): the lead-adjusted aim
+    /// point of a pass currently in flight toward this player. Set (on
+    /// the RECEIVER, not the passer) by `handle_pass_to_event` at pass
+    /// dispatch time, using the exact same `ideal_target` the ball
+    /// itself is aimed at — closing a coordination gap: previously
+    /// `Ball.pending_pass_target` had zero readers anywhere in a
+    /// receiving player's own movement code, so a receiver's run during
+    /// the ball's flight was entirely independent of where the ball was
+    /// actually headed (confirmed by a full-tree grep before this fix).
+    /// `None` when no pass is currently incoming. Read by
+    /// `incoming_pass_awareness_velocity` (processor.rs) as a BLENDED
+    /// nudge — not a hard override — toward the target, weighted by the
+    /// receiver's own off_ball_attack composite (off_the_ball/
+    /// anticipation/decisions/pace) so a sharp off-ball mover reads and
+    /// meets a leading ball far better than a poor one, preserving
+    /// exactly the skill differentiation the passer's side already has
+    /// (`anticipation`-scaled `lead_fraction` in `handle_pass_to_event`)
+    /// instead of flattening every receiver into an equally good one.
+    pub incoming_pass_target: Option<Vector3<f32>>,
+    /// Ticks remaining on `incoming_pass_target` (0 = inactive). Self-
+    /// clears via the same per-tick decrement loop as
+    /// `kickoff_pass_pending` et al., sized to the passing lead
+    /// formula's own flight-time ceiling (`flight_time_est.clamp(8.0,
+    /// 80.0)` in `handle_pass_to_event`) plus margin, so it naturally
+    /// expires around when the ball would have arrived even if nothing
+    /// else clears it first.
+    pub incoming_pass_ticks: u16,
     /// "Link with X" pair preference (wishlist #5): passes toward this
     /// teammate get a success/EV bias in the pass evaluator, and the
     /// pair's chemistry is pinned high at kickoff. Set symmetrically on
@@ -446,8 +500,12 @@ impl MatchPlayer {
             mark_target: None,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
+            byline_commitment_ticks: 0,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,
+            aerial_contest_won: 0,
+            incoming_pass_target: None,
+            incoming_pass_ticks: 0,
             link_target: None,
             intercept_target: None,
             supply_target: None,
@@ -524,8 +582,12 @@ impl MatchPlayer {
             mark_target: None,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
+            byline_commitment_ticks: 0,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,
+            aerial_contest_won: 0,
+            incoming_pass_target: None,
+            incoming_pass_ticks: 0,
             link_target: None,
             intercept_target: None,
             supply_target: None,

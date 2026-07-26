@@ -267,26 +267,40 @@ impl GoalkeeperWalkingState {
         };
 
         // Base distance from goal line
-        let mut optimal_distance = 8.0; // Base distance from goal
+        let mut optimal_distance = 10.0; // Base distance from goal
 
         // Adjust based on ball position and goalkeeper skills
         if ctx.ball().on_own_side() {
             // Ball on own half - position based on threat
             let threat_factor = ball_distance_to_goal / (ctx.context.field_size.width as f32 * 0.5);
 
-            // Better command of area = more aggressive positioning
-            optimal_distance += (25.0 - threat_factor * 15.0) * command_of_area;
+            // realism-bug (2026-07-26): same sourced-doctrine fix as the
+            // Standing state's `calculate_optimal_position` (see that
+            // file's comment for the measured baseline/citations) —
+            // this formula duplicated the same too-shallow ceiling
+            // (25.0/15.0, max ~36u even at full skill) and is kept in
+            // sync with it. Scaled ~4x (100.0/60.0, same 25:15 ratio)
+            // so a genuine close threat lets a good keeper's rest
+            // position reach the real 75-130u sweeper-keeper range.
+            optimal_distance += (100.0 - threat_factor * 60.0) * command_of_area;
 
             // Better positioning = more accurate placement
             optimal_distance *= 0.7 + positioning_skill * 0.6;
 
-            // If ball is wide, adjust position laterally
-            let ball_y_offset = ball_position.y - goal_position.y;
-            let lateral_adjustment = ball_y_offset * 0.25 * positioning_skill; // Better positioning = better angle coverage
+            // realism-bug (2026-07-25): same fix as the Standing state's
+            // `calculate_optimal_position` — angle-bisection doctrine
+            // says lateral offset should track the ANGLE from goal to
+            // ball (`angle_to_ball.y`, already normalized), not a flat
+            // fraction of the raw y-offset at a small, threat-gated
+            // standing depth. See that file's comment for the measured
+            // baseline and full reasoning; kept in sync since both
+            // states duplicated the same flawed formula.
+            const ANGLE_COVERAGE_DEPTH: f32 = 100.0;
+            let skill_factor = 0.6 + positioning_skill * 0.4;
 
             // Calculate the position
             let mut new_position = goal_position + angle_to_ball * optimal_distance;
-            new_position.y += lateral_adjustment;
+            new_position.y = goal_position.y + angle_to_ball.y * ANGLE_COVERAGE_DEPTH * skill_factor;
 
             // Ensure within penalty area
             self.limit_to_penalty_area(new_position, ctx)
