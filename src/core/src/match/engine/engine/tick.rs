@@ -180,6 +180,44 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
     /// force-clears any stragglers' targets when the window ends.
     pub(super) fn apply_restart_retreat_tick(field: &mut MatchField, context: &MatchContext) {
         const ARRIVAL_TOLERANCE: f32 = 4.0;
+
+        // realism-bug (2026-07-27, Pavel): corners, close-range free
+        // kicks, and penalties are always patiently organized regardless
+        // of team-shape numbers (`set_pieces::is_patiently_organized_
+        // restart` — same classification `run.rs`'s early-exit gate uses,
+        // kept as one shared function so the two can't drift apart). For
+        // exactly those three, nothing tactically meaningful depends on
+        // HOW the walk into shape unfolds — only on whether it finishes —
+        // so it happens at a deliberately unrealistic multiple of top
+        // speed instead of making a viewer watch several real seconds of
+        // a wall/box shape form. Goal kicks, throw-ins, and deep free
+        // kicks are excluded: that's exactly the window
+        // `counterattack_advantage` is judging for a genuine quick-vs-
+        // patient decision, and it needs to unfold at a real, watchable
+        // pace for that decision to mean anything.
+        let kicking_side = field
+            .ball
+            .current_owner
+            .and_then(|id| field.players.iter().find(|p| p.id == id))
+            .and_then(|p| p.side);
+        let dist_to_goal_if_free_kick = {
+            let goal_pos = match kicking_side {
+                Some(crate::r#match::PlayerSide::Left) => context.goal_positions.right,
+                Some(crate::r#match::PlayerSide::Right) => context.goal_positions.left,
+                None => context.goal_positions.right,
+            };
+            (field.ball.position - goal_pos).magnitude()
+        };
+        const FAST_FORWARD_SPEED_MULTIPLIER: f32 = 5.0;
+        let speed_multiplier = if crate::r#match::engine::set_pieces::is_patiently_organized_restart(
+            field.ball.pass_origin_restart,
+            dist_to_goal_if_free_kick,
+        ) {
+            FAST_FORWARD_SPEED_MULTIPLIER
+        } else {
+            1.0
+        };
+
         for player in field.players.iter_mut().filter(|p| !p.is_sent_off) {
             let Some(target) = player.restart_retreat_target else {
                 continue;
@@ -191,8 +229,26 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 player.restart_retreat_target = None;
                 continue;
             }
-            // Clamp to the remaining distance ("arrive" steering) — `pace`
-            // (~1-20 u/tick) is frequently larger than the last few ticks'
+            // realism-bug (2026-07-27): this used to read
+            // `player.skills.physical.pace` directly as the per-tick speed
+            // — but `pace` is the RAW 1-20 skill scale, not a calibrated
+            // velocity. Every other movement path in the engine goes
+            // through `PlayerMatchState::process` (player/state.rs), which
+            // converts pace into a real per-tick speed via
+            // `max_speed_with_condition` (0.36-0.63 u/tick — the
+            // calibrated sprint band from `max_speed()`) before applying
+            // it. This function calls `move_to()` directly and never
+            // passes through that conversion, so a full-pace retreat moved
+            // at up to ~20 u/tick — 30-50x the real sprint speed used
+            // everywhere else — which at this window's ~30ms sample
+            // cadence rendered as an outright teleport (measured:
+            // single-sample jumps up to 800u, 72-76% of goal-kick
+            // non-taker traces showing a >40u jump). Using the same
+            // calibrated conversion every other state uses keeps this a
+            // genuine full-sprint retreat without the unit error.
+            //
+            // Clamp to the remaining distance ("arrive" steering) — real
+            // sprint speed is frequently larger than the last few ticks'
             // remaining distance, and without this the player overshoots
             // the target every tick and oscillates back and forth forever
             // instead of converging (found via raw position traces showing
@@ -200,7 +256,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // the entire retreat window). Clamping means the player covers
             // ground at full pace until within one tick's reach, then
             // takes exactly the remaining distance and lands on target.
-            let speed = player.skills.physical.pace.min(dist);
+            let speed = (player
+                .skills
+                .max_speed_with_condition(player.player_attributes.condition)
+                * speed_multiplier)
+                .min(dist);
             player.velocity = to_target.normalize() * speed;
             player.check_boundary_collision(context);
             player.move_to();

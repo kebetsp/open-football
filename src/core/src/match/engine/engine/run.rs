@@ -857,8 +857,130 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     // reaction floor and the maximum cap) has roughly a
                     // 20% chance of firing early, not a coin flip.
                     const EARLY_RESTART_ROLL_PER_TICK: u64 = 12; // /10000 ≈ 0.12%/tick
+
+                    // realism-bug (2026-07-27): scale that flat baseline
+                    // by the real team-shape advantage
+                    // (`set_pieces::restart_timing_advantage`) — a team
+                    // with more players still forward/ready than the
+                    // defence has recovered should take it quickly
+                    // (real doctrine: quick free kicks/corners/throw-ins
+                    // exploit a disorganised defence); a team that isn't
+                    // itself ready yet has no reason to rush. Penalties
+                    // are excluded — a real penalty taker doesn't rush or
+                    // delay the kick based on outfield shape, it's a
+                    // fixed isolated procedure, so they keep the original
+                    // flat baseline. The scale factor itself has no
+                    // sourced real-world figure (same flagged-estimate
+                    // status as EARLY_RESTART_ROLL_PER_TICK) — tune
+                    // ADVANTAGE_ROLL_SCALE if the resulting fast/patient
+                    // mix needs adjusting.
+                    //
+                    // realism-bug (2026-07-27, follow-up — Pavel): a direct
+                    // free kick in genuine shooting/crossing range (≤280u —
+                    // the same "crossable range" `award_restart_for_foul`
+                    // already uses to decide whether to form a wall at all
+                    // and stage the §11.7 attacking shape) was firing the
+                    // quick-restart roll and rushing a low-value sideways
+                    // pass before either the wall or the attacking shape
+                    // had time to form. The counting metric alone can't
+                    // tell this case apart from a genuine tactical
+                    // opportunity: a defensive wall + markers structurally
+                    // needs MORE players to organise than the ~4 the
+                    // attacking side stages, so `defending_scrambling` is
+                    // almost always higher right after the award — reading
+                    // as "advantage" even though no real team would rush a
+                    // promising direct free kick to exploit it. Real
+                    // doctrine has no ambiguity here: a shootable/crossable
+                    // free kick is patiently organised, full stop — a quick
+                    // take only makes sense when a genuinely open,
+                    // clearly-better-placed teammate exists right now,
+                    // which isn't something this counting metric can judge
+                    // (it counts headcount, not lane occlusion or shot
+                    // quality). Per Pavel's own fallback, hard-disable the
+                    // quick option in this zone instead of trying to model
+                    // the narrower "is there truly a great pass on"
+                    // condition — multiplier 0 means the early-exit roll
+                    // can never fire, so the full natural stoppage window
+                    // always plays out and `resolve_free_kick`'s real
+                    // distance-based shot/cross model decides the outcome.
+                    //
+                    // realism-bug (2026-07-27, follow-up 2 — Pavel): the
+                    // identical bias hits corners even harder — a corner's
+                    // whole value is numbers in the box, and Pavel directly
+                    // observed deliveries with 2 attackers vs 6 defenders
+                    // because the corner fired before the attacking
+                    // box-crowding shape (§9.3.3 pushed-up centre-backs/
+                    // second wave) had time to arrive, while the defending
+                    // six-slot block (naturally more bodies) read as
+                    // "scrambling" and drove the multiplier up. Unlike a
+                    // deep free kick, there's no "safe zone" for a corner —
+                    // it's always taken right in the danger area by
+                    // definition — so this is a blanket disable, same
+                    // mechanism as the direct-FK case above.
+                    // realism-bug (2026-07-27, follow-up 3 — Pavel): folded
+                    // Penalty into the same shared classification
+                    // (`set_pieces::is_patiently_organized_restart`) — a
+                    // real penalty is never taken "quickly" based on
+                    // outfield shape either, so it belongs in the same
+                    // always-wait bucket as corners/close free kicks, not
+                    // a separate flat-baseline case that could still
+                    // occasionally roll an early exit.
+                    let kicking_side = field
+                        .ball
+                        .current_owner
+                        .and_then(|id| field.players.iter().find(|p| p.id == id))
+                        .and_then(|p| p.side);
+                    let dist_to_goal_if_free_kick = {
+                        let goal_pos = match kicking_side {
+                            Some(PlayerSide::Left) => context.goal_positions.right,
+                            Some(PlayerSide::Right) => context.goal_positions.left,
+                            None => context.goal_positions.right,
+                        };
+                        (field.ball.position - goal_pos).magnitude()
+                    };
+                    let never_rush = crate::r#match::engine::set_pieces::is_patiently_organized_restart(
+                        field.ball.pass_origin_restart,
+                        dist_to_goal_if_free_kick,
+                    );
+                    let advantage_multiplier: f32 = if never_rush {
+                        0.0
+                    } else {
+                        match kicking_side {
+                            Some(side) => {
+                                let advantage = crate::r#match::engine::set_pieces::counterattack_advantage(
+                                    &field.players,
+                                    side,
+                                    context.field_size.width as f32,
+                                );
+                                const ADVANTAGE_ROLL_SCALE: f32 = 0.35;
+                                (1.0 + advantage as f32 * ADVANTAGE_ROLL_SCALE).clamp(0.15, 4.0)
+                            }
+                            None => 1.0,
+                        }
+                    };
+                    let scaled_roll =
+                        ((EARLY_RESTART_ROLL_PER_TICK as f32) * advantage_multiplier) as u64;
                     if context.total_match_time >= context.dead_ball_min_ms
-                        && context.rng.range_u64(0, 10000) < EARLY_RESTART_ROLL_PER_TICK
+                        && context.rng.range_u64(0, 10000) < scaled_roll
+                    {
+                        context.dead_ball_until_ms = context.total_match_time;
+                    }
+                    // realism-bug (2026-07-27, follow-up 3 — Pavel): for the
+                    // always-patiently-organized types, don't make a viewer
+                    // sit through the rest of a randomly-chosen stoppage
+                    // window once the shape is ACTUALLY complete — end it
+                    // the moment every player who was assigned a target has
+                    // reached it. This is what actually realizes "don't
+                    // waste time on a run that changes nothing": speeding
+                    // up the walk (`apply_restart_retreat_tick`, tick.rs)
+                    // alone would just mean everyone stands still for
+                    // whatever's left of the random cap. Goal kicks/throw-
+                    // ins/deep free kicks are untouched — they keep the
+                    // natural randomized window, since that's the window
+                    // `counterattack_advantage` is judging.
+                    if never_rush
+                        && context.total_match_time >= context.dead_ball_min_ms
+                        && field.players.iter().all(|p| p.restart_retreat_target.is_none())
                     {
                         context.dead_ball_until_ms = context.total_match_time;
                     }
@@ -1113,6 +1235,127 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     // level timeouts are skipped while committed (see
                     // the dribbling states), so this is the actual bound.
                     p.byline_commitment_ticks = 1200;
+                }
+            }
+
+            // realism-bug (2026-07-27): occasional "round the keeper"
+            // decision for a genuine clean 1v1 vs. the GK — see
+            // round_keeper_commitment_ticks' doc comment (player.rs).
+            // One-shot-per-possession via gk1v1_decision_made: the roll
+            // only happens once per continuous spell of ball ownership,
+            // not every tick the clean-1v1 condition holds (which would
+            // otherwise compound a small per-tick probability into
+            // near-certainty over a multi-second breakaway).
+            let gk_positions: Vec<(u32, PlayerSide, Vector3<f32>)> = field
+                .players
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p.tactical_position.current_position.position_group(),
+                        crate::PlayerFieldPositionGroup::Goalkeeper
+                    )
+                })
+                .map(|p| (p.team_id, p.side.unwrap_or(PlayerSide::Left), p.position))
+                .collect();
+            for p in field.players.iter_mut() {
+                if p.round_keeper_commitment_ticks > 0 {
+                    if raw_owner != Some(p.id) {
+                        p.round_keeper_commitment_ticks = 0;
+                    } else {
+                        p.round_keeper_commitment_ticks -= 1;
+                    }
+                    continue;
+                }
+                if raw_owner != Some(p.id) {
+                    p.gk1v1_decision_made = false;
+                    continue;
+                }
+                if p.gk1v1_decision_made {
+                    continue;
+                }
+                if !matches!(
+                    p.tactical_position.current_position.position_group(),
+                    crate::PlayerFieldPositionGroup::Forward
+                ) {
+                    continue;
+                }
+                let Some((_, gk_side, gk_pos)) =
+                    gk_positions.iter().find(|(team_id, _, _)| *team_id != p.team_id)
+                else {
+                    continue;
+                };
+                // No other outfield opponent within 40u -- genuinely
+                // clean, matching the same radius the diagnostic
+                // measurement used to define a "clean GK 1v1" baseline.
+                let clean = !opponent_positions.iter().any(|(team_id, pos)| {
+                    *team_id != p.team_id && (*pos - p.position).magnitude() < 40.0
+                });
+                if !clean {
+                    continue;
+                }
+                let goal_x = match p.side {
+                    Some(PlayerSide::Left) => context.field_size.width as f32,
+                    _ => 0.0,
+                };
+                let dist_to_goal = (goal_x - p.position.x).abs();
+                if !(40.0..220.0).contains(&dist_to_goal) {
+                    continue;
+                }
+                // Keeper genuinely advanced off his own line -- real
+                // coaching doctrine sourced during this investigation:
+                // rounding the keeper is only viable when he's "several
+                // yards outside the six-yard box" (totalfootballanalysis.
+                // com). 44u = this engine's own six-yard-box-equivalent
+                // depth (teamplay/zones.rs, already established elsewhere).
+                let gk_own_goal_x = match gk_side {
+                    PlayerSide::Left => 0.0,
+                    PlayerSide::Right => context.field_size.width as f32,
+                };
+                let gk_off_line = (gk_pos.x - gk_own_goal_x).abs();
+                if gk_off_line < 44.0 {
+                    continue;
+                }
+                p.gk1v1_decision_made = true;
+                // Rare by design -- real one-on-ones are overwhelmingly
+                // finished with a direct/placed shot, not a dribble round
+                // the keeper (sourced StatsBomb Bundesliga 2023/24 pull,
+                // this investigation: only 1/23 foot-based one-on-one
+                // shots used a Lob technique, the closest real-world
+                // proxy). No public dataset isolates "round the keeper"
+                // attempt rate specifically -- flagged estimate (category
+                // d), skill-scaled.
+                let composure01 = ((p.skills.mental.composure - 1.0) / 19.0).clamp(0.0, 1.0);
+                let dribble01 = ((p.skills.technical.dribbling - 1.0) / 19.0).clamp(0.0, 1.0);
+                let flair01 = ((p.skills.mental.flair - 1.0) / 19.0).clamp(0.0, 1.0);
+                let prob =
+                    (0.05 + composure01 * 0.05 + dribble01 * 0.05 + flair01 * 0.05).clamp(0.05, 0.20);
+                let roll = context.rng.range_u64(0, 10000);
+                if roll < (prob * 10000.0) as u64 {
+                    // realism-bug follow-up: a raw tick trace showed the
+                    // GK retreating toward his own goal in the SAME
+                    // direction as the attacker for the whole chase --
+                    // continuously re-targeting his live position meant
+                    // the effective closing rate was only the difference
+                    // of their speeds and the gap never closed. Freeze
+                    // the target now, at decision time, exactly like a
+                    // real striker committing to a route.
+                    let goal_pos = Vector3::new(
+                        goal_x,
+                        context.field_size.height as f32 / 2.0,
+                        0.0,
+                    );
+                    let to_goal = (goal_pos - p.position).normalize();
+                    let lateral = Vector3::new(-to_goal.y, to_goal.x, 0.0);
+                    let side = if p.position.y > gk_pos.y { -1.0 } else { 1.0 };
+                    let target = gk_pos + lateral * side * 22.0 + to_goal * 20.0;
+                    p.round_keeper_target_x = target.x.clamp(15.0, context.field_size.width as f32 - 15.0);
+                    p.round_keeper_target_y = target.y.clamp(15.0, context.field_size.height as f32 - 15.0);
+                    // 500 ticks (5s) -- the frozen target can still be
+                    // 120-176u away at realistic ~0.35-0.6u/tick dribble
+                    // speed, needing up to ~500 ticks worst case; a real
+                    // end-to-end breakaway chase does take several
+                    // seconds too.
+                    p.round_keeper_commitment_ticks = 500;
                 }
             }
 

@@ -204,6 +204,37 @@ pub struct MatchPlayer {
     /// Cleared on ball release, genuine two-man pressure, or budget
     /// expiry (engine loop, same pattern as the three fields above).
     pub byline_commitment_ticks: u16,
+    /// realism-bug (2026-07-27): a genuine, clean 1v1-vs-GK opportunity had
+    /// no code path at all that could choose "carry the ball around the
+    /// keeper" — evaluate_forward_shot_decision only ever returns Shoot/
+    /// Pass/Hold, and the existing GK-avoidance steering in
+    /// ForwardDribblingState::velocity() only sidesteps to open a shooting
+    /// ANGLE, never continues past him into the net. Same persistent-ticks
+    /// pattern as byline_commitment_ticks: while active, ForwardDribblingState
+    /// skips its normal shot-dispatch priorities and velocity() steers past
+    /// the keeper's current position instead of at/around him for an angle.
+    /// Cleared on ball release or on release-condition (carrier's position
+    /// has advanced past the keeper toward goal).
+    pub round_keeper_commitment_ticks: u16,
+    /// realism-bug follow-up (2026-07-27): frozen at arm time (not
+    /// recomputed live from the GK's current position). Raw tick trace
+    /// showed the GK retreating toward his own goal in the SAME direction
+    /// as the attacking carrier during the whole chase -- continuously
+    /// re-targeting his live position meant the effective closing rate was
+    /// only the DIFFERENCE of their speeds (~0.235u/tick measured, far
+    /// below either player's own ~0.35u/tick absolute speed), so the gap
+    /// never closed inside any reasonable ticks budget. A real striker
+    /// commits to a route based on the keeper's position at the moment of
+    /// decision, not a target that keeps receding as the keeper recovers.
+    pub round_keeper_target_x: f32,
+    pub round_keeper_target_y: f32,
+    /// realism-bug (2026-07-27): one-shot-per-possession lock so the
+    /// round-keeper probability roll (in the engine loop) fires at most
+    /// once per continuous spell of ball ownership, not every tick the
+    /// clean-1v1 condition happens to hold (which would compound a small
+    /// per-tick probability into near-certainty over a multi-second
+    /// breakaway). Reset to false whenever the player doesn't own the ball.
+    pub gk1v1_decision_made: bool,
     /// realism-bug (2026-07-19): throw-in taker's forced-release window,
     /// in remaining ticks (0 = inactive). Same pattern as
     /// `kickoff_pass_pending` — a throw-in is a single discrete motion
@@ -501,6 +532,10 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            round_keeper_commitment_ticks: 0,
+            round_keeper_target_x: 0.0,
+            round_keeper_target_y: 0.0,
+            gk1v1_decision_made: false,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,
             aerial_contest_won: 0,
@@ -583,6 +618,10 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            round_keeper_commitment_ticks: 0,
+            round_keeper_target_x: 0.0,
+            round_keeper_target_y: 0.0,
+            gk1v1_decision_made: false,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,
             aerial_contest_won: 0,

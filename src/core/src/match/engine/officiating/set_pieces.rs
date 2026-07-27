@@ -720,6 +720,99 @@ pub fn recovery_shape_targets(
         .collect()
 }
 
+/// realism-bug (2026-07-27, redesign — Pavel): replaces the original
+/// `restart_timing_advantage`, which counted "players who haven't finished
+/// walking to an assigned `restart_retreat_target`" as a proxy for "is this
+/// a good moment for a quick restart." That was the wrong quantity, for two
+/// reasons proven by a real observed failure (a corner taken quickly with
+/// 2 attackers vs 5-6 defenders actually in the box): (1) a player who's
+/// already well-positioned before the restart is never assigned a target
+/// at all (the recovery-shape logic skips anyone within 20u of their
+/// spot), so "how many attackers are dangerously placed" and "how many
+/// attackers still have somewhere to walk to" are different, often
+/// opposite, quantities; (2) a defensive shape structurally needs more
+/// assigned targets than an attacking one (a wall + markers vs. a handful
+/// of attacking runs), so the old metric was systematically biased toward
+/// reading "the defence is behind" regardless of the real numbers on the
+/// pitch.
+///
+/// This measures the real thing instead: current, actual positions,
+/// relative to the halfway line — the standard real-football framing for
+/// "are we caught with numbers forward, are they light at the back." A
+/// player only counts if they're in the half nearer the goal being
+/// attacked (`in_attacked_half`): a KICKING-side player there is already
+/// forward/dangerous; a DEFENDING-side player there is organized in their
+/// own half. Both use the identical spatial test because "the attacked
+/// half" and "the defending side's own half" are the same half by
+/// definition — only which side's players get counted in it differs.
+///
+/// Only meaningful for restarts where a fast break is the actual tactic
+/// (goal kicks, throw-ins, deep free kicks) — the caller scopes which
+/// restart types this applies to, not this function. Corners and
+/// close-range free kicks never call this: a promising set piece is never
+/// worth rushing regardless of numbers (see the `never_rush` gate in
+/// `run.rs`), so there's no "is it worth it" question to compute there.
+pub fn counterattack_advantage(
+    players: &[crate::r#match::MatchPlayer],
+    kicking_side: crate::r#match::PlayerSide,
+    field_width: f32,
+) -> i32 {
+    use crate::PlayerFieldPositionGroup;
+    let halfway = field_width * 0.5;
+    let mut attackers_forward: i32 = 0;
+    let mut defenders_back: i32 = 0;
+    for p in players.iter().filter(|p| !p.is_sent_off) {
+        if p.tactical_position.current_position.position_group()
+            == PlayerFieldPositionGroup::Goalkeeper
+        {
+            continue;
+        }
+        let in_attacked_half = match kicking_side {
+            crate::r#match::PlayerSide::Left => p.position.x > halfway,
+            crate::r#match::PlayerSide::Right => p.position.x < halfway,
+        };
+        if !in_attacked_half {
+            continue;
+        }
+        if p.side == Some(kicking_side) {
+            attackers_forward += 1;
+        } else {
+            defenders_back += 1;
+        }
+    }
+    attackers_forward - defenders_back
+}
+
+/// realism-bug (2026-07-27, Pavel): shared classification for the three
+/// restart types that are ALWAYS patiently organized regardless of team-
+/// shape numbers — corners, close-range free kicks, and penalties. A real
+/// team never rushes a promising set piece (see `counterattack_advantage`'s
+/// doc comment for why a naive numbers-count reads backwards here anyway).
+/// Used in two places that must agree, which is why this is a single
+/// shared function rather than the same distance check duplicated twice
+/// (this project's own repeated lesson — see `WALL_NEAR_SHIFT_FRACTION`'s
+/// comment on the same risk): `run.rs`'s early-exit-by-chance roll (never
+/// fires for these types — the wait always plays out) and
+/// `apply_restart_retreat_tick` (`tick.rs`, these types walk into shape at
+/// a deliberately unrealistic speed and the stoppage ends the instant
+/// everyone's actually arrived, rather than a viewer watching several
+/// real seconds of a wall/box shape form when the outcome never depended
+/// on the exact pace of that walk). Goal kicks, throw-ins, and deep free
+/// kicks are deliberately excluded from both — that's exactly the window
+/// `counterattack_advantage` judges, and it needs to unfold at a real,
+/// watchable pace for a "quick vs. patient" decision to mean anything.
+pub fn is_patiently_organized_restart(
+    pass_origin_restart: crate::r#match::PassOriginRestart,
+    dist_to_goal_if_free_kick: f32,
+) -> bool {
+    use crate::r#match::PassOriginRestart;
+    match pass_origin_restart {
+        PassOriginRestart::Corner | PassOriginRestart::Penalty => true,
+        PassOriginRestart::DirectFreeKick => dist_to_goal_if_free_kick <= 280.0,
+        _ => false,
+    }
+}
+
 /// Throw-in shape (realism-bug pass, 2026-07-18). Unlike a foul/corner/
 /// goal-kick — genuine team-wide stoppages that earned `recovery_shape_
 /// targets`'s full-formation recovery — a throw-in is a local, low-stakes

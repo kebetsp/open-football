@@ -106,6 +106,15 @@ pub mod tackle_stats {
     pub static FWD_SUCCESSES: AtomicU64 = AtomicU64::new(0);
     pub static GK_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 
+    // TEMPORARY /realism-bug dribbling investigation (2026-07-27): which gate
+    // inside DefenderTacklingState::process() is responsible for the
+    // entries->attempts collapse (thousands of entries, ~10 attempts/match).
+    // Remove once the mechanism is found and fixed.
+    pub static DEF_GATE_TOO_FAR: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_GATE_NOT_IN_RANGE: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_GATE_COOLDOWN: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_GATE_NOT_BEST: AtomicU64 = AtomicU64::new(0);
+
     pub fn reset() {
         for c in [
             &DEF_ENTRIES,
@@ -120,9 +129,22 @@ pub mod tackle_stats {
             &MID_SUCCESSES,
             &FWD_SUCCESSES,
             &GK_SUCCESSES,
+            &DEF_GATE_TOO_FAR,
+            &DEF_GATE_NOT_IN_RANGE,
+            &DEF_GATE_COOLDOWN,
+            &DEF_GATE_NOT_BEST,
         ] {
             c.store(0, Ordering::Relaxed);
         }
+    }
+
+    pub fn snapshot_gates() -> [u64; 4] {
+        [
+            DEF_GATE_TOO_FAR.load(Ordering::Relaxed),
+            DEF_GATE_NOT_IN_RANGE.load(Ordering::Relaxed),
+            DEF_GATE_COOLDOWN.load(Ordering::Relaxed),
+            DEF_GATE_NOT_BEST.load(Ordering::Relaxed),
+        ]
     }
 
     pub fn snapshot() -> [u64; 12] {
@@ -207,6 +229,38 @@ impl StateProcessingHandler for ForwardRunningState {
 
         // Handle cases when player has the ball
         if ctx.player.has_ball(ctx) {
+            // realism-bug (2026-07-27): round-the-keeper commitment. Armed
+            // rarely (run.rs) for a genuine clean 1v1 vs. the GK — checked
+            // here FIRST because an unpressured breakaway run is actually
+            // ForwardRunningState, not ForwardDribblingState (Core Rule 3:
+            // the commitment armed correctly but never fired a shot until
+            // this branch was added, because the consuming code lived in
+            // a state that wasn't the one executing). "Reached" is
+            // measured against the FROZEN target set once at arm time
+            // (player.rs, round_keeper_target_x/y) — a live-recomputed
+            // target let a retreating keeper "outrun" the closing
+            // attacker (their relative closing rate was only the
+            // difference of their speeds). See the twin branch in
+            // ForwardDribblingState.
+            if ctx.player.round_keeper_commitment_ticks > 0 {
+                let target = Vector3::new(
+                    ctx.player.round_keeper_target_x,
+                    ctx.player.round_keeper_target_y,
+                    0.0,
+                );
+                let reached = (target - ctx.player.position).magnitude() < 15.0;
+                if reached {
+                    let decision = evaluate_forward_shot_decision(ctx, "FWD_ROUND_KEEPER");
+                    if let ShotDecision::Shoot { reason } = decision {
+                        return Some(
+                            StateChangeResult::with_forward_state(ForwardState::Shooting)
+                                .with_shot_reason(reason),
+                        );
+                    }
+                }
+                return None; // keep carrying; velocity() steers to the frozen target
+            }
+
             // Corner taker: set the corner up via Crossing (which holds the
             // delivery until centre-backs have pushed up to attack it).
             if ctx.ball().is_team_attacking_corner() {
@@ -1123,6 +1177,26 @@ impl StateProcessingHandler for ForwardRunningState {
 
         // Movement with ball
         if ctx.player.has_ball(ctx) {
+            // realism-bug (2026-07-27): round-the-keeper commitment
+            // override — steer to the FROZEN target (set once at arm
+            // time, player.rs) rather than the keeper's live position.
+            // Twin of the branch in ForwardDribblingState::velocity().
+            if ctx.player.round_keeper_commitment_ticks > 0 {
+                let target = Vector3::new(
+                    ctx.player.round_keeper_target_x,
+                    ctx.player.round_keeper_target_y,
+                    0.0,
+                );
+                return Some(
+                    SteeringBehavior::Arrive {
+                        target,
+                        slowing_distance: 8.0,
+                    }
+                    .calculate(ctx.player)
+                    .velocity
+                        * fatigue_factor,
+                );
+            }
             Some(self.calculate_ball_carrying_movement(ctx) * fatigue_factor)
         }
         // Without ball — spread across pitch using unique player slots

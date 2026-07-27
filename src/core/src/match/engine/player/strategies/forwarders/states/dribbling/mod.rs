@@ -72,6 +72,31 @@ impl StateProcessingHandler for ForwardDribblingState {
         let distance_to_goal = ctx.ball().distance_to_opponent_goal();
         let can_shoot = ctx.team().can_shoot() && ctx.player().can_shoot();
 
+        // realism-bug (2026-07-27): round-the-keeper commitment. Armed
+        // rarely (run.rs, see round_keeper_commitment_ticks' doc comment)
+        // for a genuine clean 1v1 vs. the GK. While active, skip the
+        // normal shot-dispatch priorities entirely — velocity() (below)
+        // steers past the keeper's actual position instead of at/around
+        // him for an angle — and only shoot once the carrier has
+        // genuinely advanced beyond the keeper toward goal.
+        if ctx.player.round_keeper_commitment_ticks > 0 {
+            // realism-bug follow-up: measured against the FROZEN target
+            // (set once at arm time), not the GK's live position -- see
+            // round_keeper_target_x/y's doc comment (player.rs).
+            let target = Vector3::new(
+                ctx.player.round_keeper_target_x,
+                ctx.player.round_keeper_target_y,
+                0.0,
+            );
+            let reached = (target - ctx.player.position).magnitude() < 15.0;
+            if reached {
+                if let Some(result) = dispatch_shot(ctx, "FWD_ROUND_KEEPER") {
+                    return Some(result);
+                }
+            }
+            return None; // keep carrying; velocity() steers to the frozen target
+        }
+
         // PRIORITY 0: Near opponent goalkeeper.
         if let Some(gk) = ctx.players().opponents().goalkeeper().next() {
             let distance_to_gk = (ctx.player.position - gk.position).magnitude();
@@ -260,6 +285,27 @@ impl StateProcessingHandler for ForwardDribblingState {
                     .velocity,
                 );
             }
+        }
+
+        // realism-bug (2026-07-27): round-the-keeper commitment override
+        // — carry PAST the keeper's current position rather than just
+        // sidestepping to open a shooting angle (the generic GK-avoidance
+        // block right below this only ever does the latter, which is why
+        // no decision path previously existed for actually beating him).
+        if ctx.player.round_keeper_commitment_ticks > 0 {
+            let target = Vector3::new(
+                ctx.player.round_keeper_target_x,
+                ctx.player.round_keeper_target_y,
+                0.0,
+            );
+            return Some(
+                SteeringBehavior::Arrive {
+                    target,
+                    slowing_distance: 8.0,
+                }
+                .calculate(ctx.player)
+                .velocity,
+            );
         }
 
         // GK-avoidance: when the keeper is in close range, sidestep to

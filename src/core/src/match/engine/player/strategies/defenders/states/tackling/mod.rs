@@ -50,6 +50,8 @@ impl StateProcessingHandler for DefenderTacklingState {
 
             // If opponent is too far for tackling, press instead
             if distance_to_opponent > PRESSING_DISTANCE {
+                #[cfg(feature = "match-logs")]
+                crate::tackle_stats::DEF_GATE_TOO_FAR.fetch_add(1, Ordering::Relaxed);
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Pressing,
                 ));
@@ -57,6 +59,8 @@ impl StateProcessingHandler for DefenderTacklingState {
 
             // If opponent is close but not in tackle range, keep pressing
             if distance_to_opponent > TACKLE_DISTANCE_THRESHOLD {
+                #[cfg(feature = "match-logs")]
+                crate::tackle_stats::DEF_GATE_NOT_IN_RANGE.fetch_add(1, Ordering::Relaxed);
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Pressing,
                 ));
@@ -70,6 +74,8 @@ impl StateProcessingHandler for DefenderTacklingState {
             // on the player itself — whatever path routed us here, if we
             // just tackled, we can't tackle again for ~1 s.
             if !ctx.player.can_attempt_tackle() {
+                #[cfg(feature = "match-logs")]
+                crate::tackle_stats::DEF_GATE_COOLDOWN.fetch_add(1, Ordering::Relaxed);
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Pressing,
                 ));
@@ -83,6 +89,8 @@ impl StateProcessingHandler for DefenderTacklingState {
             // football: ~18). Only the best-positioned teammate
             // engages; the rest fall back to Pressing to cover angles.
             if !ctx.team().is_best_player_to_chase_ball() {
+                #[cfg(feature = "match-logs")]
+                crate::tackle_stats::DEF_GATE_NOT_BEST.fetch_add(1, Ordering::Relaxed);
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Pressing,
                 ));

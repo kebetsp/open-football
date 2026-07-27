@@ -96,8 +96,15 @@ impl StateProcessingHandler for MidfielderPressingState {
         if let Some(opponent) = ctx.players().opponents().nearby(60.0).with_ball(ctx).next() {
             let opponent_distance = (opponent.position - ctx.player.position).magnitude();
 
-            // Engage tackle aggressively — midfielders must win the ball
-            if opponent_distance < 50.0 {
+            // Engage tackle aggressively — midfielders must win the ball.
+            // Realism-bug 2026-07-27: aligned with MidfielderTacklingState's
+            // own TACKLE_DISTANCE_THRESHOLD (8u). At 50u this was a 42u dead
+            // zone -- Tackling::process() immediately found opponent_distance
+            // > 8u and bounced back to Pressing every tick, using Tackling's
+            // weaker steering instead of Pressing's own chase logic for the
+            // whole close-in. Measured entries:attempts was ~1000:1 (worse
+            // than defenders' ~300:1) before this fix.
+            if opponent_distance < 8.0 {
                 return Some(StateChangeResult::with_midfielder_state(
                     MidfielderState::Tackling,
                 ));

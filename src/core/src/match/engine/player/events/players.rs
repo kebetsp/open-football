@@ -3941,20 +3941,84 @@ impl PlayerEventDispatcher {
             Some(field.home_team_id)
         };
         let possession_retained = owner_team == fouled_team_id;
+        // 2026-07-27 realism-bug: attack_value used to be pure ball
+        // field-position (0.30 + progress*0.40) — any foul with the
+        // ball ~37.5% up the pitch cleared the 0.45 advantage bar
+        // regardless of whether a real route to goal existed. Real
+        // advantage doctrine (Law 5's "will genuinely benefit") turns
+        // on numbers recovered goal-side of the ball and pressure on
+        // the ball carrier, not just how advanced the ball is — a team
+        // that keeps the ball hemmed in by a recovered block has no
+        // more genuine advantage than one that lost it outright. Two
+        // new geometric terms below fold that in directly from field
+        // positions (no per-player context needed, so this stays
+        // isolated to this one function). The fouler is excluded from
+        // the pressure term deliberately: by definition he was close
+        // enough to make contact, so his own distance is an artifact
+        // of the foul itself, not a signal about whether the position
+        // is genuinely crowded.
         let attack_value = if let Some(team) = fouled_team_id {
-            let bx = field.ball.position.x;
+            let ball_pos = field.ball.position;
             let target_right = team == field.home_team_id;
             let progress = if target_right {
-                (bx / (field.size.width as f32)).clamp(0.0, 1.0)
+                (ball_pos.x / (field.size.width as f32)).clamp(0.0, 1.0)
             } else {
-                (1.0 - bx / (field.size.width as f32)).clamp(0.0, 1.0)
+                (1.0 - ball_pos.x / (field.size.width as f32)).clamp(0.0, 1.0)
             };
-            let base = 0.30 + progress * 0.40;
             let center_y = field.size.height as f32 / 2.0;
             let centrality =
-                1.0 - ((field.ball.position.y - center_y).abs() / center_y).clamp(0.0, 1.0);
+                1.0 - ((ball_pos.y - center_y).abs() / center_y).clamp(0.0, 1.0);
             let nudge = 0.05 * centrality;
-            (base + nudge).clamp(0.0, 1.0)
+
+            // Numbers goal-side of the ball, in a corridor wide enough
+            // to matter (~16.25m each way — a defender out on the far
+            // touchline isn't part of "the block", one covering the
+            // direct route to goal is). Excludes the goalkeeper: him
+            // being goal-side is the baseline, not a recovered body.
+            let goal_x = if target_right {
+                field.size.width as f32
+            } else {
+                0.0
+            };
+            const LANE_CORRIDOR_HALF_WIDTH: f32 = 130.0;
+            let defenders_between = field
+                .players
+                .iter()
+                .filter(|p| p.team_id != team)
+                .filter(|p| !p.tactical_position.current_position.is_goalkeeper())
+                .filter(|p| {
+                    let between_ball_and_goal = if target_right {
+                        p.position.x > ball_pos.x && p.position.x < goal_x
+                    } else {
+                        p.position.x < ball_pos.x && p.position.x > goal_x
+                    };
+                    between_ball_and_goal
+                        && (p.position.y - ball_pos.y).abs() <= LANE_CORRIDOR_HALF_WIDTH
+                })
+                .count();
+            let lane_bonus = 0.30 * (1.0 - (defenders_between.min(3) as f32) / 3.0);
+
+            // Immediate pressure from opponents OTHER than the fouler —
+            // a closely-marked possession isn't the "controlled" attack
+            // advantage requires, even in open field position.
+            let nearest_opp_dist = field
+                .players
+                .iter()
+                .filter(|p| p.team_id != team && p.id != fouler_id)
+                .map(|p| {
+                    let dx = p.position.x - ball_pos.x;
+                    let dy = p.position.y - ball_pos.y;
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .fold(f32::INFINITY, f32::min);
+            let pressure_penalty = if nearest_opp_dist.is_finite() {
+                0.15 * (1.0 - ((nearest_opp_dist - 15.0) / 35.0).clamp(0.0, 1.0))
+            } else {
+                0.0
+            };
+
+            let base = 0.15 + progress * 0.35;
+            (base + lane_bonus - pressure_penalty + nudge).clamp(0.0, 1.0)
         } else {
             0.0
         };

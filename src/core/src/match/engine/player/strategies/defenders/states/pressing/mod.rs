@@ -8,7 +8,15 @@ use crate::r#match::{
 };
 use nalgebra::Vector3;
 
-const TACKLING_DISTANCE_THRESHOLD: f32 = 25.0; // Commit from ~2.5× the old 20u lunge range — carriers can't brush past at 21u
+// Realism-bug 2026-07-27: aligned with DefenderTacklingState's own
+// TACKLE_DISTANCE_THRESHOLD (10u). At 25u, a defender entering Tackling
+// found distance_to_opponent > 10u on the very next check and bounced
+// straight back to Pressing -- a 15u dead zone where the state machine
+// thrashed every tick and used Tackling's weaker (non-predictive) chase
+// steering instead of Pressing's lead-time+goalside-bias closing
+// algorithm. Measured: DEF_GATE_NOT_IN_RANGE fired 1800-4700 times/match
+// (vs 5-18 real attempts) because of this exact mismatch.
+const TACKLING_DISTANCE_THRESHOLD: f32 = 10.0;
 const BASE_PRESSING_DISTANCE: f32 = 45.0;
 const MAX_PRESSING_BONUS: f32 = 35.0; // effective range: 45-80
 const BASE_PRESSING_DISTANCE_DEFENSIVE_THIRD: f32 = 40.0;
