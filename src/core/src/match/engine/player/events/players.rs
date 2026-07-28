@@ -5108,7 +5108,38 @@ impl PlayerEventDispatcher {
                             // recovery_shape_targets's own small 0.12
                             // forward creep entirely) instead of
                             // advancing with the rest of the team.
+                            //
+                            // realism-bug (2026-07-29, Pavel): forwards
+                            // used to have NO override here, falling
+                            // through to the generic
+                            // `recovery_shape_targets` role-graduated
+                            // shift below. That shift anchors on
+                            // `start_position`, and a forward's own
+                            // resting anchor (e.g. ForwardCenter x=395 on
+                            // an 840-wide pitch) sits just inside
+                            // midfield — squarely inside band 3's own
+                            // restart range (roughly 360-560u, bounded by
+                            // both `own_goal_dist>360` and the attacked-
+                            // goal `dist_goal>280` gate). So for most of
+                            // this band the restart is at or beyond the
+                            // forward's anchor, and the generic shift's
+                            // gap-gate (only pushes if `gap>0`, capped at
+                            // 35% of the gap) computed a target close to
+                            // or behind the ball — visibly behind the
+                            // midfielders just pushed ahead of it,
+                            // reading as the forward retreating into the
+                            // vacated midfield slot. Real doctrine: the
+                            // forward stays the highest, furthest-
+                            // advanced out-ball option for a punched free
+                            // kick, not a body that drops to help in
+                            // midfield. Fixed the same way as the
+                            // midfielder branch above — target computed
+                            // from `restart_pos`, not the shallow static
+                            // anchor — pushed further out (100u) than
+                            // the midfielders' lay-off line (60u) so the
+                            // two lines stay visibly distinct.
                             const AHEAD_OF_BALL_OFFSET: f32 = 60.0;
+                            const FORWARD_AHEAD_OFFSET: f32 = 100.0;
                             for p in field.players.iter() {
                                 if p.id == taker_id || p.is_sent_off || p.side != Some(victim_side)
                                 {
@@ -5124,6 +5155,12 @@ impl PlayerEventDispatcher {
                                     teleports.push((p.id, pos));
                                 } else if group == PlayerFieldPositionGroup::Defender {
                                     teleports.push((p.id, p.start_position));
+                                } else if group == PlayerFieldPositionGroup::Forward {
+                                    let mut pos = restart_pos + dir * FORWARD_AHEAD_OFFSET;
+                                    pos.y = p.position.y;
+                                    pos.x = pos.x.clamp(2.0, field_w - 2.0);
+                                    pos.y = pos.y.clamp(2.0, field_h - 2.0);
+                                    teleports.push((p.id, pos));
                                 }
                             }
                         }
