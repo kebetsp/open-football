@@ -1255,6 +1255,31 @@ impl PassEvaluator {
         ctx: &StateProcessingContext,
         max_distance: f32,
     ) -> Option<(MatchPlayerLite, &'static str)> {
+        // realism-bug (2026-07-28): a free kick that falls through to
+        // ShortRoutine/Recycle (§12.2, `resolve_free_kick`) only arms
+        // `free_kick_pass_pending` to force the taker into his role's
+        // normal Passing state — it never constrained WHO that state's
+        // own `find_best_pass_option` call is allowed to consider, and
+        // that call's normal search radius is 300-400u (nearly half the
+        // pitch length), not a "short routine" or even a realistic
+        // "recycle to a deeper teammate" distance. Combined with the
+        // §11.7 box-staging congestion crushing every forward option's
+        // score (see the `passer_open_chance` waiver below, which only
+        // fires for a genuine near-goal dribble, not a stationary FK
+        // taker 25-35m out), an isolated CB/DM sitting near the taker's
+        // OWN half could still out-score every crowded forward option
+        // and win outright — a real free kick is never played the
+        // length of the pitch backward. Clamp the search radius whenever
+        // this is a free-kick recycle/short decision so only a genuinely
+        // nearby teammate (a real lay-off or drop-back-and-reset) is
+        // ever a candidate; every other passing decision is unaffected.
+        const FREE_KICK_RECYCLE_MAX_DISTANCE: f32 = 160.0;
+        let max_distance = if ctx.player.free_kick_pass_pending > 0 {
+            max_distance.min(FREE_KICK_RECYCLE_MAX_DISTANCE)
+        } else {
+            max_distance
+        };
+
         let mut best_option: Option<MatchPlayerLite> = None;
         let mut best_score = 0.0;
 
