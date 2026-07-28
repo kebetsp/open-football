@@ -561,7 +561,8 @@ impl<'p> StateProcessor<'p> {
         match ctx.player.state {
             Forward(ForwardState::Passing)
             | Midfielder(MidfielderState::Passing)
-            | Defender(DefenderState::Passing) => None,
+            | Defender(DefenderState::Passing)
+            | Goalkeeper(GoalkeeperState::Passing) => None,
             Forward(_) => Some(StateChangeResult::with_forward_state(ForwardState::Passing)),
             Midfielder(_) => Some(StateChangeResult::with_midfielder_state(
                 MidfielderState::Passing,
@@ -569,9 +570,18 @@ impl<'p> StateProcessor<'p> {
             Defender(_) => Some(StateChangeResult::with_defender_state(
                 DefenderState::Passing,
             )),
-            // pick_free_kick_taker excludes goalkeepers; an injured
-            // taker has bigger problems than pass selection.
-            Goalkeeper(_) | PlayerState::Injured => None,
+            // realism-bug (2026-07-28): deep-FK team-positioning system —
+            // band 1 (a restart within ~25m of the taker's own goal) now
+            // has `pick_free_kick_taker` select the GK himself. Force him
+            // into `GoalkeeperState::Passing`, the same short/medium/long
+            // distribution decision a save already routes through
+            // (`GoalkeeperPassingState`, reachable from Diving/
+            // PreparingForSave) — reused rather than reinvented, and
+            // already skill/pressure/space-graduated.
+            Goalkeeper(_) => Some(StateChangeResult::with_goalkeeper_state(
+                GoalkeeperState::Passing,
+            )),
+            PlayerState::Injured => None,
         }
     }
 

@@ -4660,12 +4660,52 @@ impl PlayerEventDispatcher {
             Vector3::new(x, y, 0.0)
         };
 
+        // realism-bug (2026-07-28): deep-free-kick team-positioning
+        // system (Pavel spec). Classify how deep in the TAKING team's
+        // OWN half this restart is (own_goal_dist — distinct from the
+        // attacked-goal `dist_goal` computed below for the wall/
+        // attacking-shape logic) so the right role steps up: the GK for
+        // a restart very close to our own goal, a defender for a
+        // middle-third one, a midfielder further out. Only kicks in
+        // beyond the crossable/wall-forming range (dist_goal > 280u) —
+        // closer to the attacked goal, taker selection is unchanged
+        // (nearest eligible outfield player, already tuned for direct
+        // shots/crosses). Recomputed independently here (not reusing
+        // the later `dist_goal`/`goal_x`, which aren't in scope yet at
+        // this point in the function) using the identical formula, so
+        // the two can never disagree.
+        let deep_fk_role: Option<PlayerFieldPositionGroup> = if in_penalty_area {
+            None
+        } else {
+            let fk_goal_x = match fouler_side {
+                PlayerSide::Left => 0.0,
+                PlayerSide::Right => field_w,
+            };
+            let fk_mid_y = field_h * 0.5;
+            let dg = Vector3::new(fk_goal_x - restart_pos.x, fk_mid_y - restart_pos.y, 0.0);
+            let fk_dist_goal = (dg.x * dg.x + dg.y * dg.y).sqrt();
+            if fk_dist_goal > 280.0 {
+                let own_goal_x = if fk_goal_x == 0.0 { field_w } else { 0.0 };
+                let og = Vector3::new(own_goal_x - restart_pos.x, fk_mid_y - restart_pos.y, 0.0);
+                let own_goal_dist = (og.x * og.x + og.y * og.y).sqrt();
+                Some(if own_goal_dist < 200.0 {
+                    PlayerFieldPositionGroup::Goalkeeper // band 1: <25m from our own goal
+                } else if own_goal_dist < 360.0 {
+                    PlayerFieldPositionGroup::Defender // band 2: 25-45m
+                } else {
+                    PlayerFieldPositionGroup::Midfielder // band 3: 45m+ up to the wall-forming range
+                })
+            } else {
+                None
+            }
+        };
+
         // Pick a taker from the victim's on-field players. Penalty uses
         // penalty-taking composite; FK uses free-kick composite.
         let taker_id = if in_penalty_area {
             Self::pick_penalty_taker(field, victim_side)
         } else {
-            Self::pick_free_kick_taker(field, victim_side, restart_pos)
+            Self::pick_free_kick_taker(field, victim_side, restart_pos, deep_fk_role)
         };
         let taker_id = match taker_id {
             Some(id) => id,
@@ -5000,6 +5040,103 @@ impl PlayerEventDispatcher {
                 // below) — defenders shift least, midfielders more,
                 // forwards most, matching real buildup/possession-
                 // retention doctrine instead of an arbitrary headcount.
+
+                // realism-bug (2026-07-28): the whole-team shift above
+                // was a uniform default with no awareness of WHO the
+                // taker is or how the rest of the team should organise
+                // around him. `deep_fk_role` (computed before taker
+                // selection, above) tells us exactly which of Pavel's
+                // three deep-FK bands this restart is in — band 1 (GK
+                // taker) needs no extra shape (every outfield player
+                // already gets the default forward push below, and the
+                // GK himself is excluded from that function entirely);
+                // bands 2/3 need explicit, band-specific placements that
+                // the generic role-graduated shift can't express: a
+                // defender-taker's fellow defenders holding a shallow
+                // covering line just behind the ball rather than
+                // advancing with everyone else, and a midfielder-taker's
+                // fellow midfielders stepping a few metres AHEAD of the
+                // ball as genuine lay-off options. These are pushed into
+                // `teleports` (same walked-not-snapped §13.4 mechanism as
+                // the wall/box-clear above) so `recovery_shape_targets`
+                // skips them entirely via `staged_ids` below, rather than
+                // both systems fighting over the same player.
+                if let Some(role) = deep_fk_role {
+                    match role {
+                        PlayerFieldPositionGroup::Defender => {
+                            // Band 2 (25-45m from our own goal): other
+                            // defenders hold ~4m (32u, midpoint of the
+                            // spec's 3-5m) behind the ball on their own
+                            // existing channel; midfielders/forwards get
+                            // an explicit extra push (~5m/40u beyond
+                            // their own anchor) — genuinely "further"
+                            // than the held-back defenders, not just the
+                            // default role-graduated shift.
+                            const BEHIND_BALL_OFFSET: f32 = 32.0;
+                            const FURTHER_PUSH_OFFSET: f32 = 40.0;
+                            for p in field.players.iter() {
+                                if p.id == taker_id || p.is_sent_off || p.side != Some(victim_side) {
+                                    continue;
+                                }
+                                let group =
+                                    p.tactical_position.current_position.position_group();
+                                if group == PlayerFieldPositionGroup::Defender {
+                                    let mut pos = restart_pos - dir * BEHIND_BALL_OFFSET;
+                                    pos.y = p.position.y;
+                                    pos.x = pos.x.clamp(2.0, field_w - 2.0);
+                                    pos.y = pos.y.clamp(2.0, field_h - 2.0);
+                                    teleports.push((p.id, pos));
+                                } else if matches!(
+                                    group,
+                                    PlayerFieldPositionGroup::Midfielder
+                                        | PlayerFieldPositionGroup::Forward
+                                ) {
+                                    let mut pos = p.start_position + dir * FURTHER_PUSH_OFFSET;
+                                    pos.x = pos.x.clamp(2.0, field_w - 2.0);
+                                    pos.y = pos.y.clamp(2.0, field_h - 2.0);
+                                    teleports.push((p.id, pos));
+                                }
+                            }
+                        }
+                        PlayerFieldPositionGroup::Midfielder => {
+                            // Band 3 (45m+ from our own goal, up to the
+                            // wall-forming range): other midfielders
+                            // push ~7.5m (60u, midpoint of the spec's
+                            // 5-10m) ahead of the ball on their own
+                            // channel as lay-off options; defenders hold
+                            // their pure formation anchor (bypassing
+                            // recovery_shape_targets's own small 0.12
+                            // forward creep entirely) instead of
+                            // advancing with the rest of the team.
+                            const AHEAD_OF_BALL_OFFSET: f32 = 60.0;
+                            for p in field.players.iter() {
+                                if p.id == taker_id || p.is_sent_off || p.side != Some(victim_side)
+                                {
+                                    continue;
+                                }
+                                let group =
+                                    p.tactical_position.current_position.position_group();
+                                if group == PlayerFieldPositionGroup::Midfielder {
+                                    let mut pos = restart_pos + dir * AHEAD_OF_BALL_OFFSET;
+                                    pos.y = p.position.y;
+                                    pos.x = pos.x.clamp(2.0, field_w - 2.0);
+                                    pos.y = pos.y.clamp(2.0, field_h - 2.0);
+                                    teleports.push((p.id, pos));
+                                } else if group == PlayerFieldPositionGroup::Defender {
+                                    teleports.push((p.id, p.start_position));
+                                }
+                            }
+                        }
+                        // Band 1 (GK taker): no override needed — every
+                        // outfield teammate already gets the default
+                        // role-graduated forward push below ("everyone
+                        // else is pushed up"), and the GK himself is
+                        // teleported onto the ball above, separately
+                        // from this whole shape mechanism.
+                        PlayerFieldPositionGroup::Goalkeeper
+                        | PlayerFieldPositionGroup::Forward => {}
+                    }
+                }
             }
         }
         // §13.4: the wall / box-clear get a genuine retreat target (same
@@ -5096,6 +5233,7 @@ impl PlayerEventDispatcher {
         field: &MatchField,
         victim_side: PlayerSide,
         restart_pos: Vector3<f32>,
+        role_pref: Option<PlayerFieldPositionGroup>,
     ) -> Option<u32> {
         use crate::r#match::engine::set_pieces::score_free_kick_taker;
         // realism-bug (2026-07-20): a soft additive distance PENALTY
@@ -5116,31 +5254,62 @@ impl PlayerEventDispatcher {
         // do it). A structural cutoff can't be "not quite enough" the
         // way a soft penalty's magnitude was.
         const PROXIMITY_WINDOW: f32 = 70.0; // ~8.75m
-        let candidates: Vec<(u32, f32, f32)> = field
-            .players
-            .iter()
-            .filter(|p| {
-                p.side == Some(victim_side)
-                    && !p.is_sent_off
-                    && p.tactical_position.current_position.position_group()
-                        != PlayerFieldPositionGroup::Goalkeeper
-            })
-            .map(|p| {
-                let dx = p.position.x - restart_pos.x;
-                let dy = p.position.y - restart_pos.y;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let base = score_free_kick_taker(
-                    p.skills.technical.free_kicks,
-                    p.skills.technical.technique,
-                    p.skills.technical.long_shots,
-                    p.skills.technical.crossing,
-                    p.skills.mental.vision,
-                    p.skills.mental.composure,
-                    p.attributes.pressure,
-                );
-                (p.id, dist, base)
-            })
-            .collect();
+
+        fn collect(
+            field: &MatchField,
+            victim_side: PlayerSide,
+            restart_pos: Vector3<f32>,
+            include: impl Fn(PlayerFieldPositionGroup) -> bool,
+        ) -> Vec<(u32, f32, f32)> {
+            field
+                .players
+                .iter()
+                .filter(|p| {
+                    p.side == Some(victim_side)
+                        && !p.is_sent_off
+                        && include(p.tactical_position.current_position.position_group())
+                })
+                .map(|p| {
+                    let dx = p.position.x - restart_pos.x;
+                    let dy = p.position.y - restart_pos.y;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    let base = score_free_kick_taker(
+                        p.skills.technical.free_kicks,
+                        p.skills.technical.technique,
+                        p.skills.technical.long_shots,
+                        p.skills.technical.crossing,
+                        p.skills.mental.vision,
+                        p.skills.mental.composure,
+                        p.attributes.pressure,
+                    );
+                    (p.id, dist, base)
+                })
+                .collect()
+        }
+
+        // realism-bug (2026-07-28): deep-FK team-positioning system
+        // (Pavel spec) — `role_pref` (set by `award_restart_for_foul`'s
+        // `deep_fk_role` classification) restricts the candidate pool to
+        // the role that should realistically step up for how deep this
+        // restart is: the GK for a restart near our own goal, a
+        // defender for a middle-third one, a midfielder further out.
+        // Falls back to the original any-outfield-player pool (GK
+        // excluded) if the preferred role has nobody eligible — e.g. a
+        // sent-off GK with no outfield replacement in goal, not modelled
+        // in this engine — so a rare edge case degrades gracefully
+        // instead of returning no taker at all.
+        let mut candidates: Vec<(u32, f32, f32)> = match role_pref {
+            Some(group) => collect(field, victim_side, restart_pos, |g| g == group),
+            None => collect(field, victim_side, restart_pos, |g| {
+                g != PlayerFieldPositionGroup::Goalkeeper
+            }),
+        };
+        if candidates.is_empty() && role_pref.is_some() {
+            candidates = collect(field, victim_side, restart_pos, |g| {
+                g != PlayerFieldPositionGroup::Goalkeeper
+            });
+        }
+
         let min_dist = candidates
             .iter()
             .map(|&(_, d, _)| d)
