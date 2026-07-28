@@ -86,6 +86,24 @@ const ROTATION_WEIGHT: f32 = 20.0;
 /// as the other milestone weights in this file.
 const WEAK_SIDE_PATIENCE_WEIGHT: f32 = 18.0;
 
+/// Pressure-relief support ("show for the ball" — wishlist item
+/// "pressure-sensitive spread distance", implemented here on top of the
+/// possession-decision-intelligence architecture rather than the old
+/// dead-code `is_ball_holder_under_pressure`/`CheckToFeet` scaffolding it
+/// originally lived in). Weighted well above the other milestone terms —
+/// measured via a match-logs score trace that a lower (tens-scale, ~30)
+/// weight left close candidates scoring a mean of ~7-8 under genuine
+/// pressure against ~27-34 for 80-200u candidates, i.e. structurally
+/// unable to win even when a genuinely open near pocket existed.
+const PRESSURE_RELIEF_WEIGHT: f32 = 70.0;
+
+/// Range within which a close option can plausibly act as an immediate
+/// out-ball. Deliberately wider than `SHORT_SUPPORT_RADIUS` (28u) so the
+/// two terms overlap smoothly: inside 28u the redundancy penalty is
+/// being relaxed at the same time the relief bonus ramps up, rather than
+/// the bonus only starting exactly where the penalty stops.
+const PRESSURE_RELIEF_RADIUS: f32 = 45.0;
+
 /// Radius inside which a candidate is penalised per nearby teammate —
 /// same 90u repulsion radius the forward zone scorer uses.
 const TEAMMATE_REPULSION_RADIUS: f32 = 90.0;
@@ -373,6 +391,48 @@ pub fn refine_support_position(
     }
     consider(ctx.player.position);
 
+    // Pressure-relief candidates: the caller's own baseline `proposed`
+    // target is a SUPPORT/SPACING point (typically 80-180u from the ball
+    // holder for these states — build-up outlets, box runs, wide
+    // stretch), so the ±50u ring above almost never produces a candidate
+    // close enough to the holder for the pressure-relief terms in
+    // `score_candidate` to ever matter — confirmed empirically via a
+    // match-logs trace (selected distance-to-holder was statistically
+    // flat across every pressure bucket before this fix, ~130-140u
+    // regardless of pressure). Mirrors `carry_candidates`'s own
+    // byline-candidate precedent (2026-07-25): when a real pattern has
+    // no candidate representing it, add one explicitly rather than hope
+    // the general ring reaches it. Genuinely inert (loop doesn't run)
+    // whenever the holder isn't under real pressure.
+    if let Some(h) = &holder {
+        let holder_pressure = ctx.player().pressure().pressure_intensity_for(h.id);
+        // Same 0.5 engagement floor as `score_candidate` — mild pressure
+        // is common and shouldn't trigger extra candidate injection that
+        // would only ever score at the (also-gated) baseline anyway.
+        if holder_pressure > 0.5 {
+            // Two radii, not one: a "pressured" holder by definition has
+            // opponents within ~30u (`pressure_intensity_for`'s own
+            // scan radius), so a single fixed ring often lands inside
+            // that same crowd too — measured via a match-logs trace
+            // showing close
+            // candidates scoring far below the eventual winner even with
+            // the pressure-relief bonus applied. A tighter ring (genuine
+            // one-touch range) and a wider one (just beyond the crowd,
+            // the real "show on the far side of the marker" pocket) give
+            // the scorer real open options to choose between instead of
+            // one coarse sample per direction.
+            const RELIEF_RING_DEG: [f32; 8] = [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0];
+            for &radius_frac in &[0.45, 0.9] {
+                let relief_radius = PRESSURE_RELIEF_RADIUS * radius_frac;
+                for &deg in &RELIEF_RING_DEG {
+                    let rad = deg.to_radians();
+                    let offset = Vector3::new(rad.cos(), rad.sin(), 0.0) * relief_radius;
+                    consider(h.position + offset);
+                }
+            }
+        }
+    }
+
     if found_valid { best } else { best_any }
 }
 
@@ -407,13 +467,67 @@ fn score_candidate(
         .sum::<f32>();
     score -= crowd * TEAMMATE_REPULSION_WEIGHT;
 
+    // Pressure-relief support ("show for the ball" — wishlist item
+    // "pressure-sensitive spread distance"): how surrounded the HOLDER
+    // currently is, reusing the same crowding primitive Milestone 6's
+    // `marking_pressure` already normalizes below — one formula, another
+    // consumer, rather than inventing new proximity math. Computed once,
+    // unconditionally (0.0 when there's no holder), so it can also drive
+    // the tether blend at the bottom of this function, not just the
+    // holder-relative terms below.
+    let holder_pressure = holder
+        .as_ref()
+        .map(|h| ctx.player().pressure().pressure_intensity_for(h.id))
+        .unwrap_or(0.0);
+
+    // Engagement, not raw pressure: mild pressure (a single opponent
+    // loosely tracking, `holder_pressure` in roughly 0.1-0.3) is by far
+    // the MOST common reading in ordinary play — nudging the scoring
+    // landscape on nearly every tick at that level measurably suppressed
+    // goals in a regression gate (isolated via scoped git-stash: ~3.67
+    // baseline vs. ~2.89 with an unconditional linear blend, consistent
+    // across two independent batch pairs) even though it rarely flipped
+    // the actual winning candidate — it just nudged close decisions.
+    // `PRESSURE_ENGAGEMENT_FLOOR` keeps every term below it byte-for-byte
+    // identical to no-pressure behaviour; only genuinely elevated
+    // pressure (the same range the match-logs distance trace actually
+    // showed moving selected positions) engages the mechanism at all.
+    const PRESSURE_ENGAGEMENT_FLOOR: f32 = 0.5;
+    let relief_engagement =
+        ((holder_pressure - PRESSURE_ENGAGEMENT_FLOOR) / (1.0 - PRESSURE_ENGAGEMENT_FLOOR))
+            .clamp(0.0, 1.0);
+
     if let Some(h) = holder {
         let holder_dist = (position - h.position).magnitude();
 
         // Short redundant support: a candidate a couple of metres from the
-        // carrier offers a trivial pass — deprioritise it firmly.
+        // carrier offers a trivial pass — deprioritise it firmly. Relaxed
+        // under genuine pressure: a close option stops being a redundant
+        // trivial pass and becomes the actual point once the holder is
+        // truly surrounded (matches the wishlist's own framing: "one
+        // thing if your partner is surrounded... needs help... another
+        // thing if there is space").
         if holder_dist < SHORT_SUPPORT_RADIUS {
-            score -= (SHORT_SUPPORT_RADIUS - holder_dist) * 2.5;
+            score -= (SHORT_SUPPORT_RADIUS - holder_dist) * 2.5 * (1.0 - relief_engagement);
+        }
+
+        // Pressure-relief bonus: reward a close, genuinely CLEAN outlet
+        // specifically when the holder needs one — gated on both the
+        // holder's own pressure and the candidate spot itself being
+        // clear to receive at (`congestion`, already computed above for
+        // the open-space term), so this never rewards converging into
+        // another marked/crowded spot just because the holder is under
+        // pressure elsewhere. Additive, never gates the reachability/
+        // decoy/rotation/weak-side terms below — same "don't let one
+        // term zero out another" discipline Milestone 6 already
+        // established for reachability vs. decoy value. Zero whenever
+        // pressure is below the engagement floor, so ordinary unpressed
+        // circulation is untouched.
+        if relief_engagement > 0.0 && holder_dist < PRESSURE_RELIEF_RADIUS {
+            let closeness =
+                ((PRESSURE_RELIEF_RADIUS - holder_dist) / PRESSURE_RELIEF_RADIUS).clamp(0.0, 1.0);
+            let candidate_openness = (1.0 - congestion.min(10.0) / 10.0).clamp(0.0, 1.0);
+            score += relief_engagement * closeness * candidate_openness * PRESSURE_RELIEF_WEIGHT;
         }
 
         // Passing-lane clearance from the holder, and lane QUALITY: a clear
@@ -507,8 +621,24 @@ fn score_candidate(
     // above); its job is positioning for a LATER switch of play.
     score += weak_side_patience_adjustment(ctx, position);
 
-    // Tether: stay recognisably within the caller's tactical intent.
-    score -= (position - proposed).magnitude() * TETHER_WEIGHT;
+    // Tether: stay recognisably within the caller's tactical intent —
+    // blended toward the HOLDER's own position as pressure rises PAST the
+    // engagement floor. Below the floor this is exactly `proposed`
+    // (unchanged behaviour for every already-verified milestone: ordinary
+    // spread/reachability/decoy/rotation/weak-side scoring never sees
+    // this term move for mild, common pressure readings). Past the floor,
+    // "the caller's tactical intent" itself shifts from "hold attacking
+    // shape" to "get open near the outlet" — real football doesn't treat
+    // an emergency out-ball as a deviation from shape, it treats it as
+    // the actual priority. Necessary because the pressure-relief bonus
+    // above was measured (match-logs trace) to be too small on its own to
+    // overcome the tether pull toward a distant `proposed` target — the
+    // tether itself has to relax, not just gain a competing bonus.
+    let tether_target = match holder {
+        Some(h) => proposed + (h.position - proposed) * relief_engagement,
+        None => proposed,
+    };
+    score -= (position - tether_target).magnitude() * TETHER_WEIGHT;
 
     score
 }

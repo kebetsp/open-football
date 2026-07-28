@@ -77,16 +77,24 @@ impl<'p> PressureOperationsImpl<'p> {
 
     /// Calculate pressure intensity (0.0 = no pressure, 1.0 = extreme pressure)
     pub fn pressure_intensity(&self) -> f32 {
+        self.pressure_intensity_for(self.ctx.player.id)
+    }
+
+    /// Same bucketed-distance pressure formula as `pressure_intensity`,
+    /// generalized to an arbitrary player id — lets a caller ask "is
+    /// TEAMMATE X under pressure," not just "am I." Needs ≥3 opponents
+    /// within 10u to fully saturate, which makes it a meaningfully
+    /// sharper signal than `on_ball_value::congestion_risk` (designed
+    /// as a mild risk-COST term for value calculations, and saturates
+    /// from a single opponent at ~24u — too coarse a trigger for "is
+    /// this player genuinely surrounded and needs help," which is a
+    /// distinct question from "how risky is losing the ball here").
+    pub fn pressure_intensity_for(&self, player_id: u32) -> f32 {
         // Single scan at max distance, bucket by distance
         let mut close: f32 = 0.0;
         let mut medium: f32 = 0.0;
         let mut far: f32 = 0.0;
-        for (_id, dist) in self
-            .ctx
-            .tick_context
-            .grid
-            .opponents(self.ctx.player.id, 30.0)
-        {
+        for (_id, dist) in self.ctx.tick_context.grid.opponents(player_id, 30.0) {
             far += 1.0;
             if dist <= 20.0 {
                 medium += 1.0;
