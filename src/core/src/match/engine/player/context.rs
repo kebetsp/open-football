@@ -92,6 +92,8 @@ pub struct BallMetadata {
     /// if any. Read by the processor's hold override so he stays put
     /// (and genuinely stationary) until the kick.
     pub corner_short_option: Option<u32>,
+    /// Mirrors `Ball.throw_in_preferred_receiver` (realism-bug 2026-07-28).
+    pub throw_in_preferred_receiver: Option<u32>,
 
     /// Tick of the most recent live rebound (dangerous parry / loose
     /// block deflection). Read by the team shot gate to suspend the
@@ -138,6 +140,7 @@ impl BallMetadata {
         self.cached_shot_target = field.ball.cached_shot_target;
         self.pass_origin_restart = field.ball.pass_origin_restart;
         self.corner_short_option = field.ball.corner_short_option;
+        self.throw_in_preferred_receiver = field.ball.throw_in_preferred_receiver;
         self.last_rebound_tick = field.ball.last_rebound_tick;
     }
 }
@@ -159,6 +162,7 @@ impl From<&MatchField> for BallMetadata {
             cached_shot_target: None,
             pass_origin_restart: PassOriginRestart::OpenPlay,
             corner_short_option: None,
+            throw_in_preferred_receiver: None,
             last_rebound_tick: 0,
         };
         meta.update(field);

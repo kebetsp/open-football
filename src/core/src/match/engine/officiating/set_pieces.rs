@@ -813,6 +813,58 @@ pub fn is_patiently_organized_restart(
     }
 }
 
+/// realism-bug (2026-07-28): nudges a base support-position target away
+/// from its nearest opponent when that opponent sits close enough to
+/// represent real marking pressure — otherwise returns the base target
+/// unchanged. Self-contained (no `StateProcessingContext` is available at
+/// `throw_in_shape_targets`'s call site — the restart is a one-shot award,
+/// not a per-player state tick, so the richer off-ball value machinery
+/// used elsewhere in the engine, e.g. `spacing::refine_support_position`,
+/// isn't plumbing-compatible here without a larger rework).
+///
+/// `MARKED_RADIUS`/`EVASION_DIST` are flagged estimates (no open dataset
+/// isolates real throw-in marking-evasion distance) in the same spirit as
+/// this file's other unsourced set-piece constants.
+fn evade_marker(
+    base_target: nalgebra::Vector3<f32>,
+    opps: &[&crate::r#match::MatchPlayer],
+    field_width: f32,
+    field_height: f32,
+) -> nalgebra::Vector3<f32> {
+    use nalgebra::Vector3;
+
+    /// Inside this radius a defender is genuinely marking the spot, not
+    /// just incidentally nearby — the receiver needs to actively lose
+    /// them, not just walk to the blind fixed offset.
+    const MARKED_RADIUS: f32 = 30.0;
+    /// How far to push away from the marker once evasion triggers — a
+    /// real, noticeable "check away" run, not a token nudge.
+    const EVASION_DIST: f32 = 26.0;
+
+    let nearest = opps
+        .iter()
+        .map(|o| {
+            let d = (o.position - base_target).magnitude();
+            (o.position, d)
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let Some((opp_pos, dist)) = nearest else {
+        return base_target;
+    };
+    if dist >= MARKED_RADIUS || dist < 0.5 {
+        return base_target;
+    }
+
+    let away = (base_target - opp_pos) / dist;
+    let evaded = base_target + away * EVASION_DIST;
+    Vector3::new(
+        evaded.x.clamp(10.0, field_width - 10.0),
+        evaded.y.clamp(10.0, field_height - 10.0),
+        0.0,
+    )
+}
+
 /// Throw-in shape (realism-bug pass, 2026-07-18). Unlike a foul/corner/
 /// goal-kick — genuine team-wide stoppages that earned `recovery_shape_
 /// targets`'s full-formation recovery — a throw-in is a local, low-stakes
@@ -843,6 +895,7 @@ pub fn throw_in_shape_targets(
     throwing_side: crate::r#match::PlayerSide,
     thrower_id: u32,
     throw_pos: nalgebra::Vector3<f32>,
+    field_width: f32,
     field_height: f32,
 ) -> Vec<(u32, nalgebra::Vector3<f32>)> {
     use crate::PlayerFieldPositionGroup;
@@ -886,15 +939,6 @@ pub fn throw_in_shape_targets(
         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let close_target = throw_pos + Vector3::new(forward * 8.0, inward * CLOSE_SUPPORT_DIST, 0.0);
-    if let Some(close) = mates.first() {
-        out.push((close.id, close_target));
-    }
-    if let Some(deep) = mates.get(1) {
-        let target = throw_pos + Vector3::new(forward * 30.0, inward * DEEP_SUPPORT_DIST, 0.0);
-        out.push((deep.id, target));
-    }
-
     let defending_side = match throwing_side {
         PlayerSide::Left => PlayerSide::Right,
         PlayerSide::Right => PlayerSide::Left,
@@ -913,6 +957,35 @@ pub fn throw_in_shape_targets(
         let db = (b.position - throw_pos).magnitude_squared();
         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // realism-bug (2026-07-28): the close/deep support targets used to be a
+    // blind fixed offset — a receiver "shows" at the same spot regardless
+    // of whether a defender is standing right on it. Real support play is
+    // a receiver actively checking away from whoever is marking them to
+    // create genuine separation before the ball is released (coaching
+    // doctrine: a throw-in receiver "shows early, then moves to lose the
+    // marker" — Soccer Coach Weekly / Coaching American Soccer, already
+    // the basis for CLOSE_SUPPORT_DIST/DEEP_SUPPORT_DIST above). Nudge the
+    // base spot away from its nearest defender when marked — a real,
+    // noticeable run, not a token adjustment — otherwise leave it as-is.
+    let close_target = evade_marker(
+        throw_pos + Vector3::new(forward * 8.0, inward * CLOSE_SUPPORT_DIST, 0.0),
+        &opps,
+        field_width,
+        field_height,
+    );
+    if let Some(close) = mates.first() {
+        out.push((close.id, close_target));
+    }
+    if let Some(deep) = mates.get(1) {
+        let target = evade_marker(
+            throw_pos + Vector3::new(forward * 30.0, inward * DEEP_SUPPORT_DIST, 0.0),
+            &opps,
+            field_width,
+            field_height,
+        );
+        out.push((deep.id, target));
+    }
 
     if let Some(presser) = opps.first() {
         let to_ball = throw_pos - presser.position;

@@ -103,6 +103,7 @@ impl Ball {
             throwing_side,
             thrower_id,
             throw_pos,
+            field_width,
             field_height,
         );
         crate::match_log_info!(
@@ -126,6 +127,14 @@ impl Ball {
                 );
             }
         }
+        // realism-bug (2026-07-28): `shape`'s first entry, when present, is
+        // always the close-support attacker (`throw_in_shape_targets`
+        // pushes close-support before deep-support/presser/marker) — the
+        // specifically prepared, marker-evasion-adjusted option. Recorded
+        // so the pass evaluator's selection multiplier can actually prefer
+        // the receiver the shape mechanism just spent the dead-ball window
+        // positioning, instead of a fully generic search that ignores it.
+        self.throw_in_preferred_receiver = shape.first().map(|(id, _)| *id);
         self.pending_restart_teleports.extend(shape);
 
         context.dead_ball_min_ms = context.total_match_time + 300;

@@ -295,6 +295,15 @@ pub struct Ball {
     /// live and un-struck, so the delivery picker's "genuinely standing
     /// there, stationary" gate can actually be met.
     pub corner_short_option: Option<u32>,
+    /// realism-bug (2026-07-28): the throw-in's staged close-support
+    /// receiver — the specifically prepared, marker-evasion-adjusted
+    /// option from `throw_in_shape_targets`. Read by the pass evaluator's
+    /// selection multiplier so the thrower actually prefers the receiver
+    /// the shape mechanism just spent the dead-ball window positioning,
+    /// instead of the fully generic evaluator ignoring that prep and
+    /// reaching for whichever teammate scores highest by open-play
+    /// criteria (which skewed noticeably longer than real throw-ins).
+    pub throw_in_preferred_receiver: Option<u32>,
     /// Set at pass-kick. Lives for the pass window (~220 ticks) and the
     /// offside resolver fires the call only when the receiver becomes
     /// active (touches the ball or claims). Cleared on resolution,
@@ -485,6 +494,7 @@ impl Ball {
             restart_pending_taker: None,
             free_kick_decided: false,
             corner_short_option: None,
+            throw_in_preferred_receiver: None,
             last_touch_player_id: None,
             last_touch_team_id: None,
             last_touch_tick: 0,

@@ -7,7 +7,8 @@ use crate::r#match::engine::psychology::Psychology;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
-    BallSideZone, GamePhase, MatchPlayer, MatchPlayerLite, PlayerSide, StateProcessingContext,
+    BallSideZone, GamePhase, MatchPlayer, MatchPlayerLite, PassOriginRestart, PlayerSide,
+    StateProcessingContext,
 };
 
 /// Comprehensive pass evaluation result
@@ -1805,6 +1806,25 @@ impl PassEvaluator {
                 1.0
             };
 
+            // realism-bug (2026-07-28): a throw-in's close-support receiver
+            // (`throw_in_shape_targets`) is a specifically prepared,
+            // marker-evasion-adjusted option — but without this the fully
+            // generic evaluator ignored that prep entirely and reached for
+            // whichever teammate scored highest by ordinary open-play
+            // criteria, producing throws that landed noticeably longer
+            // (mean ~24m vs a real ~15m) and skewed toward "wide open"
+            // zones far more than real throw-ins do. Same multiplicative
+            // idiom as link_modifier above (a probability nudge alone is
+            // invisible against this chain).
+            let throw_in_preferred_modifier = if ctx.tick_context.ball.pass_origin_restart
+                == PassOriginRestart::ThrowIn
+                && ctx.tick_context.ball.throw_in_preferred_receiver == Some(teammate.id)
+            {
+                4.0
+            } else {
+                1.0
+            };
+
             // Apply graduated recency penalty to discourage ping-pong passing
             // Apply congestion penalty to force ball out of huddles
             let score = score
@@ -1814,7 +1834,8 @@ impl PassEvaluator {
                 * bias_modifier
                 * link_modifier
                 * supply_modifier
-                * intercept_modifier;
+                * intercept_modifier
+                * throw_in_preferred_modifier;
 
             if score > best_score && is_acceptable {
                 best_score = score;
