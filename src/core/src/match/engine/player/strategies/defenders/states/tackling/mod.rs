@@ -44,6 +44,18 @@ impl StateProcessingHandler for DefenderTacklingState {
             ));
         }
 
+        // realism-bug (2026-07-28): Law 13 — an opponent inside the legal
+        // 9.15m free-kick retreat distance may not challenge for the ball
+        // at all until he's actually retreated. No roll, no contact —
+        // he's not even allowed to be this close yet, so `Pressing`
+        // (which itself now retreats him via the processor override)
+        // is the only legal state.
+        if ctx.ball().is_free_kick_encroaching() {
+            return Some(StateChangeResult::with_defender_state(
+                DefenderState::Pressing,
+            ));
+        }
+
         // Check if there's an opponent with the ball
         if let Some(opponent) = ctx.players().opponents().with_ball().next() {
             let distance_to_opponent = opponent.distance(ctx);

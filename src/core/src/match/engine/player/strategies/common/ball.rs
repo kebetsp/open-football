@@ -86,6 +86,37 @@ impl<'b> BallOperationsImpl<'b> {
         self.is_opponent_goal_kick() || self.is_held_by_opponent_goalkeeper()
     }
 
+    /// realism-bug (2026-07-28): true while THIS player is a defending
+    /// opponent standing inside the legal 9.15m (73u) minimum distance
+    /// from a live direct-free-kick taker who still personally holds the
+    /// ball. IFAB Law 13 — opponents must retreat at least 9.15m and stay
+    /// there "until the ball is in play"; this is the hard, binary
+    /// window that requirement covers, not a statistical target. Gated
+    /// on `current_owner` still being the opposing (taker's) team so the
+    /// window closes the instant the kick is genuinely struck — the ball
+    /// goes unowned/airborne or changes hands, and ordinary open-play
+    /// engagement rules resume immediately, exactly matching "until it
+    /// is in play." Deliberately does NOT gate on `restart_pending_taker`
+    /// (which persists after release until the receiver's first touch)
+    /// — that would wrongly suppress a legitimate interception of an
+    /// already-struck, in-flight free-kick pass.
+    pub fn is_free_kick_encroaching(&self) -> bool {
+        use crate::r#match::PassOriginRestart;
+        if self.ctx.tick_context.ball.pass_origin_restart != PassOriginRestart::DirectFreeKick {
+            return false;
+        }
+        let Some(owner_id) = self.ctx.tick_context.ball.current_owner else {
+            return false;
+        };
+        let Some(owner) = self.ctx.context.players.by_id(owner_id) else {
+            return false;
+        };
+        if owner.team_id == self.ctx.player.team_id {
+            return false; // taker is a teammate — not the defending side
+        }
+        self.distance() < 73.0
+    }
+
     /// True while the opponent has a goal kick from their own goal area.
     /// The ball is right at the goal we're attacking (distance < 80u).
     /// Forwards and midfielders should retreat rather than press the GK.

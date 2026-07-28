@@ -370,6 +370,17 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
+        // realism-bug (2026-07-28): mandatory free-kick retreat (Law 13).
+        // Applied AFTER the assignment override so an encroaching
+        // defender retreats even if a manager has explicitly told him to
+        // press/mark the taker — a hard legal requirement outranks a
+        // tactical instruction. No tempo multiplier: a legally-required
+        // retreat is urgent regardless of the team's set tempo, matching
+        // §13.4's own full-pace retreat during the dead-ball freeze.
+        if let Some(velocity) = Self::free_kick_retreat_velocity(&processing_ctx) {
+            result.velocity = Some(velocity);
+        }
+
         // §12.4: the staged short-corner option holds his spot until the
         // corner is struck — without this his state machine runs him back
         // toward his anchor and the delivery picker's "genuinely
@@ -843,6 +854,50 @@ impl<'p> StateProcessor<'p> {
             return None;
         }
         Some(to_ball.normalize() * player.skills.physical.pace)
+    }
+
+    /// realism-bug (2026-07-28): mandatory free-kick retreat. §13.4's
+    /// `apply_restart_retreat_tick` only walks a defender out during the
+    /// frozen `dead_ball_retreat_active` window; ground-truth engine
+    /// diagnostics (not just position-sample reconstruction) showed that
+    /// window closing with the NEAREST defender still inside the legal
+    /// 9.15m (73u) minimum on ~50% of free kicks, and by the moment the
+    /// taker actually released the ball (~150-200ms later, once normal
+    /// AI had resumed with zero dead-ball awareness) that had climbed to
+    /// ~93% — the freeze ends, but nothing stops a defender's ordinary
+    /// Pressing/Tackling AI from closing straight back in. This is the
+    /// second half of the fix (the Tackling states above refuse to roll
+    /// a challenge while encroaching; this makes retreat itself an
+    /// obligation, not just "can't win the ball yet" — same idiom as
+    /// `assignment_override_velocity`, but placed AFTER it so a
+    /// manager's explicit press/mark instruction can never override a
+    /// hard Law 13 requirement). Steers directly away from the ball at
+    /// full retreat pace — the same calibrated speed conversion
+    /// `apply_restart_retreat_tick` already uses (raw `skills.physical.pace`
+    /// is a 1-20 rating, not a per-tick velocity; `rebound_crash_velocity`
+    /// above still has that bug, but it's out of scope here).
+    fn free_kick_retreat_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.tactical_position.current_position.is_goalkeeper() {
+            return None; // GK retreat is out of scope — mirrors the wall/box-clear exclusion
+        }
+        if !ctx.ball().is_free_kick_encroaching() {
+            return None;
+        }
+        let ball_pos = ctx.tick_context.positions.ball.position;
+        let away = player.position - ball_pos;
+        let dist = away.magnitude();
+        let dir = if dist > 0.5 {
+            away.normalize()
+        } else {
+            // Degenerate (standing on the ball) — retreat toward own goal,
+            // the only direction guaranteed not to re-encroach the box.
+            (ctx.ball().direction_to_own_goal() - player.position).normalize()
+        };
+        let speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some(dir * speed)
     }
 }
 
