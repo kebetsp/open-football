@@ -64,7 +64,26 @@ impl StateProcessingHandler for DefenderPressingState {
             // Repeat-tackle prevention lives on the player via
             // `tackle_cooldown` — a single-state cooldown here wouldn't
             // cover the Standing/Running/Covering re-entry paths.
-            if distance_to_opponent < TACKLING_DISTANCE_THRESHOLD {
+            //
+            // realism-bug (2026-07-30): the cooldown check alone isn't
+            // enough — it only lives INSIDE Tackling::process(), which
+            // bounces a cooldown player straight back to Pressing. With
+            // no cooldown awareness here, Pressing immediately routed
+            // them right back into Tackling on the very next tick (still
+            // within TACKLING_DISTANCE_THRESHOLD), producing a 1-tick
+            // Tackling<->Pressing flicker that lasted the full ~30s
+            // cooldown window. Measured via raw position/state traces:
+            // multi-player clusters stuck near-motionless (88-96% of
+            // samples <0.6u/s) for up to 18-19 real seconds, both the
+            // engaged defender AND an opposing presser oscillating in
+            // lockstep the entire time. Gating entry here on
+            // `can_attempt_tackle()` lets a cooldown player fall through
+            // to the role-based coordination below (Cover/Marking/
+            // HoldingLine) instead — a real defender who just missed a
+            // tackle jockeys/covers, he doesn't keep re-lunging.
+            if distance_to_opponent < TACKLING_DISTANCE_THRESHOLD
+                && ctx.player.can_attempt_tackle()
+            {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Tackling,
                 ));

@@ -104,7 +104,19 @@ impl StateProcessingHandler for MidfielderPressingState {
             // weaker steering instead of Pressing's own chase logic for the
             // whole close-in. Measured entries:attempts was ~1000:1 (worse
             // than defenders' ~300:1) before this fix.
-            if opponent_distance < 8.0 {
+            //
+            // realism-bug (2026-07-30): that fix alone reintroduced the
+            // exact 1-tick thrash it was meant to remove, just gated on
+            // cooldown instead of distance — a midfielder on
+            // `tackle_cooldown` still satisfies `opponent_distance < 8.0`
+            // every tick, gets bounced back out of Tackling by its own
+            // cooldown check, and immediately re-enters here next tick.
+            // Raw traces showed this running every single 30ms sample for
+            // 18+ seconds in lockstep with an opposing defender doing the
+            // same. Requiring `can_attempt_tackle()` here lets a cooldown
+            // midfielder fall through to normal Pressing chase/cover
+            // behaviour instead of flickering in place.
+            if opponent_distance < 8.0 && ctx.player.can_attempt_tackle() {
                 return Some(StateChangeResult::with_midfielder_state(
                     MidfielderState::Tackling,
                 ));

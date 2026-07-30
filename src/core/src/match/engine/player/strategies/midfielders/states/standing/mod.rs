@@ -24,16 +24,38 @@ impl StateProcessingHandler for MidfielderStandingState {
 
         if ctx.player.has_ball(ctx) {
             // Go directly to Passing state — it has the best pass evaluation logic
-            // Only hold possession if under no pressure and no teammates nearby
-            // With the ball and no passing options, stay in Standing —
-            // the top-of-function idle logic will refresh next tick.
-            // HoldingPossession did nothing extra beyond that.
+            //
+            // realism-bug (2026-07-30): the "no passing options, stay in
+            // Standing" branch used to return `None` — no state change,
+            // and `velocity()` below hardcodes `Vector3::zeros()` for
+            // this state unconditionally, so a midfielder who receives
+            // the ball with no teammate within 30u simply froze:
+            // completely motionless, forever, since nothing in this
+            // function's flow re-evaluates the actual decision beyond
+            // this branch's own `has_passing_options()` check, and there
+            // is no `in_state_time` escalation reachable while the ball
+            // is held (that check exists further down, but only for the
+            // no-ball path). Raw match traces showed exactly this: a
+            // midfielder who'd just won the ball back sat in `Standing`
+            // motionless for ~20 real seconds while two opponents
+            // repeatedly (and fruitlessly, since he never moved or
+            // released) tried to dispossess him — the actual mechanism
+            // behind "players clash for the ball and get stuck."
+            // Route to Running instead — it already owns the full
+            // on-ball decision ladder (carry/dribble toward space via
+            // `carry_candidates`, shoot, pass) plus its own
+            // `in_state_time`-based anti-oscillation escalation that
+            // eventually forces a resolution, so a player with no
+            // immediate outlet now shields/carries to create one
+            // instead of standing dead still.
             return if self.has_passing_options(ctx) {
                 Some(StateChangeResult::with_midfielder_state(
                     MidfielderState::Passing,
                 ))
             } else {
-                None
+                Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::Running,
+                ))
             };
         } else {
             // Loose-ball claim lives in the dispatcher.

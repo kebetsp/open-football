@@ -39,7 +39,18 @@ impl StateProcessingHandler for ForwardPressingState {
             ));
         }
 
-        if ctx.ball().distance() < 30.0 && ctx.ball().is_owned() {
+        // realism-bug (2026-07-30): ForwardTacklingState::process() already
+        // bounces a cooldown forward straight back to Pressing (see that
+        // file's own `can_attempt_tackle()` check) — but this entry
+        // condition didn't know about the cooldown, so a forward within
+        // 30u of a ball still owned by an opponent re-entered Tackling on
+        // the very next tick regardless, producing the same 1-tick
+        // Tackling<->Pressing flicker fixed in the defender/midfielder
+        // Pressing states for the identical reason (raw traces showed
+        // 18+ seconds of near-motionless clustering, both sides bouncing
+        // in lockstep).
+        if ctx.ball().distance() < 30.0 && ctx.ball().is_owned() && ctx.player.can_attempt_tackle()
+        {
             return Some(StateChangeResult::with_forward_state(
                 ForwardState::Tackling,
             ));
