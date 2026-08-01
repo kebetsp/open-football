@@ -572,7 +572,22 @@ impl Ball {
         // eventually re-engages if the ball is genuinely still sitting
         // there once that's expired, exactly matching this function's
         // own stated purpose ("ensure game never deadlocks").
-        const SHOT_TRACKED_GRACE_TICKS: u32 = 400; // ~4s on top of the phases below
+        // realism-bug (2026-08-01): 400 ticks (~4s) was too generous —
+        // measured total delay (grace + however long the ball takes to
+        // first satisfy is_slow/is_low after a deflected/off-target
+        // shot) came out to ~9s before this fallback fired, confirmed
+        // via raw position traces on 14 real cases (tightly clustered
+        // 8.4-9.6s, all correctly resolved via a legitimate Claimed
+        // event — the earlier, unbounded version of this bug is fixed;
+        // this is a separate "is the bound itself too long" question).
+        // The dedicated save mechanics resolve a shot within its natural
+        // flight/settle window if they're going to resolve it at all —
+        // waiting longer doesn't improve the odds, it just delays an
+        // already-inevitable fallback. Cut to 100 ticks (~1s) on top of
+        // the existing phase timings (15-100 ticks themselves), so the
+        // real-world total (settle time + bound) comes down
+        // substantially without returning to the old unbounded problem.
+        const SHOT_TRACKED_GRACE_TICKS: u32 = 100; // ~1s on top of the phases below
         let shot_grace = if self.cached_shot_target.is_some() {
             SHOT_TRACKED_GRACE_TICKS
         } else {
