@@ -560,6 +560,15 @@ impl Ball {
             None => return,
         };
         if self.current_owner.is_some() || self.flags.in_flight_state == 0 {
+            // realism-bug (2026-07-31) diagnostic, scratch-only: check
+            // whether the ball gets CLAIMED (current_owner set, almost
+            // certainly by the separate state-machine catch mechanic)
+            // before this function's own reach window ever opens.
+            // Remove once the investigation concludes.
+            #[cfg(feature = "match-logs")]
+            if shot_target.is_direct_fk {
+                save_accounting_stats::FK_GATE_ALREADY_OWNED.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
         // One roll per shot. This check runs every tick the ball is near
@@ -568,11 +577,46 @@ impl Ball {
         // entirely moved goals/match 0.83 → 4.0, i.e. it was converting
         // ~80% of would-be goals into saves).
         if shot_target.physics_save_rolled {
+            #[cfg(feature = "match-logs")]
+            if shot_target.is_direct_fk {
+                save_accounting_stats::FK_GATE_ALREADY_ROLLED.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
 
-        // Ball well over the bar — not a save situation.
-        if self.position.z > 2.8 {
+        // realism-bug (2026-07-31): this used to check the ball's LIVE,
+        // current-tick height (`self.position.z > 2.8`) — but that's a
+        // snapshot of an in-flight arc, not where the shot will actually
+        // cross the line. A real lofted shot is legitimately several
+        // metres up mid-flight and only descends under the bar near the
+        // very end; since this function only becomes horizontally
+        // "in reach" for the last ~2-3 ticks of a long flight, the live
+        // height and the in-reach window essentially never coincided for
+        // a genuinely lofted shot — measured as the physics-layer save
+        // NEVER once reaching its lateral_error check across 100+ direct
+        // free kicks (gate counters: z_too_high + out_of_reach summed to
+        // the shot's entire tracked flight, reached_lateral_check=0
+        // every time). `goal_line_z` is the already-computed PROJECTED
+        // height at arrival (the same value `is_catch_successful`
+        // correctly uses for its own "over the bar" check) — using it
+        // here instead judges save-ability by where the shot actually
+        // ends up, not a mid-arc altitude reading. Shots deliberately
+        // sent over the bar (`shot_goes_over_bar`) still correctly
+        // project a large `goal_line_z` and skip the save as before.
+        if shot_target.goal_line_z > 2.8 {
+            #[cfg(feature = "match-logs")]
+            if shot_target.is_direct_fk {
+                save_accounting_stats::FK_GATE_Z_TOO_HIGH.fetch_add(1, Ordering::Relaxed);
+                log::info!(
+                    "FKZ tick={} live_z={:.2} proj_z={:.2} x={:.1} vx={:.2} vz={:.2}",
+                    context.current_tick(),
+                    self.position.z,
+                    shot_target.goal_line_z,
+                    self.position.x,
+                    self.velocity.x,
+                    self.velocity.z
+                );
+            }
             return;
         }
 
@@ -601,7 +645,12 @@ impl Ball {
         };
         if past_goal_line {
             #[cfg(feature = "match-logs")]
-            save_accounting_stats::SAVE_TICKS_PAST_GOAL_LINE.fetch_add(1, Ordering::Relaxed);
+            {
+                save_accounting_stats::SAVE_TICKS_PAST_GOAL_LINE.fetch_add(1, Ordering::Relaxed);
+                if shot_target.is_direct_fk {
+                    save_accounting_stats::FK_GATE_PAST_GOAL_LINE.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             self.cached_shot_target = None;
             return;
         }
@@ -610,7 +659,19 @@ impl Ball {
         let ball_vx = self.velocity.x.abs().max(0.5);
         if dist_to_goal_x > ball_vx * 2.5 {
             #[cfg(feature = "match-logs")]
-            save_accounting_stats::SAVE_TICKS_OUT_OF_REACH.fetch_add(1, Ordering::Relaxed);
+            {
+                save_accounting_stats::SAVE_TICKS_OUT_OF_REACH.fetch_add(1, Ordering::Relaxed);
+                if shot_target.is_direct_fk {
+                    save_accounting_stats::FK_GATE_OUT_OF_REACH.fetch_add(1, Ordering::Relaxed);
+                    log::info!(
+                        "FKZ_OOR tick={} z={:.2} dist_x={:.1} vx={:.2}",
+                        context.current_tick(),
+                        self.position.z,
+                        dist_to_goal_x,
+                        ball_vx
+                    );
+                }
+            }
             return;
         }
         #[cfg(feature = "match-logs")]
@@ -622,12 +683,21 @@ impl Ball {
             PlayerSide::Right => self.velocity.x > 0.2,
         };
         if !moving_toward_goal {
+            #[cfg(feature = "match-logs")]
+            if shot_target.is_direct_fk {
+                save_accounting_stats::FK_GATE_NOT_MOVING_TOWARD_GOAL
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
 
         // Ball must be within goal width (else it's wide and the
         // post / out-of-play handler catches it).
         if (self.position.y - goal_y).abs() > GOAL_WIDTH + 1.0 {
+            #[cfg(feature = "match-logs")]
+            if shot_target.is_direct_fk {
+                save_accounting_stats::FK_GATE_OUTSIDE_GOAL_WIDTH.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
 
@@ -640,8 +710,18 @@ impl Ball {
         });
         let keeper = match keeper {
             Some(k) => k,
-            None => return,
+            None => {
+                #[cfg(feature = "match-logs")]
+                if shot_target.is_direct_fk {
+                    save_accounting_stats::FK_GATE_NO_KEEPER.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
         };
+        #[cfg(feature = "match-logs")]
+        if shot_target.is_direct_fk {
+            save_accounting_stats::FK_GATE_REACHED_LATERAL_CHECK.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Route through `effective_skill` so a tired keeper has worse
         // reach / handling / reflexes than a fresh one. Routing minute
@@ -674,6 +754,20 @@ impl Ball {
         let reach = 20.0 + scaled_agility * 8.0 + scaled_reflexes * 4.0;
         let lateral_error = (keeper.position.y - shot_target.goal_line_y).abs();
         if lateral_error > reach {
+            // realism-bug (2026-07-31) diagnostic, scratch-only: confirm
+            // whether the physics-layer save ever gets a legitimate roll
+            // for a direct FK, or whether it's structurally out of reach
+            // every time (in which case the state-machine layer is the
+            // only thing that could be stopping these shots). Remove
+            // once the investigation concludes.
+            #[cfg(feature = "match-logs")]
+            if shot_target.is_direct_fk {
+                log::info!(
+                    "FKCONV_PHYS lat_err={:.2} reach={:.2} in_reach=false",
+                    lateral_error,
+                    reach
+                );
+            }
             return;
         }
 
@@ -743,7 +837,23 @@ impl Ball {
         if let Some(t) = self.cached_shot_target.as_mut() {
             t.physics_save_rolled = true;
         }
-        if context.rng.unit_f32() >= save_prob {
+        let physics_roll = context.rng.unit_f32();
+        // realism-bug (2026-07-31) diagnostic, scratch-only: the one
+        // physics-layer roll a direct FK ever gets — lateral error,
+        // save_prob, and whether it actually saved. Remove once the
+        // investigation concludes.
+        #[cfg(feature = "match-logs")]
+        if shot_target.is_direct_fk {
+            log::info!(
+                "FKCONV_PHYS lat_err={:.2} reach={:.2} in_reach=true save_prob={:.3} roll={:.3} saved={}",
+                lateral_error,
+                reach,
+                save_prob,
+                physics_roll,
+                physics_roll < save_prob
+            );
+        }
+        if physics_roll >= save_prob {
             return; // Keeper beaten — shot goes on.
         }
         #[cfg(feature = "match-logs")]
@@ -812,6 +922,8 @@ impl Ball {
             self.flags.in_flight_state = 0;
             self.claim_cooldown = 200;
             self.record_touch(keeper_id, keeper_team, tick, true);
+            #[cfg(feature = "match-logs")]
+            log::info!("CLAIMSITE fn=try_save_shot:physics_catch id={}", keeper_id);
             events.add_ball_event(BallEvent::Claimed(keeper_id));
             return;
         }

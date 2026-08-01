@@ -202,6 +202,15 @@ impl Ball {
         // §9.4.1: a locked restart taker can never claim via the
         // pass-target privilege either (covers give-and-go edge cases
         // where the target resolves back to the taker).
+        // realism-bug (2026-08-01): `pass_target_player_id` is cleared for
+        // a shot at dispatch, but this was still catching ~12% of the
+        // direct-FK generic-claim bypass (traced) — some path re-sets it
+        // (or a stale value survives) during a live shot's flight. Same
+        // guard as everywhere else this session: a tracked shot resolves
+        // via the dedicated save mechanics only.
+        if self.cached_shot_target.is_some() {
+            return;
+        }
         if let Some(target_id) = self
             .pass_target_player_id
             .filter(|&id| self.restart_taker_lock != Some(id))
@@ -301,6 +310,10 @@ impl Ball {
                     // receiver to survive the initial close-down without
                     // shutting the game off to defensive pressure entirely.
                     self.claim_cooldown = self.claim_cooldown.max(150);
+                    #[cfg(feature = "match-logs")]
+                    if self.cached_shot_target.is_some() {
+                        log::info!("CLAIMSITE fn=try_pass_target_claim:307 id={}", target_id);
+                    }
                     if let Some(pid) = passer_id {
                         events.add_ball_event(BallEvent::PassCompleted(target_id, pid));
                     } else {
@@ -344,6 +357,10 @@ impl Ball {
                                 self.record_touch(prev_id, passer_team, tick, true);
                                 self.offside_snapshot = None;
                                 self.pass_origin_restart = PassOriginRestart::OpenPlay;
+                                #[cfg(feature = "match-logs")]
+                                if self.cached_shot_target.is_some() {
+                                    log::info!("CLAIMSITE fn=try_pass_target_claim:347 id={}", prev_id);
+                                }
                                 events.add_ball_event(BallEvent::Claimed(prev_id));
                             }
                         }
@@ -362,6 +379,26 @@ impl Ball {
         // Short passes have low velocity that triggers is_ball_stopped_on_field(),
         // but the ball is still in transit to the intended receiver
         if self.flags.in_flight_state > 0 {
+            return;
+        }
+
+        // realism-bug (2026-08-01): the DOMINANT source of the direct-FK
+        // "generic Claimed instead of a real save/miss" bypass — 115/131
+        // (87.8%) of traced instances, vs 0 from the two paths already
+        // gated (`force_claim_if_deadlock`, `check_ball_ownership`).
+        // This function has no `cached_shot_target` awareness at all: a
+        // direct FK's real flight (40-90 ticks) can outlast the flat
+        // `in_flight_state` window above (calibrated for short open-play
+        // shots), and once that expires, a shot whose velocity/position
+        // momentarily reads as "stopped" via `is_ball_stopped_on_field()`
+        // — plausible for a shot that's decelerating or between physics
+        // ticks — gets treated exactly like a genuinely dead, unowned
+        // ball sitting on the field, notifying the nearest player (often
+        // the keeper standing right there) to walk up and claim it. Same
+        // fix as everywhere else this session: a live, still-tracked
+        // shot must resolve via the dedicated save mechanics or by
+        // genuinely crossing the line / going out, never this way.
+        if self.cached_shot_target.is_some() {
             return;
         }
 
@@ -468,6 +505,10 @@ impl Ball {
                 self.pass_target_player_id = None;
                 self.take_ball_notified_players.clear();
                 self.notification_timeout = 0;
+                #[cfg(feature = "match-logs")]
+                if self.cached_shot_target.is_some() {
+                    log::info!("CLAIMSITE fn=try_notify_standing_ball:471 id={}", player_id);
+                }
                 events.add_ball_event(BallEvent::Claimed(player_id));
 
                 // Reset boundary tracking when ball is claimed
@@ -514,6 +555,30 @@ impl Ball {
             return;
         }
 
+        // realism-bug (2026-08-01, revised): the original fix here was
+        // an UNCONDITIONAL exemption for any tracked shot — it stopped
+        // the generic-claim bypass, but measured directly, it also left
+        // ~17% of direct-FK shots with the ball frozen at a fixed point
+        // near goal for 15+ seconds (one measured case: 17.9s with zero
+        // movement) with nothing left to ever recover it, because
+        // removing this safety net entirely removed the ONLY mechanism
+        // that could resolve a shot that never satisfies
+        // `try_save_shot`/`is_catch_successful`'s own conditions. Fixed
+        // by BOUNDING the exemption instead of removing this function's
+        // job entirely: a tracked shot gets a generous extra grace
+        // period (`SHOT_TRACKED_GRACE_TICKS`, on top of the normal
+        // phase timings below) so the dedicated save mechanics get a
+        // fair, unrushed chance — but this deadlock recovery still
+        // eventually re-engages if the ball is genuinely still sitting
+        // there once that's expired, exactly matching this function's
+        // own stated purpose ("ensure game never deadlocks").
+        const SHOT_TRACKED_GRACE_TICKS: u32 = 400; // ~4s on top of the phases below
+        let shot_grace = if self.cached_shot_target.is_some() {
+            SHOT_TRACKED_GRACE_TICKS
+        } else {
+            0
+        };
+
         let velocity_threshold = if self.unowned_stopped_ticks > 0 {
             DEADLOCK_VELOCITY_EXIT
         } else {
@@ -529,13 +594,15 @@ impl Ball {
             self.unowned_stopped_ticks += 1;
 
             // Determine claim distance based on how long we've been waiting
-            let (should_claim, claim_distance) = if self.unowned_stopped_ticks >= TICK_PHASE_4 {
+            let (should_claim, claim_distance) = if self.unowned_stopped_ticks
+                >= TICK_PHASE_4 + shot_grace
+            {
                 (true, CLAIM_DISTANCE_PHASE_4)
-            } else if self.unowned_stopped_ticks >= TICK_PHASE_3 {
+            } else if self.unowned_stopped_ticks >= TICK_PHASE_3 + shot_grace {
                 (true, CLAIM_DISTANCE_PHASE_3)
-            } else if self.unowned_stopped_ticks >= TICK_PHASE_2 {
+            } else if self.unowned_stopped_ticks >= TICK_PHASE_2 + shot_grace {
                 (true, CLAIM_DISTANCE_PHASE_2)
-            } else if self.unowned_stopped_ticks >= TICK_PHASE_1 {
+            } else if self.unowned_stopped_ticks >= TICK_PHASE_1 + shot_grace {
                 (true, CLAIM_DISTANCE_PHASE_1)
             } else {
                 (false, 0.0)
@@ -544,7 +611,40 @@ impl Ball {
             if should_claim {
                 // Find nearest player within current claim distance (use squared to avoid sqrt)
                 let claim_distance_sq = claim_distance * claim_distance;
-                if let Some(nearest_player) = players
+                // realism-bug (2026-08-01): when this fallback resolves a
+                // still-tracked shot (i.e. the grace period above has
+                // expired), prefer the ATTACKING team — the side that
+                // took the shot — over a defender at similar distance.
+                // Plain nearest-of-any-team structurally favours the
+                // defence here: a keeper/defenders are routinely planted
+                // closer to their own goal by design, so an unbiased
+                // "nearest wins" would hand almost every one of these
+                // genuinely-still-dangerous scrambles to the defending
+                // side by default, not because they actually reacted
+                // better. A real goalmouth scramble gives the attacking
+                // side a fair shot at poking the ball home. Falls back to
+                // plain nearest-of-any-team when no attacker is in range
+                // (a defender clearing an immediate, undefended threat is
+                // still the realistic outcome then).
+                let defending_side = self.cached_shot_target.map(|t| t.defending_side);
+                let nearest_attacker = defending_side.and_then(|def_side| {
+                    players
+                        .iter()
+                        .filter(|p| self.restart_taker_lock != Some(p.id))
+                        .filter(|p| p.side.is_some() && p.side != Some(def_side))
+                        .filter_map(|p| {
+                            let dx = p.position.x - self.position.x;
+                            let dy = p.position.y - self.position.y;
+                            let dist_sq = dx * dx + dy * dy;
+                            if dist_sq <= claim_distance_sq {
+                                Some((p, dist_sq))
+                            } else {
+                                None
+                            }
+                        })
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                });
+                let nearest_overall = players
                     .iter()
                     // §9.4.1: restart taker excluded from force-claims too.
                     .filter(|p| self.restart_taker_lock != Some(p.id))
@@ -558,8 +658,8 @@ impl Ball {
                             None
                         }
                     })
-                    .min_by(|a, b| a.1.total_cmp(&b.1))
-                    .map(|(p, _)| p)
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some(nearest_player) = nearest_attacker.or(nearest_overall).map(|(p, _)| p)
                 {
                     // Grant ownership
                     self.current_owner = Some(nearest_player.id);
@@ -577,6 +677,10 @@ impl Ball {
                     }
 
                     self.unowned_stopped_ticks = 0;
+                    #[cfg(feature = "match-logs")]
+                    if self.cached_shot_target.is_some() {
+                        log::info!("CLAIMSITE fn=force_claim_if_deadlock:602 id={}", nearest_player.id);
+                    }
                     events.add_ball_event(BallEvent::Claimed(nearest_player.id));
                 } else if self.unowned_stopped_ticks >= TICK_PHASE_2
                     && self.take_ball_notified_players.is_empty()
@@ -891,6 +995,10 @@ impl Ball {
                     self.pass_target_player_id = None;
                     self.ownership_duration = 0;
                     self.claim_cooldown = 15;
+                    #[cfg(feature = "match-logs")]
+                    if self.cached_shot_target.is_some() {
+                        log::info!("CLAIMSITE fn=check_ball_ownership:priority_pass_target id={}", target_id);
+                    }
                     if let Some(pid) = passer_id.filter(|&id| id != target_id) {
                         events.add_ball_event(BallEvent::PassCompleted(target_id, pid));
                     } else {
@@ -908,6 +1016,21 @@ impl Ball {
         let ball_speed_sq = self.velocity.norm_squared();
 
         // Collect nearby player IDs into a small inline buffer (no heap allocation)
+        // realism-bug (2026-07-31, restored 2026-08-01): first tried and
+        // reverted on the theory the goals/match dip it coincided with
+        // was caused by it — re-measurement without it showed the SAME
+        // dip independently (2026-08-01 entry), so that correlation was
+        // noise, not causation. Restored: outcome-tracing on real
+        // direct-FK shots shows 91% resolving via a generic `Claimed`
+        // event (goalkeeper AND outfield players near the ball's path)
+        // rather than a genuine save/miss — this is the mechanism this
+        // guard targets. A live, still-tracked shot must resolve via the
+        // dedicated save mechanics or by genuinely crossing the line /
+        // going out, never via plain proximity.
+        if self.cached_shot_target.is_some() {
+            return;
+        }
+
         const MAX_NEARBY: usize = 8;
         let mut nearby_ids: [u32; MAX_NEARBY] = [0; MAX_NEARBY];
         let mut nearby_count: usize = 0;
@@ -1065,6 +1188,10 @@ impl Ball {
                 // Also set in_flight to prevent ClaimBall events from tackling states
                 self.flags.in_flight_state = cooldown as usize;
 
+                #[cfg(feature = "match-logs")]
+                if self.cached_shot_target.is_some() {
+                    log::info!("CLAIMSITE fn=check_ball_ownership:nearby_claim id={}", player.id);
+                }
                 events.add_ball_event(BallEvent::Claimed(player.id));
             } else {
                 // Same owner - just increment duration

@@ -229,6 +229,8 @@ impl Ball {
             self.offside_snapshot = None;
             self.record_touch(gk_id, gk_team, self.current_tick_cached, true);
 
+            #[cfg(feature = "match-logs")]
+            log::info!("CLAIMSITE fn=goal.rs:over_bar_goal_kick id={}", gk_id);
             events.add_ball_event(BallEvent::Claimed(gk_id));
 
             // §9.2.1 full-team recovery on the over-the-bar goal kick
@@ -407,6 +409,8 @@ impl Ball {
                 self.offside_snapshot = None;
                 self.record_touch(taker_id, taker_team, self.current_tick_cached, true);
 
+                #[cfg(feature = "match-logs")]
+                log::info!("CLAIMSITE fn=goal.rs:corner id={}", taker_id);
                 events.add_ball_event(BallEvent::Claimed(taker_id));
                 // Teleport the taker onto the ball so `move_to`'s
                 // distance check doesn't immediately null ownership
@@ -674,6 +678,8 @@ impl Ball {
             self.offside_snapshot = None;
             self.record_touch(gk_id, gk_team, self.current_tick_cached, true);
 
+            #[cfg(feature = "match-logs")]
+            log::info!("CLAIMSITE fn=goal.rs:wide_goal_kick id={}", gk_id);
             events.add_ball_event(BallEvent::Claimed(gk_id));
             // Same as corner kick: put the GK onto the ball so the
             // distance check in `move_to` doesn't immediately null

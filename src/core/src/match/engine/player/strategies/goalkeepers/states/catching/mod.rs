@@ -93,6 +93,30 @@ impl StateProcessingHandler for GoalkeeperCatchingState {
         if let Some(target) = &ctx.tick_context.ball.cached_shot_target {
             let goal_pos = ctx.ball().direction_to_own_goal();
             let intercept = Vector3::new(goal_pos.x, target.goal_line_y, 0.0);
+            // realism-bug (2026-07-30, extended 2026-07-31): a direct
+            // free kick's flight time (130-250u away, 400-800+ms / 40-90
+            // ticks) is long enough that even at NORMAL running speed
+            // (the 1.0x this comment originally capped it to) the keeper
+            // can walk down almost any reasonable initial gap over the
+            // whole flight — measured directly: after fixing shot aim to
+            // exploit the keeper's actual starting position, the median
+            // lateral error at save-check time barely moved (1.89u →
+            // 1.84u across 5000+ evaluations), because the keeper simply
+            // walks the rest of the way to the EXACT, perfectly-known
+            // `target.goal_line_y` regardless of where he started. A
+            // real keeper mostly commits to his stance BEFORE the kick
+            // (already modelled in `calculate_optimal_position`'s
+            // far-post lean) and only makes a small late reactive
+            // adjustment/dive as the ball arrives — not a sustained,
+            // omniscient walk across the goal for the better part of a
+            // second. Capped to a slow creep (reflecting that small late
+            // adjustment) instead of full running speed; the keeper's
+            // actual SAVE range is unaffected — `is_catch_successful`'s
+            // separate `reach` term already models diving distance on
+            // top of wherever he's standing when the ball arrives. Every
+            // other shot type (including normal long-range open-play
+            // shots) keeps the existing boosted-sprint behaviour.
+            let effective_boost = if target.is_direct_fk { 0.2 } else { speed_boost };
             return Some(
                 SteeringBehavior::Arrive {
                     target: intercept,
@@ -100,7 +124,7 @@ impl StateProcessingHandler for GoalkeeperCatchingState {
                 }
                 .calculate(ctx.player)
                 .velocity
-                    * speed_boost,
+                    * effective_boost,
             );
         }
 
@@ -187,8 +211,62 @@ impl GoalkeeperCatchingState {
             if target.deflected {
                 save_prob *= 0.50;
             }
-            let per_tick = prof.per_tick_save(save_prob, 3.0);
-            return ctx.context.rng.unit_f32() < per_tick;
+            // realism-bug (2026-07-30, revised 2026-07-31 twice): `per_tick_save(p, n)`
+            // derives a per-tick rate such that `n` REPEATED rolls compound
+            // back to the intended per-shot probability `p` — but this
+            // state never exits while `cached_shot_target` is live, so the
+            // ACTUAL number of ticks this roll fires is however long the
+            // keeper stays within `reach`, not a fixed constant. A hardcoded
+            // `expected_ticks=40.0` for direct FKs was wrong: measured
+            // actual evaluation counts per shot ranged 24-255 (median ~90),
+            // so the same per-tick rate still compounded well past
+            // `save_prob` for shots that ran longer than 40 ticks (measured:
+            // state-machine saves fired on ~90% of direct FK shots even
+            // after separately fixing the physics-layer height gate). A
+            // second attempt recomputed "ticks remaining" fresh on every
+            // evaluation instead — this was ALSO wrong, in the opposite
+            // direction: recomputing a brand-new n-roll decomposition every
+            // tick means the per-tick rate climbs sharply as the remaining
+            // count shrinks near arrival, so the last few ticks each carry
+            // a large chunk of `save_prob` on their own, stacked on top of
+            // everything already rolled earlier — net over-counting again.
+            // The fix that actually works: `total_flight_ticks`, a FIXED
+            // per-shot constant computed once at dispatch (the same
+            // `ticks_to_goal` already used for the goal_line_y/z
+            // projection) and stored on `ShotTarget`. Using the same
+            // constant for every evaluation of this shot means however
+            // many times the function actually fires, the cumulative
+            // probability tracks the intended per-shot value instead of
+            // compounding past it in either direction. Every other shot
+            // type keeps the untouched fixed 3.0 calibration.
+            let expected_ticks = if target.is_direct_fk {
+                target.total_flight_ticks.max(1.0)
+            } else {
+                3.0
+            };
+            let per_tick = prof.per_tick_save(save_prob, expected_ticks);
+            let roll = ctx.context.rng.unit_f32();
+            // realism-bug (2026-07-31) diagnostic, scratch-only: every
+            // per-tick evaluation of the state-machine save for a direct
+            // FK — lateral error, shot_difficulty, save_prob, per_tick
+            // rate, and the roll outcome. Grouping these by shot (the
+            // count of consecutive lines) reveals the REAL in-reach
+            // window length vs. the assumed expected_ticks=40. Remove
+            // once the investigation concludes.
+            #[cfg(feature = "match-logs")]
+            if target.is_direct_fk {
+                log::info!(
+                    "FKCONV_CATCH lat_err={:.2} reach={:.2} shot_diff={:.3} save_prob={:.3} per_tick={:.4} roll={:.4} saved={}",
+                    lateral_error,
+                    reach,
+                    shot_difficulty,
+                    save_prob,
+                    per_tick,
+                    roll,
+                    roll < per_tick
+                );
+            }
+            return roll < per_tick;
         }
 
         let distance_to_ball = ctx.ball().distance();

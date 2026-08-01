@@ -516,6 +516,8 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     defending_side,
                     deflected: false,
                     physics_save_rolled: true,
+                    is_direct_fk: false,
+                    total_flight_ticks: 0.0,
                 });
             }
             field.ball.previous_owner = Some(taker_id);
@@ -731,10 +733,28 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             &context.environment,
         );
 
-        // From a wide position a direct shot isn't realistic — the whole
-        // weight goes to the delivery/short options (§12.2).
-        let is_wide_angle = (ball_pos.y - mid_y).abs() > dist_goal * 0.6;
-        let shot_w = if is_wide_angle { 0.0 } else { scores.direct_shot };
+        // realism-bug (2026-08-01): angle was a binary gate — full band
+        // shot weight anywhere inside the 0.6 ratio, zero outside it, with
+        // no distinction between dead-central and barely-inside-the-cutoff
+        // positions. A free kick directly in front of goal is a
+        // meaningfully better shooting position than one at a marginal
+        // angle even at the same distance; real teams shoot more often
+        // the more central the position. `angle_ratio` is the same 0-1
+        // normalization the wall-shift `near_bias` formula already uses
+        // (0 = dead central, 1 = at the existing wide-angle cutoff).
+        // `CENTRAL_SHOT_BONUS` is a reasoned estimate, not sourced from a
+        // real angle-vs-selection dataset (that would need a fresh data
+        // pull) — flagged accordingly; verify behaviourally that it
+        // shifts shot share toward central positions as intended.
+        const CENTRAL_SHOT_BONUS: f32 = 0.5;
+        let angle_ratio = ((ball_pos.y - mid_y).abs() / dist_goal.max(1.0)) / 0.6;
+        let is_wide_angle = angle_ratio > 1.0;
+        let angle_factor = if is_wide_angle {
+            0.0
+        } else {
+            1.0 + (1.0 - angle_ratio) * CENTRAL_SHOT_BONUS
+        };
+        let shot_w = scores.direct_shot * angle_factor;
 
         field.ball.free_kick_decided = true;
         let total = shot_w + scores.box_delivery + scores.short_routine + scores.recycle;
@@ -811,11 +831,6 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     1.0
                 };
                 let use_far_side = context.rng.bernoulli(p_far);
-                let aim_off = if use_far_side {
-                    far_gap_min + context.rng.unit_f32() * (far_gap_max - far_gap_min).max(1.0)
-                } else {
-                    near_gap_min + context.rng.unit_f32() * (near_gap_max - near_gap_min).max(1.0)
-                };
                 // near_bias > 0 means the ball sits toward the +y post
                 // (that's the near post); the far post is the opposite
                 // side. near_bias ≈ 0 (dead-central) has no real far
@@ -826,11 +841,84 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 } else {
                     context.rng.bernoulli(0.5)
                 };
+                let (gap_min, gap_max) = if use_far_side {
+                    (far_gap_min, far_gap_max)
+                } else {
+                    (near_gap_min, near_gap_max)
+                };
+                let gap_span = (gap_max - gap_min).max(1.0);
+                let random_off = gap_min + context.rng.unit_f32() * gap_span;
+                // realism-bug (2026-07-31): the aim within the (already
+                // wall-clearing) gap was a flat uniform pick, blind to
+                // where the keeper actually stands. Measured directly
+                // (FKCONV_CATCH diagnostic, 3838 evaluations): median
+                // lateral error between the keeper and the shot's target
+                // line was only 1.89u against a ~14.5u reach — the
+                // keeper is almost always comfortably covering the shot
+                // regardless of this random pick, because his own
+                // positioning (calculate_optimal_position) derives from
+                // this SAME near_bias geometry, so a uniform pick within
+                // the gap doesn't actually create separation from him.
+                // Fix: bias the pick toward whichever edge of the gap is
+                // FARTHEST from the keeper's real, live y position — for
+                // a linear candidate range, the farthest point from any
+                // fixed reference is always at one of the two endpoints
+                // (the distance function is convex), so comparing just
+                // the two edges is sufficient, no search needed. Blended
+                // with the original random pick by the taker's free-kick
+                // skill, so a poor taker still mostly just picks a
+                // random spot in the gap (realistic — not every taker
+                // reads the keeper), while a good one increasingly picks
+                // the genuinely open side.
+                let opp_gk_y = field
+                    .players
+                    .iter()
+                    .find(|p| {
+                        p.team_id != taker_team
+                            && p.tactical_position.current_position.is_goalkeeper()
+                    })
+                    .map(|p| p.position.y);
+                let aim_off = if let Some(gk_y) = opp_gk_y {
+                    let sign = if aim_toward_plus_y { 1.0 } else { -1.0 };
+                    let dist_to_gap_min = (mid_y + sign * gap_min - gk_y).abs();
+                    let dist_to_gap_max = (mid_y + sign * gap_max - gk_y).abs();
+                    let exploit_off = if dist_to_gap_max >= dist_to_gap_min {
+                        gap_max
+                    } else {
+                        gap_min
+                    };
+                    let exploit_factor = (taker_fk / 20.0).clamp(0.15, 0.85);
+                    random_off + (exploit_off - random_off) * exploit_factor
+                } else {
+                    random_off
+                };
                 let aim_y = if aim_toward_plus_y {
                     mid_y + aim_off
                 } else {
                     mid_y - aim_off
                 };
+                // realism-bug (2026-07-31) diagnostic, scratch-only: trace
+                // the FK aim decision against the live keeper position to
+                // check whether aim and keeper stance are correlated
+                // (both derive from the same near_bias formula, which may
+                // be why the shot rarely finds genuine separation from
+                // the keeper). Remove once the 0%-conversion investigation
+                // concludes.
+                #[cfg(feature = "match-logs")]
+                {
+                    log::info!(
+                        "FKCONV_AIM tick={} taker={} dist={:.1} near_bias={:.3} use_far={} aim_off={:.2} aim_y={:.2} mid_y={:.2} gk_y={:?}",
+                        context.current_tick(),
+                        taker_id,
+                        dist_goal,
+                        near_bias,
+                        use_far_side,
+                        aim_off,
+                        aim_y,
+                        mid_y,
+                        opp_gk_y
+                    );
+                }
                 // Shot power — same formula as `shoot_goal_power`, computed
                 // here because there is no StateProcessingContext this deep
                 // in the tick.

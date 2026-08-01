@@ -269,11 +269,43 @@ pub fn score_free_kick_choices(
     let crossing = (taker_crossing_0_20 / 20.0).clamp(0.0, 1.0);
 
     // Per-band base probabilities (sum to ~1.0 within each band).
+    //
+    // realism-bug (2026-07-30): the pre-existing values here were an
+    // invented "aesthetic feel" table, never checked against a real
+    // dataset — direct FK shots measured at 0.145/match against a
+    // sourced real target of ~1.03/match (StatsBomb open data, pooled
+    // Bundesliga 2023/24 + Premier League 2015/16, 414 matches, 427
+    // real direct-FK shots / 9778 real fouls-won). Recalibrated by
+    // computing the REAL direct-shot selection rate per distance band
+    // (shots-in-band / fouls-won-in-band, same FreeKickBand thresholds
+    // converted to meters): Close(<=18.75m) 10.3% (10/97), Mid
+    // (18.75-25m) 89.8% (237/264 — the classic "shoot from the D" zone,
+    // the single biggest surprise: real teams shoot almost every time
+    // from here, not the ~15% this engine assumed), Long(25-31.25m)
+    // 27.9% (163/584), Far(31.25-35m) 2.9% (14/479). The non-shot
+    // remainder in each band keeps the OLD relative box/short/recycle
+    // ratio, just rescaled to leave room for the new shot share.
+    // realism-bug (2026-08-01): `short`/`recycle` in Mid/Long were never
+    // independently validated — only `shot` was recalibrated against real
+    // data (see comment above); short/recycle are the OLD invented table's
+    // relative proportions, just rescaled. Pavel's challenge: at a dead
+    // ball with no dynamic pressure and a defined structure, there's no
+    // pressure-driven reason to fall back to a plain pass in a genuinely
+    // "in shooting range" band — `ShortRoutine`/`Recycle` collapse to the
+    // identical downstream behaviour anyway (see `resolve_free_kick`'s
+    // selection logic — only their SUM matters). Halved short+recycle's
+    // combined share in Mid/Long specifically (the bands with a real,
+    // sourced case for shooting) and redirected it into `shot`. Close/Far
+    // untouched — those bands have a real, sourced reason for low shot
+    // share (a crowded box genuinely favours delivery), not touched here.
+    // The situational modifiers below (chasing/protecting-lead) still
+    // apply on top and are the only thing that should move recycle from
+    // its now-smaller baseline.
     let (mut shot, mut delivery, mut short, mut recycle): (f32, f32, f32, f32) = match band {
-        FreeKickBand::Close => (0.22, 0.45, 0.20, 0.13),
-        FreeKickBand::Mid => (0.15, 0.50, 0.25, 0.10),
-        FreeKickBand::Long => (0.04, 0.55, 0.30, 0.11),
-        FreeKickBand::Far => (0.00, 0.40, 0.40, 0.20),
+        FreeKickBand::Close => (0.10, 0.519, 0.231, 0.150),
+        FreeKickBand::Mid => (0.7912, 0.1176, 0.0294, 0.0118),
+        FreeKickBand::Long => (0.4038, 0.4125, 0.1125, 0.0413),
+        FreeKickBand::Far => (0.03, 0.388, 0.388, 0.194),
     };
 
     // Strong FK skill biases toward direct shot in close/mid bands.
@@ -1121,6 +1153,10 @@ mod tests {
 
     #[test]
     fn long_distance_fk_avoids_direct_shot() {
+        // realism-bug (2026-07-30): "avoids" not "never" — real Far-band
+        // (>31.25m) free kicks shoot 2.9% of the time (StatsBomb), so the
+        // weight is now a small nonzero value, deliberately far below
+        // Close/Mid/Long's.
         let env = MatchEnvironment::default();
         let scores = score_free_kick_choices(
             FreeKickBand::Far,
@@ -1132,7 +1168,18 @@ mod tests {
             false,
             &env,
         );
-        assert_eq!(scores.direct_shot, 0.0);
+        assert!(scores.direct_shot > 0.0 && scores.direct_shot < 0.05);
+        let close_scores = score_free_kick_choices(
+            FreeKickBand::Close,
+            false,
+            18.0,
+            14.0,
+            0.5,
+            false,
+            false,
+            &env,
+        );
+        assert!(scores.direct_shot < close_scores.direct_shot);
     }
 
     #[test]

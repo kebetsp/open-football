@@ -430,6 +430,39 @@ pub struct ShotTarget {
     /// of up to 0.55 per shot ON TOP of the GK state machine's own
     /// per-tick rolls, driving per-shot conversion to ~2% (real ~12%).
     pub physics_save_rolled: bool,
+    /// Set when this shot is a direct free kick (`reason == "FK_DIRECT"`).
+    /// realism-bug (2026-07-30): `GoalkeeperCatchingState` steers straight
+    /// at `goal_line_y` with a 1.6-2.6x speed boost for the ENTIRE shot
+    /// flight (the state never exits while `cached_shot_target` is live).
+    /// For a close-range shot that's a brief, realistic final adjustment
+    /// — but a direct FK's long flight time (130-250u away, 400-800+ms)
+    /// gives that boosted, perfectly-informed pursuit enough time to
+    /// fully converge onto the exact target line regardless of where the
+    /// keeper started, which measured as 0 goals across 120 direct-FK
+    /// shots (real ~6.3% conversion). Real keepers commit to a dive
+    /// within a short reactive window, not a sustained sprint chasing a
+    /// known trajectory. `is_direct_fk` lets Catching's speed_boost be
+    /// capped for this one shot type only — every other shot's save
+    /// behaviour (including normal long-range open-play shots) is
+    /// unchanged.
+    pub is_direct_fk: bool,
+    /// realism-bug (2026-07-31): the shot's own projected total flight
+    /// duration in ticks (computed once at dispatch, same `ticks_to_goal`
+    /// used for the `goal_line_y`/`goal_line_z` projection below). Used
+    /// as a FIXED `expected_ticks` for the state-machine catch roll
+    /// (`is_catch_successful`) on direct free kicks — a first attempt
+    /// recomputed "ticks remaining" fresh on every evaluation instead,
+    /// which over-counts: each tick re-derives a brand new probability
+    /// decomposition assuming THAT tick starts a fresh n-roll sequence,
+    /// so the per-tick rate climbs sharply as the remaining-count shrinks
+    /// near arrival, stacking on top of everything already rolled in
+    /// earlier ticks. A single constant fixed at dispatch time avoids
+    /// that entirely — the same total is used for every evaluation of
+    /// this shot, so however many times the function actually fires,
+    /// the cumulative probability tracks the intended per-shot value
+    /// instead of compounding past it. Unused (defaults to 0.0, inert)
+    /// for every non-FK shot, which keeps its own fixed 3.0 constant.
+    pub total_flight_ticks: f32,
 }
 
 #[derive(Default, Clone)]

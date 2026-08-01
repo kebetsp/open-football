@@ -235,6 +235,8 @@ fn clear_open_play_metadata_makes_invariants_hold_after_set_piece_restart() {
         defending_side: PlayerSide::Right,
         deflected: false,
         physics_save_rolled: false,
+        is_direct_fk: false,
+        total_flight_ticks: 0.0,
     });
     ball.pass_target_player_id = Some(10);
     ball.pending_pass_passer = Some(9);
@@ -276,6 +278,8 @@ fn shot_without_previous_owner_fails_invariant() {
         defending_side: PlayerSide::Right,
         deflected: false,
         physics_save_rolled: false,
+        is_direct_fk: false,
+        total_flight_ticks: 0.0,
     });
     // No previous_owner → "who fired this?" can't be answered — debug
     // builds and tests should flag this.
@@ -323,6 +327,8 @@ fn dead_ball_corner_with_leftover_shot_metadata_fails_invariant() {
         defending_side: PlayerSide::Right,
         deflected: false,
         physics_save_rolled: false,
+        is_direct_fk: false,
+        total_flight_ticks: 0.0,
     });
     assert!(matches!(
         ball.check_invariants(),

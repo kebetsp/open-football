@@ -89,6 +89,22 @@ pub mod save_accounting_stats {
     pub static SAVE_PHYSICS_FIRED: AtomicU64 = AtomicU64::new(0);
     pub static SAVE_PHYSICS_PASSED: AtomicU64 = AtomicU64::new(0);
 
+    // realism-bug (2026-07-31) diagnostic, scratch-only: which gate in
+    // `try_save_shot` is stopping the physics-layer save from ever
+    // evaluating for a direct FK (FKCONV_PHYS logged 0 lines across 23
+    // real shots in an initial sample — every tick is returning before
+    // reaching the lateral_error check). Remove once the investigation
+    // concludes.
+    pub static FK_GATE_ALREADY_ROLLED: AtomicU64 = AtomicU64::new(0);
+    pub static FK_GATE_Z_TOO_HIGH: AtomicU64 = AtomicU64::new(0);
+    pub static FK_GATE_PAST_GOAL_LINE: AtomicU64 = AtomicU64::new(0);
+    pub static FK_GATE_OUT_OF_REACH: AtomicU64 = AtomicU64::new(0);
+    pub static FK_GATE_NOT_MOVING_TOWARD_GOAL: AtomicU64 = AtomicU64::new(0);
+    pub static FK_GATE_OUTSIDE_GOAL_WIDTH: AtomicU64 = AtomicU64::new(0);
+    pub static FK_GATE_NO_KEEPER: AtomicU64 = AtomicU64::new(0);
+    pub static FK_GATE_REACHED_LATERAL_CHECK: AtomicU64 = AtomicU64::new(0);
+    pub static FK_GATE_ALREADY_OWNED: AtomicU64 = AtomicU64::new(0);
+
     pub fn reset() {
         for arr in [
             &SAVES_CREDITED,
@@ -102,6 +118,19 @@ pub mod save_accounting_stats {
             }
         }
         ON_TARGET_FROM_GOAL.store(0, Ordering::Relaxed);
+        for a in [
+            &FK_GATE_ALREADY_ROLLED,
+            &FK_GATE_Z_TOO_HIGH,
+            &FK_GATE_PAST_GOAL_LINE,
+            &FK_GATE_OUT_OF_REACH,
+            &FK_GATE_NOT_MOVING_TOWARD_GOAL,
+            &FK_GATE_OUTSIDE_GOAL_WIDTH,
+            &FK_GATE_NO_KEEPER,
+            &FK_GATE_REACHED_LATERAL_CHECK,
+            &FK_GATE_ALREADY_OWNED,
+        ] {
+            a.store(0, Ordering::Relaxed);
+        }
     }
 
     pub fn snapshot() -> Snapshot {
@@ -2992,7 +3021,27 @@ impl PlayerEventDispatcher {
         let exploit_shift = keeper_bias * MAX_EXPLOIT_SHIFT * placement_skill;
         let minus_share = (0.5 + exploit_shift).clamp(0.05, 0.95);
 
-        let ideal_y_target = if target_preference < side_rate * 2.0 * minus_share {
+        // realism-bug (2026-07-30): a direct free kick's `target.y` is
+        // NOT the true goal centre — `resolve_free_kick` already computes
+        // a deliberate wall-avoidance aim point (a gap beyond the wall's
+        // near/far edge, often 20-26u off true centre, `goal_center.y`
+        // here since `goal_center = shoot_event_model.target`). Every
+        // OTHER shot path's `target` genuinely IS goal-centred (see
+        // `shooting_direction()`), so re-randomising a SECOND
+        // corner-seeking offset around it here is the right generic
+        // behaviour there — but for a direct FK it double-stacks two
+        // independent "aim for a corner" decisions on top of each other,
+        // which as often as not pushes the real aim point (and the
+        // ball's actual physical velocity, computed from this value
+        // below) well past the true post: measured 0/69 goals across 100
+        // matches despite a healthy shot volume. Use the FK's own
+        // already-correct aim directly instead of re-picking a corner;
+        // the y_error/miskick/wide-miss layers below still apply
+        // normally on top, so the shot keeps realistic imprecision, just
+        // without a second systematic corner bias compounding the first.
+        let ideal_y_target = if shoot_event_model.reason == "FK_DIRECT" {
+            goal_center.y
+        } else if target_preference < side_rate * 2.0 * minus_share {
             goal_center.y - corner_reach
         } else if target_preference < side_rate * 2.0 {
             goal_center.y + corner_reach
@@ -3086,7 +3135,8 @@ impl PlayerEventDispatcher {
             + pressure_penalty * 0.04
             + low_condition_penalty * 0.03
             + desperation * 0.08;
-        if rng.random_range(0.0f32..1.0) < wide_miss_chance {
+        let wide_miss_fired = rng.random_range(0.0f32..1.0) < wide_miss_chance;
+        if wide_miss_fired {
             let extra_wide = rng.random_range(GOAL_WIDTH * 0.2..GOAL_WIDTH * 1.5);
             if rng.random_range(0.0f32..1.0) < 0.5 {
                 actual_y_target = goal_right_post + extra_wide;
@@ -3098,7 +3148,8 @@ impl PlayerEventDispatcher {
         // Miskick chance — sourced from the unified profile so it
         // includes the smoothstep poor-penalty contribution rather
         // than a single technique^3 read.
-        if rng.random_range(0.0f32..1.0) < miskick_probability {
+        let miskick_fired = rng.random_range(0.0f32..1.0) < miskick_probability;
+        if miskick_fired {
             actual_y_target += rng.random_range(-GOAL_WIDTH * 1.5..GOAL_WIDTH * 1.5);
         }
 
@@ -3388,6 +3439,33 @@ impl PlayerEventDispatcher {
             time_band_diag::XG_X1000_BY_BAND[band]
                 .fetch_add((xg * 1000.0) as u64, Ordering::Relaxed);
         }
+        // realism-bug (2026-07-31) diagnostic, scratch-only: full
+        // resolution trace for every direct-FK shot — where it actually
+        // aimed, whether wide-miss/miskick/over-bar fired, on-target
+        // status, xG, and final velocity magnitude — to find why goal
+        // conversion measured 0/214 in the prior session despite
+        // fixing frequency and the double-stacked aim bug. Remove once
+        // the investigation concludes.
+        #[cfg(feature = "match-logs")]
+        if shoot_event_model.reason == "FK_DIRECT" {
+            log::info!(
+                "FKCONV_SHOT tick={} shooter={} dist={:.1} ideal_y={:.2} clamped_y={:.2} on_target={} over_bar={} deflected={} wide_miss={} miskick={} vmag={:.2} xg={:.3} gk_y={:?} gk_dist={:?}",
+                shoot_event_model.tick,
+                shoot_event_model.from_player_id,
+                horizontal_distance,
+                ideal_y_target,
+                clamped_y_target,
+                on_target,
+                shot_goes_over_bar,
+                deflected,
+                wide_miss_fired,
+                miskick_fired,
+                final_velocity.norm(),
+                xg,
+                defending_gk_position.map(|p| p.y),
+                gk_distance,
+            );
+        }
 
         // ── xG chain / buildup distribution ──────────────────────────
         // The shooter's recent attacking partners share a small slice
@@ -3483,6 +3561,31 @@ impl PlayerEventDispatcher {
             // and the cache would mislead the keeper.
             if (dx > 0.0 && vx > 0.1) || (dx < 0.0 && vx < -0.1) {
                 let ticks_to_goal = (dx / vx).abs();
+                // realism-bug (2026-07-31): the flat 40-tick flight
+                // protection set above (`in_flight_state = 40`, "shorter
+                // flight protection for shots") was calibrated against
+                // typical open-play shot distances, whose whole flight
+                // finishes well inside that window. A direct free kick
+                // from 20-30m takes 40-90 ticks — for anything beyond
+                // ~40 ticks, protection expires mid-flight, and
+                // `ownership.rs`'s generic "settled ball, nearest player
+                // claims it" mechanism (gated only on `in_flight_state
+                // == 0` plus a slow/low check) can then claim the ball
+                // via plain proximity, bypassing `try_save_shot` and
+                // `is_catch_successful` entirely — a save with zero
+                // skill/difficulty involved. Measured directly: outcome
+                // tracing on 29 real direct-FK shots found the dominant
+                // resolution was a generic `Claimed(<goalkeeper id>)`
+                // event, not `CaughtBall`/`ParriedBall` from either
+                // dedicated save mechanism. Extends protection to the
+                // shot's own real flight duration (`ticks_to_goal`, the
+                // same quantity already stored as `total_flight_ticks`)
+                // plus a small buffer, floored at the original 40 so
+                // short shots are unaffected.
+                if shoot_event_model.reason == "FK_DIRECT" {
+                    field.ball.flags.in_flight_state =
+                        (ticks_to_goal.ceil() as usize + 10).max(40);
+                }
                 let goal_line_y = if deflected {
                     // GK reads the ORIGINAL trajectory until the
                     // deflection happens; the redirect arrives after
@@ -3506,6 +3609,8 @@ impl PlayerEventDispatcher {
                     defending_side,
                     deflected,
                     physics_save_rolled: false,
+                    is_direct_fk: shoot_event_model.reason == "FK_DIRECT",
+                    total_flight_ticks: ticks_to_goal.max(1.0),
                 });
             } else {
                 field.ball.cached_shot_target = None;
