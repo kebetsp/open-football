@@ -117,6 +117,34 @@ impl StateProcessingHandler for GoalkeeperCatchingState {
             // other shot type (including normal long-range open-play
             // shots) keeps the existing boosted-sprint behaviour.
             let effective_boost = if target.is_direct_fk { 0.2 } else { speed_boost };
+
+            // realism-bug (2026-08-01, Pavel's direction): the keeper
+            // currently starts closing toward the intercept line the
+            // INSTANT the shot is struck — zero reaction lag. Real human
+            // reaction time is ~150ms minimum (this project's own
+            // physiological anchor) before a keeper even begins
+            // reacting to a struck ball. Freezing him for that window
+            // before the (already-capped, 2026-07-31) creep begins gives
+            // him genuinely less real time to close a gap — matching
+            // "jumps but doesn't reach it" rather than tuning a
+            // probability. Elapsed flight time is derived the same way
+            // as the (reverted) dynamic-expected-ticks attempt, but used
+            // here only as a simple time gate, not a probability
+            // calculation, so it doesn't carry that attempt's
+            // over-counting flaw.
+            if target.is_direct_fk {
+                const REACTION_DELAY_TICKS: f32 = 15.0; // ~150ms
+                let ball_pos = ctx.tick_context.positions.ball.position;
+                let ball_vel = ctx.tick_context.positions.ball.velocity;
+                let remaining_dist = (goal_pos.x - ball_pos.x).abs();
+                let ball_speed_x = ball_vel.x.abs().max(0.3);
+                let remaining_ticks = remaining_dist / ball_speed_x;
+                let elapsed_ticks = (target.total_flight_ticks - remaining_ticks).max(0.0);
+                if elapsed_ticks < REACTION_DELAY_TICKS {
+                    return Some(Vector3::zeros());
+                }
+            }
+
             return Some(
                 SteeringBehavior::Arrive {
                     target: intercept,

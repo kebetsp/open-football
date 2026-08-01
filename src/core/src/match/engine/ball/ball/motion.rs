@@ -250,7 +250,35 @@ impl Ball {
         // while still keeping the ball in the corner/touchline area of the pitch.
         const BOUNDARY_INSET: f32 = 10.0;
 
-        if self.position.x <= 0.0 {
+        // realism-bug (2026-08-01): the goal line and the pitch's own
+        // out-of-bounds edge are the SAME x-coordinate (0 / field_width)
+        // — this function previously reset ANY ball crossing either
+        // boundary, with no exemption for "this position is actually a
+        // goal." `check_goal`/`check_over_goal`/`check_wide_of_goal` all
+        // run before this function every tick (see `mod.rs`), but if the
+        // ball's momentum is low near the line (measured: direct-FK
+        // shots regularly decelerate hard on approach) it can spend
+        // several ticks right at the boundary without cleanly
+        // satisfying every one of `check_goal`'s own gates on any single
+        // tick — and once this function resets the position back
+        // in-field, the crossing is gone for good; `check_goal` can
+        // never see it again. Traced directly: a real on-target,
+        // un-saved shot reached x=839.6 (inside the goal frame
+        // vertically) then silently reset to x=830 next sample and
+        // never registered. Fix: defer entirely to the goal-line
+        // handlers whenever the current position is genuinely within
+        // the goal frame (by width, regardless of height — `is_goal`
+        // covers "in", `is_over_goal` covers "over the bar", both are
+        // already-handled cases with their own dedicated logic) — only
+        // a genuine wide/touchline crossing falls through to this
+        // generic reset.
+        let in_goal_frame = context.goal_positions.is_goal(self.position).is_some()
+            || context.goal_positions.is_over_goal(self.position).is_some();
+
+        if in_goal_frame {
+            // Nothing to do here — check_goal/check_over_goal (already
+            // run this tick, before this function) own this position.
+        } else if self.position.x <= 0.0 {
             self.position.x = BOUNDARY_INSET;
             self.velocity = Vector3::zeros();
         } else if self.position.x >= field_width {

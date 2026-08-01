@@ -3085,6 +3085,24 @@ impl PlayerEventDispatcher {
         // resulting on-target rate sat at ~22% vs real ~33%. 16u with
         // damped pressure / body / condition multipliers keeps spread
         // realistic for both clean strikes and scrambling ones.
+        // realism-bug (2026-08-01): free kicks measured 63.6% "missed"
+        // vs a real-world 33.5% (StatsBomb, 427 direct FK shots), while
+        // taker selection was independently confirmed NOT to be the
+        // cause (proximity-gated with skill only breaking ties among
+        // nearby players, matching real team behaviour). Per Pavel's
+        // direction: an isolated FK-only precision boost on top of the
+        // shared shot-execution model, rather than touching the shared
+        // formula every other shot type also relies on. Magnitude is a
+        // reasoned estimate (no sourced real precision-spread dataset
+        // for free kicks specifically) — verify the resulting
+        // missed/saved/goal shift empirically against the same
+        // real-data comparison table rather than trusting the constant.
+        const FK_PRECISION_ERROR_MULT: f32 = 0.35;
+        let fk_precision_mult = if shoot_event_model.reason == "FK_DIRECT" {
+            FK_PRECISION_ERROR_MULT
+        } else {
+            1.0
+        };
         let max_y_error_raw = 16.0
             * distance_error
             * pressure_error
@@ -3092,7 +3110,8 @@ impl PlayerEventDispatcher {
             * condition_error
             * random_error_scale
             * (1.0 + desperation * 0.38)
-            * (1.0 - adjusted_accuracy * 0.55);
+            * (1.0 - adjusted_accuracy * 0.55)
+            * fk_precision_mult;
         let min_error = if horizontal_distance < 18.0 {
             3.0 + poor_penalty * 3.0
         } else if horizontal_distance < 30.0 {
@@ -3129,12 +3148,13 @@ impl PlayerEventDispatcher {
         // tail to zero (see audit_engine_gap). Elite shooters are
         // unaffected: at execution_skill ≥ 0.55, `(1 - exec)` < 0.45 and
         // `poor_penalty` is already zero.
-        let wide_miss_chance = wide_base
+        let wide_miss_chance = (wide_base
             + (1.0 - execution_skill) * 0.05
             + poor_penalty * 0.03
             + pressure_penalty * 0.04
             + low_condition_penalty * 0.03
-            + desperation * 0.08;
+            + desperation * 0.08)
+            * fk_precision_mult;
         let wide_miss_fired = rng.random_range(0.0f32..1.0) < wide_miss_chance;
         if wide_miss_fired {
             let extra_wide = rng.random_range(GOAL_WIDTH * 0.2..GOAL_WIDTH * 1.5);
