@@ -118,51 +118,15 @@ impl StateProcessingHandler for GoalkeeperCatchingState {
             // shots) keeps the existing boosted-sprint behaviour.
             let effective_boost = if target.is_direct_fk { 0.2 } else { speed_boost };
 
-            // realism-bug (2026-08-01, Pavel's direction): the keeper
-            // currently starts closing toward the intercept line the
-            // INSTANT the shot is struck — zero reaction lag. Real human
-            // reaction time is ~150ms minimum (this project's own
-            // physiological anchor) before a keeper even begins
-            // reacting to a struck ball. Freezing him for that window
-            // before the (already-capped, 2026-07-31) creep begins gives
-            // him genuinely less real time to close a gap — matching
-            // "jumps but doesn't reach it" rather than tuning a
-            // probability.
-            //
-            // realism-bug (2026-08-02): the first version derived
-            // "elapsed ticks" from the ball's CURRENT velocity each tick
-            // (`remaining_dist / ball_speed_x`) rather than a fixed
-            // reference. A direct FK regularly decelerates on approach
-            // (documented elsewhere in this file), so as the ball slows
-            // near arrival, dividing by that shrinking speed inflated the
-            // remaining-ticks estimate — which could push the computed
-            // `elapsed_ticks` back DOWN below the threshold late in
-            // flight, re-triggering the freeze right as the ball arrived,
-            // for any REACTION_DELAY_TICKS > 0 (measured: batches at 6
-            // and 15 ticks moved Saved% almost identically, both far
-            // below the ticks=0 case — the delay wasn't scaling smoothly,
-            // it was being re-applied unpredictably near the worst
-            // moment). Fixed by diffing real tick counts instead:
-            // `ShotTarget.dispatch_tick` is a fixed reference captured
-            // once at the shot's own dispatch, immune to any later
-            // change in the ball's velocity.
-            if target.is_direct_fk {
-                // Tuned down from the original 15 (~150ms) toward Pavel's
-                // explicit "step away from strict realism for game feel"
-                // instruction (2026-08-02): real free-kick conversion is
-                // ~6.3% (StatsBomb), but he wants a deliberately higher
-                // ~10% goal / ~15% saved split because free-kick goals
-                // are a fan-favourite moment. Re-verify against a fresh
-                // outcome batch if this is revisited.
-                const REACTION_DELAY_TICKS: f32 = 8.0; // ~80ms
-                let elapsed_ticks = ctx
-                    .context
-                    .current_tick()
-                    .saturating_sub(target.dispatch_tick) as f32;
-                if elapsed_ticks < REACTION_DELAY_TICKS {
-                    return Some(Vector3::zeros());
-                }
-            }
+            // realism-bug (2026-08-02, Pavel's direction): the reaction-
+            // delay freeze (previously here, 150ms then retuned to 80ms)
+            // is removed entirely as a direct test of whether it has any
+            // measurable effect on the saved-vs-goal split at all, given
+            // outcome batches kept reading noisy/inconsistent across
+            // several delay values (0/6/8/15 ticks) — see the decisions
+            // log 2026-08-01/02 entries for the full measurement history.
+            // `ShotTarget.dispatch_tick` (added for this mechanism) is
+            // left in place, unused here, in case the delay is revisited.
 
             return Some(
                 SteeringBehavior::Arrive {
