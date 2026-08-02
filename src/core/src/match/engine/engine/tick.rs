@@ -1064,11 +1064,6 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // [diag] cross has left the taker (loose / in flight).
         #[cfg(feature = "match-logs")]
         crate::mid_run_diag::CORNER_CONTEST_FIRED.fetch_add(1, Ordering::Relaxed);
-        if ball.position.z < 2.0 {
-            return;
-        }
-
-        let minute = (context.total_match_time / 60_000) as u32;
 
         // The goal under attack is the one the corner is nearest to.
         let gl = context.goal_positions.left;
@@ -1079,6 +1074,38 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         } else {
             gr
         };
+
+        // 2026-08 height-physics-rewrite fix: `z >= 2.0` used to be the
+        // ONLY gate here, an implicit proxy for "the cross has traveled
+        // far enough to be a genuine aerial threat" — a proxy that only
+        // held up under the OLD, buggy gravity, where height and
+        // horizontal flight-progress happened to be roughly correlated.
+        // Under the corrected real-ballistics gravity, a corner climbs
+        // past 2.0m almost immediately after leaving the flag (verified
+        // via raw position data: contest checks were firing with the
+        // ball ~220-245 units — 27-31 real metres — from the goal, i.e.
+        // still essentially AT the corner flag, not anywhere near the
+        // box), then STAYS above 2.0m for most of its real flight,
+        // descending back through it only near the very end. Resolving
+        // this early — before the "attacker wins" branch below
+        // teleports the ball straight to the winning player's position
+        // near goal — discarded the entire real delivery and is very
+        // likely what looked like the cross "flying way past the post":
+        // not an overshoot, an early-resolved contest silently replacing
+        // the real flight with an instant jump. Gate on genuine
+        // proximity to the box FIRST (matching the 135u radius the
+        // candidate search below already uses, with a little margin so
+        // the contest can resolve slightly before the ball is literally
+        // overhead) — the height check stays as the secondary condition
+        // it always was.
+        if (ball_pos - attacked_goal).magnitude() > 160.0 {
+            return;
+        }
+        if ball.position.z < 2.0 {
+            return;
+        }
+
+        let minute = (context.total_match_time / 60_000) as u32;
 
         // Attacking team = the cross taker's team.
         let taker = ball.previous_owner.or(ball.current_owner);

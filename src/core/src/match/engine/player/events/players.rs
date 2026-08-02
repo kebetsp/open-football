@@ -1973,6 +1973,43 @@ impl PlayerEventDispatcher {
         };
         let final_z_velocity = z_velocity.min(max_z_velocity);
 
+        // 2026-08 realism-bug fix (corner/lofted-delivery overshoot):
+        // `calculate_horizontal_velocity` above solves for a GROUND-
+        // FRICTION-DECAY speed — "how fast must this roll so friction
+        // brings it to a stop at the target distance" — computed before
+        // trajectory type or real height are even known. That model is
+        // fine for a genuinely grounded/low pass, but physically wrong
+        // for a HighArc delivery: the ball is airborne (barely
+        // decelerated by the much gentler air drag) for most of its
+        // real, correctly-long hang time (2026-08 height-physics
+        // rewrite), so at the friction-solved speed it travels far past
+        // its intended landing point before finally coming down —
+        // verified via raw flight data: corner coverage_ratio (covered
+        // distance / intended target distance) measured 1.2-1.8, i.e.
+        // 20-84% overshoot, matching Pavel's live report of corners
+        // landing "way farther than the post and players." Real
+        // ballistics: given the chosen real apex height (hence real
+        // total flight time), the horizontal speed that actually lands
+        // AT the target is `distance / flight_time` — not a friction
+        // decay solve. `GRAVITY_PER_TICK` matches `update_velocity`'s
+        // corrected per-tick gravity exactly, so this stays consistent
+        // with the ball's own real physics.
+        let horizontal_velocity = if matches!(trajectory_type, TrajectoryType::HighArc) {
+            const GRAVITY_PER_TICK: f32 = 0.000981; // 9.81 * 0.01^2, matches update_velocity
+            const MAX_LOFTED_HORIZONTAL_SPEED: f32 = 3.2; // matches MAX_PASS_VELOCITY below
+            let total_flight_ticks = (2.0 * final_z_velocity / GRAVITY_PER_TICK).max(1.0);
+            let required_speed =
+                (actual_horizontal_distance / total_flight_ticks).clamp(0.3, MAX_LOFTED_HORIZONTAL_SPEED);
+            let dir = if horizontal_velocity.norm() > 0.01 {
+                horizontal_velocity.normalize()
+            } else {
+                horizontal_velocity
+            };
+            dir * required_speed
+        } else {
+            horizontal_velocity
+        };
+
         // Calculate final velocity
         let mut final_velocity = Vector3::new(
             horizontal_velocity.x,
@@ -2095,7 +2132,6 @@ impl PlayerEventDispatcher {
 
         // Apply ball physics
         field.ball.velocity = final_velocity;
-
 
         // Record the passer in recent passers history before clearing ownership
         field.ball.record_passer(event_model.from_player_id);
