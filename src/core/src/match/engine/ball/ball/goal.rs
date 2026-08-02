@@ -30,7 +30,35 @@ impl Ball {
         if let Some(goal_side) = context.goal_positions.is_goal(self.position) {
             // Prefer current_owner (e.g. player carrying ball into goal)
             // Fall back to previous_owner (e.g. shooter or passer whose ball went in)
-            if let Some(goalscorer) = self.current_owner.or(self.previous_owner) {
+            // realism-bug (2026-08-01): a THIRD fallback to
+            // `last_shot_shooter_id`, gated on a live tracked shot
+            // (`cached_shot_target.is_some()`) so it can never misattribute
+            // an unrelated later crossing to a stale shooter id. Direct
+            // free kicks travel 150-250+ units in one uninterrupted
+            // flight — long enough to trigger an existing, separate
+            // safety-net mechanism elsewhere in the engine that nulls
+            // `previous_owner` once the ball drifts far from its last
+            // known owner mid-flight (built for pass-tracking, not shots).
+            // Once that fires, `current_owner.or(previous_owner)` came up
+            // empty and this whole branch was skipped — traced directly:
+            // a real on-target, unsaved shot flew straight through the
+            // goal frame to x=865 (25 units past the line) over a full
+            // second, never credited, before falling through to an
+            // out-of-bounds/goal-kick resolution instead. `last_shot_shooter_id`
+            // is set at the moment of the shot and isn't touched by that
+            // same clearing mechanism, so it survives exactly the case
+            // this fallback needs.
+            let goalscorer_fallback = self
+                .current_owner
+                .or(self.previous_owner)
+                .or_else(|| {
+                    if self.cached_shot_target.is_some() {
+                        self.last_shot_shooter_id
+                    } else {
+                        None
+                    }
+                });
+            if let Some(goalscorer) = goalscorer_fallback {
                 let Some(player) = context.players.by_id(goalscorer) else {
                     return;
                 };

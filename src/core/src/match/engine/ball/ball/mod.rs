@@ -463,6 +463,18 @@ pub struct ShotTarget {
     /// instead of compounding past it. Unused (defaults to 0.0, inert)
     /// for every non-FK shot, which keeps its own fixed 3.0 constant.
     pub total_flight_ticks: f32,
+    /// realism-bug (2026-08-02): the simulation tick this shot was
+    /// dispatched (`MatchContext::current_tick()` at construction time).
+    /// Used by the direct-FK reaction-delay gate in
+    /// `GoalkeeperCatchingState::velocity()` to measure genuine elapsed
+    /// flight time via tick-count diffing, NOT the ball's own current
+    /// (decelerating) velocity — a shot regularly loses speed on
+    /// approach, so re-deriving "ticks remaining" from live velocity each
+    /// tick made the elapsed-time estimate shrink back down near arrival,
+    /// intermittently re-triggering the reaction freeze at exactly the
+    /// worst moment regardless of how small the delay constant was.
+    /// Unused (defaults to 0, inert) for every non-FK shot.
+    pub dispatch_tick: u64,
 }
 
 #[derive(Default, Clone)]

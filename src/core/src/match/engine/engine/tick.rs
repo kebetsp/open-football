@@ -518,6 +518,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     physics_save_rolled: true,
                     is_direct_fk: false,
                     total_flight_ticks: 0.0,
+                    dispatch_tick: 0,
                 });
             }
             field.ball.previous_owner = Some(taker_id);

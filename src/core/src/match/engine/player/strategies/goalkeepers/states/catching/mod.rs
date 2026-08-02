@@ -127,19 +127,38 @@ impl StateProcessingHandler for GoalkeeperCatchingState {
             // before the (already-capped, 2026-07-31) creep begins gives
             // him genuinely less real time to close a gap — matching
             // "jumps but doesn't reach it" rather than tuning a
-            // probability. Elapsed flight time is derived the same way
-            // as the (reverted) dynamic-expected-ticks attempt, but used
-            // here only as a simple time gate, not a probability
-            // calculation, so it doesn't carry that attempt's
-            // over-counting flaw.
+            // probability.
+            //
+            // realism-bug (2026-08-02): the first version derived
+            // "elapsed ticks" from the ball's CURRENT velocity each tick
+            // (`remaining_dist / ball_speed_x`) rather than a fixed
+            // reference. A direct FK regularly decelerates on approach
+            // (documented elsewhere in this file), so as the ball slows
+            // near arrival, dividing by that shrinking speed inflated the
+            // remaining-ticks estimate — which could push the computed
+            // `elapsed_ticks` back DOWN below the threshold late in
+            // flight, re-triggering the freeze right as the ball arrived,
+            // for any REACTION_DELAY_TICKS > 0 (measured: batches at 6
+            // and 15 ticks moved Saved% almost identically, both far
+            // below the ticks=0 case — the delay wasn't scaling smoothly,
+            // it was being re-applied unpredictably near the worst
+            // moment). Fixed by diffing real tick counts instead:
+            // `ShotTarget.dispatch_tick` is a fixed reference captured
+            // once at the shot's own dispatch, immune to any later
+            // change in the ball's velocity.
             if target.is_direct_fk {
-                const REACTION_DELAY_TICKS: f32 = 15.0; // ~150ms
-                let ball_pos = ctx.tick_context.positions.ball.position;
-                let ball_vel = ctx.tick_context.positions.ball.velocity;
-                let remaining_dist = (goal_pos.x - ball_pos.x).abs();
-                let ball_speed_x = ball_vel.x.abs().max(0.3);
-                let remaining_ticks = remaining_dist / ball_speed_x;
-                let elapsed_ticks = (target.total_flight_ticks - remaining_ticks).max(0.0);
+                // Tuned down from the original 15 (~150ms) toward Pavel's
+                // explicit "step away from strict realism for game feel"
+                // instruction (2026-08-02): real free-kick conversion is
+                // ~6.3% (StatsBomb), but he wants a deliberately higher
+                // ~10% goal / ~15% saved split because free-kick goals
+                // are a fan-favourite moment. Re-verify against a fresh
+                // outcome batch if this is revisited.
+                const REACTION_DELAY_TICKS: f32 = 8.0; // ~80ms
+                let elapsed_ticks = ctx
+                    .context
+                    .current_tick()
+                    .saturating_sub(target.dispatch_tick) as f32;
                 if elapsed_ticks < REACTION_DELAY_TICKS {
                     return Some(Vector3::zeros());
                 }

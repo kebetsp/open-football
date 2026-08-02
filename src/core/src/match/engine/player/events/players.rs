@@ -3631,6 +3631,7 @@ impl PlayerEventDispatcher {
                     physics_save_rolled: false,
                     is_direct_fk: shoot_event_model.reason == "FK_DIRECT",
                     total_flight_ticks: ticks_to_goal.max(1.0),
+                    dispatch_tick: shoot_event_model.tick,
                 });
             } else {
                 field.ball.cached_shot_target = None;
