@@ -550,7 +550,15 @@ impl MidfielderPassingState {
         let dir = to_target / dist;
 
         let horizontal_speed = 4.0_f32;
-        let z_velocity = 5.0_f32;
+        // 2026-08 height-physics rewrite: 5.0m real target apex for a
+        // hoofed emergency clearance, converted through the same
+        // real-ballistics formula as
+        // `PlayerEventDispatcher::z_launch_velocity_for_height`
+        // (players.rs) — `position.z` is real metres (flow/goal.rs's
+        // live GOAL_HEIGHT=2.44 confirms this).
+        const GRAVITY: f32 = 9.81;
+        const TICK_SECONDS: f32 = 0.01;
+        let z_velocity: f32 = (2.0 * GRAVITY * 5.0f32).sqrt() * TICK_SECONDS;
 
         let ball_velocity = Vector3::new(
             dir.x * horizontal_speed,

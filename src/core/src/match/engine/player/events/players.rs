@@ -2001,7 +2001,11 @@ impl PlayerEventDispatcher {
         {
             // Fallback to a safe default velocity
             let safe_direction = actual_pass_vector.normalize();
-            final_velocity = Vector3::new(safe_direction.x * 1.5, safe_direction.y * 1.5, 0.3);
+            final_velocity = Vector3::new(
+                safe_direction.x * 1.5,
+                safe_direction.y * 1.5,
+                Self::z_launch_velocity_for_height(0.3),
+            );
         }
 
         // Clamp velocity magnitude to maximum.
@@ -2059,18 +2063,20 @@ impl PlayerEventDispatcher {
         // pass type (a raking 50m diagonal vs. a near-post corner) remain
         // an open, unsourced question, same caveat as the GK case above.
         if matches!(trajectory_type, TrajectoryType::HighArc) {
-            // `calculate_max_z_velocity`'s ceiling (8-15.6 for long
-            // distances) was only ever exercised through the OLD shared
-            // clamp, which crushed it down to an effective ~1.5-4.7 in
-            // practice — the previously-confirmed-realistic arc height
-            // (0.75-3.4m peaks) came from that throttled value, not the
-            // ceiling's raw output. Letting z reach the raw ceiling
-            // unclamped (first attempt at this fix) produced ~18-19m
-            // arcs. Cap z here at a value chosen to reproduce the
-            // already-confirmed-good peak, independent of horizontal.
-            const LOFTED_DELIVERY_MAX_Z_VELOCITY: f32 = 2.9;
-            if final_velocity.z > LOFTED_DELIVERY_MAX_Z_VELOCITY {
-                final_velocity.z = LOFTED_DELIVERY_MAX_Z_VELOCITY;
+            // 2026-08 height-physics rewrite: `calculate_max_z_velocity`'s
+            // own ceiling already applies (its bucket table tops out at a
+            // real 8-12m for extreme/goal-kick distances, correctly
+            // converted). This SECOND cap exists specifically to bound
+            // corner/FK-cross/GK-long deliveries — a real driven corner
+            // or cross realistically peaks around 4-5m (sourced: a real
+            // measured corner trajectory example implies a ~6.3m full
+            // ballistic apex; practical header-contest height is 1.8-2.5m
+            // — Coaching American Soccer / peer-reviewed corner-kinematics
+            // writeup), so this stays a genuine, separate, tighter ceiling
+            // rather than relying on the (taller) general long-pass cap.
+            let lofted_delivery_max_z = Self::z_launch_velocity_for_height(5.0);
+            if final_velocity.z > lofted_delivery_max_z {
+                final_velocity.z = lofted_delivery_max_z;
             }
             let horizontal_mag = (horizontal_velocity.x * horizontal_velocity.x
                 + horizontal_velocity.y * horizontal_velocity.y)
@@ -2089,6 +2095,7 @@ impl PlayerEventDispatcher {
 
         // Apply ball physics
         field.ball.velocity = final_velocity;
+
 
         // Record the passer in recent passers history before clearing ownership
         field.ball.record_passer(event_model.from_player_id);
@@ -2379,6 +2386,22 @@ impl PlayerEventDispatcher {
 
     /// Calculate z-velocity to reach target with chosen trajectory type
     /// Ground passes stay on the ground, aerial passes use physics
+    /// Converts a target REAL apex height (metres) into the raw launch
+    /// `velocity.z` this engine's ball physics needs, given the corrected
+    /// per-tick gravity integration in `Ball::update_velocity` (2026-08
+    /// height-physics rewrite): `position.z` is real metres (confirmed by
+    /// `flow/goal.rs`'s live `GOAL_HEIGHT=2.44 // Crossbar height in
+    /// metres`, compared directly against `position.z`), and since
+    /// `position += velocity` has no separate per-tick dt, `velocity.z`
+    /// must be stored as real metres-per-tick: `v_z_real * TICK_SECONDS`.
+    /// Real ballistics: `v_z_real = sqrt(2 * GRAVITY * height_m)`.
+    fn z_launch_velocity_for_height(height_m: f32) -> f32 {
+        const GRAVITY: f32 = 9.81;
+        const TICK_SECONDS: f32 = 0.01; // matches the engine's established 100-tick/s rate
+        let v_z_real = (2.0 * GRAVITY * height_m.max(0.0)).sqrt();
+        v_z_real * TICK_SECONDS
+    }
+
     fn calculate_trajectory_to_target(
         horizontal_distance: f32,
         horizontal_velocity: &Vector3<f32>,
@@ -2386,8 +2409,6 @@ impl PlayerEventDispatcher {
         skills: &PassSkills,
         rng: &MatchRng,
     ) -> f32 {
-        const GRAVITY: f32 = 9.81;
-
         let horizontal_speed = horizontal_velocity.norm();
         if horizontal_speed < 0.1 {
             return 0.0; // Avoid division by zero
@@ -2396,77 +2417,63 @@ impl PlayerEventDispatcher {
         // Add very small random variation to all trajectories for realism
         let tiny_random = rng.random_range(0.98..1.02);
 
-        match trajectory_type {
-            // Ground pass - truly on the ground (rolling)
+        // 2026-08 height-physics rewrite: every branch below now computes
+        // a target REAL apex height in metres directly — matching what
+        // each branch's own comment already described the intent to be —
+        // then converts through `z_launch_velocity_for_height`. The
+        // previous MediumArc/HighArc branches instead tried to solve a
+        // flight-time-based "ideal_z" using the real GRAVITY constant
+        // against a TICK-based `flight_time`, without ever converting
+        // between real seconds and ticks — a second, independent instance
+        // of the same unit-conversion mistake fixed in `update_velocity`.
+        let height_m = match trajectory_type {
+            // Ground pass - truly on the ground (rolling), just enough
+            // lift to handle slight bumps in the turf.
             TrajectoryType::Ground => {
-                // Almost no lift - just enough to handle slight bumps
-                // This keeps the ball rolling along the ground
                 let base_lift = 0.02 * skills.technique;
                 let random_variation = rng.random_range(0.0..0.1);
-                base_lift * random_variation * tiny_random // 0.0 to ~0.002 m/s (truly ground)
+                (base_lift * random_variation * 4.0).clamp(0.0, 0.08) // ~0-8cm
             }
 
             // Low driven - stays very close to ground, minimal arc (like real driven passes)
             TrajectoryType::LowDriven => {
-                // Very slight lift - driven passes should barely leave the ground
-                // Maximum height should be ~0.3-0.8m for realistic driven passes
                 let distance_factor = (horizontal_distance / 150.0).clamp(0.2, 0.8);
                 let skill_factor = skills.technique * skills.availability_factor;
-
-                let base_z = 0.2 + (distance_factor * 0.5); // 0.2 to 0.7 m/s (much lower)
+                let base = 0.2 + (distance_factor * 0.5); // 0.2-0.7m base
                 let variation = rng.random_range(0.9..1.1);
-
-                base_z * skill_factor * variation * tiny_random
+                base * (0.5 + skill_factor * 0.5) * variation // ~0.1-0.8m
             }
 
-            // Medium arc - moderate parabolic trajectory (height ~1.5-3m, reduced)
+            // Medium arc - moderate parabolic trajectory, real target ~1.5-3m
             TrajectoryType::MediumArc => {
-                let base_flight_time = horizontal_distance / horizontal_speed;
-                let flight_time = base_flight_time * 0.5; // Reduced from 0.7 - lower arc
-
-                let ideal_z = 0.65 * GRAVITY * flight_time; // Reduced from 0.8
-
-                // Skill affects consistency
                 let execution_quality = skills.overall_quality();
                 let error_range = (1.0 - execution_quality) * 0.12;
                 let error = rng.random_range(1.0 - error_range..1.0 + error_range);
-
-                ideal_z * error * tiny_random
+                (1.5 + execution_quality * 1.5) * error // 1.5-3m
             }
 
-            // High arc - high parabolic trajectory (height ~4-8m)
+            // High arc - genuine lofted ball over defenders, real target ~3-5.5m
             TrajectoryType::HighArc => {
-                let base_flight_time = horizontal_distance / horizontal_speed;
-                let flight_time = base_flight_time * 1.5; // High arc
-
-                let ideal_z = 0.8 * GRAVITY * flight_time;
-
-                // Requires good long passing ability
                 let execution_quality =
                     (skills.overall_quality() + skills.long_shots + skills.crossing) / 3.0;
                 let error_range = (1.0 - execution_quality) * 0.18;
                 let error = rng.random_range(1.0 - error_range..1.0 + error_range);
-
-                ideal_z * error * tiny_random
+                (3.0 + execution_quality * 2.5) * error // 3-5.5m
             }
 
-            // Chip - very high arc over short distance (height ~3-6m)
+            // Chip - clears an onrushing keeper (~2.5-3m reach) then drops
+            // back under the real crossbar (2.44m) by the net.
             TrajectoryType::Chip => {
-                // Chips are based on technique, not distance
                 let chip_ability =
                     (skills.technique * 0.5 + skills.flair * 0.3 + skills.passing * 0.2)
                         * skills.availability_factor;
-
-                // Base height for chip regardless of distance
-                let base_chip_height = 2.5 + (chip_ability * 2.0); // 2.5 to 4.5 m/s
-
-                // Execution error for this difficult skill
                 let error_range = (1.0 - chip_ability) * 0.25;
                 let error = rng.random_range(1.0 - error_range..1.0 + error_range);
-
-                base_chip_height * error * tiny_random
+                (2.5 + chip_ability * 1.5) * error // 2.5-4m
             }
-        }
+        };
+
+        Self::z_launch_velocity_for_height(height_m) * tiny_random
     }
 
     fn calculate_max_z_velocity(horizontal_distance: f32, skills: &PassSkills) -> f32 {
@@ -2474,7 +2481,14 @@ impl PlayerEventDispatcher {
         let long_pass_ability =
             (skills.vision * 0.6 + skills.long_shots * 0.4) * skills.availability_factor;
 
-        if horizontal_distance <= 20.0 {
+        // 2026-08 height-physics rewrite: these bucket bounds are real
+        // target apex heights in metres (they already read as plausible
+        // real heights — a short pass barely lofted at 0.5-0.8m, a big
+        // goal-kick/clearance punt at 8-12m — the bug was purely that
+        // this number was fed straight into the ball's launch velocity
+        // with no conversion at all). Converted via
+        // `z_launch_velocity_for_height` before being used as a ceiling.
+        let height_m = if horizontal_distance <= 20.0 {
             // Short passes - mostly ground, slight lift allowed
             0.5 + (long_pass_ability * 0.3)
         } else if horizontal_distance <= 45.0 {
@@ -2492,7 +2506,8 @@ impl PlayerEventDispatcher {
         } else {
             // Extreme distance - goalkeeper goal kicks, clearances
             8.0 + (long_pass_ability * 4.0)
-        }
+        };
+        Self::z_launch_velocity_for_height(height_m)
     }
 
     /// Records a possession gain on the claimant's team coach if this
@@ -2744,8 +2759,14 @@ impl PlayerEventDispatcher {
         {
             let dir = (shoot_event_model.target - field.ball.position).normalize();
             // Deflect upward and slightly away — the ball clears
-            // the wall but loses most of its goalward energy.
-            field.ball.velocity = Vector3::new(dir.x * 0.6, dir.y * 0.6, 1.4);
+            // the wall but loses most of its goalward energy. 1.4m is a
+            // real target apex height (2026-08 height-physics rewrite),
+            // consistent with a weak, popped-up deflection off a body.
+            field.ball.velocity = Vector3::new(
+                dir.x * 0.6,
+                dir.y * 0.6,
+                PlayerEventDispatcher::z_launch_velocity_for_height(1.4),
+            );
             field.ball.flags.in_flight_state = 30;
             field.ball.previous_owner = Some(shoot_event_model.from_player_id);
             field.ball.current_owner = None;
@@ -3300,7 +3321,13 @@ impl PlayerEventDispatcher {
         let shot_style: f32 = rng.random_range(0.0..1.0);
         let height_variation: f32 = rng.random_range(0.85..1.15);
 
-        let base_z_velocity = if horizontal_distance > 100.0 {
+        // 2026-08 height-physics rewrite: these ranges are real target
+        // apex heights in metres (already plausible real values — a
+        // close-range "ground shot" at 0.2-0.7m, a long-range "rising
+        // shot" at 2.2-3.0m — the bug was that they were fed straight
+        // into launch velocity with no meters-to-engine conversion at
+        // all). Converted via `z_launch_velocity_for_height` below.
+        let base_height_m = if horizontal_distance > 100.0 {
             // Long-range shot - varied heights (technique matters more)
             if shot_style < 0.4 {
                 rng.random_range(0.7..1.3) * technique_skill // Low driven (40%)
@@ -3328,6 +3355,7 @@ impl PlayerEventDispatcher {
                 rng.random_range(1.3..2.0) * technique_skill // Chip (5%)
             }
         };
+        let base_z_velocity = Self::z_launch_velocity_for_height(base_height_m);
 
         // Add spin/environmental variation to height
         let vertical_spin_variation = rng.random_range(0.90..1.10);
@@ -3360,12 +3388,27 @@ impl PlayerEventDispatcher {
             + poor_penalty * 0.025
             + low_condition_penalty * 0.03;
         let shot_goes_over_bar = rng.random_range(0.0f32..1.0) < over_bar_chance;
+
+        // 2026-08 height-physics rewrite. An earlier version of this fix
+        // (see the CLAUDE.md decisions log) tried to solve for a minimum
+        // "hang-time floor" using this engine's OLD, buggy height-scale —
+        // that hack is gone now that the underlying physics itself is
+        // corrected (`Ball::update_velocity`, `z_launch_velocity_for_height`
+        // above): a realistic real-world shot height (e.g. a 1.5-2.5m
+        // rising long-range strike) now naturally produces genuine
+        // real-world hang-time (a real ball launched at that height stays
+        // airborne for a real, physically-correct fraction of a second),
+        // which is more than enough to cover a realistic shot distance
+        // while still airborne — verified after this rewrite via the raw
+        // z-trajectory trace (see the batch-verification note in the
+        // decisions log), not assumed.
         let z_velocity = if shot_goes_over_bar {
-            // Shot goes over the bar — set z high enough to clear crossbar (GOAL_HEIGHT = 8.0)
-            // Ball needs to reach height > 8.0 during flight, so z_velocity must be significant
-            rng.random_range(3.0..6.0) // Guaranteed to fly high over the bar
+            // Shot goes over the bar — real target height clearly above
+            // the real crossbar (GOAL_HEIGHT = 2.44m, flow/goal.rs).
+            let over_bar_height_m = rng.random_range(3.0..6.0);
+            Self::z_launch_velocity_for_height(over_bar_height_m)
         } else {
-            (base_z_velocity * height_variation * vertical_spin_variation).min(5.0)
+            base_z_velocity * height_variation * vertical_spin_variation
         };
 
         // Calculate final velocity
@@ -3376,9 +3419,12 @@ impl PlayerEventDispatcher {
         // in front and beaten; loft the ball above his reach (interactions.rs
         // exempts z > 2.5u from interception/save) on a slow arc that drops
         // back under the bar. Slower horizontal than a driven shot so the
-        // ball has time to descend inside the goal; z chosen to clear the
-        // keeper early and fall under GOAL_HEIGHT (8u) by the line. Total
-        // magnitude kept under MAX_SHOT_VELOCITY so the clamp below is inert.
+        // ball has time to descend inside the goal. 2026-08 height-physics
+        // rewrite: 2.8m is a real target apex — clears a real keeper's
+        // outstretched reach (~2.5m) with margin, then falls back under
+        // the real crossbar (GOAL_HEIGHT=2.44m, flow/goal.rs) well before
+        // the goal line under real gravity. Total magnitude kept under
+        // MAX_SHOT_VELOCITY so the clamp below is inert.
         if shoot_event_model.reason == "FWD_CHIP" {
             let to_goal = goal_center - field.ball.position;
             let dir2d = Vector3::new(to_goal.x, to_goal.y, 0.0);
@@ -3388,7 +3434,11 @@ impl PlayerEventDispatcher {
                 Vector3::new(1.0, 0.0, 0.0)
             };
             let chip_speed = (horizontal_distance * 0.045).clamp(1.3, 1.75);
-            final_velocity = Vector3::new(dir2d.x * chip_speed, dir2d.y * chip_speed, 2.55);
+            final_velocity = Vector3::new(
+                dir2d.x * chip_speed,
+                dir2d.y * chip_speed,
+                Self::z_launch_velocity_for_height(2.8),
+            );
         }
 
         // CRITICAL: Validate and clamp velocity to prevent cosmic-speed shots
@@ -3402,13 +3452,31 @@ impl PlayerEventDispatcher {
         {
             // Fallback to a safe default velocity toward the goal
             let safe_direction = (goal_center - field.ball.position).normalize();
-            final_velocity = Vector3::new(safe_direction.x * 5.0, safe_direction.y * 5.0, 1.0);
+            final_velocity = Vector3::new(
+                safe_direction.x * 5.0,
+                safe_direction.y * 5.0,
+                Self::z_launch_velocity_for_height(1.0),
+            );
         }
 
-        // Clamp velocity magnitude to maximum realistic shot speed
-        let velocity_magnitude = final_velocity.norm();
-        if velocity_magnitude > MAX_SHOT_VELOCITY {
-            final_velocity = final_velocity * (MAX_SHOT_VELOCITY / velocity_magnitude);
+        // Clamp velocity magnitude to maximum realistic shot speed.
+        //
+        // 2026-08 realism-bug fix: this used to clamp the COMBINED (x,y,z)
+        // magnitude — the same "shared budget" bug already found and fixed
+        // for corner/FK-cross/GK-long passes on 2026-07-16 (a genuine z
+        // component, even a modest one, would scale horizontal speed DOWN
+        // too, since both shared one budget). For shots this was mostly
+        // inert historically because base z-velocity was small — but the
+        // new hang-time floor above deliberately raises z for long shots,
+        // and squashing horizontal to compensate would undo exactly the
+        // fix (a shot that arrives later AND slower). Clamp horizontal
+        // independently, same pattern already proven safe for passes.
+        let horizontal_magnitude =
+            (final_velocity.x * final_velocity.x + final_velocity.y * final_velocity.y).sqrt();
+        if horizontal_magnitude > MAX_SHOT_VELOCITY {
+            let scale = MAX_SHOT_VELOCITY / horizontal_magnitude;
+            final_velocity.x *= scale;
+            final_velocity.y *= scale;
         }
 
         // Record shot in player memory. A shot counts as "on target" only
@@ -3618,10 +3686,11 @@ impl PlayerEventDispatcher {
                 } else {
                     field.ball.position.y + final_velocity.y * ticks_to_goal
                 };
-                // Arc approximation: z under gravity (~0.157 u/tick² from
-                // update_velocity's 9.81 * 0.016 scaling).
+                // Arc approximation: z under gravity (~0.000981 real-metre
+                // u/tick² from update_velocity's 2026-08 height-physics
+                // rewrite — GRAVITY(9.81) * TICK_SECONDS(0.01)²).
                 let goal_line_z = (field.ball.position.z + final_velocity.z * ticks_to_goal
-                    - 0.5 * 0.157 * ticks_to_goal * ticks_to_goal)
+                    - 0.5 * 0.000981 * ticks_to_goal * ticks_to_goal)
                     .max(0.0);
                 field.ball.cached_shot_target = Some(ShotTarget {
                     goal_line_y,

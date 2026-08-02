@@ -33,6 +33,34 @@ impl Ball {
         // A real football on grass decelerates at about 0.5-1.5 m/s² depending on grass conditions
         const GROUND_FRICTION_COEFFICIENT: f32 = 0.015; // Smooth velocity-proportional friction
 
+        // 2026-08 realism-bug fix: a genuine struck shot (`cached_shot_target`
+        // is Some for the whole tracked flight, from dispatch to resolution)
+        // gets much lighter friction once it lands (z<=0.1) before reaching
+        // the goal line. Real driven shots are hit far too hard, and the
+        // remaining distance is covered far too quickly, for rolling
+        // friction to meaningfully matter the way it legitimately does for
+        // a slow, deliberately-placed pass — a shot that skims/lands short
+        // of goal should keep arriving with real pace, not visibly crawl
+        // in. At the same per-tick decay rate as a normal pass (0.015),
+        // a long-range shot that lands ~60-70 ticks from goal loses over
+        // half its speed before arrival — this drops that to ~10-15%,
+        // leaving the "did it stay elevated the whole way" question (a
+        // separate, deliberately NOT-fixed-here issue — see the shot
+        // z-velocity comment above) untouched, and only fixes how the
+        // ball behaves for whatever portion of the trip it does spend
+        // rolling. Ordinary passes/crosses/corners/goal-kicks/dribbles
+        // are unaffected — this only engages while a shot is actively
+        // being tracked toward goal.
+        // No direct source found for "struck shot skid friction" specifically
+        // (flagged estimate, category d) — general rolling-football-on-grass
+        // deceleration is sourced at 0.5-3 m/s² (FizziQ/StickMan Physics
+        // video-analysis writeups), which is what the existing 0.015
+        // coefficient above is already meant to represent for a normal,
+        // already-slow rolling pass. A ball that's just been struck hard
+        // and is skidding (not yet in pure rolling contact) sheds speed
+        // more slowly than that — reasoned, not directly sourced.
+        const GROUND_FRICTION_COEFFICIENT_SHOT: f32 = 0.003;
+
         // CRITICAL: Global velocity sanity check - prevent cosmic-speed balls
         // Check for NaN or infinity and reset to zero
         if self.velocity.x.is_nan()
@@ -67,7 +95,12 @@ impl Ball {
                 if horizontal_speed_sq > STOPPING_THRESHOLD * STOPPING_THRESHOLD {
                     // Apply friction as a multiplier for smooth exponential decay
                     // friction_factor < 1.0 means the ball gradually slows down
-                    let friction_factor = 1.0 - GROUND_FRICTION_COEFFICIENT;
+                    let friction_coeff = if self.cached_shot_target.is_some() {
+                        GROUND_FRICTION_COEFFICIENT_SHOT
+                    } else {
+                        GROUND_FRICTION_COEFFICIENT
+                    };
+                    let friction_factor = 1.0 - friction_coeff;
                     self.velocity.x *= friction_factor;
                     self.velocity.y *= friction_factor;
                 }
@@ -89,12 +122,51 @@ impl Ball {
                     Vector3::zeros()
                 };
 
-                // Gravity force (constant downward)
-                let gravity_force = Vector3::new(0.0, 0.0, -GRAVITY);
-
-                // Apply forces
-                let acceleration = air_drag_force / BALL_MASS + gravity_force;
-                self.velocity += acceleration * 0.016; // ~60fps timestep
+                // 2026-08 realism-bug fix (full height-physics rewrite):
+                // gravity is split from air drag and given its own,
+                // dimensionally-correct per-tick scaling.
+                //
+                // `position.z` is REAL METERS, not the 8-units/meter scale
+                // used for x/y — confirmed definitively by `flow/goal.rs`'s
+                // LIVE, actively-used goal detection: `GOAL_HEIGHT: f32 =
+                // 2.44; // Crossbar height in meters`, compared directly
+                // against `position.z` with no scaling, and independently
+                // corroborated by `ownership.rs`'s PLAYER_HEIGHT=1.8m /
+                // PLAYER_JUMP_REACH=3.5m / MAX_BALL_HEIGHT=4.0m (also
+                // direct, unscaled comparisons) and every defender/GK
+                // reach threshold in the 1.5-2.8m range across the engine.
+                //
+                // Since `move_to()` does `position.z += velocity.z` with
+                // NO separate dt multiply, `velocity.z` must be stored as
+                // real METERS PER TICK (v_z_real_mps * TICK_SECONDS) for
+                // that accumulation to produce correct real heights. A
+                // real acceleration `a` [m/s²] changes real velocity by
+                // `a*dt` each tick; the STORED (already dt-premultiplied)
+                // velocity therefore changes by `a*dt²` per tick — NOT the
+                // flat `a*0.016` this line previously used, which was off
+                // by ~160x (0.016 vs the correct TICK_SECONDS²=0.0001 at
+                // this engine's real, already-established 100-tick/s rate
+                // — see MAX_SHOT_VELOCITY's comment in players.rs for that
+                // rate) and was also missing the meters-vs-8-units-per-
+                // meter distinction entirely. Combined, this made a
+                // corner's launch (LOFTED_DELIVERY_MAX_Z_VELOCITY=2.9)
+                // produce a measured, verified real apex of ~26 metres —
+                // taller than most stadiums — invisible only because the
+                // 2D top-down renderer never draws height at all.
+                //
+                // Air drag's existing per-tick scaling (0.016) is
+                // deliberately left UNCHANGED here — it was never part of
+                // this bug (it acts on x/y, which are already correctly
+                // on the tick-native game-unit scale) and touching it is
+                // out of scope for the height-physics fix; its effect on
+                // z is negligible now that z's own magnitude is correctly
+                // tiny (real vertical launch speeds of a few m/s, stored
+                // as fractions of a metre per 10ms tick).
+                const TICK_SECONDS: f32 = 0.01; // matches the engine's established 100-tick/s rate
+                let air_drag_accel = air_drag_force / BALL_MASS;
+                self.velocity.x += air_drag_accel.x * 0.016;
+                self.velocity.y += air_drag_accel.y * 0.016;
+                self.velocity.z += air_drag_accel.z * 0.016 - GRAVITY * TICK_SECONDS * TICK_SECONDS;
             }
         } else {
             // Ball has nearly stopped - bring to complete rest smoothly
@@ -119,8 +191,14 @@ impl Ball {
             self.velocity.x *= 0.95;
             self.velocity.y *= 0.95;
 
-            // If bounce is too small, stop vertical movement
-            if self.velocity.z.abs() < 0.3 {
+            // If bounce is too small, stop vertical movement. 2026-08
+            // height-physics rewrite: 0.3 was calibrated for the OLD,
+            // ~20-160x-too-large z-velocity scale — under real metres-
+            // per-tick storage every legitimate bounce (even off a high
+            // corner/clearance) is well under 0.3, so this threshold
+            // used to kill every single bounce outright. 0.01 (real
+            // ~1 m/s) only cuts off truly negligible residual bounces.
+            if self.velocity.z.abs() < 0.01 {
                 self.velocity.z = 0.0;
             }
         }

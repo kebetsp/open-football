@@ -75,7 +75,17 @@ impl Ball {
                 Some(PlayerSide::Right) => -7.0,
                 _ => 7.0,
             };
-            self.velocity = Vector3::new(push_x, 0.0, 1.5);
+            // 2026-08 height-physics rewrite: 0.8m is a real target apex
+            // for a hard, deliberate "clear the stall zone" kick — a low,
+            // driven push, not a lofted one. Same conversion as
+            // `PlayerEventDispatcher::z_launch_velocity_for_height`
+            // (players.rs) — duplicated locally, matching this codebase's
+            // existing pattern of a local `GRAVITY` const per file rather
+            // than a shared physics module.
+            const GRAVITY: f32 = 9.81;
+            const TICK_SECONDS: f32 = 0.01;
+            let stall_kick_z = (2.0 * GRAVITY * 0.8f32).sqrt() * TICK_SECONDS;
+            self.velocity = Vector3::new(push_x, 0.0, stall_kick_z);
             self.previous_owner = self.current_owner;
             self.current_owner = None;
             self.ownership_duration = 0;

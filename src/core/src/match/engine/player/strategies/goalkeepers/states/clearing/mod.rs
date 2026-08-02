@@ -88,8 +88,16 @@ impl GoalkeeperClearingState {
 
         // Lofted z — strong vertical so the ball flies over the defensive
         // line and clears the danger zone. Skilled keepers loft it a
-        // touch higher.
-        let z_velocity = 4.5 + kicking_power * 1.0; // 4.5 - 5.5 u/tick
+        // touch higher. 2026-08 height-physics rewrite: 4.5-5.5m is a
+        // real target apex for a big keeper punt clearance, converted
+        // through the same real-ballistics formula as
+        // `PlayerEventDispatcher::z_launch_velocity_for_height`
+        // (players.rs) — `position.z` is real metres (flow/goal.rs's
+        // live GOAL_HEIGHT=2.44 confirms this).
+        let height_m = 4.5 + kicking_power * 1.0; // 4.5 - 5.5m real apex
+        const GRAVITY: f32 = 9.81;
+        const TICK_SECONDS: f32 = 0.01;
+        let z_velocity = (2.0 * GRAVITY * height_m.max(0.0)).sqrt() * TICK_SECONDS;
 
         let ball_velocity = Vector3::new(horizontal_velocity.x, horizontal_velocity.y, z_velocity);
 

@@ -557,7 +557,17 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 }
             } else {
                 // No keeper to save it — treat as a miss over the bar.
-                field.ball.velocity = Vector3::new(dir2d.x * 2.8, dir2d.y * 2.8, 3.0);
+                // 2026-08 height-physics rewrite: 4.0m is a real target
+                // apex, clearly above the real crossbar (2.44m,
+                // flow/goal.rs) — same conversion as
+                // `PlayerEventDispatcher::z_launch_velocity_for_height`,
+                // duplicated locally per this codebase's existing
+                // per-file physics-constant pattern.
+                field.ball.velocity = Vector3::new(
+                    dir2d.x * 2.8,
+                    dir2d.y * 2.8,
+                    (2.0 * 9.81f32 * 4.0f32).sqrt() * 0.01,
+                );
                 field.ball.previous_owner = Some(taker_id);
                 field.ball.current_owner = None;
                 field.ball.claim_cooldown = 80;
@@ -568,8 +578,14 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             }
         } else {
             // MISSED — over the bar; check_over_goal turns it into a
-            // goal kick.
-            field.ball.velocity = Vector3::new(dir2d.x * 2.8, dir2d.y * 2.8, 3.0);
+            // goal kick. 2026-08 height-physics rewrite: 4.0m real
+            // target apex, same conversion as the other penalty-miss
+            // branch above.
+            field.ball.velocity = Vector3::new(
+                dir2d.x * 2.8,
+                dir2d.y * 2.8,
+                (2.0 * 9.81f32 * 4.0f32).sqrt() * 0.01,
+            );
             field.ball.previous_owner = Some(taker_id);
             field.ball.current_owner = None;
             field.ball.claim_cooldown = 80;
@@ -1230,9 +1246,22 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 Vector3::new(1.0, 0.0, 0.0)
             };
             let b = &mut field.ball;
+            // Position (2.55) is a real metre height — header contact
+            // height, already correct, no scaling needed (`position.z`
+            // is real metres — flow/goal.rs). The descent velocity
+            // (-0.35) WAS tuned under the old, buggy gravity scale to
+            // fall through the [1.4, 2.5] heading band in ~3 ticks —
+            // its own comment's stated real target (~0.3-0.4s) is
+            // actually ~30-40 ticks, the same tick/second confusion
+            // fixed everywhere else in this rewrite. Under the corrected
+            // gravity (Ball::update_velocity, 2026-08), near-zero initial
+            // vertical velocity lets real gravity alone carry the ball
+            // down through that band in a physically correct ~0.4-0.5s —
+            // matching real header hang time without needing a large
+            // artificial descent push.
             b.position =
                 Vector3::new(winner_pos.x - dir.x * 2.0, winner_pos.y - dir.y * 2.0, 2.55);
-            b.velocity = Vector3::new(dir.x * 1.8, dir.y * 1.8, -0.35);
+            b.velocity = Vector3::new(dir.x * 1.8, dir.y * 1.8, -0.004);
             b.current_owner = None;
             b.previous_owner = taker;
             b.flags.in_flight_state = 1;
@@ -1414,9 +1443,12 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 // corner resolver) and mark the win so the receiving
                 // state's carve-out fires a contact-only roll instead of
                 // re-running a full duel.
+                // See the identical corner-resolver comment above for why
+                // the descent velocity dropped from -0.35 to -0.004 in
+                // this 2026-08 height-physics rewrite.
                 field.ball.position =
                     Vector3::new(winner_pos.x - dir.x * 2.0, winner_pos.y - dir.y * 2.0, 2.55);
-                field.ball.velocity = Vector3::new(dir.x * 1.8, dir.y * 1.8, -0.35);
+                field.ball.velocity = Vector3::new(dir.x * 1.8, dir.y * 1.8, -0.004);
                 field.ball.current_owner = None;
                 field.ball.previous_owner = Some(winner_id);
                 field.ball.flags.in_flight_state = 1;

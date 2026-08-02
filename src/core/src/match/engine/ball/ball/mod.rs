@@ -856,8 +856,10 @@ impl Ball {
     ///
     /// Units are ticks, not seconds: position integration is
     /// `position += velocity` per tick (no dt scaling), while gravity
-    /// applies `velocity.z += -GRAVITY * 0.016` per tick. So the
-    /// effective per-tick² gravity is `9.81 * 0.016 ≈ 0.157`, and the
+    /// applies `velocity.z += -GRAVITY * TICK_SECONDS²` per tick (real
+    /// meters-per-tick storage — see `update_velocity`'s 2026-08 height-
+    /// physics rewrite comment for the full derivation). So the
+    /// effective per-tick² gravity is `9.81 * 0.01² ≈ 0.000981`, and the
     /// resulting `time_to_ground` comes out in ticks — which matches
     /// the horizontal integration `x += vx` per tick.
     pub fn calculate_landing_position(&self) -> Vector3<f32> {
@@ -865,7 +867,7 @@ impl Ball {
             return self.position;
         }
 
-        const G_PER_TICK: f32 = 9.81 * 0.016;
+        const G_PER_TICK: f32 = 9.81 * 0.01 * 0.01;
         let vz = self.velocity.z;
         let h = self.position.z;
 
