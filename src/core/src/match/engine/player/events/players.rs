@@ -1994,7 +1994,26 @@ impl PlayerEventDispatcher {
         // decay solve. `GRAVITY_PER_TICK` matches `update_velocity`'s
         // corrected per-tick gravity exactly, so this stays consistent
         // with the ball's own real physics.
-        let horizontal_velocity = if matches!(trajectory_type, TrajectoryType::HighArc) {
+        //
+        // 2026-08 follow-up (scope check, Pavel): also extended to
+        // MediumArc. HighArc-only initially looked sufficient — a large
+        // aggregate sample of plain MediumArc passes/crosses (n=598)
+        // showed no systemic issue — but a raw per-delivery trace,
+        // filtered to genuinely plausible (non-contaminated) flight
+        // durations via tick-count, found deep-free-kick MediumArc
+        // deliveries at longer distances (60-160u) consistently
+        // travelling 1.7-2.2x further than their target in a flight
+        // duration matching the real expected hang time — the same
+        // friction-vs-ballistics mismatch, just smaller/less visible in
+        // aggregate for MediumArc's typically shorter average distance.
+        // Ground/LowDriven were separately checked (short, uncontaminated
+        // samples landed within ~1-6 units of target) and are NOT
+        // extended — their real height/hang-time is small enough that
+        // the friction model still holds up.
+        let horizontal_velocity = if matches!(
+            trajectory_type,
+            TrajectoryType::HighArc | TrajectoryType::MediumArc
+        ) {
             const GRAVITY_PER_TICK: f32 = 0.000981; // 9.81 * 0.01^2, matches update_velocity
             const MAX_LOFTED_HORIZONTAL_SPEED: f32 = 3.2; // matches MAX_PASS_VELOCITY below
             let total_flight_ticks = (2.0 * final_z_velocity / GRAVITY_PER_TICK).max(1.0);
