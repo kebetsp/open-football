@@ -91,6 +91,18 @@ impl StateProcessingHandler for ForwardPressingState {
         // Only pursue if opponent has the ball and it's within pressing range
         if let Some(_opponent) = ctx.players().opponents().with_ball().next() {
             if ball_distance < MAX_PRESS_BALL_DISTANCE {
+                // realism-bug (2026-08-05): same danger-zone urgency as
+                // `ForwardTacklingState` — a presser closing down the
+                // ball edge-of-box has far more to gain from winning it
+                // clean than one doing so in his own half, and should
+                // close in with real urgency rather than settling into
+                // a standing jockey at 15-18u. See that file for the
+                // sourcing note (reasoned estimate, category d).
+                let dist_to_goal = (ctx.player().opponent_goal_position()
+                    - ctx.tick_context.positions.ball.position)
+                    .magnitude();
+                let danger_proximity = (1.0 - (dist_to_goal / 250.0)).clamp(0.0, 1.0);
+                let urgency_boost = 1.0 + danger_proximity * 0.6;
                 return Some(
                     SteeringBehavior::Pursuit {
                         target: ctx.tick_context.positions.ball.position,
@@ -98,6 +110,7 @@ impl StateProcessingHandler for ForwardPressingState {
                     }
                     .calculate(ctx.player)
                     .velocity
+                        * urgency_boost
                         + ctx.player().separation_velocity(),
                 );
             }

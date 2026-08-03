@@ -223,14 +223,33 @@ impl StateProcessingHandler for ForwardTacklingState {
                     .velocity,
                 );
             } else {
-                // Chase more aggressively when further away
+                // Chase more aggressively when further away.
+                //
+                // realism-bug (2026-08-05): this pursuit previously had
+                // no urgency scaling at all — a forward "chasing
+                // aggressively" moved at plain calculated speed whether
+                // the ball was in his own half or on the edge of the
+                // opponent's box. Pavel's point: winning the ball THIS
+                // close to the opponent's own goal is a high-value
+                // turnover (close to a direct scoring chance), so a real
+                // presser closes in with real urgency there, not a token
+                // close-down that settles into a standing jockey. No
+                // sourced stat exists for exactly how urgency scales
+                // with zone (category d, reasoned estimate) — 250u
+                // (~31m) covers the final-third/edge-of-box range,
+                // tunable on review.
+                let dist_to_goal =
+                    (ctx.player().opponent_goal_position() - opponent.position).magnitude();
+                let danger_proximity = (1.0 - (dist_to_goal / 250.0)).clamp(0.0, 1.0);
+                let urgency_boost = 1.0 + danger_proximity * 0.6;
                 return Some(
                     SteeringBehavior::Pursuit {
                         target: opponent.position,
                         target_velocity: Vector3::zeros(), // Opponent velocity not available in lite struct
                     }
                     .calculate(ctx.player)
-                    .velocity,
+                    .velocity
+                        * urgency_boost,
                 );
             }
         }

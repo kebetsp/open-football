@@ -735,12 +735,34 @@ impl DefenderRunningState {
         // check; see its docs for the triggers.
         //   * Possession mode → recycle through safe build-up.
         //   * Otherwise        → find a progressive pass forward.
-        if !opp_within_30 && ctx.team().is_control_ball() {
+        //
+        // realism-bug (2026-08-05): this whole search used to be gated
+        // on `!opp_within_30` — a real, jockeying presser at 12-30u (not
+        // yet an immediate 12u threat, but genuine felt pressure) meant
+        // NO pass search ever ran at all, not even to notice a teammate
+        // actively offering a deep/backward outlet. Traced live: a
+        // carrier sat 15-18u from a presser for 7 real minutes, a
+        // teammate came to help, and the carrier still never looked —
+        // confirmed the search genuinely never executed in that zone.
+        // Now the search always runs when in control; under real
+        // pressure (opp_within_30) the forward-only progressive search
+        // falls back to the safe/backward-inclusive one if it finds
+        // nothing, so a genuine deep outlet a teammate is offering
+        // (which `find_progressive_pass_target` structurally excludes —
+        // it requires `forward > 0.2`, i.e. ahead toward goal) still
+        // gets used instead of the carrier doing nothing.
+        if ctx.team().is_control_ball() {
             let possession_mode = ctx.team().should_play_possession();
             let target = if possession_mode {
                 self.find_safe_buildup_pass(ctx, 200.0)
             } else {
-                self.find_progressive_pass_target(ctx)
+                self.find_progressive_pass_target(ctx).or_else(|| {
+                    if opp_within_30 {
+                        self.find_safe_buildup_pass(ctx, 200.0)
+                    } else {
+                        None
+                    }
+                })
             };
             if let Some(target) = target {
                 let reason = if possession_mode {
