@@ -126,6 +126,49 @@ impl Serialize for PlayerStateEntry {
     }
 }
 
+/// Ground-truth per-player "duel" debug snapshot (2026-08-05, requested by
+/// Pavel as a real, engine-side replacement for guessing at carrier-vs-
+/// presser standoffs from client-side position approximations — same
+/// motivation as the existing shot-debug panel, but sourced from the
+/// engine's OWN field/player data at recording time rather than
+/// reconstructed after the fact). Only recorded for players within
+/// `DUEL_DEBUG_RADIUS` of the ball (see `write_match_positions`), so this
+/// stays small and focused on players actually part of a live duel.
+#[derive(Debug, Clone)]
+pub struct DuelDebugEntry {
+    pub timestamp: u64,
+    /// Distance to this player's nearest OPPONENT (not the ball) — the
+    /// exact ground-truth number Pavel asked to verify directly, computed
+    /// once here from the same `field.players` data used everywhere else.
+    pub nearest_opp_dist: f32,
+    pub nearest_opp_id: u32,
+    /// True iff `field.ball.current_owner == Some(this player)`.
+    pub has_ball: bool,
+    /// `tackle_cooldown == 0` — whether a tackle attempt is even legally
+    /// possible for this player right now (see `MatchPlayer::can_attempt_tackle`).
+    pub tackle_ready: bool,
+    /// This player's own current speed (units/tick) — distinguishes "not
+    /// moving because the state produced ~0 velocity" from "moving but
+    /// pinned by an opponent at matching speed."
+    pub velocity_mag: f32,
+}
+
+impl Serialize for DuelDebugEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(6))?;
+        seq.serialize_element(&self.timestamp)?;
+        seq.serialize_element(&self.nearest_opp_dist)?;
+        seq.serialize_element(&self.nearest_opp_id)?;
+        seq.serialize_element(&self.has_ball)?;
+        seq.serialize_element(&self.tackle_ready)?;
+        seq.serialize_element(&self.velocity_mag)?;
+        seq.end()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResultMatchPositionData {
     ball: Vec<ResultPositionDataItem>,
@@ -136,6 +179,10 @@ pub struct ResultMatchPositionData {
     player_states: HashMap<u32, Vec<PlayerStateEntry>>,
     /// Fast dedup: last recorded state compact ID per player (avoids String allocation)
     last_state_ids: HashMap<u32, u16>,
+    /// Ground-truth duel debug snapshots (see `DuelDebugEntry`) — only
+    /// populated when track_events is true, and only for players near
+    /// the ball at recording time.
+    duel_debug: HashMap<u32, Vec<DuelDebugEntry>>,
     track_events: bool,
     track_positions: bool,
 }
@@ -148,8 +195,11 @@ impl Serialize for ResultMatchPositionData {
         S: Serializer,
     {
         let has_states = self.track_events && !self.player_states.is_empty();
-        let field_count =
-            2 + if self.track_events { 2 } else { 0 } + if has_states { 1 } else { 0 };
+        let has_duel_debug = self.track_events && !self.duel_debug.is_empty();
+        let field_count = 2
+            + if self.track_events { 2 } else { 0 }
+            + if has_states { 1 } else { 0 }
+            + if has_duel_debug { 1 } else { 0 };
         let mut map = serializer.serialize_map(Some(field_count))?;
 
         map.serialize_entry("ball", &self.ball)?;
@@ -162,6 +212,10 @@ impl Serialize for ResultMatchPositionData {
 
         if has_states {
             map.serialize_entry("states", &self.player_states)?;
+        }
+
+        if has_duel_debug {
+            map.serialize_entry("duel_debug", &self.duel_debug)?;
         }
 
         map.end()
@@ -177,6 +231,7 @@ impl ResultMatchPositionData {
             events: Vec::new(),
             player_states: HashMap::new(),
             last_state_ids: HashMap::new(),
+            duel_debug: HashMap::new(),
             track_events: false,
             track_positions: true,
         }
@@ -190,6 +245,7 @@ impl ResultMatchPositionData {
             events: Vec::new(),
             player_states: HashMap::with_capacity(44),
             last_state_ids: HashMap::with_capacity(44),
+            duel_debug: HashMap::with_capacity(44),
             track_events: true,
             track_positions: true,
         }
@@ -203,6 +259,7 @@ impl ResultMatchPositionData {
             events: Vec::new(),
             player_states: HashMap::new(),
             last_state_ids: HashMap::new(),
+            duel_debug: HashMap::new(),
             track_events: false,
             track_positions: false,
         }
@@ -284,6 +341,7 @@ impl ResultMatchPositionData {
                 events: Vec::new(),
                 player_states: HashMap::new(),
                 last_state_ids: HashMap::new(),
+                duel_debug: HashMap::new(),
                 track_events: self.track_events,
                 track_positions: self.track_positions,
             };
@@ -575,6 +633,18 @@ impl ResultMatchPositionData {
                 }],
             );
         }
+    }
+
+    /// Record a ground-truth duel debug snapshot. Caller (`write_match_positions`)
+    /// already gates this to players near the ball, so no further filtering
+    /// happens here — every call is recorded, unlike `add_player_state`'s
+    /// change-only dedup, since these values (distance, velocity) are
+    /// meaningful even when they haven't changed.
+    pub fn add_duel_debug(&mut self, player_id: u32, entry: DuelDebugEntry) {
+        if !self.track_events {
+            return;
+        }
+        self.duel_debug.entry(player_id).or_default().push(entry);
     }
 
     /// Get the most recent pass event at or before a timestamp

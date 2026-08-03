@@ -59,6 +59,37 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             match_data.add_player_positions(player.id, timestamp, player.position);
             if track_events {
                 match_data.add_player_state(player.id, timestamp, player.state.compact_id(), &player.state);
+
+                // Ground-truth duel debug (2026-08-05, requested to
+                // replace guessing at carrier-vs-presser standoffs from
+                // reconstructed position data — see `DuelDebugEntry`).
+                // Recorded only for the ball owner or a player genuinely
+                // near an opponent, so this stays small and focused on
+                // actual duels rather than every player every tick.
+                const DUEL_DEBUG_RADIUS: f32 = 60.0;
+                let has_ball = field.ball.current_owner == Some(player.id);
+                let mut nearest_dist = f32::MAX;
+                let mut nearest_id = 0u32;
+                for other in field.players.iter().filter(|o| !o.is_sent_off && o.team_id != player.team_id) {
+                    let d = (other.position - player.position).magnitude();
+                    if d < nearest_dist {
+                        nearest_dist = d;
+                        nearest_id = other.id;
+                    }
+                }
+                if has_ball || nearest_dist < DUEL_DEBUG_RADIUS {
+                    match_data.add_duel_debug(
+                        player.id,
+                        DuelDebugEntry {
+                            timestamp,
+                            nearest_opp_dist: nearest_dist,
+                            nearest_opp_id: nearest_id,
+                            has_ball,
+                            tackle_ready: player.can_attempt_tackle(),
+                            velocity_mag: player.velocity.magnitude(),
+                        },
+                    );
+                }
             }
         });
 
