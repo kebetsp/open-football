@@ -11,7 +11,7 @@
 
 use crate::PlayerPositionType;
 use crate::r#match::player::strategies::common::players::ops::on_ball_value;
-use crate::r#match::{BallSideZone, MatchPlayerLite, StateProcessingContext};
+use crate::r#match::{BallSideZone, MatchPlayerLite, PlayerSide, StateProcessingContext};
 use nalgebra::Vector3;
 
 /// Milestone 7 (possession-decision-intelligence PRD) — which flank a
@@ -103,6 +103,51 @@ const PRESSURE_RELIEF_WEIGHT: f32 = 70.0;
 /// being relaxed at the same time the relief bonus ramps up, rather than
 /// the bonus only starting exactly where the penalty stops.
 const PRESSURE_RELIEF_RADIUS: f32 = 45.0;
+
+/// Realism-bug (2026-08-03): a single opponent standing directly in the
+/// ball holder's path forward (jockeying/blocking range, within a
+/// forward-facing cone) — distinct from `pressure_intensity_for`'s
+/// aggregate multi-opponent congestion measure, which needs roughly 3
+/// close opponents to cross its own 0.5 engagement floor and therefore
+/// never engages for a lone marker simply blocking the route forward.
+/// This is the specific, everyday defensive pattern Pavel reported: the
+/// carrier can't advance (blocked ahead) and can't retreat either, no
+/// teammate ever drops behind the ball line to offer a reset, and the
+/// stalemate resolves via an unrealistic full-power long clearance.
+/// Deliberately purely geometric (no movement history) — the fix
+/// attempted via `spacing_stats`/cluster-freeze detection (2026-07-30)
+/// targeted near-zero-movement clusters and, per Pavel, missed exactly
+/// this "barely wiggling, not literally frozen" case; a snapshot check
+/// of "is someone blocking my forward cone right now" can't miss it
+/// regardless of how much the carrier shuffles in place.
+const BLOCK_RADIUS: f32 = 18.0;
+/// cos(60°) ≈ 0.5 — the opponent must sit within roughly a 60° cone
+/// dead ahead of the holder along the attacking direction, not merely
+/// beside or behind him.
+const BLOCK_FORWARD_COS: f32 = 0.5;
+
+/// True when at least one opponent is within `BLOCK_RADIUS` of the ball
+/// holder, roughly in front of him along his team's attacking direction
+/// — i.e. genuinely blocking his route forward, not just nearby.
+fn carrier_blocked_ahead(
+    ctx: &StateProcessingContext,
+    holder: &MatchPlayerLite,
+    opponents: &[Vector3<f32>],
+) -> bool {
+    let attacking_dir: f32 = match ctx.player.side {
+        Some(PlayerSide::Left) => 1.0,
+        Some(PlayerSide::Right) => -1.0,
+        None => return false,
+    };
+    opponents.iter().any(|opp| {
+        let to_opp = opp - holder.position;
+        let dist = (to_opp.x * to_opp.x + to_opp.y * to_opp.y).sqrt();
+        if !(1.0..=BLOCK_RADIUS).contains(&dist) {
+            return false;
+        }
+        (to_opp.x / dist) * attacking_dir > BLOCK_FORWARD_COS
+    })
+}
 
 /// Radius inside which a candidate is penalised per nearby teammate —
 /// same 90u repulsion radius the forward zone scorer uses.
@@ -404,12 +449,28 @@ pub fn refine_support_position(
     // no candidate representing it, add one explicitly rather than hope
     // the general ring reaches it. Genuinely inert (loop doesn't run)
     // whenever the holder isn't under real pressure.
+    // Realism-bug (2026-08-03): whether a lone opponent is blocking the
+    // holder's route forward — see `carrier_blocked_ahead`'s own doc
+    // comment. OR'd into the existing pressure gate below (rather than
+    // replacing it) so both the pre-existing multi-opponent-congestion
+    // case and this single-marker-block case reach the same relief
+    // machinery.
+    let blocked_ahead = holder
+        .as_ref()
+        .map(|h| carrier_blocked_ahead(ctx, h, &opponents))
+        .unwrap_or(false);
+
     if let Some(h) = &holder {
         let holder_pressure = ctx.player().pressure().pressure_intensity_for(h.id);
         // Same 0.5 engagement floor as `score_candidate` — mild pressure
         // is common and shouldn't trigger extra candidate injection that
         // would only ever score at the (also-gated) baseline anyway.
-        if holder_pressure > 0.5 {
+        // `blocked_ahead` is a second, independent way in: a lone marker
+        // directly blocking the route forward never crosses the 0.5
+        // aggregate-pressure floor (it needs ~3 close opponents), so
+        // without this the whole relief mechanism silently never
+        // engaged for that specific, common case.
+        if holder_pressure > 0.5 || blocked_ahead {
             // Two radii, not one: a "pressured" holder by definition has
             // opponents within ~30u (`pressure_intensity_for`'s own
             // scan radius), so a single fixed ring often lands inside
@@ -428,6 +489,30 @@ pub fn refine_support_position(
                     let rad = deg.to_radians();
                     let offset = Vector3::new(rad.cos(), rad.sin(), 0.0) * relief_radius;
                     consider(h.position + offset);
+                }
+            }
+        }
+
+        // Realism-bug (2026-08-03) — a genuine DEEP outlet, behind the
+        // ball line, not just the close relief pocket above (which tops
+        // out at 40.5u — still adjacent to the very marker doing the
+        // blocking). Real football: when a lone defender cuts off the
+        // route forward, a covering teammate (a deeper midfielder,
+        // fullback, or centre-back) drops off to reset — a genuine
+        // backward release, not a shuffle. Gated strictly on
+        // `blocked_ahead` (not on aggregate pressure) since this is
+        // specifically the "can't go forward" pattern, not "surrounded."
+        if blocked_ahead {
+            let attacking_dir: f32 = match ctx.player.side {
+                Some(PlayerSide::Left) => 1.0,
+                Some(PlayerSide::Right) => -1.0,
+                None => 0.0,
+            };
+            const DEEP_OUTLET_DISTANCES: [f32; 2] = [55.0, 90.0];
+            const DEEP_OUTLET_LATERAL: [f32; 3] = [-30.0, 0.0, 30.0];
+            for &dist in &DEEP_OUTLET_DISTANCES {
+                for &lat in &DEEP_OUTLET_LATERAL {
+                    consider(h.position + Vector3::new(-attacking_dir * dist, lat, 0.0));
                 }
             }
         }
@@ -493,9 +578,27 @@ fn score_candidate(
     // pressure (the same range the match-logs distance trace actually
     // showed moving selected positions) engages the mechanism at all.
     const PRESSURE_ENGAGEMENT_FLOOR: f32 = 0.5;
-    let relief_engagement =
+    let pressure_engagement =
         ((holder_pressure - PRESSURE_ENGAGEMENT_FLOOR) / (1.0 - PRESSURE_ENGAGEMENT_FLOOR))
             .clamp(0.0, 1.0);
+    // Realism-bug (2026-08-03): a lone opponent directly blocking the
+    // holder's route forward (see `carrier_blocked_ahead`) engages this
+    // same relief machinery at full strength, independent of the
+    // aggregate `pressure_engagement` above — that aggregate needs ~3
+    // close opponents to ever leave 0.0, so a single blocking marker
+    // (the reported case) never moved it. Full engagement here matches
+    // the already-accepted design for genuine congestion: past the
+    // floor, "the caller's tactical intent" shifts from holding shape
+    // to getting the carrier an out-ball.
+    let blocked_ahead = holder
+        .as_ref()
+        .map(|h| carrier_blocked_ahead(ctx, h, opponents))
+        .unwrap_or(false);
+    let relief_engagement = if blocked_ahead {
+        1.0
+    } else {
+        pressure_engagement
+    };
 
     if let Some(h) = holder {
         let holder_dist = (position - h.position).magnitude();
