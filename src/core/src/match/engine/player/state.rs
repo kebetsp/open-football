@@ -49,6 +49,48 @@ impl Display for PlayerState {
     }
 }
 
+// Root-cause-agnostic stuck-player safety net (2026-08-04). Two
+// independent state-machine gaps (DefenderGuardingState had no
+// has_ball check; MidfielderTacklingState had no "carrier not yet in
+// range" fallback) both produced the exact same observable symptom: a
+// player's finalized velocity converging to exactly zero and staying
+// there indefinitely because nothing ever re-evaluates a new target.
+// Rather than trust that those were the only two gaps of this shape,
+// this watches the ONE thing every such bug has in common — the
+// player simply never moves — regardless of which state or mechanism
+// caused it. It does NOT replace fixing a root cause when one is
+// found (see the guarding/tackling fixes committed alongside this);
+// it's a backstop for whichever gap hasn't been found yet. Every
+// trigger is logged so a firing safety net reads as "go investigate
+// this," never as a silent, unnoticed fix.
+//
+// Thresholds are tiered by how plausible genuine, correct stillness
+// is for the situation — a player holding the ball motionless is
+// essentially never legitimate in real football; a player mid-tackle-
+// attempt is meant to resolve within a tick or two; everything else
+// (Guarding, Marking, Covering, HoldingLine, Standing, Returning,
+// Walking, Pressing...) is a positional-holding state that can
+// legitimately sit near-motionless for many seconds — measured
+// directly (2026-08-04): an earlier design that also treated "near an
+// opponent" as suspicious produced ~4 false triggers/match, almost all
+// Guarding/Marking/Returning/Walking correctly shadowing a similarly-
+// stationary opponent. Proximity doesn't predict stuckness; the state
+// itself does.
+const STUCK_EPSILON_SQ: f32 = 0.0004; // 0.02 u/tick — genuinely stopped, not just slow
+const STUCK_THRESHOLD_HAS_BALL: u16 = 400; // 4s engine-time
+const STUCK_THRESHOLD_TACKLING: u16 = 200; // 2s engine-time
+const STUCK_THRESHOLD_FAR: u16 = 2500; // 25s engine-time
+// Goalkeepers legitimately hold a static position for long real stretches
+// whenever play is at the other end — measured directly (2026-08-04): a
+// 40-match sanity batch with STUCK_THRESHOLD_FAR alone produced 22 false
+// triggers, 100% of them goalkeepers with no opponent within radius at
+// all (nearest_opp == f32::MAX). Outfield players never triggered the
+// far tier in that same batch. GK gets a much longer grace period on
+// this specific tier; the has_ball tier (a GK holding the ball forever
+// IS still a real bug shape) stays untouched.
+const STUCK_THRESHOLD_FAR_GK: u16 = 9000; // 90s engine-time
+const STUCK_NEAR_PLAY_RADIUS: f32 = 60.0; // matches DUEL_DEBUG_RADIUS
+
 pub struct PlayerMatchState;
 
 impl PlayerMatchState {
@@ -156,6 +198,74 @@ impl PlayerMatchState {
             } else {
                 player.velocity = velocity;
             }
+
+            // Root-cause-agnostic stuck detector — see the module-level
+            // doc comment. Judges the FINAL, already-clamped velocity
+            // (the actual thing that will or won't move the player this
+            // tick), so it's blind to which state or mechanism produced
+            // it.
+            if player.velocity.norm_squared() > STUCK_EPSILON_SQ {
+                player.stuck_ticks = 0;
+            } else {
+                player.stuck_ticks = player.stuck_ticks.saturating_add(1);
+
+                let has_ball = tick_context.ball.current_owner == Some(player.id);
+                // Diagnostic only now (see below) — proximity to an
+                // opponent turned out NOT to predict genuine stuckness:
+                // a 40-match sanity batch with a distance-based "near
+                // play" tier produced ~4 false triggers/match, almost
+                // entirely Guarding/Marking/Returning/Walking — states
+                // that correctly hold near-zero velocity for many
+                // seconds while shadowing a similarly-stationary
+                // opponent. The real signal is whether the STATE ITSELF
+                // is supposed to resolve quickly, not how close anyone
+                // is standing.
+                let nearest_opp_dist = tick_context
+                    .grid
+                    .opponents(player.id, STUCK_NEAR_PLAY_RADIUS)
+                    .map(|(_, d)| d)
+                    .fold(f32::MAX, f32::min);
+
+                // Tackling is the one state in this engine whose entire
+                // premise is "resolve within a tick or two" (attempt,
+                // succeed/fail/foul, or bounce out via a distance/
+                // cooldown gate) — a sustained, motionless presence here
+                // is anomalous almost immediately, regardless of role.
+                // This is exactly bug #2's shape (MidfielderTacklingState
+                // missing its too-far fallback).
+                let is_tackling = matches!(
+                    player.state,
+                    PlayerState::Defender(DefenderState::Tackling)
+                        | PlayerState::Midfielder(MidfielderState::Tackling)
+                        | PlayerState::Forward(ForwardState::Tackling)
+                        | PlayerState::Goalkeeper(GoalkeeperState::Tackling)
+                );
+
+                let threshold = if has_ball {
+                    STUCK_THRESHOLD_HAS_BALL
+                } else if is_tackling {
+                    STUCK_THRESHOLD_TACKLING
+                } else if player_position_group == PlayerFieldPositionGroup::Goalkeeper {
+                    STUCK_THRESHOLD_FAR_GK
+                } else {
+                    STUCK_THRESHOLD_FAR
+                };
+
+                if player.stuck_ticks >= threshold {
+                    log::warn!(
+                        "STUCK_RECOVERY player={} team={} prev_state={} has_ball={} nearest_opp={:.1} stuck_ticks={}",
+                        player.id,
+                        player.team_id,
+                        player.state,
+                        has_ball,
+                        nearest_opp_dist,
+                        player.stuck_ticks
+                    );
+                    let recovery = Self::recovery_state(player_position_group, has_ball);
+                    Self::change_state(player, recovery);
+                    player.stuck_ticks = 0;
+                }
+            }
         }
 
         state_change_result.events
@@ -164,5 +274,39 @@ impl PlayerMatchState {
     fn change_state(player: &mut MatchPlayer, state: PlayerState) {
         player.in_state_time = 0;
         player.state = state;
+    }
+
+    /// Safe, neutral re-entry state per role — lets the normal role-block
+    /// decision logic reassign fresh duties next tick instead of leaving
+    /// a broken state in place. Mirrors the existing idiom already used
+    /// deliberately elsewhere in this codebase (e.g.
+    /// `DefenderGuardingState`'s own crisis override: "Drop to Standing
+    /// so the role block assigns fresh duties against the active
+    /// threat").
+    fn recovery_state(group: PlayerFieldPositionGroup, has_ball: bool) -> PlayerState {
+        match group {
+            PlayerFieldPositionGroup::Goalkeeper => PlayerState::Goalkeeper(GoalkeeperState::Standing),
+            PlayerFieldPositionGroup::Defender => {
+                if has_ball {
+                    PlayerState::Defender(DefenderState::Running)
+                } else {
+                    PlayerState::Defender(DefenderState::Standing)
+                }
+            }
+            PlayerFieldPositionGroup::Midfielder => {
+                if has_ball {
+                    PlayerState::Midfielder(MidfielderState::Running)
+                } else {
+                    PlayerState::Midfielder(MidfielderState::Standing)
+                }
+            }
+            PlayerFieldPositionGroup::Forward => {
+                if has_ball {
+                    PlayerState::Forward(ForwardState::Running)
+                } else {
+                    PlayerState::Forward(ForwardState::Standing)
+                }
+            }
+        }
     }
 }

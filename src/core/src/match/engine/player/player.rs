@@ -153,6 +153,13 @@ pub struct MatchPlayer {
     /// within the same second, which would otherwise produce 40+ fouls
     /// per team in the first 5 minutes of every match.
     pub tackle_cooldown: u16,
+    /// Consecutive ticks this player's final velocity has been ~zero.
+    /// Reset to 0 the instant real movement is detected. Root-cause-
+    /// agnostic safety net (2026-08-04) — see `PlayerMatchState::process`
+    /// for the detection/recovery logic. Does not replace fixing the
+    /// underlying state-machine gap when one is found; it's a backstop
+    /// for whichever gap hasn't been found yet.
+    pub stuck_ticks: u16,
     /// Tagged reason for the next Shoot event. Set by each transition
     /// point that routes into the Shooting state (e.g. "FWD_RUN_PRIO05",
     /// "FWD_POINT_BLANK", "MID_POINT_BLANK_RUN"). The Shooting state
@@ -524,6 +531,7 @@ impl MatchPlayer {
             fouls_committed: 0,
             is_sent_off: false,
             tackle_cooldown: 0,
+            stuck_ticks: 0,
             pending_shot_reason: None,
             behavioral_directive: None,
             directive_base: None,
@@ -610,6 +618,7 @@ impl MatchPlayer {
             fouls_committed: 0,
             is_sent_off: false,
             tackle_cooldown: 0,
+            stuck_ticks: 0,
             pending_shot_reason: None,
             behavioral_directive: None,
             directive_base: None,
