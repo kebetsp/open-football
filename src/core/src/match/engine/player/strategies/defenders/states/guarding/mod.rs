@@ -22,6 +22,24 @@ pub struct DefenderGuardingState {}
 
 impl StateProcessingHandler for DefenderGuardingState {
     fn process(&self, ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        // realism-bug (2026-08-04): Guarding has no ball-handling logic at
+        // all — every branch below assumes the ball is with an opponent or
+        // loose, and `find_guard_target` explicitly skips the ball carrier
+        // ("that's for pressing/tackling") with no fallback for the case
+        // where WE are that carrier. Traced live via the duel-debug panel:
+        // a defender who gained the ball while guarding an off-ball
+        // opponent (e.g. a stray interception) stayed in Guarding, arrived
+        // at his marking position, and froze there indefinitely — holding
+        // the ball, never dribbling/passing/shooting, for the rest of the
+        // standoff. Every other defender state already checks this first;
+        // Guarding was the one gap. Route to Running so on-ball decision
+        // logic actually runs, same as Tackling/Standing/etc.
+        if ctx.player.has_ball(ctx) {
+            return Some(StateChangeResult::with_defender_state(
+                DefenderState::Running,
+            ));
+        }
+
         // BOX EMERGENCY — engage the carrier immediately if they're in
         // our box and we're one of the two closest defenders. Guarding
         // an off-ball runner is the wrong duty at that moment.

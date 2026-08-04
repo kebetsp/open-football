@@ -95,6 +95,22 @@ impl StateProcessingHandler for MidfielderTacklingState {
 
         if let Some(opponent) = opponents_with_ball.next() {
             let opponent_distance = ctx.tick_context.grid.get(ctx.player.id, opponent.id);
+            // realism-bug (2026-08-04): missing fallback for "carrier is not
+            // yet in tackle range" — DefenderTacklingState/ForwardTacklingState
+            // both revert to Pressing (an actively-chasing state) here;
+            // this state fell through to `None` (no state change) instead,
+            // leaving the player stuck in Tackling with no active-chase
+            // steering. Combined with Pursuit's own slowing-near-target
+            // behavior, this converged to a stable standoff well short of
+            // contact range (observed clustering 15-18u) rather than
+            // closing in — traced live via the duel-debug panel as a
+            // multi-minute freeze against a carrier who never released
+            // the ball either (a separate bug, `DefenderGuardingState`).
+            if opponent_distance > TACKLE_DISTANCE_THRESHOLD {
+                return Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::Pressing,
+                ));
+            }
             if opponent_distance <= TACKLE_DISTANCE_THRESHOLD {
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::MID_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
