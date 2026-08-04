@@ -56,6 +56,18 @@ impl StateProcessingHandler for DefenderTacklingState {
             ));
         }
 
+        // realism-bug (2026-08-04): Law 12 — a goalkeeper in secure
+        // possession (or a live opponent goal kick) cannot be legally
+        // challenged for the ball at all; there is no duel to attempt.
+        // Covers a defender who has pushed forward (e.g. for a corner)
+        // and finds himself near the opponent GK after a claim. Mirrors
+        // the free-kick-encroachment guard above.
+        if ctx.ball().is_opponent_restart() {
+            return Some(StateChangeResult::with_defender_state(
+                DefenderState::Pressing,
+            ));
+        }
+
         // Check if there's an opponent with the ball
         if let Some(opponent) = ctx.players().opponents().with_ball().next() {
             let distance_to_opponent = opponent.distance(ctx);

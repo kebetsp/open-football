@@ -48,6 +48,16 @@ impl StateProcessingHandler for MidfielderTacklingState {
             ));
         }
 
+        // realism-bug (2026-08-04): Law 12 — a goalkeeper in secure
+        // possession (or a live opponent goal kick) cannot be legally
+        // challenged for the ball at all; there is no duel to attempt.
+        // Mirrors the free-kick-encroachment guard above.
+        if ctx.ball().is_opponent_restart() {
+            return Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Pressing,
+            ));
+        }
+
         let ball_distance = ctx.ball().distance();
 
         if ball_distance > 150.0 {

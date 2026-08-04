@@ -47,6 +47,18 @@ impl StateProcessingHandler for ForwardTacklingState {
             ));
         }
 
+        // realism-bug (2026-08-04): Law 12 — a goalkeeper in secure
+        // possession (or a live opponent goal kick) cannot be legally
+        // challenged for the ball at all; there is no duel to attempt.
+        // Without this, `opponents.with_ball()` below happily finds the
+        // GK himself and rolls a tackle attempt against him. Only
+        // Pressing (positional jockeying, no contact) applies.
+        if ctx.ball().is_opponent_restart() {
+            return Some(StateChangeResult::with_forward_state(
+                ForwardState::Pressing,
+            ));
+        }
+
         // Per-player tackle cooldown. Without it a forward in Tackling
         // state attempts a fresh tackle every tick — 100 attempts × 15%
         // base foul chance = 15 fouls per forward per match, and with

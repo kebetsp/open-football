@@ -23,7 +23,21 @@ impl StateProcessingHandler for MidfielderInterceptingState {
             return Some(StateChangeResult::with_midfielder_state(
                 MidfielderState::Running,
             ));
-        } else {
+        }
+
+        // realism-bug (2026-08-04): Law 12 — a goalkeeper in secure
+        // possession (or a live opponent goal kick) is not an
+        // interception target; `velocity()` below otherwise pursues the
+        // ball's raw position directly, which IS the GK's position while
+        // he holds it. Pressing correctly retreats via its own
+        // `is_opponent_restart()` check.
+        if ctx.ball().is_opponent_restart() {
+            return Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Pressing,
+            ));
+        }
+
+        {
             let ball_distance = ctx.ball().distance();
 
             // Loose ball nearby — claim it directly instead of tackling thin air

@@ -22,6 +22,19 @@ impl StateProcessingHandler for ForwardInterceptingState {
             ));
         }
 
+        // realism-bug (2026-08-04): Law 12 — a goalkeeper in secure
+        // possession (or a live opponent goal kick) is not an
+        // interception target; `velocity()` below otherwise pursues the
+        // ball's raw position directly, which IS the GK's position while
+        // he holds it, producing exactly the "attacker glued to the
+        // keeper" symptom this guard fixes. Pressing correctly retreats
+        // via its own `is_opponent_restart()` check.
+        if ctx.ball().is_opponent_restart() {
+            return Some(StateChangeResult::with_forward_state(
+                ForwardState::Pressing,
+            ));
+        }
+
         let ball_distance = ctx.ball().distance();
 
         if ball_distance > 150.0 {

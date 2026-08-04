@@ -25,29 +25,44 @@ impl StateProcessingHandler for MidfielderReturningState {
             ));
         }
 
-        // CRITICAL: Tackle/press if an opponent has the ball nearby
-        if let Some(opponent) = ctx
-            .players()
-            .opponents()
-            .nearby(100.0)
-            .with_ball(ctx)
-            .next()
-        {
-            let opponent_distance = (opponent.position - ctx.player.position).magnitude();
+        // realism-bug (2026-08-04): Law 12 — a goalkeeper in secure
+        // possession (or a live opponent goal kick) is dead and cannot
+        // be legally contested. Without this exclusion, the "nearby
+        // opponent has the ball" check below finds the GK himself right
+        // after a catch and routes a midfielder who just correctly
+        // started retreating (Pressing/Running → Returning, on the same
+        // `is_opponent_restart()` signal) straight back into Tackling/
+        // Pressing/Intercepting — producing a Returning↔engage↔Pressing
+        // oscillation that keeps him glued near the keeper instead of
+        // actually walking back to his anchor.
+        let contestable = !ctx.ball().is_opponent_restart();
 
-            if opponent_distance < 40.0 {
-                return Some(StateChangeResult::with_midfielder_state(
-                    MidfielderState::Tackling,
-                ));
-            }
-            if opponent_distance < 100.0 {
-                return Some(StateChangeResult::with_midfielder_state(
-                    MidfielderState::Pressing,
-                ));
+        // CRITICAL: Tackle/press if an opponent has the ball nearby
+        if contestable {
+            if let Some(opponent) = ctx
+                .players()
+                .opponents()
+                .nearby(100.0)
+                .with_ball(ctx)
+                .next()
+            {
+                let opponent_distance = (opponent.position - ctx.player.position).magnitude();
+
+                if opponent_distance < 40.0 {
+                    return Some(StateChangeResult::with_midfielder_state(
+                        MidfielderState::Tackling,
+                    ));
+                }
+                if opponent_distance < 100.0 {
+                    return Some(StateChangeResult::with_midfielder_state(
+                        MidfielderState::Pressing,
+                    ));
+                }
             }
         }
 
-        if !ctx.team().is_control_ball()
+        if contestable
+            && !ctx.team().is_control_ball()
             && ctx.ball().distance() < 250.0
             && ctx.ball().is_towards_player_with_angle(0.8)
         {

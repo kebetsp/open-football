@@ -26,13 +26,25 @@ impl StateProcessingHandler for ForwardReturningState {
             return Some(StateChangeResult::with_forward_state(ForwardState::Running));
         }
 
-        if !ctx.team().is_control_ball() && ctx.ball().distance() < 200.0 {
+        // realism-bug (2026-08-04): Law 12 — a goalkeeper in secure
+        // possession (or a live opponent goal kick) is dead and cannot
+        // be legally contested. Without this exclusion, the two checks
+        // below immediately route a forward who just correctly started
+        // retreating (Pressing/Running → Returning, on the same
+        // `is_opponent_restart()` signal) straight back into
+        // Intercepting/Tackling — which this state exists specifically
+        // to retreat AWAY from — producing a Returning↔Intercepting/
+        // Tackling↔Pressing oscillation that keeps him glued near the
+        // keeper instead of actually walking back to his anchor.
+        let contestable = !ctx.ball().is_opponent_restart();
+
+        if contestable && !ctx.team().is_control_ball() && ctx.ball().distance() < 200.0 {
             return Some(StateChangeResult::with_forward_state(
                 ForwardState::Intercepting,
             ));
         }
 
-        if !ctx.team().is_control_ball() && ctx.ball().distance() < 100.0 {
+        if contestable && !ctx.team().is_control_ball() && ctx.ball().distance() < 100.0 {
             return Some(StateChangeResult::with_forward_state(
                 ForwardState::Tackling,
             ));
@@ -46,14 +58,15 @@ impl StateProcessingHandler for ForwardReturningState {
         }
 
         // Intercept if ball coming towards player and is closer than before
-        if !ctx.team().is_control_ball() && ctx.ball().is_towards_player_with_angle(0.9) {
+        if contestable && !ctx.team().is_control_ball() && ctx.ball().is_towards_player_with_angle(0.9) {
             return Some(StateChangeResult::with_forward_state(
                 ForwardState::Intercepting,
             ));
         }
 
         // Transition to Pressing late in the game only if ball is close as well
-        if ctx.team().is_loosing()
+        if contestable
+            && ctx.team().is_loosing()
             && ctx.context.total_match_time > (MATCH_TIME_MS - 180)
             && ctx.ball().distance() < 30.0
         {
