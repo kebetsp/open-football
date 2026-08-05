@@ -1005,6 +1005,68 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     }
                     return;
                 };
+                // realism-bug (2026-08-05): the delivery previously aimed
+                // exactly at `receiver_pos` — the staged header's live
+                // position — which the standard pass pipeline treats
+                // like any routine give-and-go: the ball lands right at
+                // his feet and `handle_pass_to_event` hands him exclusive
+                // ownership (`PassCompleted`->`ClaimBall`) the instant it
+                // "completes". `resolve_aerial_contest` (the genuine
+                // aerial-duel resolver, engine/tick.rs) only fires while
+                // `ball.current_owner.is_none()` — a cleanly-claimed pass
+                // can never reach it, so the ball never becomes a real
+                // contested header opportunity. Measured (raw event
+                // trace, 115 FK_CROSS dispatches): 93% (107/115) resolve
+                // as a plain `PassCompleted`->`ClaimBall`, and only 4.97%
+                // of all box-delivery FK crosses produced a header shot
+                // at all — vs corners' ~25-32%, which deliver to a fixed
+                // ZONE coordinate (`pick_corner_delivery`, this file's
+                // own sibling mechanism, explicit comment: "ball goes to
+                // the zone centre so it arrives at the intended area
+                // regardless of where the runner is") rather than a
+                // specific player's exact position, so a corner cross
+                // genuinely lands in contestable space instead of
+                // straight into one man's control. Fix: offset the aim
+                // point off `receiver_pos` by a real, header-duel-scale
+                // radius (matching the corner zone's own 20-40u lateral
+                // spread) toward goal, so the ball lands in the space
+                // he's attacking rather than exactly where he's
+                // currently standing — the same "arrives at the area,
+                // not the man" principle, reused rather than reinvented.
+                // Two follow-up cuts offsetting the target OFF
+                // `receiver_pos` (±20u, then ±35-70u) both measured only
+                // a partial improvement (header rate 4.97%->~8%,
+                // "completed"/claimed-cleanly still ~90% of dispatches
+                // regardless of offset magnitude) — traced the real
+                // reason via `ball/ball/ownership.rs::try_pass_target_claim`:
+                // the intended receiver (`to_player_id`, still set to
+                // `receiver_id` throughout) can privilege-claim the ball
+                // from `RECEIVER_CLAIM_DISTANCE_SQ` = 100² units (~12.5m)
+                // away while it's still up to `RECEIVER_MAX_HEIGHT` =
+                // 2.8m high — since the target was still centred ON HIM,
+                // he stayed within that huge radius no matter how far the
+                // offset pushed, guaranteeing the privileged claim beat
+                // any genuine aerial contest regardless of magnitude.
+                // Corners don't hit this because `pick_corner_delivery`'s
+                // zone coordinate is computed purely from goal/centreline
+                // geometry (near/far-post depth + lateral offset), with
+                // ZERO reference to any player's position — the "receiver"
+                // id is bookkeeping only, and can easily end up well
+                // outside the 100u claim radius of where the ball
+                // actually lands. Mirrored that same geometry here:
+                // pick a goal-relative near/far-post-style zone on
+                // whichever side the staged receiver is naturally on
+                // (so the delivery still goes to the side he's attacking)
+                // but the coordinate itself never references his live
+                // position, so he isn't structurally guaranteed to be
+                // within the privileged claim radius of it.
+                let inward: f32 = if goal_x > field_w * 0.5 { -1.0 } else { 1.0 };
+                let side_sign: f32 = if receiver_pos.y < mid_y { -1.0 } else { 1.0 };
+                let zone_target = Vector3::new(
+                    goal_x + inward * (28.0 + context.rng.unit_f32() * 22.0),
+                    mid_y + side_sign * (30.0 + context.rng.unit_f32() * 28.0),
+                    0.0,
+                );
                 // Pass power — same shape as `pass_teammate_power`.
                 let s = &taker.skills;
                 let skill_factor = (s.technical.passing / 20.0) * 0.35
@@ -1012,7 +1074,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     + (s.physical.strength / 20.0) * 0.15
                     + (s.mental.vision / 20.0) * 0.15
                     + (s.mental.composure / 20.0) * 0.15;
-                let pass_dist = (receiver_pos - ball_pos).magnitude();
+                let pass_dist = (zone_target - ball_pos).magnitude();
                 let distance_factor = (pass_dist / (field_w * 0.8)).clamp(0.25, 1.0);
                 let condition_factor =
                     0.92 + (taker.player_attributes.condition as f32 / 10_000.0) * 0.08;
@@ -1022,7 +1084,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     PassingEventContext {
                         from_player_id: taker_id,
                         to_player_id: receiver_id,
-                        pass_target: receiver_pos,
+                        pass_target: zone_target,
                         pass_force,
                         reason: "FK_CROSS",
                     },
