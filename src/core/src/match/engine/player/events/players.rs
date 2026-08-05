@@ -3197,7 +3197,46 @@ impl PlayerEventDispatcher {
         } else {
             8.5 + poor_penalty * 7.5
         };
-        let max_y_error = max_y_error_raw.clamp(min_error, 60.0);
+        // realism-bug (2026-08-05): headers had zero shot-type-specific
+        // accuracy penalty anywhere in this function — a header used
+        // the exact same execution_skill/error model as a footed
+        // strike from the same distance. Measured post height-fix (see
+        // the height_delta fix above): header on-target rate 68.1%
+        // (32/47), roughly double the real Opta baseline this file's
+        // own comment already cites (~33% for shots overall) — and
+        // real headers should sit BELOW that shot baseline, not above
+        // it (StatsBomb comparison: shot conversion ~20% vs header
+        // conversion ~10%, https://blogarchive.statsbomb.com/articles/
+        // soccer/how-do-headers-compare-to-shots/ — heading is a much
+        // less precise technique than a footed strike, fewer contact-
+        // point degrees of freedom, incoming ball pace/spin, aerial
+        // marking pressure). No sourced dataset gives an exact
+        // header-vs-foot error-spread ratio (flagged estimate, ROUGHLY
+        // reverse-engineered from the ~2x on-target overshoot measured
+        // above) — mirrors the existing `FK_PRECISION_ERROR_MULT`
+        // pattern (an isolated per-shot-type multiplier) but widens
+        // instead of tightens. Verify the resulting on-target/
+        // conversion shift empirically rather than trusting the
+        // constant, same discipline as the FK precision fix.
+        // First cut at 1.8x measured a no-op (on-target 68.1% → 68.5%,
+        // within noise, over 47/70 header shots) — raw HEADERYERR trace
+        // showed why: typical raw y-error is only 5-20u even before
+        // widening, so 1.8x (9-36u) still usually stays under the ~29u
+        // goal half-width given `ideal_y_target` is itself usually
+        // placed centrally, so continuous y-error alone rarely pushes
+        // the shot off frame. Raised substantially — verify the
+        // resulting on-target shift before trusting this constant
+        // either.
+        const HEADER_ERROR_WIDEN_MULT: f32 = 3.5;
+        let header_error_mult = if matches!(
+            shoot_event_model.shot_type,
+            crate::r#match::player::strategies::players::ShotType::Header
+        ) {
+            HEADER_ERROR_WIDEN_MULT
+        } else {
+            1.0
+        };
+        let max_y_error = (max_y_error_raw * header_error_mult).clamp(min_error, 60.0);
 
         // Add random error to y-coordinate
         let y_error = rng.random_range(-max_y_error..max_y_error);
@@ -3224,13 +3263,42 @@ impl PlayerEventDispatcher {
         // tail to zero (see audit_engine_gap). Elite shooters are
         // unaffected: at execution_skill ≥ 0.55, `(1 - exec)` < 0.45 and
         // `poor_penalty` is already zero.
+        // realism-bug (2026-08-05): a flat additive header penalty on
+        // top of the multiplicative `header_error_mult` — the small
+        // base wide-miss rates (0.03-0.15) stayed too low to matter
+        // even after multiplying by 1.8-3.5x. A real header regularly
+        // balloons off-target from a glancing/mistimed contact in a
+        // way a clean footed strike doesn't; no sourced dataset gives
+        // an exact figure (flagged estimate), reasoned to roughly
+        // double the real shot on-target miss rate for the header
+        // population as a whole.
+        // Second cut at 0.22 measured on-target 19.4% / overall header
+        // goal conversion 17.05% across a 120-match batch — closer to
+        // the sourced ~10-13.5% real band (StatsBomb comparison +
+        // PL 2023/24, see above) than the first cut's 68%/24.5%, but
+        // still somewhat high. One further nudge; this whole constant
+        // remains a flagged, unsourced estimate (no dataset gives an
+        // exact header-vs-foot wide-miss-rate delta) — stop tuning
+        // toward this specific batch after this pass and report the
+        // resulting band honestly rather than chase an exact number.
+        const HEADER_WIDE_MISS_ADD: f32 = 0.27;
+        let header_wide_miss_add = if matches!(
+            shoot_event_model.shot_type,
+            crate::r#match::player::strategies::players::ShotType::Header
+        ) {
+            HEADER_WIDE_MISS_ADD
+        } else {
+            0.0
+        };
         let wide_miss_chance = (wide_base
             + (1.0 - execution_skill) * 0.05
             + poor_penalty * 0.03
             + pressure_penalty * 0.04
             + low_condition_penalty * 0.03
             + desperation * 0.08)
-            * fk_precision_mult;
+            * fk_precision_mult
+            * header_error_mult
+            + header_wide_miss_add;
         let wide_miss_fired = rng.random_range(0.0f32..1.0) < wide_miss_chance;
         if wide_miss_fired {
             let extra_wide = rng.random_range(GOAL_WIDTH * 0.2..GOAL_WIDTH * 1.5);
@@ -3410,7 +3478,38 @@ impl PlayerEventDispatcher {
                 rng.random_range(1.3..2.0) * technique_skill // Chip (5%)
             }
         };
-        let base_z_velocity = Self::z_launch_velocity_for_height(base_height_m);
+        // realism-bug (2026-08-05): `base_height_m` above is chosen as
+        // an ABSOLUTE target height above the pitch (the comments
+        // already say so — "close-range ground shot at 0.2-0.7m" is a
+        // real height above the turf, not a delta) — but
+        // `z_launch_velocity_for_height` was fed it directly, which
+        // computes a RISE relative to `field.ball.position.z`. For a
+        // foot shot `position.z` is already ~0, so the distinction was
+        // invisible. For a header, `position.z` starts at ~2.55m (the
+        // aerial-contest drop height, engine/tick.rs
+        // resolve_corner_contest/resolve_aerial_contest) — a "ground
+        // header" target of 0.2-0.7m then got a POSITIVE launch
+        // velocity stacked on top of that 2.55m start, so its actual
+        // peak height (measured via a temporary diagnostic: 100% of 28
+        // sampled header shots, peak_z 2.67-4.53m, always above the
+        // 2.44m crossbar) sailed over the bar with no time to descend
+        // before a close-range goal line — matching the measured 0/210
+        // header-goal conversion exactly. Fix: derive the delta from
+        // the ball's CURRENT height to the target, and let the sign
+        // decide direction — below target rises toward it (identical
+        // formula, and for foot shots `position.z≈0` makes this a
+        // no-op vs. the old behaviour); above target (headers, and any
+        // future airborne-contact shot e.g. a volley) launches
+        // DOWNWARD toward it instead of adding a further climb, the
+        // same "point it at the intended height, let gravity do the
+        // rest" idea this codebase already uses for the aerial-contest
+        // drop itself.
+        let height_delta = base_height_m - field.ball.position.z;
+        let base_z_velocity = if height_delta >= 0.0 {
+            Self::z_launch_velocity_for_height(height_delta)
+        } else {
+            -Self::z_launch_velocity_for_height(-height_delta)
+        };
 
         // Add spin/environmental variation to height
         let vertical_spin_variation = rng.random_range(0.90..1.10);
