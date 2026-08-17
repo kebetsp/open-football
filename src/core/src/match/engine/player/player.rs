@@ -362,6 +362,13 @@ pub struct MatchPlayer {
     /// third ("build down the left").
     pub attack_bias: Option<i8>,
 
+    /// Manager-set build-up-vs-direct dial, -2 (possession) .. +2
+    /// (direct), 0 = neutral. Pass-evaluator weight on long-pass
+    /// selection and on the short recycle-to-the-back bonus — genuinely
+    /// changes how often the team plays out from the back vs. goes
+    /// long, not just a skill-stat flavour nudge.
+    pub directness_bias: f32,
+
     /// Manager flag protecting this player from fatigue / development subs.
     /// Mirrored from `Player::is_force_match_selection` at squad-build time.
     pub is_force_match_selection: bool,
@@ -559,6 +566,7 @@ impl MatchPlayer {
             shape_rules: Vec::new(),
             shape_base: None,
             attack_bias: None,
+            directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
             entry_match_time_ms: 0,
@@ -646,6 +654,7 @@ impl MatchPlayer {
             shape_rules: Vec::new(),
             shape_base: None,
             attack_bias: None,
+            directness_bias: 0.0,
             is_force_match_selection,
             birth_date,
             entry_match_time_ms: 0,

@@ -472,6 +472,13 @@ impl PassEvaluator {
         let risk_forward_bias = 0.7 + risk_appetite * 0.6; // 0.7..1.3
         let risk_backward_bias = 1.4 - risk_appetite * 0.8; // 1.4..0.6
 
+        // Manager-set directness dial (-2 possession .. +2 direct, 0
+        // neutral). Distinct from `risk_appetite` (match-state driven,
+        // forward vs backward) — this is a pre-match tactics-board input
+        // that specifically controls long-ball selection and the
+        // short recycle-to-the-back habit, i.e. build-up vs direct play.
+        let directness = ctx.player.directness_bias;
+
         let mut forward_value = if forward_progress < 0.0 {
             // Backward pass - penalty, but softened by phase + risk.
             let composure_reduction = (ctx.player.skills.mental.composure / 20.0) * 0.3;
@@ -689,7 +696,7 @@ impl PassEvaluator {
         let vision_skill = ctx.player.skills.mental.vision / 20.0;
         let technique_skill = ctx.player.skills.technical.technique / 20.0;
 
-        let long_pass_bonus = if pass_distance > 300.0 {
+        let long_pass_bonus_base = if pass_distance > 300.0 {
             // Extreme distance (300m+) - very risky, minimal bonus
             (vision_skill * 0.3 + technique_skill * 0.2) * 0.2
         } else if pass_distance > 200.0 {
@@ -701,6 +708,28 @@ impl PassEvaluator {
         } else if pass_distance > 60.0 {
             // Long pass (60-100m) - modest bonus
             vision_skill * 0.1
+        } else {
+            0.0
+        };
+        // Directness dial scales long-pass selection directly: +2
+        // (fully Direct) -> 1.3x, -2 (fully Possession) -> 0.7x. This
+        // secondary effect also amplifies/dampens the existing
+        // PlaysShortPasses/PlaysLongPasses trait bonuses below, which
+        // key off long_pass_bonus too.
+        let long_pass_bonus = long_pass_bonus_base * (1.0 + directness * 0.15);
+
+        // Directness dial, PRIMARY unweighted effect. `long_pass_bonus`
+        // above only enters `tactical_value` at a 0.05 weight — too
+        // diluted to move behaviour on its own (measured: a 2026-08-05
+        // A/B batch showed no detectable shift in pass-length share).
+        // This term is added FLAT, the same pattern already proven for
+        // cutback_bonus/build_up_recycle_bonus in this file, so it
+        // isn't drowned out by the weighted sum. Signal: -1 at a 0u
+        // pass, +1 at a 180u+ pass, centred on the 60u boundary the
+        // evaluator already treats as "long" above.
+        let directness_length_bias = if directness != 0.0 {
+            let length_signal = ((pass_distance - 60.0) / 120.0).clamp(-1.0, 1.0);
+            directness * length_signal * 0.12
         } else {
             0.0
         };
@@ -835,7 +864,11 @@ impl PassEvaluator {
             if patient {
                 bonus += 0.10;
             }
-            bonus.clamp(0.12, 0.40)
+            // Directness dial shifts the recycle floor/ceiling directly:
+            // Direct (+2) suppresses the "safe short ball back" habit,
+            // Possession (-2) reinforces it — this is the build-up half
+            // of the same manager dial that scales long_pass_bonus above.
+            (bonus - directness * 0.06).clamp(0.02, 0.45)
         } else {
             0.0
         };
@@ -877,7 +910,8 @@ impl PassEvaluator {
             if under_press {
                 bonus += 0.10;
             }
-            bonus.clamp(0.12, 0.35)
+            // Same directness treatment as build_up_recycle_bonus above.
+            (bonus - directness * 0.06).clamp(0.02, 0.40)
         } else {
             0.0
         };
@@ -1060,6 +1094,7 @@ impl PassEvaluator {
             forward_width_bonus_unweighted +  // /goal 2026-07-26: flat, same family as cutback_bonus
             build_up_recycle_bonus +
             stalled_recycle_bonus +
+            directness_length_bias +
             counter_first_pass_bonus +
             same_side_density_penalty +
             sideways_penalty;
