@@ -114,12 +114,23 @@ impl<'p> DefensiveOperationsImpl<'p> {
 
     /// Find the opponent defensive line position — single-pass, zero allocation
     pub fn find_defensive_line(&self) -> f32 {
+        // realism-bug (offside investigation): this used to filter to
+        // `is_defender()`-tagged opponents only, which misses a deep-
+        // sitting midfielder or wing-back who's actually the deepest
+        // outfield player — the real offside rule (`build_offside_snapshot`
+        // in players.rs) sorts ALL opponents by depth (GK included) and
+        // takes the second-to-last. GK is excluded here deliberately
+        // (not to approximate "second-to-last" by omission — a GK who
+        // isn't the deepest player is the rare edge case the real rule
+        // already handles by including him in its own sort; this
+        // self-assessment helper only needs the deepest OUTFIELD line,
+        // which is what "last defender" means in the ordinary case).
         let (sum, count, min_x, max_x) = self
             .ctx
             .players()
             .opponents()
             .all()
-            .filter(|p| p.tactical_positions.is_defender())
+            .filter(|p| !p.tactical_positions.is_goalkeeper())
             .map(|p| p.position.x)
             .fold((0.0f32, 0u32, f32::MAX, f32::MIN), |(s, c, mn, mx), x| {
                 (s + x, c + 1, mn.min(x), mx.max(x))
@@ -133,6 +144,74 @@ impl<'p> DefensiveOperationsImpl<'p> {
             Some(PlayerSide::Left) => max_x,
             Some(PlayerSide::Right) => min_x,
             None => sum / count as f32,
+        }
+    }
+
+    /// Shared "shoulder of the last defender" tolerance. Previously
+    /// four different constants (1.5 / 2.0 / 5.0 / 8.0) existed across
+    /// the various offside-adjacent checks in this codebase for
+    /// conceptually the same margin — unified here so every caller
+    /// agrees on what "held onside" means.
+    pub const OFFSIDE_HOLD_MARGIN: f32 = 6.0;
+
+    /// Clamp a movement target's x-coordinate so a player chasing/
+    /// running toward `natural_target_x` doesn't get ahead of the
+    /// opponent's defensive line while `teammate_on_ball` is true (a
+    /// teammate still holds the ball, or — for a chase/pursuit target —
+    /// the ball itself hasn't yet travelled past the line). The clamp
+    /// lifts once the caller passes `teammate_on_ball = false`. Shared
+    /// by every "hold onside until the ball is genuinely released"
+    /// site (RunningInBehind, Midfielder Walking/Running, TakeBall)
+    /// instead of each reimplementing the same min/max-by-side logic.
+    pub fn onside_hold_x(&self, natural_target_x: f32, teammate_on_ball: bool) -> f32 {
+        if !teammate_on_ball {
+            return natural_target_x;
+        }
+        let line = self.find_defensive_line();
+        match self.ctx.player.side {
+            Some(PlayerSide::Left) => natural_target_x.min(line - Self::OFFSIDE_HOLD_MARGIN),
+            Some(PlayerSide::Right) => natural_target_x.max(line + Self::OFFSIDE_HOLD_MARGIN),
+            None => natural_target_x,
+        }
+    }
+
+    /// realism-bug (offside investigation): `TakeBall` (the universal
+    /// "go collect the ball" state every position group enters the
+    /// instant they're closest to an unowned ball — including a
+    /// teammate's pass still in flight, since `current_owner` is None
+    /// while airborne) had zero offside awareness. Measured: 84% of
+    /// real offside calls happened with the receiver already in
+    /// TakeBall at the moment of the kick, sprinting well ahead of the
+    /// defensive line before a teammate's pass even targeted them
+    /// (mean overshoot ~7.6m). `onside_hold_x` doesn't fit here — it
+    /// keys on "does a teammate still hold the ball," which is never
+    /// true during TakeBall by construction (the ball must be unowned
+    /// to trigger it). The right condition is instead "has the BALL
+    /// ITSELF already travelled past the line" — a real striker times
+    /// his run to arrive with or after a through ball, not ahead of it.
+    /// If the ball is still short of the line, hold the chase target at
+    /// the line; once the ball has genuinely crossed it, the clamp
+    /// lifts and the chase proceeds normally (a legitimate onside run
+    /// to meet a ball already released into the space behind the
+    /// defence).
+    pub fn clamp_chase_target_x(&self, chase_target_x: f32, ball_x: f32) -> f32 {
+        let line = self.find_defensive_line();
+        match self.ctx.player.side {
+            Some(PlayerSide::Left) => {
+                if ball_x > line {
+                    chase_target_x
+                } else {
+                    chase_target_x.min(line - Self::OFFSIDE_HOLD_MARGIN)
+                }
+            }
+            Some(PlayerSide::Right) => {
+                if ball_x < line {
+                    chase_target_x
+                } else {
+                    chase_target_x.max(line + Self::OFFSIDE_HOLD_MARGIN)
+                }
+            }
+            None => chase_target_x,
         }
     }
 

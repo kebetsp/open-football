@@ -1,8 +1,8 @@
 use crate::r#match::forwarders::states::ForwardState;
 use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondition};
 use crate::r#match::{
-    ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
-    SteeringBehavior,
+    ConditionContext, PlayerSide, StateChangeResult, StateProcessingContext,
+    StateProcessingHandler, SteeringBehavior,
 };
 use nalgebra::Vector3;
 
@@ -50,7 +50,25 @@ impl StateProcessingHandler for ForwardTakeBallState {
         // ground balls (z ≈ 0) use Pursuit with the current position +
         // velocity so we lead the ball.
         let is_aerial = ball_pos.z > 2.3;
-        let target = if is_aerial { landing } else { ball_pos };
+        let mut target = if is_aerial { landing } else { ball_pos };
+
+        // realism-bug (offside investigation): TakeBall previously had
+        // zero offside awareness — see `clamp_chase_target_x`'s doc
+        // comment for the full reasoning. Only relevant when the chase
+        // target is genuinely in the opponent's half (offside can't
+        // occur in your own half).
+        let half_width = ctx.context.field_size.width as f32 / 2.0;
+        let in_opponent_half = match ctx.player.side {
+            Some(PlayerSide::Left) => target.x > half_width,
+            Some(PlayerSide::Right) => target.x < half_width,
+            None => false,
+        };
+        if in_opponent_half {
+            target.x = ctx
+                .player()
+                .defensive()
+                .clamp_chase_target_x(target.x, ball_pos.x);
+        }
 
         let mut arrive_velocity = if is_aerial {
             SteeringBehavior::Arrive {

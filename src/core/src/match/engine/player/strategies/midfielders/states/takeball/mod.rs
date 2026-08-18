@@ -1,8 +1,8 @@
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
 use crate::r#match::{
-    ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
-    SteeringBehavior,
+    ConditionContext, PlayerSide, StateChangeResult, StateProcessingContext,
+    StateProcessingHandler, SteeringBehavior,
 };
 use nalgebra::Vector3;
 
@@ -43,7 +43,22 @@ impl StateProcessingHandler for MidfielderTakeBallState {
         let ball_vel = ctx.tick_context.positions.ball.velocity;
         let landing = ctx.tick_context.positions.ball.landing_position;
         let is_aerial = ball_pos.z > 2.3;
-        let target = if is_aerial { landing } else { ball_pos };
+        let mut target = if is_aerial { landing } else { ball_pos };
+
+        // realism-bug (offside investigation): see the doc comment on
+        // `clamp_chase_target_x` (defensive.rs) for the full reasoning.
+        let half_width = ctx.context.field_size.width as f32 / 2.0;
+        let in_opponent_half = match ctx.player.side {
+            Some(PlayerSide::Left) => target.x > half_width,
+            Some(PlayerSide::Right) => target.x < half_width,
+            None => false,
+        };
+        if in_opponent_half {
+            target.x = ctx
+                .player()
+                .defensive()
+                .clamp_chase_target_x(target.x, ball_pos.x);
+        }
 
         let mut arrive_velocity = if is_aerial {
             SteeringBehavior::Arrive {

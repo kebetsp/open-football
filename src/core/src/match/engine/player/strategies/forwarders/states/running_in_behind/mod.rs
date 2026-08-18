@@ -6,8 +6,7 @@ use crate::r#match::player::strategies::common::players::ops::forward_shot_decis
 use crate::r#match::player::strategies::common::players::ops::on_ball_value;
 use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
-    ConditionContext, PlayerSide, StateChangeResult, StateProcessingContext,
-    StateProcessingHandler,
+    ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
 };
 use nalgebra::Vector3;
 
@@ -114,15 +113,10 @@ impl StateProcessingHandler for ForwardRunningInBehindState {
                 .owner_id()
                 .and_then(|id| ctx.context.players.by_id(id))
                 .map_or(false, |o| o.team_id == ctx.player.team_id && o.id != ctx.player.id);
-        if teammate_on_ball {
-            const ONSIDE_HOLD: f32 = 6.0;
-            let line = ctx.player().defensive().find_defensive_line();
-            match ctx.player.side {
-                Some(PlayerSide::Left) => run_target.x = run_target.x.min(line - ONSIDE_HOLD),
-                Some(PlayerSide::Right) => run_target.x = run_target.x.max(line + ONSIDE_HOLD),
-                None => {}
-            }
-        }
+        run_target.x = ctx
+            .player()
+            .defensive()
+            .onside_hold_x(run_target.x, teammate_on_ball);
 
         // §11.9: never run into the space the ball carrier is already
         // running into — the carrier owns that space. Shifts the run

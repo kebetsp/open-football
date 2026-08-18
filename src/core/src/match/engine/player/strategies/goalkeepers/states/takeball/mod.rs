@@ -1,8 +1,8 @@
 use crate::r#match::goalkeepers::states::common::{ActivityIntensity, GoalkeeperCondition};
 use crate::r#match::goalkeepers::states::state::GoalkeeperState;
 use crate::r#match::{
-    ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
-    SteeringBehavior,
+    ConditionContext, PlayerSide, StateChangeResult, StateProcessingContext,
+    StateProcessingHandler, SteeringBehavior,
 };
 use nalgebra::Vector3;
 
@@ -50,7 +50,25 @@ impl StateProcessingHandler for GoalkeeperTakeBallState {
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         // Use Seek for full-speed approach - no slowing when chasing a loose ball
-        let target = ctx.tick_context.positions.ball.position;
+        let mut target = ctx.tick_context.positions.ball.position;
+
+        // realism-bug (offside investigation, user's explicit "including
+        // GK" scope): see `clamp_chase_target_x`'s doc comment. In
+        // practice `should_force_takeball`'s own 60u claim radius keeps
+        // a GK anchored near his own box, so this rarely engages — but
+        // the Law applies equally, so it's here for genuine consistency
+        // rather than a special-cased exemption.
+        let half_width = ctx.context.field_size.width as f32 / 2.0;
+        let in_opponent_half = match ctx.player.side {
+            Some(PlayerSide::Left) => target.x > half_width,
+            Some(PlayerSide::Right) => target.x < half_width,
+            None => false,
+        };
+        if in_opponent_half {
+            let ball_x = ctx.tick_context.positions.ball.position.x;
+            target.x = ctx.player().defensive().clamp_chase_target_x(target.x, ball_x);
+        }
+
         let mut arrive_velocity = SteeringBehavior::Seek { target }
             .calculate(ctx.player)
             .velocity;

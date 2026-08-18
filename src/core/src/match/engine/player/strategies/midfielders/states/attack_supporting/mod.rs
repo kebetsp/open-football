@@ -997,31 +997,20 @@ impl MidfielderAttackSupportingState {
         channels
     }
 
-    /// Check if position risks being offside
+    /// Check if position risks being offside. Delegates to the shared
+    /// `find_defensive_line`/`OFFSIDE_HOLD_MARGIN` (realism-bug offside
+    /// investigation) so this agrees with every other offside-adjacent
+    /// check instead of carrying its own separate line computation and
+    /// tolerance constant.
     fn is_offside_risk(&self, ctx: &StateProcessingContext, position: Vector3<f32>) -> bool {
-        let last_defender = ctx
-            .players()
-            .opponents()
-            .all()
-            .filter(|opp| !opp.tactical_positions.is_goalkeeper())
-            .min_by(|a, b| {
-                let a_x = match ctx.player.side {
-                    Some(PlayerSide::Left) => a.position.x,
-                    Some(PlayerSide::Right) => -a.position.x,
-                    None => 0.0,
-                };
-                let b_x = match ctx.player.side {
-                    Some(PlayerSide::Left) => b.position.x,
-                    Some(PlayerSide::Right) => -b.position.x,
-                    None => 0.0,
-                };
-                b_x.partial_cmp(&a_x).unwrap_or(Ordering::Equal)
-            });
+        let defensive = ctx.player().defensive();
+        let line = defensive.find_defensive_line();
+        let margin = crate::r#match::player::strategies::common::players::ops::defensive::DefensiveOperationsImpl::OFFSIDE_HOLD_MARGIN;
 
-        if let Some(defender) = last_defender {
+        if ctx.players().opponents().all().count() > 0 {
             match ctx.player.side {
-                Some(PlayerSide::Left) => position.x > defender.position.x + 5.0,
-                Some(PlayerSide::Right) => position.x < defender.position.x - 5.0,
+                Some(PlayerSide::Left) => position.x > line + margin,
+                Some(PlayerSide::Right) => position.x < line - margin,
                 None => false,
             }
         } else {

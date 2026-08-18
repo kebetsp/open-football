@@ -77,9 +77,26 @@ impl StateProcessingHandler for ForwardAssistingState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        // realism-bug (offside investigation): this Arrived straight at
+        // the opponent goal with zero offside consideration — measured
+        // as the second-largest contributor after TakeBall (3.2% of
+        // real offside calls). Same "hold at the shoulder of the last
+        // defender while a teammate still has the ball" idiom used by
+        // RunningInBehind/Walking/Running.
+        let mut target = ctx.player().opponent_goal_position();
+        let teammate_on_ball = !ctx.ball().is_in_flight()
+            && ctx
+                .ball()
+                .owner_id()
+                .and_then(|id| ctx.context.players.by_id(id))
+                .map_or(false, |o| o.team_id == ctx.player.team_id && o.id != ctx.player.id);
+        target.x = ctx
+            .player()
+            .defensive()
+            .onside_hold_x(target.x, teammate_on_ball);
         Some(
             SteeringBehavior::Arrive {
-                target: ctx.player().opponent_goal_position(),
+                target,
                 slowing_distance: 10.0,
             }
             .calculate(ctx.player)

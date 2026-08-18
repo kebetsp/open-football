@@ -1,5 +1,4 @@
 use crate::club::player::traits::BehavioralDirective;
-use crate::r#match::PlayerSide;
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
 use crate::r#match::player::strategies::common::players::MatchPlayerIteratorExt;
@@ -174,15 +173,10 @@ impl StateProcessingHandler for MidfielderWalkingState {
                     .owner_id()
                     .and_then(|id| ctx.context.players.by_id(id))
                     .map_or(false, |o| o.team_id == ctx.player.team_id && o.id != ctx.player.id);
-            if teammate_on_ball {
-                const ONSIDE_HOLD: f32 = 6.0;
-                let line = ctx.player().defensive().find_defensive_line();
-                target_x = match ctx.player.side {
-                    Some(PlayerSide::Left) => target_x.min(line - ONSIDE_HOLD),
-                    Some(PlayerSide::Right) => target_x.max(line + ONSIDE_HOLD),
-                    None => target_x,
-                };
-            }
+            target_x = ctx
+                .player()
+                .defensive()
+                .onside_hold_x(target_x, teammate_on_ball);
             let target = Vector3::new(target_x, ctx.player.start_position.y, 0.0);
             let to_target = target - ctx.player.position;
             if to_target.magnitude() > 4.0 {

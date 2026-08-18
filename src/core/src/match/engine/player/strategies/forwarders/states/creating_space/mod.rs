@@ -140,21 +140,15 @@ impl ForwardCreatingSpaceState {
         let attacking_direction = self.get_attacking_direction(ctx);
         let is_attacking_left = attacking_direction.x > 0.0;
 
-        // Pre-compute defensive line for offside checks
-        let last_defender_x = all_opponent_positions.iter().fold(
-            if is_attacking_left {
-                f32::MIN
-            } else {
-                f32::MAX
-            },
-            |acc, pos| {
-                if is_attacking_left {
-                    acc.max(pos.x)
-                } else {
-                    acc.min(pos.x)
-                }
-            },
-        );
+        // Pre-compute defensive line for offside checks. realism-bug
+        // (offside investigation): this used to fold over
+        // `all_opponent_positions` unfiltered, which includes the GK —
+        // since the GK is normally the single deepest opponent, that
+        // made this "line" almost always equal to the GK's own depth
+        // (far too permissive; a candidate standing well beyond the
+        // real last outfield defender still scored as onside). Uses
+        // the shared, GK-excluding `find_defensive_line` instead.
+        let last_defender_x = ctx.player().defensive().find_defensive_line();
 
         // Find gaps between opponents using improved multi-strategy approach
         let mut candidate_positions = Vec::with_capacity(40);
@@ -333,10 +327,11 @@ impl ForwardCreatingSpaceState {
         }
 
         // Offside check using pre-computed defensive line
+        let margin = crate::r#match::player::strategies::common::players::ops::defensive::DefensiveOperationsImpl::OFFSIDE_HOLD_MARGIN;
         let is_offside = if is_attacking_left {
-            position.x > last_defender_x + 2.0
+            position.x > last_defender_x + margin
         } else {
-            position.x < last_defender_x - 2.0
+            position.x < last_defender_x - margin
         };
         if !is_offside {
             score += 15.0;
@@ -500,36 +495,21 @@ impl ForwardCreatingSpaceState {
         }
     }
 
+    /// realism-bug (offside investigation): delegates to the shared
+    /// `find_defensive_line`/`OFFSIDE_HOLD_MARGIN` instead of its own
+    /// `is_defender()`-only line (which missed a deep-sitting
+    /// midfielder or wing-back) and its own separate 2.0 tolerance.
     fn would_be_offside(&self, ctx: &StateProcessingContext, position: Vector3<f32>) -> bool {
         let attacking_direction = self.get_attacking_direction(ctx);
         let is_attacking_left = attacking_direction.x > 0.0;
-
-        // Find last defender position
-        let last_defender_x = ctx
-            .players()
-            .opponents()
-            .all()
-            .filter(|p| p.tactical_positions.is_defender())
-            .map(|p| p.position.x)
-            .fold(
-                if is_attacking_left {
-                    f32::MIN
-                } else {
-                    f32::MAX
-                },
-                |acc, x| {
-                    if is_attacking_left {
-                        acc.max(x)
-                    } else {
-                        acc.min(x)
-                    }
-                },
-            );
+        let defensive = ctx.player().defensive();
+        let line = defensive.find_defensive_line();
+        let margin = crate::r#match::player::strategies::common::players::ops::defensive::DefensiveOperationsImpl::OFFSIDE_HOLD_MARGIN;
 
         if is_attacking_left {
-            position.x > last_defender_x + 2.0
+            position.x > line + margin
         } else {
-            position.x < last_defender_x - 2.0
+            position.x < line - margin
         }
     }
 

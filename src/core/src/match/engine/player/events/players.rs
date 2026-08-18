@@ -4586,169 +4586,23 @@ impl PlayerEventDispatcher {
         })
     }
 
-    /// Decide whether the snapshot represents an offside position.
-    /// Tolerance 1.5u to absorb foot-vs-shoulder ambiguity. Kept for
-    /// callers that want a free function rather than the snapshot
-    /// method; the snapshot's `is_offside` is the canonical version.
-    #[allow(dead_code)]
-    pub(crate) fn snapshot_is_offside(snap: &OffsideSnapshot) -> bool {
-        const TOLERANCE: f32 = 1.5;
-        match snap.passer_side {
-            PlayerSide::Left => {
-                if snap.receiver_x_at_kick <= snap.ball_x_at_kick + TOLERANCE {
-                    return false;
-                }
-                snap.receiver_x_at_kick > snap.second_last_defender_x + TOLERANCE
-            }
-            PlayerSide::Right => {
-                if snap.receiver_x_at_kick >= snap.ball_x_at_kick - TOLERANCE {
-                    return false;
-                }
-                snap.receiver_x_at_kick < snap.second_last_defender_x - TOLERANCE
-            }
-        }
-    }
-
-    /// Legacy direct check kept for any in-tree callers that still want
-    /// pass-creation-time offside (none should remain after the delayed
-    /// resolver).
-    #[allow(dead_code)]
-    fn is_receiver_offside(receiver_id: u32, passer_id: u32, field: &MatchField) -> bool {
-        let receiver = match field.players.iter().find(|p| p.id == receiver_id) {
-            Some(p) => p,
-            None => return false,
-        };
-
-        // Verify passer exists
-        if !field.players.iter().any(|p| p.id == passer_id) {
-            return false;
-        }
-
-        let receiver_side = match receiver.side {
-            Some(s) => s,
-            None => return false,
-        };
-
-        let half_width = field.size.half_width as f32;
-        let ball_x = field.ball.position.x;
-        let receiver_x = receiver.position.x;
-
-        // Tolerance to avoid marginal false positives
-        const TOLERANCE: f32 = 1.0;
-
-        match receiver_side {
-            PlayerSide::Left => {
-                // Left side attacks right: opponent goal at x = field_width
-                // Must be in opponent's half (past halfway)
-                if receiver_x < half_width {
-                    return false;
-                }
-                // Must be ahead of the ball (closer to opponent goal)
-                if receiver_x <= ball_x + TOLERANCE {
-                    return false;
-                }
-                // Collect all opponents (Right side players)
-                // Right side's own goal is at x = field_width
-                // Sort DESCENDING so [0] = closest to their goal (GK), [1] = second-to-last
-                let mut opponent_xs: Vec<f32> = field
-                    .players
-                    .iter()
-                    .filter(|p| p.side == Some(PlayerSide::Right))
-                    .map(|p| p.position.x)
-                    .collect();
-                opponent_xs.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-
-                if opponent_xs.len() < 2 {
-                    return false;
-                }
-                let second_last_x = opponent_xs[1];
-
-                // Offside if receiver is beyond (greater x) the second-to-last opponent
-                receiver_x > second_last_x + TOLERANCE
-            }
-            PlayerSide::Right => {
-                // Right side attacks left: opponent goal at x = 0
-                // Must be in opponent's half (before halfway)
-                if receiver_x > half_width {
-                    return false;
-                }
-                // Must be ahead of the ball (closer to opponent goal, i.e. smaller x)
-                if receiver_x >= ball_x - TOLERANCE {
-                    return false;
-                }
-                // Collect all opponents (Left side players)
-                // Left side's own goal is at x = 0
-                // Sort ASCENDING so [0] = closest to their goal (GK), [1] = second-to-last
-                let mut opponent_xs: Vec<f32> = field
-                    .players
-                    .iter()
-                    .filter(|p| p.side == Some(PlayerSide::Left))
-                    .map(|p| p.position.x)
-                    .collect();
-                opponent_xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
-                if opponent_xs.len() < 2 {
-                    return false;
-                }
-                let second_last_x = opponent_xs[1];
-
-                // Offside if receiver is beyond (smaller x) the second-to-last opponent
-                receiver_x < second_last_x - TOLERANCE
-            }
-        }
-    }
-
-    /// Handle an offside event: stop the ball, award a free kick to the nearest opponent.
+    /// Count-only, by explicit design decision (2026-08 offside
+    /// investigation): offside is detected and tallied so its real rate
+    /// can be tracked while the underlying player-behavior fixes bed in,
+    /// but does NOT stop play, award a free kick, or change possession
+    /// yet — that consequence is deliberately deferred. Previously this
+    /// stopped the ball and handed possession to the nearest opponent;
+    /// all of that was removed. `try_pass_target_claim` (ownership.rs)
+    /// no longer short-circuits the reception when this fires, so the
+    /// pass completes normally.
     fn handle_offside_event(
         offside_player_id: u32,
-        position: Vector3<f32>,
+        _position: Vector3<f32>,
         field: &mut MatchField,
     ) {
-        // Increment offside stat on the player
         if let Some(player) = field.players.iter_mut().find(|p| p.id == offside_player_id) {
             player.statistics.offsides += 1;
         }
-
-        // Determine the offside player's side to find opponents
-        let offside_side = field
-            .players
-            .iter()
-            .find(|p| p.id == offside_player_id)
-            .and_then(|p| p.side);
-
-        // Find nearest opponent to the offside position to award free kick
-        let nearest_opponent_id = field
-            .players
-            .iter()
-            .filter(|p| p.side != offside_side && p.side.is_some())
-            .min_by(|a, b| {
-                let dist_a = (a.position - position).norm();
-                let dist_b = (b.position - position).norm();
-                dist_a
-                    .partial_cmp(&dist_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .map(|p| p.id);
-
-        // Stop ball at offside position
-        field.ball.position = position;
-        field.ball.velocity = Vector3::new(0.0, 0.0, 0.0);
-
-        // Award possession to nearest opponent (free kick)
-        if let Some(opponent_id) = nearest_opponent_id {
-            field.ball.previous_owner = field.ball.current_owner;
-            field.ball.current_owner = Some(opponent_id);
-            field.ball.ownership_duration = 0;
-            // §9.4.1: this player is the staged free-kick taker.
-            field.ball.restart_pending_taker = Some(opponent_id);
-        }
-
-        // Protected possession (same pattern as foul free kick)
-        field.ball.claim_cooldown = 60;
-        field.ball.flags.in_flight_state = 60;
-        field.ball.contested_claim_count = 0;
-        field.ball.pass_target_player_id = None;
-        field.ball.clear_pass_history();
     }
 
     /// Identify the goalkeeper who is about to clear a shot, if any.

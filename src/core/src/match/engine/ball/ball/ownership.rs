@@ -251,6 +251,17 @@ impl Ball {
                     // claim. Set-piece-origin snapshots were never built
                     // (exempt origins skip snapshot creation), so there's
                     // no need to re-check the origin here.
+                    // Count-only, by explicit design decision (2026-08
+                    // offside investigation): still detected and tallied
+                    // (see `handle_offside_event`, now stats-only) so the
+                    // real rate can be tracked while the underlying
+                    // player-behavior fixes bed in, but no longer stops
+                    // play — falls through to the normal reception below
+                    // instead of `return`ing early, so the pass completes
+                    // as if legal. Revert this block (restore the early
+                    // return + FreeKick/ball-stop side effects that used
+                    // to live here) to re-enable the free-kick
+                    // consequence once ready.
                     if let Some(snap) = self.offside_snapshot {
                         if snap.receiver_id == target_id && snap.is_offside() {
                             let restart_pos = Vector3::new(
@@ -259,13 +270,7 @@ impl Ball {
                                 0.0,
                             );
                             self.offside_snapshot = None;
-                            self.pass_target_player_id = None;
-                            self.flags.in_flight_state = 0;
-                            self.cached_shot_target = None;
-                            self.pass_origin_restart = PassOriginRestart::FreeKick;
-                            self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
                             events.add_ball_event(BallEvent::Offside(target_id, restart_pos));
-                            return;
                         }
                     }
                     let passer_id = self.previous_owner;
