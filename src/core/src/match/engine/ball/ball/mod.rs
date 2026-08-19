@@ -475,6 +475,16 @@ pub struct ShotTarget {
     /// worst moment regardless of how small the delay constant was.
     /// Unused (defaults to 0, inert) for every non-FK shot.
     pub dispatch_tick: u64,
+    /// Set when this "shot" is a deliberate concede-a-restart action
+    /// (`reason == "FWD_RUN_SAFE_RESTART"`, 2026-08 dribble/pass/shot
+    /// decision plan) rather than a genuine attempt on goal. Read by
+    /// `try_block_shot` to nudge its outcome weights toward a real
+    /// touch/deflection (the whole point of this action — get rid of
+    /// the ball under pressure, not let the defender calmly control it)
+    /// rather than the default distribution tuned for a contested shot
+    /// at goal. Unused (defaults to `false`, inert) for every other
+    /// shot type.
+    pub is_safe_restart: bool,
 }
 
 #[derive(Default, Clone)]

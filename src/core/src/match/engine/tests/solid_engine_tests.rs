@@ -238,6 +238,7 @@ fn clear_open_play_metadata_makes_invariants_hold_after_set_piece_restart() {
         is_direct_fk: false,
         total_flight_ticks: 0.0,
         dispatch_tick: 0,
+        is_safe_restart: false,
     });
     ball.pass_target_player_id = Some(10);
     ball.pending_pass_passer = Some(9);
@@ -282,6 +283,7 @@ fn shot_without_previous_owner_fails_invariant() {
         is_direct_fk: false,
         total_flight_ticks: 0.0,
         dispatch_tick: 0,
+        is_safe_restart: false,
     });
     // No previous_owner → "who fired this?" can't be answered — debug
     // builds and tests should flag this.
@@ -332,6 +334,7 @@ fn dead_ball_corner_with_leftover_shot_metadata_fails_invariant() {
         is_direct_fk: false,
         total_flight_ticks: 0.0,
         dispatch_tick: 0,
+        is_safe_restart: false,
     });
     assert!(matches!(
         ball.check_invariants(),

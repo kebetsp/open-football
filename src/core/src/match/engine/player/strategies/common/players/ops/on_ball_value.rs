@@ -285,6 +285,70 @@ pub fn angle_xg_correction(ctx: &StateProcessingContext) -> f32 {
     (actual / reference).clamp(0.5, 1.6)
 }
 
+/// "Genuinely open net" fast-path signal (2026-07-28, Pavel's "wide open
+/// goal, GK dragged wide, no shot" report). Used ONLY by two narrow
+/// consumers — the long-range willingness floor in
+/// `forward_shot_decision.rs` and the team-cooldown exemption in
+/// `TeamOperationsImpl::can_shoot` — never by `shot_clarity()` /
+/// `has_clear_shot()` itself, which is deliberately GK-blind by design
+/// (see that function's own doc comment on why tying the general
+/// clear-shot gate to keeper position would create a bad incentive for
+/// the AI to "wait for the keeper to be out of position" on ordinary
+/// shots). This is a separate, additional, stricter signal for the
+/// specific case real players treat as basically automatic regardless
+/// of range: nobody in the shot lane AND the keeper barely covers the
+/// goal-mouth angle from here.
+///
+/// Real-world grounding: no public dataset isolates "shot-taking rate
+/// with a genuinely open net, any range" — this is a reasoned estimate
+/// (category (d) per the realism framework), not a sourced target. The
+/// qualitative case is uncontroversial (a real player very rarely
+/// declines a clean look at an unguarded goal at any sensible range);
+/// the previous willingness model had no mechanism honouring that past
+/// 36u at all.
+///
+/// Returns `(is_open, gk_occlusion)`. `gk_occlusion` is how much of the
+/// unoccluded goal-mouth angle the keeper's position currently blocks,
+/// in `[0, 1]` — 0 means the keeper isn't in the way at all. `is_open`
+/// additionally requires the outfield lane to be clear (`has_clear_shot`)
+/// and the shot to be within the engine's own absolute shot-distance
+/// ceiling (220u — matches the hard cap in `forward_shot_decision.rs`;
+/// duplicated here as a guard since this is also consulted from
+/// `team.rs`, which has no equivalent prior distance check of its own).
+pub fn open_net_signal(ctx: &StateProcessingContext) -> (bool, f32) {
+    let shot_pos = ctx.player.position;
+    let goal_position = ctx.player().opponent_goal_position();
+    let distance = (goal_position - shot_pos).magnitude();
+    if distance > 220.0 {
+        return (false, 0.0);
+    }
+
+    let gk_pos = ctx
+        .players()
+        .opponents()
+        .goalkeeper()
+        .next()
+        .map(|g| g.position);
+
+    let full_angle = effective_open_angle(ctx, shot_pos, None);
+    let occluded_angle = match gk_pos {
+        Some(gp) => effective_open_angle(ctx, shot_pos, Some(gp)),
+        None => full_angle,
+    };
+    let gk_occlusion = if full_angle > 0.02 {
+        (1.0 - occluded_angle / full_angle).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    // Keeper blocking less than ~15% of the visible angle is "not
+    // meaningfully in the way" — genuinely dragged out of position, not
+    // just favouring a side while still covering the frame.
+    const OPEN_NET_OCCLUSION_MAX: f32 = 0.15;
+    let is_open = ctx.player().has_clear_shot() && gk_occlusion < OPEN_NET_OCCLUSION_MAX;
+    (is_open, gk_occlusion)
+}
+
 /// PRD: docs/attacker-angle-seeking-and-gk-drag (Option B completion,
 /// Milestone 1). Projects where the keeper could realistically be by the
 /// time the carrier reaches `candidate` — the `gk_projected_pos` term the
@@ -781,4 +845,167 @@ pub fn best_pass_value_from(ctx: &StateProcessingContext, point: Vector3<f32>) -
         }
     }
     best
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Unified dribble/pass/shoot/safe-restart/recycle comparison (2026-08
+// realism-bug session — see the offside/TakeBall work earlier the same
+// session for the architectural precedent this follows). `ForwardRunningState`
+// previously decided pass vs. dribble via two independent, sequential
+// skill-curve gates that never compared against each other, and forced a
+// Pass as the fallback when both failed regardless of whether one existed.
+// These three functions let that fallback tier become a genuine value
+// comparison instead.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Real value of shooting from the carrier's CURRENT position — reuses the
+/// exact same xG computation `evaluate_forward_shot_decision`
+/// (forward_shot_decision.rs) already trusts (distance-banded
+/// `expected_xg` × this file's own `angle_xg_correction`), so the raw
+/// magnitude is directly comparable to what that function would compute,
+/// just queryable as a pure value without committing to
+/// `ShotDecision::Shoot`. Naturally near-zero from a hopeless distance/
+/// angle, naturally high for a genuine chance — no separate distance/
+/// angle gate is layered on top.
+///
+/// `SHOOT_COMPARISON_SCALE`: raw xG lives on a "true probability this
+/// exact attempt scores" scale (typical realistic in-game values ~0.02-
+/// 0.15, per `expected_xg`'s own calibration comment — real shot
+/// populations average ~0.10). `pass_val`/`dribble_val` at this same
+/// decision point live on a *different* currency — `pass_value_from`'s
+/// terminal value is `shallow_terminal_value_at`, an angle-subtended
+/// POSITIONAL-danger proxy (`effective_open_angle`-based, ~[0,1], no
+/// steep distance decay), not a converted goal probability — the same
+/// currency `carry_value`'s own internal shot term (`carry_shot_value`)
+/// already uses. Comparing raw xG against that proxy directly is
+/// comparing different units: measured against ~11,800 real in-match
+/// decision points reaching this comparison (2026-08 diagnostic,
+/// VALCMP), raw xG's mean (0.018) sat roughly 15-20x below pass/dribble's
+/// means (0.26/0.36) and shoot won 0% of comparisons — including cases
+/// with a plainly reasonable close-range attempt on offer. This constant
+/// is the documented conversion between the two currencies, not a hard
+/// override: it does not touch the underlying xG shape (a hopeless long
+/// shot still scores far below a genuine chance, just as before), it
+/// only rescales the whole curve up so a *good* chance can plausibly
+/// outweigh a *mediocre* pass/dribble option, matching Pavel's framing
+/// ("shot gets a strong situational preference via genuine xG magnitude,
+/// not a hard override"). Tuned against that same diagnostic data (not
+/// sourced — no dataset publishes a "how often should a forward shoot
+/// vs. pass at this specific decision tier" rate), iterating 8/10/15:
+/// 15 pushed goals/match to a repeatable ~4.6-5.2 across two 20-30-match
+/// batches (too high); 8 pulled it to ~2.6-2.9; 10 landed at 2.53-3.17
+/// across three batches (pooled ~2.9/75 matches), statistically
+/// indistinguishable from the SAME-day, unmodified, already-deployed
+/// baseline measured the identical way (2.53, then 3.13 — pooled
+/// ~2.83/60 matches) — i.e. 10 sits within this project's own
+/// well-documented batch-to-batch noise band rather than shifting goals/
+/// match at all attributably. At scale=10, the dispatched
+/// `FWD_RUN_VALUE_SHOOT` event (previously 0/match, the reported bug)
+/// fires ~10-13/match, roughly half of all shot attempts in a match —
+/// this call site only runs AFTER the eager high-priority shot chain
+/// (FWD_ROUND_KEEPER/FWD_RUN_SHOOT_ON_SIGHT/FWD_SNAPSHOT_PRESSED/
+/// FWD_RUN_POINT_BLANK/FWD_RUN_PRIO05_CLEAR/FWD_RUN_PRIO06_BOX) has
+/// already declined, so the population reaching here is deliberately
+/// skewed toward mediocre-to-poor chances — a real, non-trivial win
+/// rate here (not a rare one) is consistent with this being the exact
+/// gap the wider deflection/corner investigation flagged: too few shot
+/// attempts from anything but a clean chance, suppressing blocks/
+/// deflections/corners league-wide. `shoot_value()` has exactly one call
+/// site (this comparison) as of 2026-08, so this scaling lives here
+/// rather than at the call site.
+const SHOOT_COMPARISON_SCALE: f32 = 10.0;
+
+pub fn shoot_value(ctx: &StateProcessingContext) -> f32 {
+    // Same hard gates evaluate_forward_shot_decision checks first — a
+    // shot that's mechanically impossible right now (cooldown, absurd
+    // range) must never win the comparison just because its xG looks
+    // fine in isolation.
+    if !ctx.team().can_shoot() || !ctx.player().can_shoot() {
+        return 0.0;
+    }
+    let distance = ctx.ball().distance_to_opponent_goal();
+    if distance > 220.0 {
+        return 0.0;
+    }
+    let profile = ctx.player().shooting().shot_profile();
+    let has_clear = ctx.player().has_clear_shot();
+    let mut xg = profile.expected_xg(distance, has_clear);
+    xg *= angle_xg_correction(ctx);
+    (xg * SHOOT_COMPARISON_SCALE).max(0.0)
+}
+
+/// A candidate "put it into the nearest defender and concede a controlled
+/// restart rather than risk losing the ball badly" action.
+pub struct SafeRestartCandidate {
+    pub value: f32,
+    pub target_defender_id: u32,
+    pub aim_point: Vector3<f32>,
+}
+
+/// Distance margins for `safe_restart_value` — reasoned estimates (no
+/// sourced dataset exists for this niche a behaviour), not sourced. Tune
+/// from observed batch behaviour rather than treating as calibrated.
+const SAFE_RESTART_LINE_MARGIN: f32 = 40.0; // ~5m from a byline/touchline
+const SAFE_RESTART_PRESS_MARGIN: f32 = 24.0; // ~3m from the nearest defender
+const SAFE_RESTART_BASE_VALUE: f32 = 0.30;
+
+/// Value of deliberately sending the ball into the nearest opponent to
+/// concede a corner/throw-in/goal-kick instead of risking a turnover.
+/// Deliberately a smooth, continuous falloff on both the line-proximity
+/// and press-proximity terms (a hard cutoff was found, earlier this same
+/// investigation, to create an unrealistic discontinuity in the analogous
+/// `shot_clarity` angle formula) — so the value tapers to zero rather than
+/// jumping, and is ~0 from mid-pitch by construction, with no separate
+/// "don't try this from the middle of the field" gate needed.
+///
+/// Returns `None` when no opponent is close enough to plausibly be the
+/// target of the deflection at all.
+pub fn safe_restart_value(ctx: &StateProcessingContext) -> Option<SafeRestartCandidate> {
+    let pos = ctx.player.position;
+    let field_width = ctx.context.field_size.width as f32;
+    let field_height = ctx.context.field_size.height as f32;
+
+    let dist_to_line = pos
+        .x
+        .min(field_width - pos.x)
+        .min(pos.y)
+        .min(field_height - pos.y);
+    let line_factor = (1.0 - dist_to_line / SAFE_RESTART_LINE_MARGIN).clamp(0.0, 1.0);
+    if line_factor <= 0.0 {
+        return None;
+    }
+
+    let nearest_defender = ctx
+        .players()
+        .opponents()
+        .all()
+        .filter(|p| !p.tactical_positions.is_goalkeeper())
+        .map(|p| (p.id, p.position, (p.position - pos).magnitude()))
+        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))?;
+    let (defender_id, defender_pos, defender_dist) = nearest_defender;
+    let press_factor = (1.0 - defender_dist / SAFE_RESTART_PRESS_MARGIN).clamp(0.0, 1.0);
+    if press_factor <= 0.0 {
+        return None;
+    }
+
+    let value = SAFE_RESTART_BASE_VALUE * line_factor * press_factor;
+    if value <= 0.0 {
+        return None;
+    }
+    Some(SafeRestartCandidate {
+        value,
+        target_defender_id: defender_id,
+        aim_point: defender_pos,
+    })
+}
+
+/// Modest, deliberately unglamorous "hold shape / turn back / lay it off
+/// safely" floor value. Reasoned starting constant, not sourced — should
+/// only ever win the comparison because every other candidate scored
+/// lower, never because it's hardcoded as a default fallback (that was
+/// the exact bug this whole comparison replaces).
+const RECYCLE_VALUE: f32 = 0.15;
+
+pub fn recycle_value(_ctx: &StateProcessingContext) -> f32 {
+    RECYCLE_VALUE
 }

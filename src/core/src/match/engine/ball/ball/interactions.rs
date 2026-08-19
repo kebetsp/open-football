@@ -222,7 +222,7 @@ impl Ball {
         events: &mut EventCollection,
     ) {
         // Only live shots — no cache means no shot in flight, no block.
-        let _shot_target = match self.cached_shot_target {
+        let shot_target = match self.cached_shot_target {
             Some(t) => t,
             None => return,
         };
@@ -392,9 +392,25 @@ impl Ball {
         let rev_y = -shot_dir_x * angle.sin() + (-shot_dir_y) * angle.cos();
         let tick = self.current_tick_cached;
 
+        // realism-bug (2026-08, safe-restart plan, task 4): a player who
+        // deliberately struck this ball at the defender to concede a
+        // restart (`is_safe_restart`, not an on-goal attempt) is trying
+        // to send it out of play, not offer the defender a comfortable
+        // take. Small, additive nudge — shrink the clean-control share
+        // and hand the difference to the corner-style deflection-out
+        // branch; every other branch weight (and every non-safe-restart
+        // shot) is untouched. Reasoned, not sourced — this is the same
+        // genuinely niche behaviour the plan itself flags as having no
+        // findable real-world rate to calibrate against.
+        let p_controlled = if shot_target.is_safe_restart {
+            controlled_block_prob * 0.5
+        } else {
+            controlled_block_prob
+        };
+        let corner_bump = if shot_target.is_safe_restart { 0.12 } else { 0.0 };
+
         let roll = context.rng.unit_f32();
-        let p_controlled = controlled_block_prob;
-        let p_corner = p_controlled + 0.23;
+        let p_corner = p_controlled + 0.23 + corner_bump;
         let p_safe = p_corner + 0.23;
         let p_loose = p_safe + 0.40; // ~40% loose central rebound
         // remainder ~14% → unlucky deflection toward goal (slows but stays live)

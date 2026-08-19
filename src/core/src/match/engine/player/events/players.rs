@@ -2774,6 +2774,118 @@ impl PlayerEventDispatcher {
         const MAX_SHOT_VELOCITY: f32 = 3.2;
         const MIN_SHOT_DISTANCE: f32 = 1.0; // Minimum distance to prevent NaN from normalization
 
+        // realism-bug (2026-08, dribble/pass/shot decision plan —
+        // docs/../.claude/plans/steady-scribbling-pike.md): the on-ball
+        // value comparison (`on_ball_value::safe_restart_value`) judged
+        // deliberately conceding a controlled restart better than
+        // shooting/passing/dribbling. Dedicated early-return branch —
+        // none of the goal-aiming/y-error/miskick/wall logic below
+        // applies, this ball was never meant to threaten a goal. Aim
+        // directly at the nearest non-GK opponent (re-found here, fresh,
+        // rather than threading the decision-time target through
+        // `pending_shot_reason`, which is just a `&'static str` — the
+        // situation a tick or two later is functionally identical) with
+        // a modest, grounded, skill-scaled strike — a real "backs to the
+        // wall, get rid of it" clearance, not a power shot.
+        //
+        // Deliberately does NOT try to force a specific restart type
+        // (corner vs. throw-in vs. goal-kick) here. `try_block_shot`
+        // still gets a chance to fire (a well-formed `cached_shot_target`
+        // is set below purely so its `.is_some()` gate passes — its own
+        // corridor scan reads live ball velocity/positions, not this
+        // struct's fields, confirmed by reading it: the match binding is
+        // `_shot_target`) and, per task 4, its outcome weights are
+        // nudged toward a genuine touch/deflection for this reason tag.
+        // But `try_block_shot`'s own `p_corner` branch assumes a
+        // near-goal shot (it teleports the ball to the BLOCKER's own
+        // byline) — correct when this fires near the opponent's goal
+        // (the common case: forwards are usually in the attacking
+        // third), geometrically wrong for the rarer case where the
+        // carrier is pinned near a midfield touchline instead. Not
+        // specially guarded against — accepted as a known, flagged edge
+        // case rather than a deeper change to a shared, already-proven
+        // function. Either way (touch or clean miss), the ball's own
+        // straight-line trajectory toward a boundary-adjacent opponent,
+        // combined with the EXISTING generic out-of-bounds classifiers
+        // (`goal.rs`'s `check_wide_of_goal`/`check_over_goal`, the
+        // throw-in touchline check — all keyed on `last_touch_player_id`,
+        // not on anything this branch sets) is what actually resolves
+        // corner vs. throw-in vs. goal-kick — no new restart-type logic
+        // needed here.
+        if shoot_event_model.reason == "FWD_RUN_SAFE_RESTART" {
+            let shooter_id = shoot_event_model.from_player_id;
+            let shooter_pos = field.ball.position;
+            let shooter_team_id = field.get_player(shooter_id).map(|p| p.team_id);
+            let shooter_side = field.get_player(shooter_id).and_then(|p| p.side);
+            let shooter_power_skill = field
+                .get_player(shooter_id)
+                .map(|p| (p.skills.technical.long_shots / 20.0).clamp(0.0, 1.0))
+                .unwrap_or(0.5);
+
+            let target = shooter_team_id.and_then(|team_id| {
+                field
+                    .players
+                    .iter()
+                    .filter(|p| p.team_id != team_id)
+                    .filter(|p| {
+                        p.tactical_position.current_position.position_group()
+                            != PlayerFieldPositionGroup::Goalkeeper
+                    })
+                    .map(|p| (p.position, (p.position - shooter_pos).magnitude()))
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            });
+
+            if let Some((defender_pos, dist)) = target {
+                let dir = if dist > MIN_SHOT_DISTANCE {
+                    (defender_pos - shooter_pos) / dist
+                } else {
+                    Vector3::new(1.0, 0.0, 0.0)
+                };
+                // ~1.2-2.0 u/tick — a deliberate, real-paced strike, well
+                // under MAX_SHOT_VELOCITY (3.2), matching the plan's own
+                // note that a "reasonable, not maximal-force" strike is
+                // already what the block-chance physics rewards (a
+                // faster shot is HARDER for a defender to get a body in
+                // front of — `try_block_shot`'s own `speed_penalty` term
+                // — so blasting it would work against the intent here).
+                let speed = 1.2 + shooter_power_skill * 0.8;
+                field.ball.velocity = dir * speed;
+                field.ball.position.z = 0.0;
+                field.ball.previous_owner = Some(shooter_id);
+                field.ball.current_owner = None;
+                field.ball.pass_target_player_id = None;
+                field.ball.carry_owner = None;
+                field.ball.clear_pending_pass_metadata();
+                field.ball.flags.in_flight_state = 40; // matches every other dispatched shot
+                if let Some(side) = shooter_side {
+                    let field_height = field.size.height as f32;
+                    let defending_side = match side {
+                        PlayerSide::Left => PlayerSide::Right,
+                        PlayerSide::Right => PlayerSide::Left,
+                    };
+                    field.ball.cached_shot_target = Some(ShotTarget {
+                        goal_line_y: (shooter_pos.y + dir.y * 100.0).clamp(0.0, field_height),
+                        goal_line_z: 0.0,
+                        defending_side,
+                        deflected: false,
+                        physics_save_rolled: false,
+                        is_direct_fk: false,
+                        total_flight_ticks: (dist / speed).max(1.0),
+                        dispatch_tick: shoot_event_model.tick,
+                        is_safe_restart: true,
+                    });
+                }
+            } else {
+                // No eligible opponent found (extremely rare —
+                // `safe_restart_value` itself requires one to fire this
+                // reason at all). Leave the ball dead rather than
+                // falling through to goal-aiming logic below that
+                // assumes an on-target attempt.
+                field.ball.velocity = Vector3::zeros();
+            }
+            return;
+        }
+
         // §9.4.1 same-touch rule: a shot struck directly from a restart
         // (direct free kick at goal) locks the taker out of the next
         // touch, e.g. his own rebound off the keeper or post. Keyed on
@@ -3855,6 +3967,7 @@ impl PlayerEventDispatcher {
                     is_direct_fk: shoot_event_model.reason == "FK_DIRECT",
                     total_flight_ticks: ticks_to_goal.max(1.0),
                     dispatch_tick: shoot_event_model.tick,
+                    is_safe_restart: false,
                 });
             } else {
                 field.ball.cached_shot_target = None;

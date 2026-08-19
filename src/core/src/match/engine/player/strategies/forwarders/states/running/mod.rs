@@ -5,10 +5,10 @@ use crate::r#match::forwarders::states::ForwardState;
 use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondition};
 use crate::r#match::player::events::{PassingEventContext, PlayerEvent};
 use crate::r#match::player::strategies::common::players::MatchPlayerIteratorExt;
+use crate::r#match::player::strategies::common::players::ops::on_ball_value;
 use crate::r#match::player::strategies::common::players::ops::forward_shot_decision::{
     ShotDecision, evaluate_forward_shot_decision,
 };
-use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
     ConditionContext, GamePhase, MatchPlayerLite, PlayerDistanceFromStartPosition, PlayerSide,
     StateChangeResult, StateProcessingContext, StateProcessingHandler, SteeringBehavior,
@@ -187,7 +187,6 @@ const MEDIUM_RANGE_DISTANCE: f32 = 70.0; // ~35m - medium range shots
 
 // Passing decision thresholds for forwards
 const SHOOTING_ZONE_DISTANCE: f32 = 48.0; // Only shoot under pressure from close range
-const TEAMMATE_ADVANTAGE_STRICT_RATIO: f32 = 0.7; // Teammate must be 30% closer to override
 
 // Performance thresholds
 const SPRINT_DURATION_THRESHOLD: u64 = 150; // Ticks before considering fatigue
@@ -960,54 +959,94 @@ impl StateProcessingHandler for ForwardRunningState {
                 }
             }
 
-            // Evaluate best action based on game context
-            // Require minimum carry time to prevent instant pass-after-receive
-            let ownership_ticks = ctx.tick_context.ball.ownership_duration;
-            if ownership_ticks > 12 && self.should_pass(ctx) {
-                return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
-            }
-
-            if ownership_ticks > 20 && self.should_dribble(ctx) {
-                return Some(StateChangeResult::with_forward_state(
-                    ForwardState::Dribbling,
-                ));
-            }
-
-            // Cross from wide position in attacking third
+            // Cross from wide position in attacking third — a distinct
+            // wide-position action, evaluated separately from (and before)
+            // the value comparison below.
             if self.should_cross(ctx) {
                 return Some(StateChangeResult::with_forward_state(
                     ForwardState::Crossing,
                 ));
             }
 
-            // ANTI-OSCILLATION: If carrying ball too long without acting, force a decision
-            // Prefer passing over shooting to maintain realistic play.
-            //
-            // The decision point used to fire a Shoot event directly when
-            // a competent finisher had a clear shot in close range. That
-            // bypassed every gate in the centralised helper because
-            // ForwardShootingState skips its own helper call when
-            // `pending_shot_reason` is Some. Now the final yes/no comes
-            // from the helper too — a sprinting Composure-8 striker no
-            // longer auto-fires just because we hit the 120-tick limit.
-            if ctx.in_state_time > 120 {
-                let finishing = ctx.player.skills.technical.finishing / 20.0;
-                if can_shoot
-                    && distance_to_goal < POINT_BLANK_DISTANCE * 1.5
-                    && finishing > 0.5
-                    && ctx.player().has_clear_shot()
-                    && ctx.player().shooting().has_good_angle()
-                {
-                    if let ShotDecision::Shoot { reason } =
-                        evaluate_forward_shot_decision(ctx, "FWD_RUN_ANTI_OSCILLATION")
-                    {
+            // realism-bug (2026-08): unified dribble/pass/shoot/safe-restart/
+            // recycle comparison. Replaces the old should_pass/should_dribble
+            // sequential gates (independent skill-curve rolls that never
+            // compared against each other) and the anti-oscillation
+            // branch's hardcoded "force a Pass regardless of whether one
+            // exists" fallback. Each candidate's value is a real, honestly
+            // computed number (see on_ball_value.rs's shoot_value /
+            // safe_restart_value / recycle_value docs) — none is a
+            // hardcoded default; recycle only wins because it genuinely
+            // scored higher than a bad pass would have, not because the
+            // code ran out of other branches. Engages past the same
+            // 12-tick settle floor should_pass used to require.
+            let ownership_ticks = ctx.tick_context.ball.ownership_duration;
+            if ownership_ticks > 12 {
+                let (_dribble_target, dribble_val) = on_ball_value::carry_candidates(ctx);
+                let pass_val = on_ball_value::best_pass_value_from(ctx, ctx.player.position);
+                let shoot_val = on_ball_value::shoot_value(ctx);
+                let safe_restart = on_ball_value::safe_restart_value(ctx);
+                let safe_restart_val = safe_restart.as_ref().map(|c| c.value).unwrap_or(0.0);
+                let recycle_val = on_ball_value::recycle_value(ctx);
+
+                crate::match_log_info!(
+                    "VALCMP pass={:.3} dribble={:.3} shoot={:.3} safe_restart={:.3} recycle={:.3} dist_goal={:.1}",
+                    pass_val,
+                    dribble_val,
+                    shoot_val,
+                    safe_restart_val,
+                    recycle_val,
+                    ctx.ball().distance_to_opponent_goal()
+                );
+
+                let mut best_label = "recycle";
+                let mut best_val = recycle_val;
+                if pass_val > best_val {
+                    best_label = "pass";
+                    best_val = pass_val;
+                }
+                if dribble_val > best_val {
+                    best_label = "dribble";
+                    best_val = dribble_val;
+                }
+                if shoot_val > best_val {
+                    best_label = "shoot";
+                    best_val = shoot_val;
+                }
+                if safe_restart_val > best_val {
+                    best_label = "safe_restart";
+                }
+
+                match best_label {
+                    "pass" => {
+                        return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
+                    }
+                    "dribble" => {
+                        return Some(StateChangeResult::with_forward_state(
+                            ForwardState::Dribbling,
+                        ));
+                    }
+                    "shoot" => {
                         return Some(
                             StateChangeResult::with_forward_state(ForwardState::Shooting)
-                                .with_shot_reason(reason),
+                                .with_shot_reason("FWD_RUN_VALUE_SHOOT"),
                         );
                     }
+                    "safe_restart" => {
+                        return Some(
+                            StateChangeResult::with_forward_state(ForwardState::Shooting)
+                                .with_shot_reason("FWD_RUN_SAFE_RESTART"),
+                        );
+                    }
+                    _ => {
+                        // Recycle won: nothing else scored better than
+                        // holding shape. No forced action — let the
+                        // player's existing movement/positioning continue
+                        // and re-evaluate next tick, rather than forcing
+                        // a pass that just lost the comparison.
+                        return None;
+                    }
                 }
-                return Some(StateChangeResult::with_forward_state(ForwardState::Passing));
             }
 
             // Continue running with ball briefly while looking for an opening
@@ -1981,83 +2020,6 @@ impl ForwardRunningState {
         best_gap
     }
 
-    /// Calculate supporting movement when team has ball
-
-    fn should_pass(&self, ctx: &StateProcessingContext) -> bool {
-        let teammates: Vec<MatchPlayerLite> = ctx.players().teammates().nearby(300.0).collect();
-
-        if teammates.is_empty() {
-            return false;
-        }
-
-        // Core skill curves — sigmoid-rolled per evaluation so the
-        // full 1-20 range matters for each decision branch, replacing
-        // `> 0.7` cliffs that flattened mid-skill players.
-        let vision_raw = ctx.player.skills.mental.vision;
-        let passing_raw = ctx.player.skills.technical.passing;
-        let decisions_raw = ctx.player.skills.mental.decisions;
-        let teamwork_raw = ctx.player.skills.mental.teamwork;
-
-        // Situational factors — use common pressure check
-        let under_pressure = ctx.player().pressure().is_under_immediate_pressure();
-        let distance_to_goal = ctx.ball().distance_to_opponent_goal();
-        let stamina = ctx.player.player_attributes.condition_percentage() as f32 / 100.0;
-
-        // 1. MUST PASS: Heavy pressure or exhaustion
-        if under_pressure {
-            let pass_p = SkillCurve::new(passing_raw, 10.0, 0.6).probability();
-            if ctx.context.rng.unit_f32() < pass_p || stamina < 0.4 {
-                return self.has_safe_passing_option(ctx, &teammates);
-            }
-        }
-
-        // 2. PREFER TO RUN/SHOOT: Very close to goal - only pass if teammate is much better positioned
-        if distance_to_goal < CLOSE_RANGE_DISTANCE && !under_pressure {
-            return self.has_better_positioned_teammate(ctx, &teammates, distance_to_goal);
-        }
-
-        if distance_to_goal < SHOOTING_ZONE_DISTANCE && !under_pressure {
-            // Enhanced shooting zone - only forward passes to significantly better teammates
-            return self.has_forward_pass_to_better_teammate(ctx, &teammates, distance_to_goal);
-        }
-
-        // 3. LOOK FOR QUALITY OPPORTUNITIES: vision/passing scale smoothly
-        let quality_p = SkillCurve::new(vision_raw, 14.0, 0.6)
-            .probability()
-            .max(SkillCurve::new(passing_raw, 14.0, 0.6).probability());
-        if ctx.context.rng.unit_f32() < quality_p
-            && self.has_teammate_in_dangerous_position(ctx, &teammates, distance_to_goal)
-        {
-            return true;
-        }
-
-        // 4. TEAM PLAY: teamwork and decisions blend smoothly
-        let team_p = SkillCurve::new(teamwork_raw, 14.0, 0.6).probability()
-            * SkillCurve::new(decisions_raw, 12.0, 0.6).probability();
-        if ctx.context.rng.unit_f32() < team_p {
-            return self.has_good_passing_option(ctx, &teammates);
-        }
-
-        // 5. DEFAULT: Keep the ball unless there's a clear benefit to passing
-        false
-    }
-
-    /// Check if there's a safe pass available under pressure
-    fn has_safe_passing_option(
-        &self,
-        ctx: &StateProcessingContext,
-        teammates: &[MatchPlayerLite],
-    ) -> bool {
-        teammates.iter().any(|teammate| {
-            let has_clear_lane = ctx.player().has_clear_pass(teammate.id);
-            let not_marked = !self.is_teammate_heavily_marked(ctx, teammate);
-
-            has_clear_lane && not_marked
-        })
-    }
-
-    /// Check if a teammate has a MUCH better shot opportunity (vision/teamwork-aware)
-    /// Used in process() to defer to a better-positioned teammate.
     fn has_teammate_with_much_better_shot(
         &self,
         ctx: &StateProcessingContext,
@@ -2090,126 +2052,6 @@ impl ForwardRunningState {
         })
     }
 
-    /// Check if any teammate is in a significantly better scoring position
-    fn has_better_positioned_teammate(
-        &self,
-        ctx: &StateProcessingContext,
-        teammates: &[MatchPlayerLite],
-        current_distance: f32,
-    ) -> bool {
-        teammates.iter().any(|teammate| {
-            let teammate_distance =
-                (teammate.position - ctx.player().opponent_goal_position()).magnitude();
-            let is_much_closer = teammate_distance < current_distance * 0.6;
-            let not_heavily_marked = !self.is_teammate_heavily_marked(ctx, teammate);
-            let has_clear_lane = ctx.player().has_clear_pass(teammate.id);
-
-            is_much_closer && not_heavily_marked && has_clear_lane
-        })
-    }
-
-    /// Check for forward passes to better positioned teammates (prevents backward passes near goal)
-    fn has_forward_pass_to_better_teammate(
-        &self,
-        ctx: &StateProcessingContext,
-        teammates: &[MatchPlayerLite],
-        current_distance: f32,
-    ) -> bool {
-        let player_pos = ctx.player.position;
-
-        teammates.iter().any(|teammate| {
-            // Must be a forward pass direction
-            let is_forward_pass = match ctx.player.side {
-                Some(PlayerSide::Left) => teammate.position.x > player_pos.x,
-                Some(PlayerSide::Right) => teammate.position.x < player_pos.x,
-                None => false,
-            };
-
-            if !is_forward_pass {
-                return false; // Reject backward passes
-            }
-
-            // Teammate must be much closer to goal
-            let teammate_distance =
-                (teammate.position - ctx.player().opponent_goal_position()).magnitude();
-            let is_much_closer =
-                teammate_distance < current_distance * TEAMMATE_ADVANTAGE_STRICT_RATIO;
-            let not_heavily_marked = !self.is_teammate_heavily_marked(ctx, teammate);
-            let has_clear_lane = ctx.player().has_clear_pass(teammate.id);
-
-            is_much_closer && not_heavily_marked && has_clear_lane
-        })
-    }
-
-    /// Check for teammates in dangerous attacking positions (free zones or making runs)
-    fn has_teammate_in_dangerous_position(
-        &self,
-        ctx: &StateProcessingContext,
-        teammates: &[MatchPlayerLite],
-        current_distance: f32,
-    ) -> bool {
-        teammates.iter().any(|teammate| {
-            let teammate_distance =
-                (teammate.position - ctx.player().opponent_goal_position()).magnitude();
-
-            // Check if teammate is in a good attacking position
-            let in_attacking_position = teammate_distance < current_distance * 1.1;
-
-            // Check if teammate is in free space (use pre-computed distances)
-            let in_free_space = ctx.tick_context.grid.opponents(teammate.id, 12.0).count() < 2;
-
-            // Check if teammate is making a forward run
-            let teammate_velocity = ctx.tick_context.positions.players.velocity(teammate.id);
-            let making_run = teammate_velocity.magnitude() > 2.0 && {
-                let to_goal = ctx.player().opponent_goal_position() - teammate.position;
-                teammate_velocity.normalize().dot(&to_goal.normalize()) > 0.5
-            };
-
-            let has_clear_pass = ctx.player().has_clear_pass(teammate.id);
-
-            has_clear_pass && in_attacking_position && (in_free_space || making_run)
-        })
-    }
-
-    /// Check for any good passing option (balanced assessment)
-    fn has_good_passing_option(
-        &self,
-        ctx: &StateProcessingContext,
-        teammates: &[MatchPlayerLite],
-    ) -> bool {
-        teammates.iter().any(|teammate| {
-            let has_clear_lane = ctx.player().has_clear_pass(teammate.id);
-            let has_space = ctx.tick_context.grid.opponents(teammate.id, 10.0).count() < 2;
-
-            // Prefer forward passes (side-aware)
-            let is_forward_pass = match ctx.player.side {
-                Some(PlayerSide::Left) => teammate.position.x > ctx.player.position.x,
-                Some(PlayerSide::Right) => teammate.position.x < ctx.player.position.x,
-                None => false,
-            };
-
-            has_clear_lane && has_space && is_forward_pass
-        })
-    }
-
-    fn is_teammate_heavily_marked(
-        &self,
-        ctx: &StateProcessingContext,
-        _teammate: &MatchPlayerLite,
-    ) -> bool {
-        // Single scan at max distance, bucket by distance
-        let mut markers = 0;
-        let mut very_close = 0;
-        for (_id, dist) in ctx.tick_context.grid.opponents(ctx.player.id, 8.0) {
-            markers += 1;
-            if dist <= 3.0 {
-                very_close += 1;
-            }
-        }
-
-        markers >= 2 || (markers >= 1 && very_close > 0)
-    }
-
     fn should_cross(&self, ctx: &StateProcessingContext) -> bool {
         let field_height = ctx.context.field_size.height as f32;
         let y = ctx.player.position.y;
@@ -2233,49 +2075,6 @@ impl ForwardRunningState {
         let crossing = ctx.player.skills.technical.crossing / 20.0;
 
         teammates_in_box >= 1 && crossing > 0.4
-    }
-
-    fn should_dribble(&self, ctx: &StateProcessingContext) -> bool {
-        let dribbling_raw = ctx.player.skills.technical.dribbling;
-        let pace_raw = ctx.player.skills.physical.pace;
-
-        // Check for opponents directly ahead (not just any nearby)
-        let goal_pos = ctx.player().opponent_goal_position();
-        let player_pos = ctx.player.position;
-        let to_goal = (goal_pos - player_pos).normalize();
-
-        let opponents_blocking = ctx
-            .players()
-            .opponents()
-            .nearby(25.0)
-            .filter(|opp| {
-                let to_opp = (opp.position - player_pos).normalize();
-                to_opp.dot(&to_goal) > 0.5
-                    && (opp.position - player_pos).norm_squared() < 20.0 * 20.0
-            })
-            .count();
-
-        // No opponents blocking — just keep running, don't dribble
-        if opponents_blocking == 0 {
-            return false;
-        }
-
-        // Take-on willingness scales smoothly with dribbling + pace.
-        // Two thresholds (skilled vs. modest) become two sigmoid pivots
-        // (14/12 dribbling, 12/10 pace) so a 7/20 dribbler still
-        // *sometimes* takes on a single defender and a 17/20 elite
-        // attempts 2-man take-ons most of the time.
-        let elite_take_on = SkillCurve::new(dribbling_raw, 14.0, 0.6).probability()
-            * SkillCurve::new(pace_raw, 12.0, 0.6).probability();
-        let modest_take_on = SkillCurve::new(dribbling_raw, 10.0, 0.6).probability();
-        let roll = ctx.context.rng.unit_f32();
-        if roll < elite_take_on {
-            opponents_blocking <= 2
-        } else if roll < modest_take_on {
-            opponents_blocking <= 1
-        } else {
-            false
-        }
     }
 
     fn is_in_good_attacking_position(&self, ctx: &StateProcessingContext) -> bool {
