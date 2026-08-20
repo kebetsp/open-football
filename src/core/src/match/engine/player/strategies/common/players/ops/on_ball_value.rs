@@ -272,6 +272,26 @@ pub fn effective_open_angle(
     gk_pos: Option<Vector3<f32>>,
 ) -> f32 {
     let goal_position = ctx.player().opponent_goal_position();
+    effective_open_angle_at_goal(shot_pos, goal_position, gk_pos)
+}
+
+/// Generalization of `effective_open_angle` that takes an explicit goal
+/// position instead of deriving it from `ctx.player().
+/// opponent_goal_position()` — that derivation is only correct when
+/// `ctx.player` IS the shooter. Added 2026-08-20 (D1 of docs/defensive-
+/// decision-logic-spec.md): `defensive_value.rs`'s
+/// `value_conceded_if_beaten` needs this same occluded-angle geometry
+/// evaluated at the ATTACKER's position against the DEFENDER's own goal
+/// (`ctx.ball().direction_to_own_goal()`), where `ctx.player` is the
+/// defender, not the attacker — `opponent_goal_position()` would silently
+/// return the wrong goal in that context. Behavior-preserving refactor:
+/// `effective_open_angle` above is now a thin wrapper and every existing
+/// caller sees identical output for identical inputs.
+pub fn effective_open_angle_at_goal(
+    shot_pos: Vector3<f32>,
+    goal_position: Vector3<f32>,
+    gk_pos: Option<Vector3<f32>>,
+) -> f32 {
     let x_offset = (goal_position.x - shot_pos.x).abs().max(1.0);
     let post_a_y = goal_position.y - GOAL_HALF_WIDTH;
     let post_b_y = goal_position.y + GOAL_HALF_WIDTH;
@@ -1032,7 +1052,12 @@ pub struct SafeRestartCandidate {
 /// Distance margins for `safe_restart_value` — reasoned estimates (no
 /// sourced dataset exists for this niche a behaviour), not sourced. Tune
 /// from observed batch behaviour rather than treating as calibrated.
-const SAFE_RESTART_LINE_MARGIN: f32 = 40.0; // ~5m from a byline/touchline
+/// `pub(crate)`: `defensive_value.rs`'s `concede_out_value` (D1 of
+/// docs/defensive-decision-logic-spec.md) reuses this exact margin for
+/// the defender-side geometry, per the spec's explicit instruction that
+/// both sides of the interaction reason about the same boundary-line
+/// shape.
+pub(crate) const SAFE_RESTART_LINE_MARGIN: f32 = 40.0; // ~5m from a byline/touchline
 const SAFE_RESTART_PRESS_MARGIN: f32 = 24.0; // ~3m from the nearest defender
 const SAFE_RESTART_BASE_VALUE: f32 = 0.30;
 

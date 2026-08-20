@@ -267,44 +267,30 @@ impl DefenderTacklingState {
         opponent: &MatchPlayerLite,
     ) -> (bool, bool, FoulSeverity) {
         let rng = &ctx.context.rng;
-        let minute = sc::minute_from_ms(ctx.context.total_match_time);
 
-        // Unified defender profile drives both the success and the foul
-        // model. tackle_profile blends tackling/positioning/anticipation/
+        // Unified defender profile drives the foul model below.
+        // tackle_profile blends tackling/positioning/anticipation/
         // composure/strength/balance/agility; discipline is the
         // composure/decisions/concentration blend that suppresses fouls.
         let def_profile = DefenderSkillProfile::from_ctx(ctx);
         let aggression01 = (ctx.player.skills.mental.aggression / 20.0).clamp(0.0, 1.0);
 
-        // Opponent carry score — composite-led for registered attackers,
-        // skill blend fallback when the opponent is missing from the
-        // registry.
-        let attacker_score = if let Some(att) = ctx.context.players.by_id(opponent.id) {
-            sc::dribble_attack(att, minute)
-        } else {
-            let dribbling;
-            let agility;
-            {
-                let players = ctx.player();
-                let s = players.skills(opponent.id);
-                dribbling = sc::n(s.technical.dribbling);
-                agility = sc::n(s.physical.agility);
-            }
-            (dribbling + agility) * 0.5
-        };
-
-        // Logistic success: tackle_profile vs attacker carry.
-        // Sigmoid 3.2 → 2.4 and upper clamp 0.72 → 0.55 trim the
-        // strong-defender-vs-weak-attacker dominance. At equal skill
-        // `raw_diff = 0` and `sigmoid = 0.5` regardless of coefficient,
-        // so calibration-neutral for equal matchups. The 0.55 cap means
-        // even an elite CB vs a poor forward leaves the attacker with
-        // 45% per-attempt survival — across 3 engagement sequences in
-        // the final third that's ~14% accumulated retention, enough to
-        // let weak teams complete the occasional shooting chain at
-        // extreme skill gaps (the prior 0.62 cap gave only ~5%).
-        let raw_diff = def_profile.tackle_profile - attacker_score;
-        let success_chance = (1.0 / (1.0 + (-raw_diff * 2.4).exp())).clamp(0.06, 0.55);
+        // Logistic success: tackle_profile vs attacker carry. Extracted
+        // to `defensive_value::tackle_win_probability` (2026-08-20, D1 of
+        // docs/defensive-decision-logic-spec.md) so it's queryable
+        // without re-deriving or re-tuning it — same formula, same
+        // constants, unchanged behavior here. See that function's own
+        // doc comment for the calibration history behind the 2.4
+        // steepness and 0.06-0.55 clamp (weak-team-competitiveness
+        // rationale: even an elite CB vs a poor forward leaves the
+        // attacker with 45% per-attempt survival — across 3 engagement
+        // sequences in the final third that's ~14% accumulated
+        // retention, enough to let weak teams complete the occasional
+        // shooting chain at extreme skill gaps).
+        let success_chance =
+            crate::r#match::player::strategies::common::players::ops::defensive_value::tackle_win_probability(
+                ctx, opponent,
+            );
 
         let tackle_success = rng.random::<f32>() < success_chance;
 

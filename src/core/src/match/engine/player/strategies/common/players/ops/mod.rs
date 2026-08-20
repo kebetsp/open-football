@@ -3,6 +3,7 @@ pub use slot_coverage::*;
 
 pub mod defender_skill;
 pub mod defensive;
+pub mod defensive_value;
 pub mod dribble_duel;
 pub mod effective_skill;
 pub mod first_touch;
@@ -21,6 +22,7 @@ pub mod xg;
 
 pub use defender_skill::*;
 pub use defensive::*;
+pub use defensive_value::*;
 pub use dribble_duel::*;
 pub use effective_skill::*;
 pub use first_touch::*;
