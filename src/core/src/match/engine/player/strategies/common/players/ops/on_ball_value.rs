@@ -48,9 +48,86 @@ const BALL_SPEED: f32 = 3.2;
 /// selection score.
 const CONGESTION_RADIUS: f32 = 35.0;
 
-/// Cap on summed `congestion_risk`, matching `risk_penalty`'s own 0.3
-/// cap so the two cost terms stay comparable in magnitude.
+/// Cap on summed local-density `congestion_risk`. Unchanged from the
+/// original Milestone 3 value (0.3) — see `structural_lane_risk` below
+/// for the actual 2026-08-20 fix; the local-density term itself keeps its
+/// original role (a real-time, opponent-proximity signal) and its
+/// original magnitude.
 pub(crate) const CONGESTION_CAP: f32 = 0.3;
+
+/// 2026-08-20 (docs/realism-wing-play-and-risk-modeling.md): a genuine
+/// ADDITIVE structural risk term grounded in the Q1 measured
+/// carry-episode loss rate by starting lane (center 39.8% n=7,944,
+/// half-space 37.8% n=7,515, flank 31.2% n=638 ±3.6% 95% CI — real
+/// outcomes from this engine's own matches).
+///
+/// First attempt (superseded, kept as a lesson): scaling the existing
+/// local-density `congestion_risk` by a lane MULTIPLIER. Verified with a
+/// raw diagnostic (`CONGESTDIAG`) that this had no real effect: 65% of
+/// candidate evaluations have ZERO opponents within `CONGESTION_RADIUS`
+/// at all, and multiplying zero by any lane factor is still zero — so
+/// the fix only ever touched the minority of already-crowded candidates,
+/// never gave a genuinely EMPTY central spot any extra caution the way
+/// real football's central-risk premium (which reflects tighter angles
+/// and less recovery time generally, not just "a defender happens to be
+/// standing right here this exact tick") actually requires. Confirmed
+/// via a second diagnostic (`CARRYDIAG`, `carry_candidates`' own chosen
+/// point) that the multiplicative version moved nothing at n≈4,400-4,600
+/// samples/side (shift means overlapped within their own 95% CIs in
+/// every lane bucket) — a genuine, verified null result, not assumed.
+///
+/// This additive term instead gives every point in a riskier lane some
+/// baseline cost independent of the moment's local density — the
+/// structural counterpart to the (unchanged) real-time proximity signal
+/// above. Normalized to the flank (safest observed lane) baseline, since
+/// `congestion_risk`'s own currency is an abstract cost score, not a
+/// probability — the RELATIVE excess-over-flank shape is what's grounded
+/// in measurement; `STRUCTURAL_LANE_SCALE` converts that relative shape
+/// into an absolute magnitude, tuned (not sourced — no dataset connects
+/// a probability differential to this engine's abstract value units) via
+/// the same `CARRYDIAG` diagnostic used to catch the multiplicative
+/// design's null result, then verified end-to-end against the Part 1
+/// lane-usage remeasurement and the standard regression batch (values
+/// tried logged in the doc's Part 6).
+const LANE_EXCESS_CENTER: f32 = 0.398 - 0.312; // ≈0.086
+const LANE_EXCESS_HALFSPACE: f32 = 0.378 - 0.312; // ≈0.066
+const LANE_EXCESS_FLANK: f32 = 0.0;
+const STRUCTURAL_LANE_SCALE: f32 = 3.5;
+
+/// Width-ratio anchor points (0.0 = dead centre, 1.0 = touchline),
+/// matching the midpoint of each lane band in the same 5-lane model the
+/// Q1 measurement and the Part 1 passing-lane analysis both use (0-0.2
+/// centre, 0.2-0.6 half-space, 0.6-1.0 flank).
+const LANE_ANCHOR_CENTER: f32 = 0.1;
+const LANE_ANCHOR_HALFSPACE: f32 = 0.4;
+const LANE_ANCHOR_FLANK: f32 = 0.8;
+
+/// Continuous (piecewise-linear, no hard cliffs — same "smooth falloff
+/// over a discontinuity" principle `safe_restart_value`'s own comment
+/// already documents) interpolation of the Q1 lane-excess anchors above,
+/// by `point`'s lateral distance from the pitch centre-line. Present
+/// (nonzero) for EVERY point in a risky lane, regardless of whether an
+/// opponent happens to be nearby at this exact tick — the structural
+/// counterpart the multiplicative design's null result showed was
+/// missing.
+fn structural_lane_risk(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
+    let field_height = ctx.context.field_size.height as f32;
+    let lateral_center = field_height / 2.0;
+    let width_ratio = ((point.y - lateral_center).abs() / (field_height / 2.0)).clamp(0.0, 1.0);
+
+    let excess = if width_ratio <= LANE_ANCHOR_CENTER {
+        LANE_EXCESS_CENTER
+    } else if width_ratio <= LANE_ANCHOR_HALFSPACE {
+        let t = (width_ratio - LANE_ANCHOR_CENTER) / (LANE_ANCHOR_HALFSPACE - LANE_ANCHOR_CENTER);
+        LANE_EXCESS_CENTER + t * (LANE_EXCESS_HALFSPACE - LANE_EXCESS_CENTER)
+    } else if width_ratio <= LANE_ANCHOR_FLANK {
+        let t = (width_ratio - LANE_ANCHOR_HALFSPACE) / (LANE_ANCHOR_FLANK - LANE_ANCHOR_HALFSPACE);
+        LANE_EXCESS_HALFSPACE + t * (LANE_EXCESS_FLANK - LANE_EXCESS_HALFSPACE)
+    } else {
+        LANE_EXCESS_FLANK
+    };
+    excess * STRUCTURAL_LANE_SCALE
+}
 
 /// Ticks for `opponent` to reach `point`: their real, condition-adjusted
 /// max speed (u/tick) plus the reaction-time floor. This is the single
@@ -115,17 +192,27 @@ fn risk_penalty(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
 /// Milestone 3 — genuine crowding cost at `point`, replacing "risk" that
 /// only ever measured "did I retreat from goal" with a real local-
 /// density term: a linear falloff summed over every opponent within
-/// `CONGESTION_RADIUS`, capped at `CONGESTION_CAP` so it stays
-/// comparable in magnitude to `risk_penalty`. Reuses
-/// `ForwardCreatingSpaceState`'s own congestion-scoring shape rather
-/// than reinventing it.
+/// `CONGESTION_RADIUS`. Reuses `ForwardCreatingSpaceState`'s own
+/// congestion-scoring shape rather than reinventing it.
+///
+/// 2026-08-20 (docs/realism-wing-play-and-risk-modeling.md): the raw
+/// opponent-proximity sum is now additionally scaled by
+/// `lane_risk_multiplier` before the cap is applied — a genuinely
+/// crowded CENTRAL point is scored as riskier than an equally-crowded
+/// WIDE point, matching this engine's own measured carry-loss-rate gap
+/// (Part 4, Q1) rather than treating "3 opponents nearby" as identically
+/// dangerous everywhere on the pitch. This does not replace the local
+/// density signal (still real, still the primary driver of variation
+/// tick-to-tick) — it corrects its calibration by lane on top.
 pub fn congestion_risk(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
     let mut total = 0.0f32;
     for opp in ctx.players().opponents().nearby_at(point, CONGESTION_RADIUS) {
         let dist = (point - opp.position).magnitude();
         total += ((CONGESTION_RADIUS - dist) / CONGESTION_RADIUS).max(0.0);
     }
-    total.min(CONGESTION_CAP)
+    let local = total.min(CONGESTION_CAP);
+    let structural = structural_lane_risk(ctx, point);
+    local + structural
 }
 
 /// Carry value at a single candidate point — Component B's scoring
