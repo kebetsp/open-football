@@ -115,6 +115,11 @@ pub mod tackle_stats {
     pub static DEF_GATE_COOLDOWN: AtomicU64 = AtomicU64::new(0);
     pub static DEF_GATE_NOT_BEST: AtomicU64 = AtomicU64::new(0);
 
+    // D2 of docs/defensive-decision-logic-spec.md: how often the new
+    // tackle/contain/concede-out comparison holds off on a tackle that
+    // the old code would have unconditionally attempted.
+    pub static DEF_GATE_CONTAIN_OR_CONCEDE: AtomicU64 = AtomicU64::new(0);
+
     pub fn reset() {
         for c in [
             &DEF_ENTRIES,
@@ -133,6 +138,7 @@ pub mod tackle_stats {
             &DEF_GATE_NOT_IN_RANGE,
             &DEF_GATE_COOLDOWN,
             &DEF_GATE_NOT_BEST,
+            &DEF_GATE_CONTAIN_OR_CONCEDE,
         ] {
             c.store(0, Ordering::Relaxed);
         }

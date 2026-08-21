@@ -120,7 +120,51 @@ impl StateProcessingHandler for DefenderTacklingState {
                 ));
             }
 
-            // We're close enough to tackle! One shot per Tackling entry,
+            // We're close enough to tackle — but "close enough" no longer
+            // means "must attempt." D2 of docs/defensive-decision-logic-
+            // spec.md: compare tackle_value against contain_value/
+            // concede_out_value (D1, defensive_value.rs) before
+            // committing. `ctx.in_state_time` (ticks spent in this
+            // Tackling entry) stands in for `contain_duration_ticks` —
+            // deliberately reusing the existing state-time tracker
+            // instead of adding a new persistent per-player field, a
+            // smaller and lower-risk choice than D1 originally flagged.
+            // concede_out_value's actual execution mechanism doesn't
+            // exist yet (D3) — until then it's treated the same as
+            // contain_value winning (hold off, keep jockeying): an
+            // honest interim behavior, not a silent no-op pretending to
+            // execute a deflection that isn't built.
+            //
+            // IMPORTANT: when holding off, return `None` (stay in THIS
+            // state) rather than transitioning to Pressing. A first cut
+            // returned to Pressing here — but that's a state CHANGE,
+            // which resets `ctx.in_state_time` back to 0 the moment
+            // Pressing routes back into Tackling next tick (it does,
+            // via the same distance/role gates above), so the urgency
+            // decay term in `contain_value` could never actually erode
+            // — exactly the "free stall" risk the spec explicitly
+            // flagged. Confirmed with real match-log data before fixing
+            // it: the pre-fix wiring showed wildly inconsistent hold-off
+            // rates across otherwise-similar matches (20.7%-94.3% of
+            // decision points), consistent with some duels getting stuck
+            // in a never-decaying contain loop. Staying in Tackling
+            // (this state's own velocity()/movement, not a lunge — the
+            // actual tackle roll only happens via the explicit
+            // `attempt_sliding_tackle` call below, which this branch
+            // skips) lets `in_state_time` genuinely accumulate and the
+            // urgency term genuinely decay tick over tick.
+            use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
+            let tackle_val = dv::tackle_value(ctx, &opponent);
+            let contain_val = dv::contain_value(ctx, &opponent, ctx.in_state_time as f32);
+            let concede_val = dv::concede_out_value(ctx, &opponent);
+
+            if tackle_val < contain_val || tackle_val < concede_val {
+                #[cfg(feature = "match-logs")]
+                crate::tackle_stats::DEF_GATE_CONTAIN_OR_CONCEDE.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+
+            // Tackle wins the comparison. One shot per Tackling entry,
             // enforced by the cooldown.
             #[cfg(feature = "match-logs")]
             crate::tackle_stats::DEF_ATTEMPTS.fetch_add(1, Ordering::Relaxed);

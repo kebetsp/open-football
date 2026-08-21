@@ -241,7 +241,27 @@ pub fn contain_value(
     // no reason to jockey once the tackle is already clearly winning.
     let non_favorable_factor = (1.0 - (p / TACKLE_WIN_PROB_CEILING)).clamp(0.0, 1.0);
     let urgency = (1.0 - contain_duration_ticks / CONTAIN_URGENCY_DECAY_TICKS).clamp(0.0, 1.0);
-    CONTAIN_BASE_VALUE * goal_side_factor * cover_bonus * (0.5 + 0.5 * non_favorable_factor) * urgency
+    // D2 real-match measurement (2026-08-21, docs/defensive-decision-
+    // logic-spec.md): the first cut of this function had no notion that
+    // continuing to contain still lets a genuinely dangerous attacker
+    // keep the ball — contain buys TIME, it doesn't neutralize the
+    // threat the way a won tackle or a conceded restart does. Isolated
+    // regression (D1+D2 vs D1-only, two 24-30 match rounds each, same
+    // pre-existing unrelated WIP on both sides) showed a real, repeated
+    // goals/match increase (pooled ~4.70 vs ~3.91) with foul-rate flat
+    // (~15.4 both sides — the spec's foul-coupling risk did NOT
+    // materialize, only this one did). Discounting by how dangerous the
+    // attacker's position already is fixes the actual mechanism: a
+    // defender in the six-yard box facing a striker doesn't patiently
+    // contain in real football, they commit — this factor makes that
+    // the model's own behavior rather than tuning an unrelated constant.
+    let danger_discount = 1.0 - value_conceded_if_beaten(ctx, opponent.position);
+    CONTAIN_BASE_VALUE
+        * goal_side_factor
+        * cover_bonus
+        * (0.5 + 0.5 * non_favorable_factor)
+        * urgency
+        * danger_discount
 }
 
 const CONCEDE_BASE_VALUE: f32 = 0.30;
