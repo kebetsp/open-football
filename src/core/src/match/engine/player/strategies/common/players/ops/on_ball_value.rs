@@ -215,6 +215,74 @@ pub fn congestion_risk(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32
     local + structural
 }
 
+/// P1 (A1, The Gaffer repo's `docs/attacking-defensive-decision-rebuild-
+/// plan.md` §2.1/§2.2) — lane-occupancy-diversity. A direct
+/// implementation of Guardiola's literal training-grid rule (that
+/// plan's research doc, `docs/ball-circulation-central-bias.md` §8.2):
+/// no more than `LANE_OCCUPANCY_CAPACITY` teammates in the same one of
+/// the 5 vertical lanes (`PitchLane`, `teamplay/tactical.rs`) at once.
+/// Distinct from `structural_lane_risk` above (that's opponent-danger
+/// BY lane; this is teammate-redundancy WITHIN a lane) and distinct
+/// from the real-time proximity terms (`congestion_risk`,
+/// `TEAMMATE_REPULSION` in `spacing.rs`) — a teammate 60u away in the
+/// same lane is still "on the same line" in Guardiola's sense even
+/// though he sits outside any proximity radius.
+pub const LANE_OCCUPANCY_CAPACITY: usize = 2;
+/// Penalty per teammate beyond capacity already occupying a candidate
+/// point's lane. `carry_value`'s other terms operate on roughly a
+/// [-1, +1.5] scale (`control_prob × shot/pass value`, up to ~0.3 for
+/// `risk_penalty`/`congestion_risk`) — this needs to matter on that
+/// scale without dominating it. Untuned reasoned estimate, same status
+/// as every P1 constant this phase — the batch/occupancy-grid
+/// verification in `docs/attacking-defensive-decision-rebuild-plan.md`
+/// §3 is the first real calibration pass against outcome data.
+pub const LANE_OCCUPANCY_PENALTY: f32 = 0.12;
+/// Reward for a candidate that vacates the carrier's own CURRENT lane
+/// when it's already at/over capacity — the second half of Guardiola's
+/// rule ("whoever was already there must vacate"). Smaller than the
+/// penalty: a nudge toward genuinely spreading out, not a mandate that
+/// overrides a clearly better nearby option.
+pub const LANE_VACATE_BONUS: f32 = 0.05;
+
+/// How many OTHER teammates currently occupy the same 5-lane band as
+/// `point`. Shared primitive for the on-ball (`carry_value`, below) and
+/// off-ball (`spacing.rs::score_candidate`) lane-diversity terms — see
+/// `LANE_OCCUPANCY_CAPACITY`'s doc comment for the rule this measures.
+pub fn teammates_sharing_lane(ctx: &StateProcessingContext, point: Vector3<f32>) -> usize {
+    let field_h = ctx.context.field_size.height as f32;
+    let lane = crate::r#match::PitchLane::for_y(field_h, point.y);
+    ctx.players()
+        .teammates()
+        .all()
+        .filter(|t| t.id != ctx.player.id)
+        .filter(|t| crate::r#match::PitchLane::for_y(field_h, t.position.y) == lane)
+        .count()
+}
+
+/// Net lane-occupancy-diversity adjustment for a hypothetical carry
+/// candidate at `point`: penalizes joining an already-at-capacity lane,
+/// rewards leaving one that already is. See `LANE_OCCUPANCY_CAPACITY`/
+/// `LANE_OCCUPANCY_PENALTY`/`LANE_VACATE_BONUS`.
+fn lane_occupancy_adjustment(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
+    let field_h = ctx.context.field_size.height as f32;
+    let candidate_lane = crate::r#match::PitchLane::for_y(field_h, point.y);
+    let current_lane = crate::r#match::PitchLane::for_y(field_h, ctx.player.position.y);
+
+    let mut adjustment = 0.0f32;
+    let occupants = teammates_sharing_lane(ctx, point);
+    if occupants >= LANE_OCCUPANCY_CAPACITY {
+        let over = (occupants - LANE_OCCUPANCY_CAPACITY + 1) as f32;
+        adjustment -= over * LANE_OCCUPANCY_PENALTY;
+    }
+    if candidate_lane != current_lane {
+        let current_occupants = teammates_sharing_lane(ctx, ctx.player.position);
+        if current_occupants >= LANE_OCCUPANCY_CAPACITY {
+            adjustment += LANE_VACATE_BONUS;
+        }
+    }
+    adjustment
+}
+
 /// Carry value at a single candidate point — Component B's scoring
 /// function. `carry_shot_value` supplies Component A's keeper-aware
 /// angle term; `best_pass_value_from(P)` (Component C, Milestone 3) is
@@ -226,13 +294,17 @@ pub fn congestion_risk(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32
 /// congestion cost (`congestion_risk`) is subtracted alongside the
 /// existing retreat-based `risk_penalty` — a candidate can be penalised
 /// for being crowded independently of whether it's also a retreat.
+/// `lane_occupancy_adjustment` (P1/A1) is additive on top — a genuinely
+/// good shooting/passing point should still win even in a crowded lane;
+/// this only tips close decisions toward spreading out.
 pub fn carry_value(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
     let cp = control_prob(ctx, point);
     let sv = carry_shot_value(ctx, point);
     let pv = best_pass_value_from(ctx, point);
     let risk = risk_penalty(ctx, point);
     let congestion = congestion_risk(ctx, point);
-    cp * sv.max(pv) - risk - congestion
+    let lane_diversity = lane_occupancy_adjustment(ctx, point);
+    cp * sv.max(pv) - risk - congestion + lane_diversity
 }
 
 /// Half-width of the goal in game units — same constant `flow/goal.rs`

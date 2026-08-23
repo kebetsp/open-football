@@ -11,7 +11,9 @@
 
 use crate::PlayerPositionType;
 use crate::r#match::player::strategies::common::players::ops::on_ball_value;
-use crate::r#match::{BallSideZone, MatchPlayerLite, PlayerSide, StateProcessingContext};
+use crate::r#match::{
+    BallSideZone, MatchPlayerLite, PitchLane, PlayerSide, StateProcessingContext,
+};
 use nalgebra::Vector3;
 
 /// Milestone 7 (possession-decision-intelligence PRD) — which flank a
@@ -85,6 +87,21 @@ const ROTATION_WEIGHT: f32 = 20.0;
 /// tether/repulsion terms it competes with — same tens-scale reasoning
 /// as the other milestone weights in this file.
 const WEAK_SIDE_PATIENCE_WEIGHT: f32 = 18.0;
+
+/// P1 (A1, `docs/attacking-defensive-decision-rebuild-plan.md` §2.1/
+/// §2.2) — off-ball counterpart to `on_ball_value::lane_occupancy_
+/// adjustment` (same rule — Guardiola's "no more than
+/// `on_ball_value::LANE_OCCUPANCY_CAPACITY` teammates in the same
+/// vertical lane" — reuses that shared capacity constant rather than
+/// re-deriving it), scored on this file's own tens-scale rather than
+/// `carry_value`'s roughly [-1,+1.5] scale. Tens-scale reasoning matches
+/// `ROTATION_WEIGHT`/`WEAK_SIDE_PATIENCE_WEIGHT` above — a nudge among
+/// several competing terms, not a dominant one.
+const LANE_OCCUPANCY_PENALTY_WEIGHT: f32 = 22.0;
+/// Reward for a candidate that vacates an already-at-capacity current
+/// lane. Smaller than the penalty, same "nudge not mandate" reasoning
+/// as `on_ball_value::LANE_VACATE_BONUS`.
+const LANE_VACATE_BONUS_WEIGHT: f32 = 10.0;
 
 /// Pressure-relief support ("show for the ball" — wishlist item
 /// "pressure-sensitive spread distance", implemented here on top of the
@@ -718,6 +735,15 @@ fn score_candidate(
     // purely about the wide-vs-tuck decision, not overall shape.
     score += rotation_adjustment(ctx, position);
 
+    // P1 (A1) — lane-occupancy-diversity: penalise a candidate that would
+    // put more than `on_ball_value::LANE_OCCUPANCY_CAPACITY` teammates in
+    // the same vertical lane, reward vacating a lane the player's own
+    // current position already shares with that many or more. Distinct
+    // from `rotation_adjustment` above (that's specifically the
+    // wide-fullback/winger flank-role handoff); this is Guardiola's
+    // general 5-lane diversity rule, applies to every candidate.
+    score += lane_occupancy_adjustment(ctx, position, teammates);
+
     // Milestone 12 — weak-side off-ball patience: a candidate on the
     // opposite lateral side from the ball isn't judged on immediate
     // reachability (already near-zero there via the Milestone 5 term
@@ -776,6 +802,41 @@ fn rotation_adjustment(ctx: &StateProcessingContext, candidate: Vector3<f32>) ->
     } else {
         ROTATION_WEIGHT * 0.5
     }
+}
+
+/// P1 (A1) — off-ball counterpart to `on_ball_value::lane_occupancy_
+/// adjustment`. Uses this function's own already-fetched `teammates`
+/// slice (id + position pairs, self already excluded by the caller)
+/// instead of re-querying `ctx.players()` per candidate — cheaper than
+/// the on-ball version, which has no such slice available to it.
+fn lane_occupancy_adjustment(
+    ctx: &StateProcessingContext,
+    candidate: Vector3<f32>,
+    teammates: &[(u32, Vector3<f32>)],
+) -> f32 {
+    let field_h = ctx.context.field_size.height as f32;
+    let candidate_lane = PitchLane::for_y(field_h, candidate.y);
+    let current_lane = PitchLane::for_y(field_h, ctx.player.position.y);
+
+    let mut adjustment = 0.0f32;
+    let occupants = teammates
+        .iter()
+        .filter(|(_, pos)| PitchLane::for_y(field_h, pos.y) == candidate_lane)
+        .count();
+    if occupants >= on_ball_value::LANE_OCCUPANCY_CAPACITY {
+        let over = (occupants - on_ball_value::LANE_OCCUPANCY_CAPACITY + 1) as f32;
+        adjustment -= over * LANE_OCCUPANCY_PENALTY_WEIGHT;
+    }
+    if candidate_lane != current_lane {
+        let current_occupants = teammates
+            .iter()
+            .filter(|(_, pos)| PitchLane::for_y(field_h, pos.y) == current_lane)
+            .count();
+        if current_occupants >= on_ball_value::LANE_OCCUPANCY_CAPACITY {
+            adjustment += LANE_VACATE_BONUS_WEIGHT;
+        }
+    }
+    adjustment
 }
 
 /// Milestone 12 (possession-decision-intelligence PRD) — weak-side
