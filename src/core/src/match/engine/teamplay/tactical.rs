@@ -115,6 +115,89 @@ impl BallSideZone {
     }
 }
 
+/// The standard positional-play five-lane model — touchline / half-space
+/// / centre / half-space / touchline — used by Guardiola's own training
+/// grid (5 vertical lanes) and reused throughout
+/// `docs/ball-circulation-central-bias.md` §8.2 and
+/// `docs/attacking-defensive-decision-rebuild-plan.md` §2.1/§2.2 (A1).
+/// Deliberately a *different, finer* split than `BallSideZone`'s 3-band
+/// left/center/right (which biases ball-side rest-defence/support, not
+/// lane-occupancy diversity) — the two are not meant to be unified.
+/// `Near`/`Far` refer to low-y vs. high-y, not either team's own left/
+/// right, matching this module's existing side-agnostic convention
+/// (`BallSideZone` is computed once and shared by both teams).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PitchLane {
+    TouchlineNear,
+    HalfSpaceNear,
+    Centre,
+    HalfSpaceFar,
+    TouchlineFar,
+}
+
+impl PitchLane {
+    /// Bucket a y-coordinate into one of 5 equal-width lanes. Guardiola's
+    /// own grid is 5 vertical lanes with no published unequal split, so
+    /// equal fifths (of `field_height`, ~13.6 m each on a 68 m pitch) is
+    /// the correct default rather than an invented uneven ratio.
+    pub fn for_y(field_height: f32, y: f32) -> PitchLane {
+        let fifth = field_height / 5.0;
+        let idx = (y / fifth).floor().clamp(0.0, 4.0) as u8;
+        match idx {
+            0 => PitchLane::TouchlineNear,
+            1 => PitchLane::HalfSpaceNear,
+            2 => PitchLane::Centre,
+            3 => PitchLane::HalfSpaceFar,
+            _ => PitchLane::TouchlineFar,
+        }
+    }
+
+    /// Index into a `[T; 5]` lane-occupancy array, `TouchlineNear` = 0.
+    pub fn index(self) -> usize {
+        match self {
+            PitchLane::TouchlineNear => 0,
+            PitchLane::HalfSpaceNear => 1,
+            PitchLane::Centre => 2,
+            PitchLane::HalfSpaceFar => 3,
+            PitchLane::TouchlineFar => 4,
+        }
+    }
+
+    /// True for the two touchline/half-space lanes on either side of
+    /// centre — the "wide lane" definition `wide_marked_count` (below)
+    /// uses to decide whether a player is genuinely offering width.
+    pub fn is_wide(self) -> bool {
+        !matches!(self, PitchLane::Centre)
+    }
+}
+
+/// Named constants for the P0 lane/distortion sensor layer
+/// (`docs/attacking-defensive-decision-rebuild-plan.md` §2.1). Kept in
+/// their own block per this project's own convention ("weights are
+/// centralized constants... if Anna/Pavel's visual review wants it
+/// stronger") rather than as inline magic numbers, even though nothing
+/// reads these yet — P0 is instrumentation-only, no decision logic
+/// branches on `TeamTacticalState`'s new fields this phase.
+pub mod spatial_sensor {
+    /// Marking-proximity radius (engine units, 8u/m) a player must be
+    /// within of *some* opponent to count as "genuinely pulling a
+    /// defender wide" for `wide_marked_count`, rather than merely
+    /// standing in a wide lane unmarked. Reasoned estimate (~4 m real
+    /// marking distance × 8u/m) — no sourced dataset for this specific
+    /// radius; flagged as an estimate per this project's Core Rule 3,
+    /// to be tuned once A2 actually consumes it (§2.2).
+    pub const WIDE_MARKING_PROXIMITY_RADIUS: f32 = 32.0;
+
+    /// Per-marked-wide-player contribution to
+    /// `TeamTacticalState::central_congestion_discount`, and the
+    /// discount's overall cap. Both placeholders — P0 computes the
+    /// scalar so A2 has a real, already-verified sensor to read; the
+    /// magnitudes themselves are untuned since nothing consumes them
+    /// this phase.
+    pub const DISCOUNT_PER_WIDE_MARKED_PLAYER: f32 = 0.08;
+    pub const MAX_CENTRAL_CONGESTION_DISCOUNT: f32 = 0.30;
+}
+
 /// Inputs to `TeamTacticalState::refresh` — bundled so the call site
 /// stays readable. The engine's tick loop fills this once per refresh
 /// and hands it over.
@@ -270,6 +353,34 @@ pub struct TeamTacticalState {
     pub side_density_left: u8,
     pub side_density_center: u8,
     pub side_density_right: u8,
+    /// Count of own outfield players (excl. GK, sent-off) in each of the
+    /// 5 standard positional-play lanes — see `PitchLane`. Index 0 =
+    /// `TouchlineNear` (low y), 4 = `TouchlineFar` (high y). Read-only
+    /// sensor as of P0 (`docs/attacking-defensive-decision-rebuild-plan.md`)
+    /// — nothing branches on this yet; A1 is the first planned consumer.
+    pub lane_occupancy: [u8; 5],
+    /// Count of own outfield players currently BOTH in a wide lane
+    /// (`PitchLane::is_wide`) AND within
+    /// `spatial_sensor::WIDE_MARKING_PROXIMITY_RADIUS` of some opponent —
+    /// i.e. genuinely pulling a defender wide, not just standing wide
+    /// unmarked. The "distortion credit" from the plan's §2.1/§8.3: a
+    /// relational signal no existing static per-candidate width bonus
+    /// captures.
+    pub wide_marked_count: u8,
+    /// Derived scalar: how much a central point's congestion cost
+    /// *should* be discounted because teammates elsewhere are genuinely
+    /// stretching the defense. Computed from `wide_marked_count` via
+    /// `spatial_sensor`'s constants. Not consumed by anything until A2
+    /// (§2.2 of the plan) — P0 only proves the sensor is honest.
+    pub central_congestion_discount: f32,
+    /// Lateral (y-axis) spread of THIS team's own outfield line(s) — max
+    /// minus min y among outfield, non-sent-off players, in engine units.
+    /// Cheap compactness proxy (§4 of the plan explicitly rejects full
+    /// Voronoi/pitch-control modelling as premature). A consumer reads
+    /// the OPPONENT's copy of this field to answer "how compact is the
+    /// team we're attacking against" — feeds A2's distortion credit and
+    /// D3's central-priority default shape.
+    pub defensive_compactness_spread: f32,
 }
 
 impl TeamTacticalState {
@@ -294,6 +405,10 @@ impl TeamTacticalState {
             side_density_left: 4,
             side_density_center: 3,
             side_density_right: 4,
+            lane_occupancy: [0, 0, 0, 0, 0],
+            wide_marked_count: 0,
+            central_congestion_discount: 0.0,
+            defensive_compactness_spread: 0.0,
         }
     }
 
@@ -719,6 +834,94 @@ impl TeamTacticalState {
         away.side_density_left = a_left.min(11) as u8;
         away.side_density_center = a_center.min(11) as u8;
         away.side_density_right = a_right.min(11) as u8;
+
+        // ── P0 spatial sensor: 5-lane occupancy, distortion credit,
+        // defensive compactness (docs/attacking-defensive-decision-
+        // rebuild-plan.md §2.1). Read-only instrumentation — nothing
+        // branches on these fields yet. Outfield (non-GK, non-sent-off)
+        // players only, since a goalkeeper's lane occupancy has no
+        // bearing on width/lane-diversity doctrine.
+        let mut home_lanes = [0u8; 5];
+        let mut away_lanes = [0u8; 5];
+        let mut home_min_y = f32::MAX;
+        let mut home_max_y = f32::MIN;
+        let mut away_min_y = f32::MAX;
+        let mut away_max_y = f32::MIN;
+        // (position, is_wide_lane) per outfield player, kept for the
+        // second, marking-proximity pass below.
+        let mut home_outfield: Vec<(nalgebra::Vector3<f32>, bool)> = Vec::with_capacity(11);
+        let mut away_outfield: Vec<(nalgebra::Vector3<f32>, bool)> = Vec::with_capacity(11);
+
+        for p in field
+            .players
+            .iter()
+            .filter(|p| !p.is_sent_off && !p.tactical_position.current_position.is_goalkeeper())
+        {
+            let lane = PitchLane::for_y(field_height, p.position.y);
+            let is_home = p.team_id == inputs.home_team_id;
+            if is_home {
+                home_lanes[lane.index()] = home_lanes[lane.index()].saturating_add(1);
+                home_min_y = home_min_y.min(p.position.y);
+                home_max_y = home_max_y.max(p.position.y);
+                home_outfield.push((p.position, lane.is_wide()));
+            } else {
+                away_lanes[lane.index()] = away_lanes[lane.index()].saturating_add(1);
+                away_min_y = away_min_y.min(p.position.y);
+                away_max_y = away_max_y.max(p.position.y);
+                away_outfield.push((p.position, lane.is_wide()));
+            }
+        }
+        home.lane_occupancy = home_lanes;
+        away.lane_occupancy = away_lanes;
+        home.defensive_compactness_spread = if home_outfield.is_empty() {
+            0.0
+        } else {
+            (home_max_y - home_min_y).max(0.0)
+        };
+        away.defensive_compactness_spread = if away_outfield.is_empty() {
+            0.0
+        } else {
+            (away_max_y - away_min_y).max(0.0)
+        };
+
+        // Distortion credit: for each side's wide-lane outfield players,
+        // count how many sit within marking-proximity of ANY opponent
+        // (outfield or GK — a keeper rushing out still counts as
+        // "marking" for this purpose, cheap to include, no reason to
+        // exclude). O(11×11) worst case, run once per refresh cycle
+        // (~every 10 ticks) — negligible next to the per-tick candidate-
+        // scoring work elsewhere in this engine.
+        // No `away_team_id` exists on `TacticalRefreshInputs` — the rest
+        // of this module identifies "away" purely as "not home_team_id"
+        // (see the `owning_team_id` check above), so this pass matches
+        // that same convention rather than inventing a lookup.
+        let radius_sq = spatial_sensor::WIDE_MARKING_PROXIMITY_RADIUS
+            * spatial_sensor::WIDE_MARKING_PROXIMITY_RADIUS;
+        let count_marked_wide = |own: &[(nalgebra::Vector3<f32>, bool)],
+                                  is_home_side: bool|
+         -> u8 {
+            let mut n = 0u8;
+            for (pos, _is_wide) in own.iter().filter(|(_, w)| *w) {
+                let marked = field.players.iter().filter(|p| !p.is_sent_off).any(|opp| {
+                    let opp_is_home = opp.team_id == inputs.home_team_id;
+                    opp_is_home != is_home_side
+                        && (opp.position - pos).magnitude_squared() <= radius_sq
+                });
+                if marked {
+                    n = n.saturating_add(1);
+                }
+            }
+            n
+        };
+        home.wide_marked_count = count_marked_wide(&home_outfield, true);
+        away.wide_marked_count = count_marked_wide(&away_outfield, false);
+
+        home.central_congestion_discount = (home.wide_marked_count as f32
+            * spatial_sensor::DISCOUNT_PER_WIDE_MARKED_PLAYER)
+            .min(spatial_sensor::MAX_CENTRAL_CONGESTION_DISCOUNT);
+        away.central_congestion_discount = (away.wide_marked_count as f32
+            * spatial_sensor::DISCOUNT_PER_WIDE_MARKED_PLAYER)
+            .min(spatial_sensor::MAX_CENTRAL_CONGESTION_DISCOUNT);
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -1677,5 +1880,46 @@ mod tests {
         assert!(late > early);
         // Spec cap: bounded to 0.05.
         assert!(late <= 0.0501);
+    }
+
+    // ── PitchLane (P0 spatial sensor,
+    // docs/attacking-defensive-decision-rebuild-plan.md §2.1) ─────────
+
+    #[test]
+    fn pitch_lane_covers_five_equal_bands() {
+        // field_height = 545 (this engine's standard pitch), fifth ≈ 109.
+        let fh = 545.0;
+        assert_eq!(PitchLane::for_y(fh, 0.0), PitchLane::TouchlineNear);
+        assert_eq!(PitchLane::for_y(fh, 50.0), PitchLane::TouchlineNear);
+        assert_eq!(PitchLane::for_y(fh, 150.0), PitchLane::HalfSpaceNear);
+        assert_eq!(PitchLane::for_y(fh, 272.5), PitchLane::Centre);
+        assert_eq!(PitchLane::for_y(fh, 400.0), PitchLane::HalfSpaceFar);
+        assert_eq!(PitchLane::for_y(fh, 545.0), PitchLane::TouchlineFar);
+        // Exactly on a boundary belongs to the lane it's entering, not
+        // the one it's leaving — matches the `floor()` convention.
+        assert_eq!(PitchLane::for_y(fh, 109.0), PitchLane::HalfSpaceNear);
+    }
+
+    #[test]
+    fn pitch_lane_index_round_trips() {
+        let lanes = [
+            PitchLane::TouchlineNear,
+            PitchLane::HalfSpaceNear,
+            PitchLane::Centre,
+            PitchLane::HalfSpaceFar,
+            PitchLane::TouchlineFar,
+        ];
+        for (i, lane) in lanes.iter().enumerate() {
+            assert_eq!(lane.index(), i);
+        }
+    }
+
+    #[test]
+    fn pitch_lane_wide_excludes_only_centre() {
+        assert!(PitchLane::TouchlineNear.is_wide());
+        assert!(PitchLane::HalfSpaceNear.is_wide());
+        assert!(!PitchLane::Centre.is_wide());
+        assert!(PitchLane::HalfSpaceFar.is_wide());
+        assert!(PitchLane::TouchlineFar.is_wide());
     }
 }
