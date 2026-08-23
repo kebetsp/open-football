@@ -189,6 +189,31 @@ fn risk_penalty(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
     (retreat / 300.0).min(0.3)
 }
 
+/// P2 (A2, The Gaffer repo's `docs/attacking-defensive-decision-rebuild-
+/// plan.md` §2.1/§2.2) — the "relational width" mechanism the research
+/// doc's §8.3/§1.1 identifies as missing from every prior width attempt
+/// (2026-07-26, 2026-08-20 in CLAUDE.md): none of them let one player's
+/// position affect another's value calculation, so a static per-
+/// candidate width bonus could never substitute for the real defensive-
+/// stretch effect genuine width produces. Reads P0's team-level
+/// distortion credit (`TeamTacticalState::central_congestion_discount`,
+/// `teamplay/tactical.rs`) — how many of THIS player's own teammates are
+/// currently, genuinely pulling a defender wide elsewhere, already
+/// capped at `spatial_sensor::MAX_CENTRAL_CONGESTION_DISCOUNT` there —
+/// and discounts a CENTRAL point's congestion cost in proportion,
+/// scaled by `centrality` (1.0 at the pitch's own centre-line, 0.0 at
+/// the touchline). Scoped to central points specifically: the whole
+/// point of width is to open the CENTRE, so a flank point gets no
+/// discount from teammates elsewhere holding width — that would be a
+/// non-sequitur, width doesn't make width itself less congested.
+fn central_congestion_discount(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
+    let field_height = ctx.context.field_size.height as f32;
+    let lateral_center = field_height / 2.0;
+    let width_ratio = ((point.y - lateral_center).abs() / (field_height / 2.0)).clamp(0.0, 1.0);
+    let centrality = 1.0 - width_ratio;
+    ctx.team().tactical().central_congestion_discount * centrality
+}
+
 /// Milestone 3 — genuine crowding cost at `point`, replacing "risk" that
 /// only ever measured "did I retreat from goal" with a real local-
 /// density term: a linear falloff summed over every opponent within
@@ -204,6 +229,12 @@ fn risk_penalty(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
 /// dangerous everywhere on the pitch. This does not replace the local
 /// density signal (still real, still the primary driver of variation
 /// tick-to-tick) — it corrects its calibration by lane on top.
+///
+/// P2 (A2): `central_congestion_discount` above is subtracted from the
+/// combined (local + structural) total — an absolute discount, not a
+/// percentage, on the same scale as the two terms it discounts (both
+/// roughly [0, 0.3]) — then clamped at 0.0 so genuine defensive
+/// congestion can never read as negative "safety."
 pub fn congestion_risk(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
     let mut total = 0.0f32;
     for opp in ctx.players().opponents().nearby_at(point, CONGESTION_RADIUS) {
@@ -212,7 +243,8 @@ pub fn congestion_risk(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32
     }
     let local = total.min(CONGESTION_CAP);
     let structural = structural_lane_risk(ctx, point);
-    local + structural
+    let discount = central_congestion_discount(ctx, point);
+    (local + structural - discount).max(0.0)
 }
 
 /// P1 (A1, The Gaffer repo's `docs/attacking-defensive-decision-rebuild-
