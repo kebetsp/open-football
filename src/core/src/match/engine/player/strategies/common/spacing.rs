@@ -122,6 +122,124 @@ const LANE_VACATE_BONUS_WEIGHT: f32 = 10.0;
 /// the undirected default.
 const CENTRAL_CORRIDOR_PRIORITY_WEIGHT: f32 = 15.0;
 
+/// P5 (A3, `docs/attacking-defensive-decision-rebuild-plan.md` §2.1/
+/// §2.2) — mobility/residency bonus. Real coaching drills "never
+/// predictable or repetitive" (research doc §8.1) — this rewards a
+/// candidate in a DIFFERENT lane than the one the player has held for
+/// a while, using P5's new `MatchPlayer.lane_residency_ticks` counter
+/// (nothing in the engine measured lane repetition before this).
+/// Fades in over a real duration (no bonus until genuinely stale, full
+/// bonus only after a further stretch) rather than firing the instant
+/// residency ticks over 0 — brief, incidental lane occupancy shouldn't
+/// trigger a "move now" signal.
+/// Tick-to-real-time note (Core Rule 3): 1 engine tick = 10ms of engine
+/// wall-clock, but the whole match is itself compressed ~9x (90 real
+/// minutes -> ~10 engine minutes), so a tick count must be multiplied
+/// by that 9x factor to read as REAL football time, not just divided
+/// by 100. `THRESHOLD_TICKS`=300 -> 3 engine-seconds -> ~27 real
+/// seconds; `FULL_TICKS`=900 -> ~81 real seconds (~1.35 real minutes)
+/// before the bonus is fully ramped. An earlier version of this
+/// comment mislabelled these as "~3s"/"~9s" — the exact unit-
+/// conversion mistake this project's own Core Rule 3 warns about,
+/// caught and corrected during this phase's own verification.
+const MOBILITY_RESIDENCY_THRESHOLD_TICKS: u16 = 300;
+const MOBILITY_RESIDENCY_FULL_TICKS: u16 = 900;
+const MOBILITY_BONUS_WEIGHT: f32 = 12.0;
+
+/// Scoped to non-defenders only — mirrors D3's defender-only gate, in
+/// reverse. Measured (A/B, this phase's own verification): applying
+/// this term to defenders too pushed goals/match to ~5.3-6.2, a real,
+/// repeated regression against the 3.0-4.5 band. Root cause: a
+/// defender holding a settled defensive lane for 27-81 real seconds is
+/// tactically CORRECT discipline, not the "predictable, repetitive"
+/// staleness §8.1's mobility doctrine actually targets (that doctrine
+/// is about ATTACKING positional variety) — penalising it nudged
+/// defenders out of their own defensive shape.
+fn mobility_adjustment(ctx: &StateProcessingContext, candidate: Vector3<f32>) -> f32 {
+    let is_defender = ctx
+        .player
+        .tactical_position
+        .current_position
+        .position_group()
+        == PlayerFieldPositionGroup::Defender;
+    if is_defender {
+        return 0.0;
+    }
+    let field_h = ctx.context.field_size.height as f32;
+    let candidate_lane_idx = PitchLane::for_y(field_h, candidate.y).index() as u8;
+    if candidate_lane_idx == ctx.player.lane_residency_lane {
+        return 0.0;
+    }
+    let residency = ctx.player.lane_residency_ticks as f32;
+    let progress = ((residency - MOBILITY_RESIDENCY_THRESHOLD_TICKS as f32)
+        / (MOBILITY_RESIDENCY_FULL_TICKS - MOBILITY_RESIDENCY_THRESHOLD_TICKS) as f32)
+        .clamp(0.0, 1.0);
+    progress * MOBILITY_BONUS_WEIGHT
+}
+
+/// P5 (A4) — vacated-space / third-man credit (research doc §8.5): a
+/// decoy run drags a marker away, and a THIRD player — not the decoy
+/// himself — exploits the space that opens up. Detects a genuinely
+/// marked decoy among the OTHER teammates (an opponent glued within
+/// close range), then rewards this candidate if it's a real attacking
+/// threat (same danger geometry Milestone 6's own decoy term already
+/// uses) with no local congestion — the space is open specifically
+/// because a defender is tied up elsewhere, not because nobody bothered
+/// marking anyone.
+/// Measured (temporary diagnostic, removed after this fix): the
+/// original 15.0u radius with no other qualifier made `has_marked_decoy`
+/// true on 56.8% of all candidate evaluations (n=270,630) — "some
+/// teammate somewhere on the pitch has an opponent nearby" is just
+/// ordinary match congestion, not a genuine decoy event. Tightened to a
+/// real tight-marking distance (matching the scale of other close-
+/// engagement radii already used in this file/D1, ~1.25m) AND gated to
+/// a teammate in the ATTACKING HALF — a marked defender in his own
+/// third isn't "dragging a marker to create space for a third-man run"
+/// in any real football sense.
+const THIRD_MAN_MARK_RADIUS: f32 = 10.0;
+const THIRD_MAN_LOCAL_CLEAR_RADIUS: f32 = 25.0;
+const THIRD_MAN_WEIGHT: f32 = 20.0;
+
+fn third_man_adjustment(
+    ctx: &StateProcessingContext,
+    candidate: Vector3<f32>,
+    opponents: &[Vector3<f32>],
+    teammates: &[(u32, Vector3<f32>)],
+) -> f32 {
+    let field_w = ctx.context.field_size.width as f32;
+    let attacking_dir: f32 = match ctx.player.side {
+        Some(PlayerSide::Left) => 1.0,
+        Some(PlayerSide::Right) => -1.0,
+        None => return 0.0,
+    };
+    let midfield_x = field_w / 2.0;
+    let has_marked_decoy = teammates.iter().any(|(_, pos)| {
+        let is_advanced = (pos.x - midfield_x) * attacking_dir > 0.0;
+        is_advanced
+            && opponents
+                .iter()
+                .any(|opp| (opp - pos).magnitude() < THIRD_MAN_MARK_RADIUS)
+    });
+    if !has_marked_decoy {
+        return 0.0;
+    }
+    let locally_clear = !opponents
+        .iter()
+        .any(|opp| (opp - candidate).magnitude() < THIRD_MAN_LOCAL_CLEAR_RADIUS);
+    if !locally_clear {
+        return 0.0;
+    }
+    let gk_pos = ctx
+        .players()
+        .opponents()
+        .goalkeeper()
+        .next()
+        .map(|g| g.position);
+    let danger =
+        (on_ball_value::effective_open_angle(ctx, candidate, gk_pos) / 1.31).clamp(0.0, 1.0);
+    danger * THIRD_MAN_WEIGHT
+}
+
 /// Pressure-relief support ("show for the ball" — wishlist item
 /// "pressure-sensitive spread distance", implemented here on top of the
 /// possession-decision-intelligence architecture rather than the old
@@ -766,6 +884,15 @@ fn score_candidate(
     // D3 — central-corridor-priority default shape (defenders only,
     // zero for every other role — see the function's own doc comment).
     score += central_corridor_priority_adjustment(ctx, position);
+
+    // P5 (A3) — mobility/residency: reward moving to a genuinely
+    // different lane after holding the current one for a while.
+    score += mobility_adjustment(ctx, position);
+
+    // P5 (A4) — vacated-space/third-man credit: a genuine attacking
+    // threat with no local congestion, while some other teammate is
+    // currently tying up a marker elsewhere.
+    score += third_man_adjustment(ctx, position, opponents, teammates);
 
     // Milestone 12 — weak-side off-ball patience: a candidate on the
     // opposite lateral side from the ball isn't judged on immediate

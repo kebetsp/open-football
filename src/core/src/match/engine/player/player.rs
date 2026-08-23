@@ -211,6 +211,19 @@ pub struct MatchPlayer {
     /// Cleared on ball release, genuine two-man pressure, or budget
     /// expiry (engine loop, same pattern as the three fields above).
     pub byline_commitment_ticks: u16,
+    /// P5 (A3, `docs/attacking-defensive-decision-rebuild-plan.md`
+    /// §2.1/§2.2) — how many consecutive ticks this player has occupied
+    /// their current `PitchLane`. Incremented each tick the lane stays
+    /// the same, reset to 0 on a lane change (engine loop, same
+    /// per-tick pattern as `byline_commitment_ticks`/`kickoff_pass_
+    /// pending` above). Operationalizes §8.1's mobility principle
+    /// ("never predictable or repetitive") — nothing in the engine
+    /// previously measured lane repetition at all.
+    pub lane_residency_ticks: u16,
+    /// The `PitchLane` index (0-4) `lane_residency_ticks` is counted
+    /// against — `u8::MAX` sentinel for "not yet initialised" so the
+    /// very first tick doesn't read as a false 0-tick match.
+    pub lane_residency_lane: u8,
     /// realism-bug (2026-07-27): a genuine, clean 1v1-vs-GK opportunity had
     /// no code path at all that could choose "carry the ball around the
     /// keeper" — evaluate_forward_shot_decision only ever returns Shoot/
@@ -547,6 +560,8 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            lane_residency_ticks: 0,
+            lane_residency_lane: u8::MAX,
             round_keeper_commitment_ticks: 0,
             round_keeper_target_x: 0.0,
             round_keeper_target_y: 0.0,
@@ -635,6 +650,8 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            lane_residency_ticks: 0,
+            lane_residency_lane: u8::MAX,
             round_keeper_commitment_ticks: 0,
             round_keeper_target_x: 0.0,
             round_keeper_target_y: 0.0,

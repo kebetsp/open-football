@@ -1172,6 +1172,21 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 .iter()
                 .map(|p| (p.team_id, p.position))
                 .collect();
+            // P5 (A3, docs/attacking-defensive-decision-rebuild-plan.md
+            // §2.1/§2.2) — lane-residency tracking, a separate pass so
+            // it runs for every player every tick regardless of the
+            // byline-commitment loop's own early `continue`s below.
+            let lane_residency_field_h = context.field_size.height as f32;
+            for p in field.players.iter_mut() {
+                let lane =
+                    crate::r#match::PitchLane::for_y(lane_residency_field_h, p.position.y).index() as u8;
+                if p.lane_residency_lane == lane {
+                    p.lane_residency_ticks = p.lane_residency_ticks.saturating_add(1);
+                } else {
+                    p.lane_residency_lane = lane;
+                    p.lane_residency_ticks = 0;
+                }
+            }
             for p in field.players.iter_mut() {
                 if p.byline_commitment_ticks > 0 {
                     if raw_owner != Some(p.id) {
