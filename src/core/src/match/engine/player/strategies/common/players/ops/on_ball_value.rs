@@ -300,16 +300,18 @@ fn lane_occupancy_adjustment(ctx: &StateProcessingContext, point: Vector3<f32>) 
     let candidate_lane = crate::r#match::PitchLane::for_y(field_h, point.y);
     let current_lane = crate::r#match::PitchLane::for_y(field_h, ctx.player.position.y);
 
+    // P6 — AI lever: `spatialBias.laneDiscipline`, 1.0 = neutral.
+    let lane_discipline = ctx.player.spatial_lane_discipline;
     let mut adjustment = 0.0f32;
     let occupants = teammates_sharing_lane(ctx, point);
     if occupants >= LANE_OCCUPANCY_CAPACITY {
         let over = (occupants - LANE_OCCUPANCY_CAPACITY + 1) as f32;
-        adjustment -= over * LANE_OCCUPANCY_PENALTY;
+        adjustment -= over * LANE_OCCUPANCY_PENALTY * lane_discipline;
     }
     if candidate_lane != current_lane {
         let current_occupants = teammates_sharing_lane(ctx, ctx.player.position);
         if current_occupants >= LANE_OCCUPANCY_CAPACITY {
-            adjustment += LANE_VACATE_BONUS;
+            adjustment += LANE_VACATE_BONUS * lane_discipline;
         }
     }
     adjustment

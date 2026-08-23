@@ -174,7 +174,8 @@ fn mobility_adjustment(ctx: &StateProcessingContext, candidate: Vector3<f32>) ->
     let progress = ((residency - MOBILITY_RESIDENCY_THRESHOLD_TICKS as f32)
         / (MOBILITY_RESIDENCY_FULL_TICKS - MOBILITY_RESIDENCY_THRESHOLD_TICKS) as f32)
         .clamp(0.0, 1.0);
-    progress * MOBILITY_BONUS_WEIGHT
+    // P6 — AI lever: `spatialBias.mobility`, 1.0 = neutral.
+    progress * MOBILITY_BONUS_WEIGHT * ctx.player.spatial_mobility
 }
 
 /// P5 (A4) — vacated-space / third-man credit (research doc §8.5): a
@@ -978,7 +979,8 @@ fn central_corridor_priority_adjustment(ctx: &StateProcessingContext, candidate:
     let field_h = ctx.context.field_size.height as f32;
     let center_y = field_h / 2.0;
     let centrality = (1.0 - (candidate.y - center_y).abs() / (field_h / 2.0)).clamp(0.0, 1.0);
-    centrality * CENTRAL_CORRIDOR_PRIORITY_WEIGHT
+    // P6 — AI lever: `defensiveBias.compactness`, 1.0 = neutral.
+    centrality * CENTRAL_CORRIDOR_PRIORITY_WEIGHT * ctx.player.defensive_compactness
 }
 
 /// P1 (A1) — off-ball counterpart to `on_ball_value::lane_occupancy_
@@ -995,6 +997,8 @@ fn lane_occupancy_adjustment(
     let candidate_lane = PitchLane::for_y(field_h, candidate.y);
     let current_lane = PitchLane::for_y(field_h, ctx.player.position.y);
 
+    // P6 — AI lever: `spatialBias.laneDiscipline`, 1.0 = neutral.
+    let lane_discipline = ctx.player.spatial_lane_discipline;
     let mut adjustment = 0.0f32;
     let occupants = teammates
         .iter()
@@ -1002,7 +1006,7 @@ fn lane_occupancy_adjustment(
         .count();
     if occupants >= on_ball_value::LANE_OCCUPANCY_CAPACITY {
         let over = (occupants - on_ball_value::LANE_OCCUPANCY_CAPACITY + 1) as f32;
-        adjustment -= over * LANE_OCCUPANCY_PENALTY_WEIGHT;
+        adjustment -= over * LANE_OCCUPANCY_PENALTY_WEIGHT * lane_discipline;
     }
     if candidate_lane != current_lane {
         let current_occupants = teammates
@@ -1010,7 +1014,7 @@ fn lane_occupancy_adjustment(
             .filter(|(_, pos)| PitchLane::for_y(field_h, pos.y) == current_lane)
             .count();
         if current_occupants >= on_ball_value::LANE_OCCUPANCY_CAPACITY {
-            adjustment += LANE_VACATE_BONUS_WEIGHT;
+            adjustment += LANE_VACATE_BONUS_WEIGHT * lane_discipline;
         }
     }
     adjustment

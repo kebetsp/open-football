@@ -111,7 +111,11 @@ impl StateProcessingHandler for ForwardPressingState {
                 // intercept point.
                 let field_height = ctx.context.field_size.height as f32;
                 let ball_pos = ctx.tick_context.positions.ball.position;
-                let jockey_sign = dv::jockey_show_outside_sign(ball_pos.y, field_height);
+                let jockey_sign = dv::jockey_show_outside_sign(
+                    ball_pos.y,
+                    field_height,
+                    ctx.player.defensive_show_outside,
+                );
                 let jockey_target = ball_pos
                     + Vector3::new(0.0, jockey_sign * dv::JOCKEY_SHOW_OUTSIDE_BIAS, 0.0);
                 return Some(

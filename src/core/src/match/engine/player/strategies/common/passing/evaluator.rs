@@ -1299,9 +1299,20 @@ impl PassEvaluator {
                 // lane = this opponent's body is doctrine-plausibly
                 // already shading the passing lane while applying
                 // pressure, not just coincidentally standing nearby.
+                // P6 AI lever: `defensiveBias.pressTrapEmphasis`, read
+                // from the PRESSER's own multiplier (not the passer's —
+                // `MatchPlayerLite` doesn't carry it, so look up the
+                // full player by id, same pattern already used by
+                // `time_to_intercept`/`tackle_win_probability`).
                 if is_central_lane && is_goal_side(opponent.position, passer.position, own_goal) > 0.0
                 {
-                    effective_radius += Self::COVER_SHADOW_RADIUS_BONUS;
+                    let press_trap_emphasis = ctx
+                        .context
+                        .players
+                        .by_id(opponent.id)
+                        .map(|p| p.defensive_press_trap_emphasis)
+                        .unwrap_or(1.0);
+                    effective_radius += Self::COVER_SHADOW_RADIUS_BONUS * press_trap_emphasis;
                 }
 
                 perp_distance < effective_radius

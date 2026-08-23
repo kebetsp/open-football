@@ -96,12 +96,17 @@ pub const JOCKEY_SHOW_OUTSIDE_BIAS: f32 = 10.0;
 /// side-relative signs (e.g. `PlayerSide`/attacking-direction flips)
 /// rather than a continuous gradient with no reference doctrine to
 /// calibrate its shape against.
-pub fn jockey_show_outside_sign(carrier_y: f32, field_height: f32) -> f32 {
-    if carrier_y < field_height / 2.0 {
+/// `show_outside` — P6 AI lever (`defensiveBias.showSide`): `true` (the
+/// real-doctrine default) keeps the base direction; `false` ("show
+/// inside") flips it, biasing the presser's body to the outside lane
+/// instead and inviting the carrier to cut infield.
+pub fn jockey_show_outside_sign(carrier_y: f32, field_height: f32, show_outside: bool) -> f32 {
+    let base = if carrier_y < field_height / 2.0 {
         1.0
     } else {
         -1.0
-    }
+    };
+    if show_outside { base } else { -base }
 }
 
 /// Existing, already-calibrated tackle-success sigmoid, extracted

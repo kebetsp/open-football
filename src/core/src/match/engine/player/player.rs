@@ -224,6 +224,29 @@ pub struct MatchPlayer {
     /// against — `u8::MAX` sentinel for "not yet initialised" so the
     /// very first tick doesn't read as a false 0-tick match.
     pub lane_residency_lane: u8,
+    /// P6 (`docs/attacking-defensive-decision-rebuild-plan.md` §0.4/
+    /// §2.2/§6) — AI-lever multipliers for P1-P5's attacking mechanisms,
+    /// set identically on every player of a team by the API request
+    /// layer (same convention as `attack_bias` above — a per-player
+    /// copy of a genuinely team-level directive, not per-player state).
+    /// 0-2 range, 1.0 = neutral (no directive). `spatial_width_emphasis`
+    /// scales P0's `DISCOUNT_PER_WIDE_MARKED_PLAYER` (feeds A2's
+    /// relational-width discount); `spatial_lane_discipline` scales A1's
+    /// lane-occupancy penalty/bonus (both on-ball and off-ball);
+    /// `spatial_mobility` scales A3's mobility/residency bonus.
+    pub spatial_width_emphasis: f32,
+    pub spatial_lane_discipline: f32,
+    pub spatial_mobility: f32,
+    /// P6 — defensive-side AI-lever multipliers, same convention.
+    /// `defensive_compactness` scales D3's central-corridor-priority
+    /// weight; `defensive_show_outside` (true = show outside, the real-
+    /// doctrine default; false = show inside) flips D1's jockey-steering
+    /// sign; `defensive_press_trap_emphasis` scales D2's cover-shadow
+    /// radius bonus (read from the PRESSER's own copy, not the passer's
+    /// — see `evaluator.rs::calculate_interception_risk`).
+    pub defensive_compactness: f32,
+    pub defensive_show_outside: bool,
+    pub defensive_press_trap_emphasis: f32,
     /// realism-bug (2026-07-27): a genuine, clean 1v1-vs-GK opportunity had
     /// no code path at all that could choose "carry the ball around the
     /// keeper" — evaluate_forward_shot_decision only ever returns Shoot/
@@ -562,6 +585,12 @@ impl MatchPlayer {
             byline_commitment_ticks: 0,
             lane_residency_ticks: 0,
             lane_residency_lane: u8::MAX,
+            spatial_width_emphasis: 1.0,
+            spatial_lane_discipline: 1.0,
+            spatial_mobility: 1.0,
+            defensive_compactness: 1.0,
+            defensive_show_outside: true,
+            defensive_press_trap_emphasis: 1.0,
             round_keeper_commitment_ticks: 0,
             round_keeper_target_x: 0.0,
             round_keeper_target_y: 0.0,
@@ -652,6 +681,12 @@ impl MatchPlayer {
             byline_commitment_ticks: 0,
             lane_residency_ticks: 0,
             lane_residency_lane: u8::MAX,
+            spatial_width_emphasis: 1.0,
+            spatial_lane_discipline: 1.0,
+            spatial_mobility: 1.0,
+            defensive_compactness: 1.0,
+            defensive_show_outside: true,
+            defensive_press_trap_emphasis: 1.0,
             round_keeper_commitment_ticks: 0,
             round_keeper_target_x: 0.0,
             round_keeper_target_y: 0.0,

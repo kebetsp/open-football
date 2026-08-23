@@ -196,7 +196,11 @@ impl StateProcessingHandler for MidfielderPressingState {
             // — jockey/"show outside": see the identical comment in
             // defenders/states/pressing/mod.rs for the doctrine.
             let field_height = ctx.context.field_size.height as f32;
-            let jockey_sign = dv::jockey_show_outside_sign(predicted.y, field_height);
+            let jockey_sign = dv::jockey_show_outside_sign(
+                predicted.y,
+                field_height,
+                ctx.player.defensive_show_outside,
+            );
             let jockey_offset = Vector3::new(0.0, jockey_sign * dv::JOCKEY_SHOW_OUTSIDE_BIAS, 0.0);
             let intercept_target = predicted + to_own_goal * goalside_bias + jockey_offset;
 

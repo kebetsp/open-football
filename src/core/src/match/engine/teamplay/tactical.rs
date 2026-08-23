@@ -916,11 +916,29 @@ impl TeamTacticalState {
         home.wide_marked_count = count_marked_wide(&home_outfield, true);
         away.wide_marked_count = count_marked_wide(&away_outfield, false);
 
+        // P6 — AI lever: `spatialBias.widthEmphasis`, 1.0 = neutral. Set
+        // identically on every player of a team (same convention as the
+        // existing `attack_bias` field) — any one player's copy reads
+        // the team's own directive value.
+        let home_width_emphasis = field
+            .players
+            .iter()
+            .find(|p| p.team_id == inputs.home_team_id)
+            .map(|p| p.spatial_width_emphasis)
+            .unwrap_or(1.0);
+        let away_width_emphasis = field
+            .players
+            .iter()
+            .find(|p| p.team_id != inputs.home_team_id)
+            .map(|p| p.spatial_width_emphasis)
+            .unwrap_or(1.0);
         home.central_congestion_discount = (home.wide_marked_count as f32
-            * spatial_sensor::DISCOUNT_PER_WIDE_MARKED_PLAYER)
+            * spatial_sensor::DISCOUNT_PER_WIDE_MARKED_PLAYER
+            * home_width_emphasis)
             .min(spatial_sensor::MAX_CENTRAL_CONGESTION_DISCOUNT);
         away.central_congestion_discount = (away.wide_marked_count as f32
-            * spatial_sensor::DISCOUNT_PER_WIDE_MARKED_PLAYER)
+            * spatial_sensor::DISCOUNT_PER_WIDE_MARKED_PLAYER
+            * away_width_emphasis)
             .min(spatial_sensor::MAX_CENTRAL_CONGESTION_DISCOUNT);
     }
 
