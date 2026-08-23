@@ -9,7 +9,7 @@
 //! role-neutral form; the caller's heuristic target anchors the search so
 //! each role's zone discipline and tactical intent stay intact.
 
-use crate::PlayerPositionType;
+use crate::{PlayerFieldPositionGroup, PlayerPositionType};
 use crate::r#match::player::strategies::common::players::ops::on_ball_value;
 use crate::r#match::{
     BallSideZone, MatchPlayerLite, PitchLane, PlayerSide, StateProcessingContext,
@@ -102,6 +102,25 @@ const LANE_OCCUPANCY_PENALTY_WEIGHT: f32 = 22.0;
 /// lane. Smaller than the penalty, same "nudge not mandate" reasoning
 /// as `on_ball_value::LANE_VACATE_BONUS`.
 const LANE_VACATE_BONUS_WEIGHT: f32 = 10.0;
+
+/// D3 (`docs/attacking-defensive-decision-rebuild-plan.md` §2.3) —
+/// central-corridor-priority default shape. Real doctrine (research
+/// doc §9.1): the centre is defended harder than the flanks for a
+/// geometric reason (360° vs. touchline-cut angle) — real defenders
+/// default toward protecting the inner lanes independent of the ball's
+/// current position. Implemented here as the value-comparison
+/// counterpart to Phase 5's directive-only `ShapeAction::TuckInside`
+/// (rather than retrofitting that position-mutation machinery to
+/// auto-populate for every defender — a much larger-blast-radius
+/// change touching the shared per-tick shape-rules loop in
+/// `engine/run.rs` for a result this file's own existing architecture
+/// already achieves more safely). This is the concrete mechanism for
+/// "some general bias toward common football logic should remain"
+/// (Pavel's own phrase in the rebuild plan's charter) — an explicit
+/// player directive (`ShapeAction`/a future `defensiveBias` field) can
+/// still amplify or override a defender's positioning; this only sets
+/// the undirected default.
+const CENTRAL_CORRIDOR_PRIORITY_WEIGHT: f32 = 15.0;
 
 /// Pressure-relief support ("show for the ball" — wishlist item
 /// "pressure-sensitive spread distance", implemented here on top of the
@@ -744,6 +763,10 @@ fn score_candidate(
     // general 5-lane diversity rule, applies to every candidate.
     score += lane_occupancy_adjustment(ctx, position, teammates);
 
+    // D3 — central-corridor-priority default shape (defenders only,
+    // zero for every other role — see the function's own doc comment).
+    score += central_corridor_priority_adjustment(ctx, position);
+
     // Milestone 12 — weak-side off-ball patience: a candidate on the
     // opposite lateral side from the ball isn't judged on immediate
     // reachability (already near-zero there via the Milestone 5 term
@@ -802,6 +825,33 @@ fn rotation_adjustment(ctx: &StateProcessingContext, candidate: Vector3<f32>) ->
     } else {
         ROTATION_WEIGHT * 0.5
     }
+}
+
+/// D3 — central-corridor-priority default shape, defenders only. `0.0`
+/// for every other role (midfielder `AttackSupporting` also calls
+/// `score_candidate` — this term is deliberately scoped to defensive
+/// positioning, not a general anti-width bias for the whole team,
+/// which would fight A1/A2's own attacking-width work). Rewards
+/// candidates closer to the pitch's own centre-line, continuous (no
+/// hard cliff, matching this file's established convention), so a
+/// defender still gets full credit for genuinely tracking a wide
+/// attacker or covering a real threat — this is a DEFAULT preference
+/// among otherwise-similar options, not an override of the state's own
+/// zone/marking logic.
+fn central_corridor_priority_adjustment(ctx: &StateProcessingContext, candidate: Vector3<f32>) -> f32 {
+    let is_defender = ctx
+        .player
+        .tactical_position
+        .current_position
+        .position_group()
+        == PlayerFieldPositionGroup::Defender;
+    if !is_defender {
+        return 0.0;
+    }
+    let field_h = ctx.context.field_size.height as f32;
+    let center_y = field_h / 2.0;
+    let centrality = (1.0 - (candidate.y - center_y).abs() / (field_h / 2.0)).clamp(0.0, 1.0);
+    centrality * CENTRAL_CORRIDOR_PRIORITY_WEIGHT
 }
 
 /// P1 (A1) — off-ball counterpart to `on_ball_value::lane_occupancy_

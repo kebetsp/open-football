@@ -4,11 +4,12 @@ use crate::club::player::registry::has_risk_tolerant_passing_trait;
 use crate::club::player::traits::PlayerTrait;
 use crate::r#match::engine::chemistry::chemistry_modifiers;
 use crate::r#match::engine::psychology::Psychology;
+use crate::r#match::player::strategies::common::players::ops::defensive_value::is_goal_side;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
-    BallSideZone, GamePhase, MatchPlayer, MatchPlayerLite, PassOriginRestart, PlayerSide,
-    StateProcessingContext,
+    BallSideZone, GamePhase, MatchPlayer, MatchPlayerLite, PassOriginRestart, PitchLane,
+    PlayerSide, StateProcessingContext,
 };
 
 /// Comprehensive pass evaluation result
@@ -1224,6 +1225,21 @@ impl PassEvaluator {
     }
 
     /// Calculate interception risk from opponents along the pass path
+    /// D2 (docs/attacking-defensive-decision-rebuild-plan.md §2.3) —
+    /// cover shadow. Real doctrine (research doc §9.4): "a presser's
+    /// body positioning to simultaneously apply pressure and block a
+    /// passing lane behind them... funnels the ball carrier's options
+    /// down to one (usually wide, usually backward)." A defender who is
+    /// BOTH goal-side of the passer AND the pass under evaluation
+    /// targets a central lane gets a wider effective interception
+    /// radius for that pass — extending `calculate_interception_risk`'s
+    /// existing corridor check, not a new mechanism. Scoped to central
+    /// lanes only (`PitchLane`, from P0/P1): the doctrine is
+    /// specifically about protecting the centre ("closing central
+    /// passing lanes... forcing the opponent wide"), not a blanket
+    /// buff to every defender's reach everywhere.
+    const COVER_SHADOW_RADIUS_BONUS: f32 = 4.0;
+
     fn calculate_interception_risk(
         ctx: &StateProcessingContext,
         passer: &MatchPlayer,
@@ -1238,6 +1254,17 @@ impl PassEvaluator {
         // the ball clears them before they can react. In real football this is ~10m (~20 units).
         // Use 25% of pass distance as alternative for short passes.
         let min_intercept_projection = 20.0_f32.min(pass_distance * 0.25);
+
+        // D2: whether THIS pass targets a central lane, computed once
+        // (pass-invariant, not per-opponent) — see the doc comment
+        // above `COVER_SHADOW_RADIUS_BONUS`.
+        let field_height = ctx.context.field_size.height as f32;
+        let receiver_lane = PitchLane::for_y(field_height, receiver.position.y);
+        let is_central_lane = !matches!(
+            receiver_lane,
+            PitchLane::TouchlineNear | PitchLane::TouchlineFar
+        );
+        let own_goal = ctx.player().opponent_goal_position();
 
         // Check for opponents who could intercept the pass
         let intercepting_opponents = ctx
@@ -1266,7 +1293,16 @@ impl PassEvaluator {
                 let anticipation = opponent_skills.mental.anticipation / 20.0;
 
                 // Better opponents can intercept from further away
-                let effective_radius = 3.0 + (interception_ability + anticipation) * 2.0;
+                let mut effective_radius = 3.0 + (interception_ability + anticipation) * 2.0;
+
+                // D2 cover shadow: goal-side of the passer + central
+                // lane = this opponent's body is doctrine-plausibly
+                // already shading the passing lane while applying
+                // pressure, not just coincidentally standing nearby.
+                if is_central_lane && is_goal_side(opponent.position, passer.position, own_goal) > 0.0
+                {
+                    effective_radius += Self::COVER_SHADOW_RADIUS_BONUS;
+                }
 
                 perp_distance < effective_radius
             })
