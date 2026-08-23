@@ -1,5 +1,6 @@
 use crate::r#match::forwarders::states::ForwardState;
 use crate::r#match::forwarders::states::common::{ActivityIntensity, ForwardCondition};
+use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
 use crate::r#match::{
     ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
     SteeringBehavior,
@@ -103,9 +104,19 @@ impl StateProcessingHandler for ForwardPressingState {
                     .magnitude();
                 let danger_proximity = (1.0 - (dist_to_goal / 250.0)).clamp(0.0, 1.0);
                 let urgency_boost = 1.0 + danger_proximity * 0.6;
+                // D1 (docs/attacking-defensive-decision-rebuild-plan.md
+                // §2.3) — jockey/"show outside": same doctrine as the
+                // defender/midfielder Pressing states, applied to this
+                // state's `Pursuit` target instead of a hand-computed
+                // intercept point.
+                let field_height = ctx.context.field_size.height as f32;
+                let ball_pos = ctx.tick_context.positions.ball.position;
+                let jockey_sign = dv::jockey_show_outside_sign(ball_pos.y, field_height);
+                let jockey_target = ball_pos
+                    + Vector3::new(0.0, jockey_sign * dv::JOCKEY_SHOW_OUTSIDE_BIAS, 0.0);
                 return Some(
                     SteeringBehavior::Pursuit {
-                        target: ctx.tick_context.positions.ball.position,
+                        target: jockey_target,
                         target_velocity: ctx.tick_context.positions.ball.velocity,
                     }
                     .calculate(ctx.player)

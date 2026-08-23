@@ -1,6 +1,7 @@
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondition};
 use crate::r#match::player::strategies::common::players::ops::defender_skill::DefenderSkillProfile;
+use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
 use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::{
@@ -219,7 +220,17 @@ impl StateProcessingHandler for DefenderPressingState {
             } else {
                 0.0
             };
-            let intercept_target = predicted + to_own_goal * shot_zone_bias;
+            // D1 (docs/attacking-defensive-decision-rebuild-plan.md §2.3)
+            // — jockey/"show outside": lean the intercept target toward
+            // the carrier's inside shoulder (away from whichever
+            // touchline he's already nearer to), so the defender's body
+            // covers the central lane on arrival and the carrier is
+            // steered wide, not straight at.
+            let field_height = ctx.context.field_size.height as f32;
+            let jockey_sign = dv::jockey_show_outside_sign(predicted.y, field_height);
+            let jockey_offset = Vector3::new(0.0, jockey_sign * dv::JOCKEY_SHOW_OUTSIDE_BIAS, 0.0);
+
+            let intercept_target = predicted + to_own_goal * shot_zone_bias + jockey_offset;
 
             let to_target = intercept_target - ctx.player.position;
             let direction = if to_target.magnitude() > 0.01 {

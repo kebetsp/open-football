@@ -1,6 +1,7 @@
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
 use crate::r#match::player::strategies::common::players::MatchPlayerIteratorExt;
+use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
 use crate::r#match::player::strategies::common::players::ops::midfielder_skill::MidfielderSkillProfile;
 use crate::r#match::{
     ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
@@ -191,7 +192,13 @@ impl StateProcessingHandler for MidfielderPressingState {
             let own_goal = ctx.ball().direction_to_own_goal();
             let to_own_goal = (own_goal - predicted).normalize();
             let goalside_bias = if opp_speed > 0.1 { 2.0 } else { 0.0 };
-            let intercept_target = predicted + to_own_goal * goalside_bias;
+            // D1 (docs/attacking-defensive-decision-rebuild-plan.md §2.3)
+            // — jockey/"show outside": see the identical comment in
+            // defenders/states/pressing/mod.rs for the doctrine.
+            let field_height = ctx.context.field_size.height as f32;
+            let jockey_sign = dv::jockey_show_outside_sign(predicted.y, field_height);
+            let jockey_offset = Vector3::new(0.0, jockey_sign * dv::JOCKEY_SHOW_OUTSIDE_BIAS, 0.0);
+            let intercept_target = predicted + to_own_goal * goalside_bias + jockey_offset;
 
             let to_target = intercept_target - ctx.player.position;
             let direction = if to_target.magnitude() > 0.01 {

@@ -69,6 +69,41 @@ pub fn is_goal_side(
     to_defender.dot(&dir)
 }
 
+/// D1 (`docs/attacking-defensive-decision-rebuild-plan.md` §2.3) —
+/// jockey/"show outside" lateral bias magnitude (engine units). Real
+/// doctrine (research doc §9.3): "the defender's job is to position
+/// their body between the attacker and the danger area... and
+/// physically steer the attacker toward the touchline" — a lateral
+/// bias to a presser's own closing target, distinct from `is_goal_side`
+/// above (goal-line axis) and the D3/D4 tackle/contain/concede-out
+/// comparison this deliberately does NOT touch (§0.3: this is HOW a
+/// defender closes down, D3/D4 is WHAT he decides once engaged).
+/// Reasoned estimate — no sourced real-world figure for this specific
+/// lateral offset, same status as every other new constant this
+/// session — kept modest relative to the existing goal-side bias
+/// (2-12u in the pressing states) so this nudges the closing ANGLE
+/// rather than dominating the direct chase.
+pub const JOCKEY_SHOW_OUTSIDE_BIAS: f32 = 10.0;
+
+/// Signed lateral (y-axis) direction a presser's own intercept target
+/// should lean to show the carrier outside: away from whichever
+/// touchline `carrier_y` already sits nearer to (the carrier's own
+/// "outside"), toward the pitch centre-line (the carrier's "inside") —
+/// so the defender's body naturally ends up between the carrier and
+/// the central/goal-scoring area, and the only route left open is the
+/// one toward the touchline. A hard binary split on which half the
+/// carrier occupies, matching this codebase's existing convention for
+/// side-relative signs (e.g. `PlayerSide`/attacking-direction flips)
+/// rather than a continuous gradient with no reference doctrine to
+/// calibrate its shape against.
+pub fn jockey_show_outside_sign(carrier_y: f32, field_height: f32) -> f32 {
+    if carrier_y < field_height / 2.0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
 /// Existing, already-calibrated tackle-success sigmoid, extracted
 /// verbatim from `DefenderTacklingState::attempt_sliding_tackle`
 /// (tackling/mod.rs) so it can be queried without re-deriving or
