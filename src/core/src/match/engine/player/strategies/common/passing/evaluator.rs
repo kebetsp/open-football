@@ -540,7 +540,18 @@ impl PassEvaluator {
                 // logged honestly rather than chased further with more
                 // expensive re-batching. Held at 2.6, the last value with
                 // a consistent (if partial) measured improvement.
-                forward_progress * 2.6 * phase_forward_mult * risk_forward_bias
+                //
+                // docs/ball-distribution-fix-plan.md F1, step 2 (2026-08-24):
+                // re-tried at a smaller, ~11.5% relative step (2.6→2.3,
+                // within F1's 10-15%/step band) alongside step 1's
+                // FORWARD_VALUE_WEIGHT cut, judged this time against the
+                // plan's own DoD metric (raw ball-position boundary/
+                // corner-pocket occupancy) rather than pass-destination
+                // lane share — a different, coarser-grained signal than
+                // the one the 2.2 attempt regressed on. See the fix
+                // plan's §1 table for the measured before/after.
+                const DEFENDER_FORWARD_MULT: f32 = 2.3;
+                forward_progress * DEFENDER_FORWARD_MULT * phase_forward_mult * risk_forward_bias
             } else {
                 forward_progress * 2.5 * phase_forward_mult * risk_forward_bias
             }
@@ -1081,7 +1092,23 @@ impl PassEvaluator {
         // phase + receiver type so they only fire in the situations
         // they were designed for. Side-overload is owned by
         // `same_side_density_penalty` (legacy half-pitch path removed).
-        let mut tactical_value = forward_value * 0.32 +
+        //
+        // docs/ball-distribution-fix-plan.md F1, step 1 (2026-08-24):
+        // `forward_value` is the single largest weighted term in this
+        // sum and, per that plan's §2 diagnosis, the primary reason the
+        // ball's own on-pitch distribution runs ~2.3-3.8x too central
+        // vs. real football (Metrica/StatsBomb-sourced target bands) —
+        // seven prior narrow additive counter-terms (defender/forward
+        // width bonuses, the is_blind_central dampener, structural_lane_
+        // risk, etc.) each plateaued specifically because they compete
+        // against this term without ever reducing it. FORWARD_VALUE_
+        // WEIGHT cut 0.32→0.28 (~12.5% relative, within F1's agreed
+        // 10-15%/step band) as the first of several planned bounded
+        // steps — re-verified via scripts/ball-distribution-check.mjs
+        // before being kept; see the fix plan's §1 table for the
+        // measured before/after.
+        const FORWARD_VALUE_WEIGHT: f32 = 0.28;
+        let mut tactical_value = forward_value * FORWARD_VALUE_WEIGHT +
             distance_value * 0.10 +
             position_value * 0.08 +
             long_pass_bonus * 0.05 +
