@@ -333,7 +333,24 @@ fn lane_occupancy_adjustment(ctx: &StateProcessingContext, point: Vector3<f32>) 
 /// this only tips close decisions toward spreading out.
 pub fn carry_value(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
     let cp = control_prob(ctx, point);
-    let sv = carry_shot_value(ctx, point);
+    // docs/ball-distribution-fix-plan.md F2, step 1 (2026-08-24):
+    // `carry_shot_value` is a pure occluded-shooting-angle measure — a
+    // central candidate genuinely has a wider angle than a wide one,
+    // which is real geometry, not a bug on its own. But per the fix
+    // plan's §2 diagnosis, this is the exact mechanism that leaves
+    // dribbling decisions centrally biased even after F1's passing-side
+    // rebalance: `sv` structurally outscores `pv` for any central-ish
+    // candidate regardless of whether a genuinely good combination
+    // option exists wide, because the MAX comparison only lets a wide
+    // candidate win when its pass value already exceeds the (unscaled)
+    // shot-angle value outright. CARRY_SHOT_VALUE_SCALE trims that
+    // structural edge (~12% relative, within F1's agreed 10-15%/step
+    // band) so a genuinely strong wide combination option can win the
+    // comparison more often, without changing what a shot from a given
+    // point is actually worth anywhere else `effective_open_angle`/xG
+    // are used directly (`carry_shot_value` has no other callers).
+    const CARRY_SHOT_VALUE_SCALE: f32 = 0.88;
+    let sv = carry_shot_value(ctx, point) * CARRY_SHOT_VALUE_SCALE;
     let pv = best_pass_value_from(ctx, point);
     let risk = risk_penalty(ctx, point);
     let congestion = congestion_risk(ctx, point);
