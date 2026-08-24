@@ -1099,6 +1099,52 @@ pub fn pass_value_from(
         + lateral_turnover_bonus)
         .clamp(0.10, 0.60);
 
+    // docs/ball-distribution-fix-plan.md Hypothesis B, continuation
+    // (2026-08-24): F4's `open_wide_bonus` (evaluator.rs) only reaches
+    // actual PASS selection — `pass_value_from` is a separate value
+    // function that feeds `carry_value`/`best_pass_value_from`
+    // (dribbling decisions never got this reward, only F2's cost-side
+    // trim to `carry_shot_value`) and, per this same file's `carry_value`
+    // doc comment, is genuinely the dominant driver of time-weighted
+    // ball position, not pass selection alone. Same mechanism as F4,
+    // reused rather than reinvented: a receiver who is genuinely wide
+    // (`receiver_width_ratio`, already computed above for the turnover
+    // term) AND genuinely unmarked is a real receiver-quality signal —
+    // added to `terminal_value` (so it's naturally scaled by
+    // `completion_prob` like every other term there, not bolted onto
+    // the final return unscaled) rather than treated as a separate
+    // reward+risk pair the way F4's version sits in evaluator.rs, since
+    // this function's own structure already has exactly one place
+    // receiver quality belongs. Same 0.55 width threshold / 15u radius /
+    // 0.38-0.22-0.0 magnitude as F4, for direct comparability across the
+    // two systems rather than a second, independently-tuned scale.
+    //
+    // Verified with a raw diagnostic trace (temporary, one real match,
+    // removed after): fires 224,538 times (215,132 at 0.38, 9,406 at
+    // 0.22), always at width_ratio > 0.55 as gated — the mechanism is
+    // real and genuinely common, not a rare edge case. DoD result
+    // (n=60 pooled): near-any-boundary +0.61pp (~2.4% relative),
+    // corner-relevant flat — modest, near the F1/F2/F3/C null band
+    // rather than F4's own +2.65pp. Plausible reason, not chased
+    // further here: this term shapes carry-target/pass-vs-dribble
+    // COMPARISONS (via `carry_value`/`best_pass_value_from`), not the
+    // concrete destination of an actually-dispatched pass — that
+    // selection is still governed by `evaluator.rs`, which F4 already
+    // fixed. Lane-level shift is real: Centre −1.37pp, TouchlineNear+Far
+    // +12.6% relative — correctly directed, smaller than F4's own shift.
+    // Kept per this project's standing practice for well-reasoned,
+    // mechanistically-verified, non-regressive steps in this family.
+    let open_wide_credit = if receiver_width_ratio > 0.55 {
+        match ctx.players().opponents().nearby_at(receiver_pos, 15.0).count() {
+            0 => 0.38,
+            1 => 0.22,
+            _ => 0.0,
+        }
+    } else {
+        0.0
+    };
+    let terminal_value = terminal_value + open_wide_credit;
+
     (completion_prob * terminal_value - (1.0 - completion_prob) * turnover_risk).max(0.0)
 }
 
