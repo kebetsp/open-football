@@ -825,6 +825,45 @@ impl PassEvaluator {
             0.0
         };
 
+        // === OPEN WIDE TEAMMATE BONUS (F4, docs/ball-distribution-fix-
+        // plan.md) ===
+        // F1 (forward_value/defender-multiplier), F2 (carry_shot_value)
+        // and F3 (structural_lane_risk) all trimmed or re-tested COST/
+        // reward-shrinking terms and each showed near-null effect on the
+        // raw, time-weighted ball-position DoD metric (near-any-boundary,
+        // corner-relevant pockets) — three-plus real, verified, isolated
+        // steps. A cheap sanity check run alongside F3 found why: PLAYERS
+        // are already reasonably spread wide off the ball (~39% near-
+        // boundary occupancy, measured) — the gap is that the BALL
+        // disproportionately stays with/among central players relative to
+        // that spread, i.e. a genuinely open, wide teammate isn't being
+        // fed enough. Every other receiver-quality bonus in this function
+        // (cutback_bonus, arriving_runner_bonus) rewards a specific
+        // CENTRAL combination pattern; there was no generic positive pull
+        // toward "there is a real, unmarked winger/fullback standing wide
+        // right now" at all — width bonuses above (`defender_width_
+        // bonus_unweighted` etc.) reward POSITION alone, not position AND
+        // genuine openness together. This is F4's first, narrowly-scoped
+        // step: a new, additive, unweighted (same family as cutback_
+        // bonus/arriving_runner_bonus, not routed through the diluted
+        // `width_bonus*0.22` term those two already learned is too weak
+        // to compete) bonus for a receiver who is both clearly wide
+        // (stricter than the 0.4-0.5 thresholds the flat width bonuses
+        // use, to target genuinely-out-near-the-touchline rather than
+        // half-space) and genuinely unmarked right now. Smaller ceiling
+        // than cutback_bonus (0.30-0.50) since this is a common, general
+        // pattern rather than a rare high-xG situation — 0.18-0.38.
+        let open_wide_bonus = if receiver_width_ratio > 0.55 {
+            let nearby_opps = ctx.tick_context.grid.opponents(receiver.id, 15.0).count();
+            match nearby_opps {
+                0 => 0.38,
+                1 => 0.22,
+                _ => 0.0,
+            }
+        } else {
+            0.0
+        };
+
         // === BUILD-UP RECYCLING BONUS ===
         // In build-up, a short pass to a CB / DM / GK that resets play
         // is a healthy modern pattern, not a panic option. Gated on:
@@ -1118,6 +1157,7 @@ impl PassEvaluator {
             switch_total +                   // Capped flat: classic + underload ≤ 0.45
             cutback_bonus +
             arriving_runner_bonus +
+            open_wide_bonus +                 // F4: flat, same family as cutback_bonus
             defender_width_bonus_unweighted + // /goal 2026-07-26: flat, same family as cutback_bonus
             forward_width_bonus_unweighted +  // /goal 2026-07-26: flat, same family as cutback_bonus
             build_up_recycle_bonus +
