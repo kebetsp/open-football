@@ -92,6 +92,14 @@ pub(crate) const CONGESTION_CAP: f32 = 0.3;
 const LANE_EXCESS_CENTER: f32 = 0.398 - 0.312; // ≈0.086
 const LANE_EXCESS_HALFSPACE: f32 = 0.378 - 0.312; // ≈0.066
 const LANE_EXCESS_FLANK: f32 = 0.0;
+// docs/ball-distribution-fix-plan.md F3 (2026-08-24): re-tested at 5.0
+// (previously rejected in the 2026-08-20 calibration pass for pushing
+// goals/match out of band against the OLD, larger central-pull reward)
+// now that F1/F2 have trimmed that reward side ~12% each — verified via
+// scripts/ball-distribution-check.mjs (n=30/side): near-any-boundary
+// moved the WRONG direction (24.08%->23.66%), corner-relevant barely
+// moved. Confirmed still not viable under the new baseline either;
+// reverted to the original 3.5, unchanged.
 const STRUCTURAL_LANE_SCALE: f32 = 3.5;
 
 /// Width-ratio anchor points (0.0 = dead centre, 1.0 = touchline),
