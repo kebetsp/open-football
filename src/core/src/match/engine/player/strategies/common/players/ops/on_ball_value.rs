@@ -17,7 +17,7 @@
 //! and B3 explicitly left out, per that function's own docstring.
 
 use crate::r#match::player::strategies::spacing;
-use crate::r#match::{MatchPlayerLite, StateProcessingContext};
+use crate::r#match::{GamePhase, MatchPlayerLite, StateProcessingContext};
 use nalgebra::Vector3;
 
 /// Human reaction-time floor (~150ms), converted directly to ticks at the
@@ -358,7 +358,54 @@ pub fn carry_value(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
     // point is actually worth anywhere else `effective_open_angle`/xG
     // are used directly (`carry_shot_value` has no other callers).
     const CARRY_SHOT_VALUE_SCALE: f32 = 0.88;
-    let sv = carry_shot_value(ctx, point) * CARRY_SHOT_VALUE_SCALE;
+    // docs/ball-distribution-fix-plan.md Hypothesis C (2026-08-24, §2.5,
+    // §5): Pavel's phase-blindness hypothesis — outside the final third,
+    // the real decision is "can I advance safely," not "how good is my
+    // shooting angle from here." `carry_shot_value` is a pure occluded-
+    // angle measure with no sense of whether a shot is even a live
+    // consideration yet, so it structurally outscores `pv` for any
+    // central-ish candidate in BuildUp/Progression too, not just Attack.
+    // `GamePhase` (teamplay/tactical.rs) already encodes exactly this
+    // three-way split by which third the ball is in — reused here rather
+    // than re-deriving distance-to-goal, per the plan's own "wire up
+    // existing, correct infrastructure" framing. `ctx.team()` is the
+    // CARRIER's own team (ctx.player is the carrier), so this is exactly
+    // the possessing team's own phase, not a third party's.
+    //
+    // Scales chosen from BallZone's own thirds geometry, not guessed
+    // uniformly: BuildUp is the whole defensive third (up to ~35m from
+    // own goal) where a real shot attempt basically never happens —
+    // near-zero. Progression is the middle third (35m-52.5m from goal at
+    // its nearest edge) where a shot is rare but not impossible (a
+    // genuine long-range strike) — heavily discounted, not zeroed.
+    // Attack (the final third) and AttackingTransition (a fast break,
+    // frequently the most dangerous moment in real football and often
+    // literally already inside the final third) both keep full shot
+    // value — this is deliberately NOT a blanket "attacking phases only"
+    // rule, a counter-attack shouldn't be penalised for not yet being
+    // formally tagged Attack.
+    //
+    // Verified with a raw phase→scale trace (temporary diagnostic, one
+    // real match, removed after): exactly 7 distinct (phase, scale)
+    // pairs observed, all matching this mapping with zero cross-wiring —
+    // BuildUp→0.10, Progression→0.35, Attack/AttackingTransition→1.00,
+    // and the out-of-possession phases (Defensive Transition/LowBlock/
+    // MidBlock — reachable here in rare edge-case ticks, e.g. a one-tick
+    // lag right after a turnover) correctly falling through to the safe
+    // default below.
+    let shot_phase_scale: f32 = match ctx.team().phase() {
+        GamePhase::BuildUp => 0.10,
+        GamePhase::Progression => 0.35,
+        GamePhase::Attack | GamePhase::AttackingTransition => 1.0,
+        // Out-of-possession phases shouldn't reach carry_value for a
+        // real carrier in practice — ctx.player is by definition on the
+        // ball — but they do, rarely (a one-tick lag around a turnover;
+        // confirmed via the trace above). Full value, matching the old
+        // (pre-Hypothesis-C) unscaled behavior, is the safe default
+        // rather than a silent trap if a new GamePhase variant is added.
+        _ => 1.0,
+    };
+    let sv = carry_shot_value(ctx, point) * CARRY_SHOT_VALUE_SCALE * shot_phase_scale;
     let pv = best_pass_value_from(ctx, point);
     let risk = risk_penalty(ctx, point);
     let congestion = congestion_risk(ctx, point);
