@@ -1145,7 +1145,105 @@ pub fn pass_value_from(
     };
     let terminal_value = terminal_value + open_wide_credit;
 
+    // G4 (docs/ball-distribution-fix-plan.md, Hypothesis G): none of the
+    // terms above ask whether the receiver has open ground to carry the
+    // ball INTO after catching it — only whether they could immediately
+    // shoot (`shallow_terminal_value_at`) or immediately lay it off again
+    // (`shallow_best_pass_value_from`), and whether they're open RIGHT NOW
+    // (`open_wide_credit`, above). A pass that lands a winger in a
+    // crowded dead-end and one that lands him in the same spot with 30m
+    // of running room ahead score identically without this term. Added
+    // to `terminal_value` for the same reason `open_wide_credit` was —
+    // this function's structure already has exactly one place receiver
+    // quality belongs, and it's naturally scaled by `completion_prob`
+    // there rather than bolted onto the final return unscaled.
+    let terminal_value = terminal_value + receiver_runway_value(ctx, receiver);
+
     (completion_prob * terminal_value - (1.0 - completion_prob) * turnover_risk).max(0.0)
+}
+
+/// G4's runway sample distance — same reach horizon `carry_candidates`
+/// uses for its own candidate ring (`REACH_TICKS`, 0.6-1.2s), clamped to
+/// the same [15, 70] band, so "ahead" means the same real-world distance
+/// a player could actually cover before the next decision point, not an
+/// arbitrarily chosen lookahead.
+fn runway_sample_point(
+    ctx: &StateProcessingContext,
+    runner_pos: Vector3<f32>,
+    runner_speed: f32,
+) -> Vector3<f32> {
+    let goal = ctx.player().opponent_goal_position();
+    let to_goal = goal - runner_pos;
+    let dist_to_goal = to_goal.magnitude();
+    let direction = if dist_to_goal > 1.0 {
+        to_goal / dist_to_goal
+    } else {
+        Vector3::new(1.0, 0.0, 0.0)
+    };
+    let runway_dist = (runner_speed * REACH_TICKS).clamp(15.0, 70.0);
+    runner_pos + direction * runway_dist
+}
+
+/// G4 (docs/ball-distribution-fix-plan.md, Hypothesis G — audit finding
+/// G4, 2026-08-25): credit for a receiver having genuine open ground to
+/// advance into after the catch, not just being open at the reception
+/// point itself. Samples a point `runway_sample_point` ahead of the
+/// receiver (toward the opponent's goal, matching this file's existing
+/// "forward" convention — `carry_candidates`'s own main candidate fan
+/// uses the identical direction) and asks whether the RECEIVER — not the
+/// passer/current ball-holder — would win a genuine race to that point
+/// against the nearest opponent.
+///
+/// Deliberately NOT a call to `control_prob`: that function hardcodes
+/// `ctx.player` (the current ball holder) as the racer and searches for
+/// opponents via `nearby(120.0)`, which is centred on `ctx.player`'s own
+/// position — correct for `carry_value`'s candidates (always within
+/// ~70u of `ctx.player`) but wrong here, since the runway point can sit
+/// 100+ units away from the passer, well outside a passer-centred
+/// search. This reimplements the same race-to-a-point shape
+/// (`time_to_intercept` vs. the runner's own real time, same sigmoid),
+/// but scored from the RECEIVER's real speed/position and searched via
+/// `nearby_at(point, ...)` — centred on the point itself, per this
+/// file's own established generalization pattern (`congestion_risk`,
+/// `lane_completion_prob`).
+///
+/// `RUNWAY_MAX_BONUS`: same order of magnitude as `open_wide_credit`'s
+/// own ceiling (0.38) rather than a fresh, independently-tuned scale —
+/// no sourced real-world target exists for how much a manager should
+/// value a receiver's future running room specifically (category (d)
+/// per this project's own Realism Diagnosis Framework); reasoned to sit
+/// slightly below `open_wide_credit` since "open now" is a stronger,
+/// more certain signal than "probably open in ~1 second," and tune from
+/// the plan's own §6 verification protocol rather than treated as
+/// calibrated on first write.
+const RUNWAY_MAX_BONUS: f32 = 0.30;
+
+fn receiver_runway_value(ctx: &StateProcessingContext, receiver: &MatchPlayerLite) -> f32 {
+    let runner_speed = ctx
+        .context
+        .players
+        .by_id(receiver.id)
+        .map(|p| p.skills.max_speed_with_condition(p.player_attributes.condition))
+        .unwrap_or(0.45);
+
+    let runway_point = runway_sample_point(ctx, receiver.position, runner_speed);
+    let runner_dist = (runway_point - receiver.position).magnitude();
+    let runner_time = runner_dist / runner_speed.max(0.05);
+
+    let mut min_opp_time = f32::MAX;
+    for opp in ctx.players().opponents().nearby_at(runway_point, 120.0) {
+        let t = time_to_intercept(ctx, &opp, runway_point);
+        if t < min_opp_time {
+            min_opp_time = t;
+        }
+    }
+    let runway_prob = if min_opp_time == f32::MAX {
+        1.0 // no opponent within range of the runway point — fully open
+    } else {
+        let advantage = min_opp_time - runner_time;
+        1.0 / (1.0 + (-advantage / CONTROL_PROB_SCALE).exp())
+    };
+    runway_prob * RUNWAY_MAX_BONUS
 }
 
 /// Thin wrapper preserving the original call signature — a pure
