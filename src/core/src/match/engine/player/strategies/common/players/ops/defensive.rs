@@ -1,5 +1,8 @@
+use crate::r#match::player::strategies::common::players::ops::on_ball_value::time_to_intercept;
 use crate::r#match::{MatchPlayerLite, PlayerSide, StateProcessingContext};
 use nalgebra::Vector3;
+#[cfg(feature = "match-logs")]
+use std::sync::atomic::Ordering;
 
 /// Operations for defensive positioning and tactics
 pub struct DefensiveOperationsImpl<'p> {
@@ -29,8 +32,52 @@ pub enum DefensiveRole {
 }
 
 const THREAT_SCAN_DISTANCE: f32 = 100.0;
-const DANGEROUS_RUN_SPEED: f32 = 2.0;
+// realism-bug (2026-08-27): this was 2.0 — unreachable at this engine's
+// real velocity scale (measured average opponent speed in a genuine
+// wide/deep candidate zone is 0.27-0.43 u/tick; max_speed_with_condition
+// tops out ~0.36-0.6 for even an elite, fully-fit player). This
+// threshold has been silently impossible to clear for any normal
+// running pace since it was introduced — `scan_for_dangerous_runs`
+// could only ever fire for corner-case velocity spikes, not real
+// attacking runs. 0.30 is a genuine "running, not standing/walking" bar
+// at the real scale (same value chosen for the new
+// `wide_run_track_override_velocity`, so both mechanisms agree on what
+// "moving with real intent" means).
+const DANGEROUS_RUN_SPEED: f32 = 0.30;
 const DANGEROUS_RUN_ANGLE: f32 = 0.5;
+
+/// TEMPORARY realism-bug diagnostic (2026-08-27, byline-duel root-cause
+/// investigation): does `scan_for_dangerous_runs`'s "aligned with the
+/// direction to goal CENTER" model actually detect a genuine wide/deep
+/// byline run as dangerous? Removed once the investigation concludes.
+#[cfg(feature = "match-logs")]
+pub mod byline_run_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static WIDE_DEEP_FAST_CANDIDATES: AtomicU64 = AtomicU64::new(0);
+    pub static WIDE_DEEP_FAST_PASSED_ALIGNMENT: AtomicU64 = AtomicU64::new(0);
+    pub static SUM_ALIGNMENT_X1000: AtomicU64 = AtomicU64::new(0);
+    pub static SCAN_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static SCAN_HAD_ANY_NEARBY: AtomicU64 = AtomicU64::new(0);
+    pub static WRT_FIRED: AtomicU64 = AtomicU64::new(0);
+    pub static WRT_SUM_START_DIST_X100: AtomicU64 = AtomicU64::new(0);
+    pub static WIDE_DEEP_SPEED_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    pub static WIDE_DEEP_SUM_SPEED_X1000: AtomicU64 = AtomicU64::new(0);
+    pub fn reset() {
+        for c in [
+            &WIDE_DEEP_FAST_CANDIDATES,
+            &WIDE_DEEP_FAST_PASSED_ALIGNMENT,
+            &SUM_ALIGNMENT_X1000,
+            &SCAN_CALLS,
+            &SCAN_HAD_ANY_NEARBY,
+            &WRT_FIRED,
+            &WRT_SUM_START_DIST_X100,
+            &WIDE_DEEP_SPEED_SAMPLES,
+            &WIDE_DEEP_SUM_SPEED_X1000,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+}
 
 // Coordination constants
 const ENGAGEMENT_DISTANCE: f32 = 20.0; // Distance at which a defender is considered "engaging" an opponent
@@ -41,6 +88,24 @@ const MIN_MARKING_SEPARATION: f32 = 15.0; // Minimum distance between defenders 
 const COVER_MAX_DISTANCE: f32 = 45.0; // Too far from carrier to be useful as cover
 const HELP_SCAN_RADIUS: f32 = 28.0; // Range in which Help defender looks for a pass option
 const COVER_GOAL_SIDE_OFFSET: f32 = 12.0; // Cover sits this far goal-side of carrier
+
+/// D8.1 (2026-08-22): reachability window for including a midfielder in
+/// the unified Primary/Cover/Help/Hold pool for a given ball-carrier
+/// threat. Reuses `on_ball_value::time_to_intercept`'s own
+/// reaction-plus-speed model rather than a flat radius — the same
+/// "genuine race/reachability, not an invented distance" discipline
+/// `defensive_value.rs::boundary_push_viability` (D6) already
+/// established for a different decision. The value is an honest unit
+/// conversion of D0's own already-established "byline 1v1" proximity
+/// figure (130u — the same geometry `SAFE_RESTART_LINE_MARGIN`/
+/// `CONCEDE_GOAL_SIDE_SATURATION` already share) through
+/// `time_to_intercept` at a typical midfielder max speed (~0.45u/tick):
+/// (130.0 / 0.45) + 15.0 (REACTION_TICKS) ≈ 304 ticks (~3s), rounded —
+/// not a fresh invented number. No sourced real-world dataset exists for
+/// "how close must a midfielder be to be a genuine defensive option"
+/// (category (d)) — D8.1's own raw-data verification is what actually
+/// validates or revises this, not the reasoning alone.
+const MIDFIELDER_REACHABILITY_TICKS: f32 = 300.0;
 
 impl<'p> DefensiveOperationsImpl<'p> {
     pub fn new(ctx: &'p StateProcessingContext<'p>) -> Self {
@@ -58,6 +123,14 @@ impl<'p> DefensiveOperationsImpl<'p> {
         scan_distance: f32,
     ) -> Option<MatchPlayerLite> {
         let own_goal_position = self.ctx.ball().direction_to_own_goal();
+
+        #[cfg(feature = "match-logs")]
+        {
+            byline_run_diag::SCAN_CALLS.fetch_add(1, Ordering::Relaxed);
+            if self.ctx.players().opponents().nearby(scan_distance).next().is_some() {
+                byline_run_diag::SCAN_HAD_ANY_NEARBY.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         // Find the closest opponent making a dangerous run — no intermediate Vec
         self.ctx
@@ -77,6 +150,26 @@ impl<'p> DefensiveOperationsImpl<'p> {
                 let to_goal = (own_goal_position - opp.position).normalize();
                 let velocity_dir = velocity.normalize();
                 let alignment = velocity_dir.dot(&to_goal);
+
+                #[cfg(feature = "match-logs")]
+                {
+                    // Same wide/deep zone `byline_commitment_ticks` (run.rs)
+                    // targets: y outside the central 38-62% band, x-depth
+                    // from goal 130-380u, moving at real pace.
+                    let h = self.ctx.context.field_size.height as f32;
+                    let wide = opp.position.y < h * 0.38 || opp.position.y > h * 0.62;
+                    let goal_x = own_goal_position.x;
+                    let depth = (goal_x - opp.position.x).abs();
+                    if wide && (130.0..380.0).contains(&depth) && speed >= DANGEROUS_RUN_SPEED {
+                        byline_run_diag::WIDE_DEEP_FAST_CANDIDATES.fetch_add(1, Ordering::Relaxed);
+                        byline_run_diag::SUM_ALIGNMENT_X1000
+                            .fetch_add((alignment.max(-1.0) * 1000.0 + 1000.0) as u64, Ordering::Relaxed);
+                        if alignment >= DANGEROUS_RUN_ANGLE {
+                            byline_run_diag::WIDE_DEEP_FAST_PASSED_ALIGNMENT
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
 
                 if alignment < DANGEROUS_RUN_ANGLE {
                     return false;
@@ -449,15 +542,25 @@ impl<'p> DefensiveOperationsImpl<'p> {
 
     // ==================== DEFENDER COORDINATION ====================
 
-    /// Check if an opponent is already being engaged by a teammate defender
-    /// Returns true if another defender is closer AND actively moving toward them
+    /// Check if an opponent is already being engaged by a teammate
+    /// defender OR midfielder. Widened from defenders-only (2026-08-22,
+    /// D8.2) — now that midfielders can also hold Primary/Cover/Help
+    /// roles (`defensive_role_for_ball_carrier_unified`), leaving this
+    /// defenders-only would let a defender double-mark an opponent a
+    /// midfielder is already engaging. No reachability pre-filter is
+    /// needed here (unlike the unified pool) — the existing
+    /// `ENGAGEMENT_DISTANCE`/velocity-alignment checks below already do
+    /// the real gating for "is someone genuinely engaging them right
+    /// now," a much tighter question than "could someone reach them."
+    /// Returns true if another teammate is closer AND actively moving
+    /// toward them.
     pub fn is_opponent_being_engaged(&self, opponent: &MatchPlayerLite) -> bool {
         let my_distance = (self.ctx.player.position - opponent.position).magnitude();
 
-        self.ctx
-            .players()
-            .teammates()
+        let teammates = self.ctx.players().teammates();
+        teammates
             .defenders()
+            .chain(teammates.midfielders())
             .filter(|d| d.id != self.ctx.player.id)
             .any(|teammate| {
                 let teammate_distance = (teammate.position - opponent.position).magnitude();
@@ -491,10 +594,19 @@ impl<'p> DefensiveOperationsImpl<'p> {
     }
 
     /// Assign a defensive role to this defender relative to the current
-    /// ball carrier. Single source of truth for defender coordination —
-    /// every role decision flows from this. Recomputed each tick, so
-    /// role changes with geometry (e.g. primary gets dribbled past →
-    /// old cover promotes to primary next tick).
+    /// ball carrier. Recomputed each tick, so role changes with geometry
+    /// (e.g. primary gets dribbled past → old cover promotes to primary
+    /// next tick).
+    ///
+    /// D8.2 (2026-08-22): superseded — all 9 real call sites across the
+    /// six defender states were switched to `defensive_role_for_ball_
+    /// carrier_unified` (defenders + reachability-gated midfielders in
+    /// one shared pool, so a defender and a midfielder agree on who's
+    /// actually Primary instead of each independently ranking only their
+    /// own position group). Kept, not deleted, so the pre-D8.2 behavior
+    /// stays a one-line diff away if a revert is ever needed; genuinely
+    /// unused right now — safe to remove in a later cleanup pass.
+    #[allow(dead_code)]
     pub fn defensive_role_for_ball_carrier(&self) -> DefensiveRole {
         let Some(ball_carrier) = self.ctx.players().opponents().with_ball().next() else {
             return DefensiveRole::Hold;
@@ -510,6 +622,96 @@ impl<'p> DefensiveOperationsImpl<'p> {
             .players()
             .teammates()
             .defenders()
+            .filter(|d| d.id != my_id)
+            .filter(|d| {
+                let dist = (d.position - ball_carrier.position).magnitude();
+                dist < my_dist || (dist == my_dist && d.id < my_id)
+            })
+            .count();
+
+        match rank {
+            0 => DefensiveRole::Primary,
+            1 if my_dist < COVER_MAX_DISTANCE => DefensiveRole::Cover,
+            _ => {
+                let carrier_id = ball_carrier.id;
+                let has_help_target = self
+                    .ctx
+                    .players()
+                    .opponents()
+                    .nearby(HELP_SCAN_RADIUS)
+                    .any(|opp| opp.id != carrier_id && !self.is_opponent_being_engaged(&opp));
+                if has_help_target {
+                    DefensiveRole::Help
+                } else {
+                    DefensiveRole::Hold
+                }
+            }
+        }
+    }
+
+    /// D8.1 (2026-08-22, isolated — not called from anywhere except this
+    /// file's own unified role function and, eventually, a diagnostic).
+    /// Ranking pool for `defensive_role_for_ball_carrier_unified`: every
+    /// defender teammate, unconditional (identical to the pre-D8 pool
+    /// `defensive_role_for_ball_carrier` above already uses), plus every
+    /// midfielder teammate whose `time_to_intercept` to the ball
+    /// carrier's own position is within `MIDFIELDER_REACHABILITY_TICKS`.
+    /// Defenders are never reachability-gated here — D8 doesn't change
+    /// anything about how a defender is judged eligible, only widens WHO
+    /// ELSE competes for the same role.
+    fn unified_defensive_pool(&self, ball_carrier_pos: Vector3<f32>) -> Vec<MatchPlayerLite> {
+        let teammates = self.ctx.players().teammates();
+        let mut pool: Vec<MatchPlayerLite> = teammates.defenders().collect();
+        pool.extend(teammates.midfielders().filter(|m| {
+            time_to_intercept(self.ctx, m, ball_carrier_pos) <= MIDFIELDER_REACHABILITY_TICKS
+        }));
+        pool
+    }
+
+    /// D8.1 (2026-08-22, isolated — new function, not called from any
+    /// state's `process()` yet; the pre-D8 `defensive_role_for_ball_
+    /// carrier` above is untouched and still the only one every existing
+    /// defender state consumes, so this has zero effect on live match
+    /// behavior until D8.2 wires it in). Same Primary/Cover/Help/Hold
+    /// ranking logic as the pre-D8 function, computed over `unified_
+    /// defensive_pool` instead of `.teammates().defenders()` alone — a
+    /// genuinely closer, reachable midfielder can out-rank a defender
+    /// for Primary/Cover, and vice versa. Callable from any position
+    /// group's context: the pool always includes every defender plus
+    /// every reachable midfielder regardless of the caller's own role,
+    /// which is what lets D8.2 wire this into midfielder states without
+    /// a parallel implementation.
+    ///
+    /// Self-eligibility: a midfielder calling this while too far away to
+    /// plausibly be a candidate at all (fails its own reachability
+    /// check) is NOT in the pool by construction — short-circuits to
+    /// `Hold` rather than computing a rank against a pool it was never
+    /// actually part of, which could otherwise produce a spurious
+    /// Primary/Cover for a midfielder nowhere near the play.
+    pub fn defensive_role_for_ball_carrier_unified(&self) -> DefensiveRole {
+        let Some(ball_carrier) = self.ctx.players().opponents().with_ball().next() else {
+            return DefensiveRole::Hold;
+        };
+
+        if self.ctx.player.tactical_position.current_position.is_midfielder() {
+            let my_lite = MatchPlayerLite {
+                id: self.ctx.player.id,
+                position: self.ctx.player.position,
+                tactical_positions: self.ctx.player.tactical_position.current_position,
+            };
+            if time_to_intercept(self.ctx, &my_lite, ball_carrier.position)
+                > MIDFIELDER_REACHABILITY_TICKS
+            {
+                return DefensiveRole::Hold;
+            }
+        }
+
+        let my_id = self.ctx.player.id;
+        let my_dist = (self.ctx.player.position - ball_carrier.position).magnitude();
+
+        let pool = self.unified_defensive_pool(ball_carrier.position);
+        let rank = pool
+            .iter()
             .filter(|d| d.id != my_id)
             .filter(|d| {
                 let dist = (d.position - ball_carrier.position).magnitude();

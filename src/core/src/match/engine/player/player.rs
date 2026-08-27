@@ -211,6 +211,23 @@ pub struct MatchPlayer {
     /// Cleared on ball release, genuine two-man pressure, or budget
     /// expiry (engine loop, same pattern as the three fields above).
     pub byline_commitment_ticks: u16,
+    /// realism-bug (2026-08-27): persistent assignment for
+    /// `wide_run_track_override_velocity` (processor.rs) — the opponent
+    /// this defender is currently shadowing on a wide run toward the
+    /// byline, if any. Without persistence, the per-tick "who's the
+    /// single closest defender" recomputation reassigns the tracker
+    /// almost every tick as relative distances jitter slightly, so no
+    /// one defender ever commits to a sustained chase long enough to
+    /// close a real gap — the same thrashing `should_yield_takeball`'s
+    /// own HYSTERESIS constant exists to prevent, applied here via an
+    /// explicit persistent target instead.
+    pub wide_run_track_target: Option<u32>,
+    /// Ticks remaining on the above assignment — refreshed every tick
+    /// the tracked opponent still satisfies the danger criteria, so a
+    /// genuine sustained run keeps the same defender committed, while
+    /// one that stops (loses the ball, gets tackled, moves away) decays
+    /// within under a second with nothing else needed to clear it.
+    pub wide_run_track_ticks: u16,
     /// P5 (A3, `docs/attacking-defensive-decision-rebuild-plan.md`
     /// §2.1/§2.2) — how many consecutive ticks this player has occupied
     /// their current `PitchLane`. Incremented each tick the lane stays
@@ -583,6 +600,8 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            wide_run_track_target: None,
+            wide_run_track_ticks: 0,
             lane_residency_ticks: 0,
             lane_residency_lane: u8::MAX,
             spatial_width_emphasis: 1.0,
@@ -679,6 +698,8 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            wide_run_track_target: None,
+            wide_run_track_ticks: 0,
             lane_residency_ticks: 0,
             lane_residency_lane: u8::MAX,
             spatial_width_emphasis: 1.0,

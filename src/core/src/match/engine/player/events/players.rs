@@ -9,6 +9,7 @@ use crate::r#match::events::{Event, EventCollection};
 use crate::r#match::player::events::{PassingEventContext, ShootingEventContext};
 use crate::r#match::player::statistics::MatchStatisticType;
 use crate::r#match::player::strategies::players::ShotSkillInputs;
+use crate::r#match::player::strategies::players::defensive_value as dv;
 use crate::r#match::player::strategies::players::ShotSkillProfile;
 use crate::r#match::player::strategies::players::ops::effective_skill::{
     ActionContext as EffSkillCtx, effective_skill,
@@ -782,6 +783,7 @@ impl PlayerEventDispatcher {
                 field.ball.pending_pass_target = Some(pass_target);
                 field.ball.pending_pass_was_cross = was_cross;
                 if was_cross {
+                    match_log_info!("CROSSDIAG ENGINE_CROSS_ATTEMPT id={}", passer_id);
                     if let Some(passer) = field.get_player_mut(passer_id) {
                         passer.statistics.add_cross_attempt();
                     }
@@ -2751,7 +2753,25 @@ impl PlayerEventDispatcher {
         field.ball.velocity = Vector3::zeros();
         field.ball.flags.in_flight_state = 0;
         field.ball.cached_shot_target = None;
+        field.ball.concede_out_shielded_opponent = None;
     }
+
+    /// Nearest of the four boundary edges from `ball_pos`. Extracted
+    /// (behavior-preserving) out of the `DEF_CONCEDE_OUT` branch below
+    /// so `DEF_SLIDE_SUCCESS` (D4.6, docs/defensive-decision-logic-
+    /// spec.md) can reuse the exact same geometry `concede_out_value`
+    /// scores against (`on_ball_value.rs`'s `SAFE_RESTART_LINE_MARGIN`)
+    /// instead of duplicating it.
+    ///
+    /// D6 (2026-08-22): moved again, this time into `defensive_value.rs`
+    /// itself (`dv::nearest_boundary_edge`) so the DECISION side
+    /// (`concede_out_value`/`slide_should_push_to_boundary`, which need
+    /// this exact same target to run the reachability race check) and
+    /// this EXECUTION side use one shared function, not two copies that
+    /// could silently drift apart the way the pre-D6 flat-distance gate
+    /// and this dispatch target already had (see `concede_out_value`'s
+    /// own D3 fix comment). Call sites below updated to `dv::nearest_
+    /// boundary_edge(...)`.
 
     fn handle_shoot_event(
         shoot_event_model: ShootingEventContext,
@@ -2881,6 +2901,311 @@ impl PlayerEventDispatcher {
                 // reason at all). Leave the ball dead rather than
                 // falling through to goal-aiming logic below that
                 // assumes an on-target attempt.
+                field.ball.velocity = Vector3::zeros();
+            }
+            return;
+        }
+
+        // D3 of docs/defensive-decision-logic-spec.md (2026-08-21): the
+        // defensive mirror of FWD_RUN_SAFE_RESTART just above.
+        // `defensive_value::concede_out_value` won the tackle/contain/
+        // concede-out comparison in `DefenderTacklingState::process()`
+        // (the OPPONENT owns the ball at that point, not this player —
+        // this is a deliberate poke/deflection, not a shot the defender
+        // was already carrying). Unlike the attacker version, the target
+        // is the nearest BOUNDARY EDGE itself, not a player — a real
+        // defender showing an attacker outside is trying to put the ball
+        // out of play, not deflect it off someone. Deliberately no
+        // `cached_shot_target`: `try_block_shot`'s outcome-weighting
+        // pipeline (save physics, p_corner/p_safe/p_controlled) models a
+        // blocked SHOT AT GOAL and doesn't map onto a defensive
+        // clearance — an attacker recovering this poke via ordinary
+        // interception is already exactly the risk `concede_out_value`
+        // priced in via `tackle_win_prob` before this branch ever fires.
+        // As with the attacker side, no restart-type logic is needed
+        // here either: `previous_owner` is set to the DEFENDER, so the
+        // ball's existing generic out-of-bounds classifiers
+        // (`goal.rs`'s `check_wide_of_goal`/`check_over_goal`, the
+        // throw-in touchline check — all keyed on `last_touch_player_id`)
+        // correctly resolve a corner/goal-kick/throw-in FOR the
+        // attacking team, matching what "deliberately concede a
+        // restart" actually means.
+        if shoot_event_model.reason == "DEF_CONCEDE_OUT" {
+            let defender_id = shoot_event_model.from_player_id;
+            // The opponent this ball is being taken FROM — captured
+            // before `current_owner` is overwritten below. Raw-data
+            // verification (2026-08-21) found this exact player
+            // re-intercepting the redirect within one tick in 7/7 real
+            // firings (a Tackling-range duel starts well inside
+            // `try_intercept`'s reach) — shielded via
+            // `concede_out_shielded_opponent` (ball/ball/mod.rs), which
+            // excludes only this one player from that check, not
+            // anyone else who might be genuinely better-positioned.
+            let dispossessed_opponent_id = field.ball.current_owner;
+            let ball_pos = field.ball.position;
+            let field_width = field.size.width as f32;
+            let field_height = field.size.height as f32;
+            let defender_power_skill = field
+                .get_player(defender_id)
+                .map(|p| (p.skills.physical.strength / 20.0).clamp(0.0, 1.0))
+                .unwrap_or(0.5);
+
+            // Nearest of the four boundary edges from the ball's live
+            // position — the same four-boundary geometry
+            // `concede_out_value` scores against (`on_ball_value.rs`'s
+            // `SAFE_RESTART_LINE_MARGIN`).
+            let target = dv::nearest_boundary_edge(ball_pos, field_width, field_height);
+
+            let dist = (target - ball_pos).magnitude().max(MIN_SHOT_DISTANCE);
+            let dir = (target - ball_pos) / dist;
+            // ~1.0-1.6 u/tick — deliberate and controlled, not a hoof.
+            // Matches FWD_RUN_SAFE_RESTART's own reasoning: a slower
+            // strike is easier for the attacking team to intercept
+            // (real risk, already priced into the decision via
+            // tackle_win_prob) but that's the honest trade-off of a
+            // genuine "show him outside, don't dive in" clearance
+            // rather than a committed, higher-risk lunge.
+            // D6: named constants (dv::CONCEDE_STRIKE_SPEED_*) instead
+            // of inline literals, so `concede_out_value`'s own
+            // reachability check (decision side) can't silently drift
+            // from this actual strike speed (execution side).
+            let speed = dv::CONCEDE_STRIKE_SPEED_BASE
+                + defender_power_skill * dv::CONCEDE_STRIKE_SPEED_RANGE;
+            field.ball.velocity = dir * speed;
+            field.ball.position.z = 0.0;
+            field.ball.previous_owner = Some(defender_id);
+            field.ball.current_owner = None;
+            field.ball.pass_target_player_id = None;
+            field.ball.carry_owner = None;
+            field.ball.clear_pending_pass_metadata();
+            field.ball.flags.in_flight_state = 40;
+            field.ball.cached_shot_target = None;
+            field.ball.concede_out_shielded_opponent = dispossessed_opponent_id;
+            return;
+        }
+
+        // D4.6 of docs/defensive-decision-logic-spec.md: the last-ditch
+        // sliding block. `desperate_slide_value` won against the
+        // implicit value of just continuing the chase
+        // (`pressing/mod.rs`, evaluated BEFORE the D1-D4 tackle/
+        // contain/concede-out comparison ever runs — this fires while
+        // the defender is still trailing, not yet in a contain
+        // position), and the outcome roll (same file) landed on
+        // Success: the slide connected and knocked the ball toward the
+        // nearest boundary. Same target geometry and shielding as
+        // `DEF_CONCEDE_OUT` just above (a genuine slide dispossesses
+        // the attacker mid-run exactly the same way a deliberate poke
+        // does — the just-tackled opponent needs the same one-tick
+        // re-interception shield) but a firmer, more committed strike
+        // (a lunge, not a controlled clearance).
+        if shoot_event_model.reason == "DEF_SLIDE_SUCCESS" {
+            let defender_id = shoot_event_model.from_player_id;
+            let dispossessed_opponent_id = field.ball.current_owner;
+            let ball_pos = field.ball.position;
+            let field_width = field.size.width as f32;
+            let field_height = field.size.height as f32;
+            let defender_power_skill = field
+                .get_player(defender_id)
+                .map(|p| (p.skills.physical.strength / 20.0).clamp(0.0, 1.0))
+                .unwrap_or(0.5);
+
+            let target = dv::nearest_boundary_edge(ball_pos, field_width, field_height);
+            let dist = (target - ball_pos).magnitude().max(MIN_SHOT_DISTANCE);
+            let dir = (target - ball_pos) / dist;
+            // ~1.4-2.2 u/tick — a committed lunge, faster than
+            // DEF_CONCEDE_OUT's controlled 1.0-1.6 poke. D6: named
+            // constants, same reasoning as the DEF_CONCEDE_OUT branch
+            // above.
+            let speed =
+                dv::SLIDE_STRIKE_SPEED_BASE + defender_power_skill * dv::SLIDE_STRIKE_SPEED_RANGE;
+            field.ball.velocity = dir * speed;
+            field.ball.position.z = 0.0;
+            field.ball.previous_owner = Some(defender_id);
+            field.ball.current_owner = None;
+            field.ball.pass_target_player_id = None;
+            field.ball.carry_owner = None;
+            field.ball.clear_pending_pass_metadata();
+            field.ball.flags.in_flight_state = 40;
+            field.ball.cached_shot_target = None;
+            field.ball.concede_out_shielded_opponent = dispossessed_opponent_id;
+            return;
+        }
+
+        // D6 (docs/defensive-decision-logic-spec.md): a successful slide
+        // whose `slide_should_push_to_boundary` check (pressing/mod.rs,
+        // evaluated at decision time using the SAME `dv::boundary_push_
+        // viability` race the DEF_SLIDE_SUCCESS branch above implicitly
+        // assumed would just work) came back false — the nearest
+        // boundary edge isn't genuinely reachable before an opponent
+        // gets there. "Tackle to get the ball" and "tackle to push the
+        // ball away" are two different decisions: this one won the
+        // ball, so it plays it safe to the nearest teammate instead of
+        // hoofing it at an edge it will never reach. A controlled speed
+        // (the same constants DEF_CONCEDE_OUT uses, not the slide's own
+        // committed-lunge speed — this is a deliberate, calm lay-off,
+        // not a desperate poke) aimed at the receiver's live position,
+        // with `pass_target_player_id` set so the same privileged-claim
+        // machinery a genuine pass already uses applies here too.
+        if shoot_event_model.reason == "DEF_SLIDE_SUCCESS_LAYOFF" {
+            let defender_id = shoot_event_model.from_player_id;
+            let dispossessed_opponent_id = field.ball.current_owner;
+            let ball_pos = field.ball.position;
+            let defender_side = field.get_player(defender_id).and_then(|p| p.side);
+            let defender_power_skill = field
+                .get_player(defender_id)
+                .map(|p| (p.skills.physical.strength / 20.0).clamp(0.0, 1.0))
+                .unwrap_or(0.5);
+
+            let nearest_teammate = field
+                .players
+                .iter()
+                .filter(|p| p.id != defender_id && p.side == defender_side)
+                .min_by(|a, b| {
+                    let da = (a.position - ball_pos).magnitude();
+                    let db = (b.position - ball_pos).magnitude();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+            if let Some(teammate) = nearest_teammate {
+                let target = teammate.position;
+                let teammate_id = teammate.id;
+                let dist = (target - ball_pos).magnitude().max(MIN_SHOT_DISTANCE);
+                let dir = (target - ball_pos) / dist;
+                let speed = dv::CONCEDE_STRIKE_SPEED_BASE
+                    + defender_power_skill * dv::CONCEDE_STRIKE_SPEED_RANGE;
+                field.ball.velocity = dir * speed;
+                field.ball.position.z = 0.0;
+                field.ball.previous_owner = Some(defender_id);
+                field.ball.current_owner = None;
+                field.ball.pass_target_player_id = Some(teammate_id);
+                field.ball.carry_owner = None;
+                field.ball.clear_pending_pass_metadata();
+                field.ball.flags.in_flight_state = 40;
+                field.ball.cached_shot_target = None;
+                field.ball.concede_out_shielded_opponent = dispossessed_opponent_id;
+            } else {
+                // No outfield teammate found (shouldn't happen with a
+                // full squad) — fall back to the boundary push rather
+                // than leave the ball inert.
+                let field_width = field.size.width as f32;
+                let field_height = field.size.height as f32;
+                let target = dv::nearest_boundary_edge(ball_pos, field_width, field_height);
+                let dist = (target - ball_pos).magnitude().max(MIN_SHOT_DISTANCE);
+                let dir = (target - ball_pos) / dist;
+                let speed = dv::SLIDE_STRIKE_SPEED_BASE
+                    + defender_power_skill * dv::SLIDE_STRIKE_SPEED_RANGE;
+                field.ball.velocity = dir * speed;
+                field.ball.position.z = 0.0;
+                field.ball.previous_owner = Some(defender_id);
+                field.ball.current_owner = None;
+                field.ball.pass_target_player_id = None;
+                field.ball.carry_owner = None;
+                field.ball.clear_pending_pass_metadata();
+                field.ball.flags.in_flight_state = 40;
+                field.ball.cached_shot_target = None;
+                field.ball.concede_out_shielded_opponent = dispossessed_opponent_id;
+            }
+            return;
+        }
+
+        // D4.6, Partial outcome: the slide gets a piece of the ball but
+        // doesn't cleanly knock it away — a genuinely loose, low-speed
+        // ball a few units off its original path, contestable by
+        // EITHER side (deliberately no `concede_out_shielded_opponent`
+        // shield here, unlike Success — Partial's whole point is that
+        // nobody has an edge on the loose ball, matching the spec's own
+        // framing of this outcome).
+        if shoot_event_model.reason == "DEF_SLIDE_PARTIAL" {
+            let defender_id = shoot_event_model.from_player_id;
+            let ball_pos = field.ball.position;
+            let field_width = field.size.width as f32;
+            let field_height = field.size.height as f32;
+            let angle = context.rng.random_range(0.0f32..std::f32::consts::TAU);
+            let offset = Vector3::new(angle.cos(), angle.sin(), 0.0) * 14.0;
+            let mut target = ball_pos + offset;
+            target.x = target.x.clamp(2.0, field_width - 2.0);
+            target.y = target.y.clamp(2.0, field_height - 2.0);
+            let dist = (target - ball_pos).magnitude().max(MIN_SHOT_DISTANCE);
+            let dir = (target - ball_pos) / dist;
+            let speed = 0.35 + context.rng.random_range(0.0f32..0.3);
+            field.ball.velocity = dir * speed;
+            field.ball.position.z = 0.0;
+            field.ball.previous_owner = Some(defender_id);
+            field.ball.current_owner = None;
+            field.ball.pass_target_player_id = None;
+            field.ball.carry_owner = None;
+            field.ball.clear_pending_pass_metadata();
+            field.ball.flags.in_flight_state = 40;
+            field.ball.cached_shot_target = None;
+            return;
+        }
+
+        // D4.6, Own-risk outcome: a mistimed slide sends the ball
+        // toward the DEFENDER'S OWN goal instead — the spec's own
+        // explicitly-named cost ("a mis-hit slide can deflect the ball
+        // into a worse spot... toward the defender's own goal"),
+        // modeled honestly rather than assumed to only ever help or do
+        // nothing. Unlike Success/Partial, this DOES set a real
+        // `cached_shot_target` with `defending_side` pointing at the
+        // DEFENDER'S OWN side — the same machinery every normal shot
+        // uses to give the defending goalkeeper (here, this defender's
+        // own keeper) a genuine save chance, rather than an
+        // unstoppable, unphysical own goal. If it isn't saved,
+        // `check_goal`'s existing auto_goal/deflection-fix logic
+        // resolves the credit (own goal vs. a deflected attacker
+        // credit) the same way it already does for any other shot that
+        // finds the net off a defender's touch — not new logic, reused
+        // as-is.
+        if shoot_event_model.reason == "DEF_SLIDE_OWN_RISK" {
+            let defender_id = shoot_event_model.from_player_id;
+            let ball_pos = field.ball.position;
+            let field_width = field.size.width as f32;
+            let field_height = field.size.height as f32;
+            let defender_side = field.get_player(defender_id).and_then(|p| p.side);
+            let defender_power_skill = field
+                .get_player(defender_id)
+                .map(|p| (p.skills.physical.strength / 20.0).clamp(0.0, 1.0))
+                .unwrap_or(0.5);
+
+            if let Some(defender_side) = defender_side {
+                let own_goal_x = match defender_side {
+                    PlayerSide::Left => 0.0,
+                    PlayerSide::Right => field_width,
+                };
+                let target = Vector3::new(own_goal_x, field_height / 2.0, 0.0);
+                let dist = (target - ball_pos).magnitude().max(MIN_SHOT_DISTANCE);
+                let dir = (target - ball_pos) / dist;
+                // ~1.5-2.3 u/tick — a genuine mishit, not a full-power
+                // strike; still fast enough to threaten the net from
+                // typical slide range.
+                let speed = 1.5 + defender_power_skill * 0.8;
+                let final_velocity = dir * speed;
+                field.ball.velocity = final_velocity;
+                field.ball.position.z = 0.0;
+                field.ball.previous_owner = Some(defender_id);
+                field.ball.current_owner = None;
+                field.ball.pass_target_player_id = None;
+                field.ball.carry_owner = None;
+                field.ball.clear_pending_pass_metadata();
+                field.ball.flags.in_flight_state = 40;
+                let dx = own_goal_x - ball_pos.x;
+                if (dx > 0.0 && final_velocity.x > 0.1) || (dx < 0.0 && final_velocity.x < -0.1) {
+                    let ticks_to_goal = (dx / final_velocity.x).abs();
+                    field.ball.cached_shot_target = Some(ShotTarget {
+                        goal_line_y: ball_pos.y + final_velocity.y * ticks_to_goal,
+                        goal_line_z: 0.0,
+                        defending_side: defender_side,
+                        deflected: false,
+                        physics_save_rolled: false,
+                        is_direct_fk: false,
+                        total_flight_ticks: ticks_to_goal.max(1.0),
+                        dispatch_tick: shoot_event_model.tick,
+                        is_safe_restart: false,
+                    });
+                } else {
+                    field.ball.cached_shot_target = None;
+                }
+            } else {
                 field.ball.velocity = Vector3::zeros();
             }
             return;

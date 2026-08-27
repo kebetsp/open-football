@@ -349,6 +349,41 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(base * (1.0 - w) + nudge * tempo * w);
         }
 
+        // Step 1-hard experiment (docs/ball-distribution-fix-plan.md §9,
+        // 2026-08-26): tests whether Step 1's soft `shape_rules` anchor
+        // (`start_position`, which states merely "blend toward" at
+        // whatever weight their own velocity code happens to give it)
+        // is being diluted by competing live pulls. Applied BEFORE the
+        // press/mark override so an explicit man-assignment still wins
+        // outright, matching the priority convention every override in
+        // this pipeline already follows.
+        // §10 thread 1 comparison (2026-08-26), corrected same day per
+        // Pavel's explicit standing rule: goals/match is informational
+        // ONLY, never a selection criterion for this or any other fix —
+        // an earlier version of this comment picked a lower weight
+        // partly to keep goals "safely in band", which was wrong and has
+        // been reverted. `WIDTH_OVERRIDE_BLEND_WEIGHT=1.0` (a genuine
+        // full-strength override, matching §10's own "must remain an
+        // actual override, not a blended nudge" design intent) gives the
+        // best result on the plan's primary DoD metric (near-any-
+        // boundary). Left as a named constant rather than removing the
+        // blend entirely because a real, still-unexplained tradeoff was
+        // found on the SECONDARY DoD metric (corner-relevant reads worse
+        // at high weight than at low weight, non-monotonically — see
+        // docs/ball-distribution-fix-plan.md §11/§12) — that's an open
+        // question about the DoD metrics themselves, not something to
+        // resolve by watering down the override for goals' sake.
+        const WIDTH_OVERRIDE_BLEND_WEIGHT: f32 = 1.0;
+        if let Some(velocity) = Self::width_hold_override_velocity(&processing_ctx) {
+            let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
+            let base = result.velocity.unwrap_or_else(Vector3::zeros);
+            result.velocity = Some(
+                (base * (1.0 - WIDTH_OVERRIDE_BLEND_WEIGHT)
+                    + velocity * WIDTH_OVERRIDE_BLEND_WEIGHT)
+                    * tempo,
+            );
+        }
+
         // Cross-player assignment overrides (press / mark). Applied AFTER
         // the state handler so the manager's man-assignment wins over
         // normal state movement, regardless of which state the player is
@@ -357,6 +392,27 @@ impl<'p> StateProcessor<'p> {
         if let Some(velocity) = Self::assignment_override_velocity(&processing_ctx) {
             let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
             result.velocity = Some(velocity * tempo);
+        }
+
+        // realism-bug (2026-08-27): defensive wide-run tracking. Applied
+        // AFTER the assignment override so an explicit press/mark target
+        // still wins outright (also re-checked inside the function
+        // itself), and BEFORE the shot-block reaction so an already-live
+        // shot takes priority over a broader tracking duty. No tempo
+        // multiplier — tracking a genuine wide run is a real defensive
+        // urgency, not a tempo-scaled positioning preference.
+        if let Some(velocity) = Self::wide_run_track_override_velocity(&processing_ctx) {
+            result.velocity = Some(velocity);
+        }
+
+        // realism-bug (2026-08-26): reactive shot-block lunge. Applied
+        // AFTER the assignment override so an explicit press/mark target
+        // still wins outright (also re-checked inside the function
+        // itself). No tempo multiplier — a reflexive block attempt is at
+        // full urgency regardless of the team's set tempo, same
+        // reasoning as the free-kick retreat below.
+        if let Some(velocity) = Self::shot_block_reaction_velocity(&processing_ctx) {
+            result.velocity = Some(velocity);
         }
 
         // Milestone 13 (possession-decision-intelligence PRD) —
@@ -798,6 +854,79 @@ impl<'p> StateProcessor<'p> {
         None
     }
 
+    /// Step 1-hard experiment (docs/ball-distribution-fix-plan.md §9/§10,
+    /// 2026-08-26) — see this function's call site for the full
+    /// rationale. A genuine velocity OVERRIDE (mirrors
+    /// `assignment_override_velocity`'s press/mark pattern exactly —
+    /// full replacement when active, not a blended nudge; a reward-side
+    /// nudge is exactly the category of fix this plan spent nine
+    /// attempts proving doesn't work here), not a soft anchor nudge:
+    /// for a wide-slotted role, while the player's own team controls
+    /// the ball, steer directly at the touchline point
+    /// `ShapeAction::HoldWidth` already computes (same target, stronger
+    /// enforcement). Exempts the ball carrier — their own on-ball
+    /// decision logic (`carry_candidates`/`pass_value_from`) is a
+    /// separate, more nuanced system this shouldn't fight — and anyone
+    /// without a captured `shape_base` (not yet on the field).
+    ///
+    /// Scoping (§10 thread 1): the original proof-of-concept fired in
+    /// literally any state, including mid-tackle, which is why it
+    /// needed scoping before shipping. Two exemptions, both checked
+    /// before the touchline pursuit is computed:
+    /// (1) any active Tackling state (any role) — a live 1v1 challenge
+    /// deserves the player's full attention, not being yanked out to
+    /// hold width mid-duel;
+    /// (2) `scan_for_dangerous_runs()` returning `Some` — that function
+    /// is already computed relative to *this* player (`opponents().nearby`
+    /// scans around `ctx.player.position`) and already excludes runners
+    /// a teammate is already engaging, so a hit here specifically means
+    /// *this* player is the relevant nearby defender for a still-live
+    /// dangerous opponent run. This covers the transition moment right
+    /// after regaining the ball (`is_control_ball()` can go true off a
+    /// favourable-direction loose ball, not only a firm claim) where a
+    /// dangerous opponent may still be live and shouldn't be abandoned
+    /// instantly for the touchline.
+    fn width_hold_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        let tactic = crate::r#match::player::strategies::common::spacing::own_tactic(ctx);
+        crate::r#match::player::strategies::common::spacing::flank_side(
+            player.tactical_position.current_position,
+            tactic,
+        )?;
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None;
+        }
+        if !ctx.team().is_control_ball() {
+            return None;
+        }
+        match ctx.player.state {
+            Defender(DefenderState::Tackling)
+            | Midfielder(MidfielderState::Tackling)
+            | Forward(ForwardState::Tackling) => return None,
+            _ => {}
+        }
+        if ctx.player().defensive().scan_for_dangerous_runs().is_some() {
+            return None;
+        }
+        let base = player.shape_base?;
+        let field_h = ctx.context.field_size.height as f32;
+        let target_y = if base.y < field_h / 2.0 {
+            28.0
+        } else {
+            field_h - 28.0
+        };
+        let target = Vector3::new(base.x, target_y, 0.0);
+        let to_target = target - player.position;
+        let dist = to_target.magnitude();
+        if dist < 3.0 {
+            return Some(Vector3::zeros());
+        }
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some(to_target.normalize() * max_speed)
+    }
+
     /// Milestone 13 (possession-decision-intelligence PRD) —
     /// event-triggered reaction to a loose ball after a block, parry, or
     /// deflection. Architecturally different from every other milestone
@@ -816,6 +945,155 @@ impl<'p> StateProcessor<'p> {
     /// identical "is this rebound situation still live" question — reused
     /// rather than re-derived so both consumers of the same underlying
     /// event agree on how long it stays live.
+    /// realism-bug (2026-08-27, deep root-cause investigation into why
+    /// wide/byline duels barely happen — the founding belief behind the
+    /// whole ball-distribution project): no defender was ever assigned
+    /// to track an opponent's run into the wide channel toward the
+    /// byline. Measured: across 1.9M+ `scan_for_dangerous_runs` calls
+    /// (the existing "should I break from shape" detector), ZERO
+    /// candidates ever satisfied its own wide+deep+fast gate — its 100u
+    /// search radius is shorter than the ~150-173u median distance
+    /// defenders actually sit at when a wide run reaches this zone
+    /// (direct position measurement: nearest opponent in the genuine
+    /// deep/wide byline-approach zone is median 173u/21.6m away, within
+    /// 3m only 3.5% of the time), and its goal-CENTER-alignment model
+    /// structurally under-recognizes a lateral byline run (a run
+    /// parallel to the touchline becomes LESS aligned with "toward goal
+    /// center" the closer it gets to the byline — backwards from real
+    /// danger). This is a genuine new structural override — the class
+    /// of fix this engine has repeatedly shown works (width_hold/
+    /// assignment/shot_block overrides above), unlike reward-value
+    /// tuning, which failed on this exact family of problem many times
+    /// (docs/ball-distribution-fix-plan.md). Assigns the single nearest
+    /// own-team defender (not already engaging another opponent, no
+    /// explicit press/mark assignment already covering them) to shadow
+    /// an opposing player making a genuine wide run into the defensive
+    /// third, goal-side of them, all the way to the byline if needed —
+    /// the fullback-tracks-the-winger duty real football has and this
+    /// engine never modeled.
+    fn wide_run_track_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None; // an explicit assignment always wins
+        }
+        if matches!(ctx.player.state, Defender(DefenderState::Tackling)) {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None; // can't track a runner while also carrying the ball
+        }
+        // The persistent assignment (who to track, and whether the
+        // assignment is still live) is decided in `run.rs`'s per-tick
+        // loop — see `wide_run_track_target`'s own doc comment for why
+        // this needs to be persistent rather than recomputed here every
+        // tick. This function only steers.
+        let target_id = player.wide_run_track_target?;
+        let runner_pos = ctx.tick_context.positions.players.position(target_id);
+
+        #[cfg(feature = "match-logs")]
+        {
+            use crate::r#match::player::strategies::players::ops::defensive::byline_run_diag as brd;
+            use std::sync::atomic::Ordering;
+            brd::WRT_FIRED.fetch_add(1, Ordering::Relaxed);
+            brd::WRT_SUM_START_DIST_X100.fetch_add(
+                ((runner_pos - player.position).magnitude() * 100.0) as u64,
+                Ordering::Relaxed,
+            );
+        }
+
+        // Shadow from the goal side, a few units off the runner's own
+        // position — a real tracking defender shepherds from inside/
+        // goal-side, not by running straight through them.
+        let own_goal = ctx.ball().direction_to_own_goal();
+        let to_goal = (own_goal - runner_pos).normalize();
+        let shadow_point = runner_pos + to_goal * 6.0;
+        let to_target = shadow_point - player.position;
+        let dist = to_target.magnitude();
+        if dist < 2.0 {
+            return Some(Vector3::zeros());
+        }
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some(to_target.normalize() * max_speed)
+    }
+
+    /// realism-bug (2026-08-26, corner/deflection investigation): a
+    /// genuine reactive lunge into a live shot's flight path. Raw
+    /// diagnostic data (temporary `block_diag`, match-logs only) showed
+    /// `Ball::try_block_shot`'s own corridor gate (BLOCK_LOOKAHEAD=40u/
+    /// BLOCK_CORRIDOR=7u) is satisfied on only ~0.6% of live-shot ticks
+    /// (49/8156 across 20 matches), even though a broad "opponent
+    /// goal-side within 10m" cover metric is close to real (84% engine
+    /// vs 88% real, StatsBomb Bundesliga 2023/24) — defenders are
+    /// generally in the area but essentially never precisely on the
+    /// shot's exact line, because nothing ever moves them there: the
+    /// corridor check is purely passive (wherever a defender already
+    /// happens to be standing). Real defenders react to a struck shot
+    /// by throwing a body/leg into its path; this is that reaction.
+    ///
+    /// This does NOT grant a block directly — `try_block_shot`'s own
+    /// existing skill-gated RNG still decides the outcome once (if) the
+    /// defender is actually in the corridor; this override only changes
+    /// whether they get the chance to be there. Bounded to a short,
+    /// realistic reactive range (60u/7.5m) so it can't warp a defender
+    /// in from across the pitch, and excluded for direct free kicks
+    /// (§13.3's own established rule: no generic outfield block chance
+    /// beyond the wall for an already-in-flight dead-ball strike).
+    fn shot_block_reaction_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None; // an explicit assignment always wins
+        }
+        if player.tactical_position.current_position.is_goalkeeper() {
+            return None; // GK has its own dedicated save mechanics
+        }
+        let shot = ctx.tick_context.ball.cached_shot_target?;
+        if shot.is_direct_fk {
+            return None;
+        }
+        // Only the defending side (opponents of the shooter) reacts.
+        if player.side != Some(shot.defending_side) {
+            return None;
+        }
+        match ctx.player.state {
+            Defender(DefenderState::Tackling)
+            | Midfielder(MidfielderState::Tackling)
+            | Forward(ForwardState::Tackling) => return None,
+            _ => {}
+        }
+
+        let ball = &ctx.tick_context.positions.ball;
+        let ball_vel_2d = (ball.velocity.x * ball.velocity.x + ball.velocity.y * ball.velocity.y).sqrt();
+        if ball_vel_2d < 0.5 {
+            return None; // ball has stopped / nearly — not a live shot
+        }
+        let shot_dir = Vector3::new(
+            ball.velocity.x / ball_vel_2d,
+            ball.velocity.y / ball_vel_2d,
+            0.0,
+        );
+
+        let to_player = player.position - ball.position;
+        let projection = to_player.x * shot_dir.x + to_player.y * shot_dir.y;
+        const REACTION_LOOKAHEAD: f32 = 40.0; // matches try_block_shot's BLOCK_LOOKAHEAD
+        let clamped_proj = projection.clamp(1.0, REACTION_LOOKAHEAD);
+        let target = ball.position + shot_dir * clamped_proj;
+
+        let to_target = target - player.position;
+        let dist = to_target.magnitude();
+        // Only a realistic reactive range — a defender already broadly
+        // engaged nearby, not one dragged in from across the pitch.
+        if !(1.0..=60.0).contains(&dist) {
+            return None;
+        }
+
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some(to_target.normalize() * max_speed)
+    }
+
     fn rebound_crash_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         let player = ctx.player;
         if player.press_target.is_some() || player.mark_target.is_some() {

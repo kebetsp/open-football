@@ -30,6 +30,62 @@ enum FirstTouchOutcome {
 }
 
 impl Ball {
+    /// D4.5 of docs/defensive-decision-logic-spec.md (realism-bug,
+    /// 2026-08-21): if the ball's CURRENT position+velocity were left
+    /// completely unclaimed, how many ticks until it would cross a
+    /// field boundary (x or y), and how far away is that boundary
+    /// right now. `None` if the ball isn't heading out at all
+    /// (near-zero velocity, or moving inward on both axes).
+    fn ticks_to_boundary_exit(&self) -> Option<(f32, f32)> {
+        let vx = self.velocity.x;
+        let vy = self.velocity.y;
+        if (vx * vx + vy * vy) < 0.0025 {
+            return None; // < 0.05 u/tick — noise floor, not a real heading
+        }
+        let mut best: Option<(f32, f32)> = None;
+        let consider = |t: f32, d: f32, best: &mut Option<(f32, f32)>| {
+            if t > 0.0 && best.map_or(true, |(bt, _)| t < bt) {
+                *best = Some((t, d));
+            }
+        };
+        if vx > 0.01 {
+            consider((self.field_width - self.position.x) / vx, self.field_width - self.position.x, &mut best);
+        } else if vx < -0.01 {
+            consider(-self.position.x / vx, self.position.x, &mut best);
+        }
+        if vy > 0.01 {
+            consider((self.field_height - self.position.y) / vy, self.field_height - self.position.y, &mut best);
+        } else if vy < -0.01 {
+            consider(-self.position.y / vy, self.position.y, &mut best);
+        }
+        best
+    }
+
+    /// D4.5: is the ball, right now, genuinely on course to cross a
+    /// boundary soon if nobody touches it — close enough that letting
+    /// it go is the real football default, not a "long way off, still
+    /// fair game to chase down" situation.
+    ///
+    /// `EXIT_LINE_MARGIN` (130u/~16m) reuses D0's own "byline 1v1
+    /// moment" proximity figure (already shared by `concede_out_value`
+    /// / `safe_restart_value` as their boundary-proximity geometry) —
+    /// not a fresh number. `EXIT_TICKS_CAP` (600 ticks/~6s) has no
+    /// external source (category (d), reasoned estimate, flagged as
+    /// such): it's wide enough that any ball genuinely inside the
+    /// margin at any speed above the 0.05u/tick noise floor still
+    /// qualifies (130u / 600 ticks ≈ 0.22 u/tick, well below any
+    /// mechanism this exemption is meant to cover), while still ruling
+    /// out a near-motionless ball technically pointed at a boundary
+    /// from staying permanently unclaimable.
+    pub(super) fn is_exiting_boundary_soon(&self) -> bool {
+        const EXIT_LINE_MARGIN: f32 = 130.0;
+        const EXIT_TICKS_CAP: f32 = 600.0;
+        match self.ticks_to_boundary_exit() {
+            Some((ticks, dist)) => dist <= EXIT_LINE_MARGIN && ticks <= EXIT_TICKS_CAP,
+            None => false,
+        }
+    }
+
     pub fn process_ownership(
         &mut self,
         context: &MatchContext,
@@ -413,7 +469,14 @@ impl Ball {
         }
 
         // Check if ball is stopped (either outside or inside field) and no one owns it
-        let is_ball_stopped = self.is_stands_outside() || self.is_ball_stopped_on_field();
+        // D4.5: a ball moving under `is_ball_stopped_on_field`'s <2.5u/tick
+        // (~31 m/s) threshold isn't necessarily abandoned — a deliberate,
+        // controlled clearance toward the boundary (~1-1.6u/tick) reads as
+        // "stopped" by that flat velocity check despite genuinely still
+        // heading out with purpose. Don't treat it as a dead ball needing
+        // collection while it's actually still on its way to the line.
+        let is_ball_stopped = self.is_stands_outside()
+            || (self.is_ball_stopped_on_field() && !self.is_exiting_boundary_soon());
 
         // Check if ball has moved significantly from last boundary position
         let has_escaped_boundary = if let Some(last_pos) = self.last_boundary_position {
@@ -541,11 +604,28 @@ impl Ball {
         const TICK_PHASE_3: u32 = 60; // ~1.0s - further expand
         const TICK_PHASE_4: u32 = 100; // ~1.6s - last resort
 
-        // Progressive claim distances — generous to handle boundary/corner situations
-        const CLAIM_DISTANCE_PHASE_1: f32 = 5.0; // Close range - matches notification claim distance
-        const CLAIM_DISTANCE_PHASE_2: f32 = 8.0; // Medium range - acceptable
-        const CLAIM_DISTANCE_PHASE_3: f32 = 12.0; // Extended range - noticeable but not terrible
-        const CLAIM_DISTANCE_PHASE_4: f32 = 15.0; // Last resort - better than stuck forever
+        // 2026-08-22 (Pavel): the old escalating radii (5/8/12/15u) handed
+        // ownership to a player up to 15u (~1.9m) away without requiring
+        // them to have moved at all — `move_to()` then glides the BALL the
+        // rest of the way to them at a fixed speed, regardless of the
+        // ball's own actual direction/momentum. That's not a chase, it's
+        // the ball being magneted onto whoever the timer picked next.
+        // `should_force_takeball` (processor.rs) already commits the
+        // single genuinely-closest teammate to a real Pursuit/Arrive chase
+        // toward the ball's live position, with NO distance cap — so a
+        // player who is actually closing the gap doesn't need this
+        // function's help at all. Phases 1-3 (the ones that fire
+        // routinely, within ~0.25-1.0s) now require the same tight,
+        // realistic contact distance the honest claim path already uses
+        // elsewhere (5u/~0.6m) — no more free distance. Phase 4 (~1.6s)
+        // keeps a modest, reduced allowance (was 15u) purely as a genuine
+        // last-resort against a true stall (e.g. the ball wedged somewhere
+        // awkward the honest chase can't cleanly reach) — not a routine
+        // outcome, since the honest chase has had 1.6s to close in first.
+        const CLAIM_DISTANCE_PHASE_1: f32 = 5.0;
+        const CLAIM_DISTANCE_PHASE_2: f32 = 5.0;
+        const CLAIM_DISTANCE_PHASE_3: f32 = 5.0;
+        const CLAIM_DISTANCE_PHASE_4: f32 = 9.0; // last-resort only, down from 15.0
 
         let is_unowned = self.current_owner.is_none();
 
@@ -609,8 +689,14 @@ impl Ball {
         let threshold_sq = velocity_threshold * velocity_threshold;
         let is_slow = velocity_sq < threshold_sq;
         let is_low = self.position.z < DEADLOCK_HEIGHT_THRESHOLD;
+        // D4.5: same reasoning as `try_notify_standing_ball` — a deliberate
+        // clearance toward the boundary (~1-1.6u/tick) reads as "slow"
+        // against this function's 3-4u/tick deadlock thresholds despite
+        // still genuinely heading out with purpose. Don't count it toward
+        // a deadlock while it's actually on its way to the line.
+        let is_exiting = self.is_exiting_boundary_soon();
 
-        if is_slow && is_low {
+        if is_slow && is_low && !is_exiting {
             self.unowned_stopped_ticks += 1;
 
             // Determine claim distance based on how long we've been waiting
@@ -712,7 +798,7 @@ impl Ball {
                 }
             }
         } else {
-            if velocity_sq >= threshold_sq {
+            if velocity_sq >= threshold_sq || is_exiting {
                 self.unowned_stopped_ticks = 0;
             }
         }

@@ -12,7 +12,7 @@
 //! | [`stall`]       | Position-anchor stall detector + snapshot diagnostics        |
 
 mod goal;
-mod interactions;
+pub mod interactions;
 mod motion;
 mod ownership;
 mod restart;
@@ -188,6 +188,29 @@ pub struct Ball {
     /// ball is claimed/saved/out since those interaction checks already
     /// early-return in that case.
     pub direct_fk_shot_in_flight: bool,
+    /// D3 of docs/defensive-decision-logic-spec.md (2026-08-21): the
+    /// specific opponent this deliberate concede-out redirect was
+    /// dispossessed from — excluded from `try_intercept` for this one
+    /// flight only (see that function's own exclusion check). Without
+    /// this, raw-data verification found the redirect was intercepted
+    /// by that SAME adjacent opponent within one tick in 7/7 traced
+    /// real firings: a Tackling-range duel starts well inside
+    /// `try_intercept`'s ~5.5u reach, so the just-dispossessed attacker
+    /// — who the whole point of the action was to show OUTSIDE — could
+    /// otherwise reclaim it before the ball moves at all. Other,
+    /// genuinely better-positioned opponents remain fully eligible to
+    /// intercept; this narrows the candidate pool by exactly one
+    /// player, not the whole mechanism.
+    pub concede_out_shielded_opponent: Option<u32>,
+    /// realism-bug (2026-08-26, corner/deflection investigation): tick
+    /// until which a `try_block_shot` corner-branch deflection is still
+    /// travelling toward the byline. Set by the corner branch; read by
+    /// `try_intercept`, which otherwise treats the deflection as an
+    /// interceptable pass from the shooter's team (via `previous_owner`,
+    /// untouched by the block) and lets the very defender who just
+    /// deflected it re-claim it within 1-2 ticks — measured at 3/4
+    /// corner-branch firings across 40 matches before this fix.
+    pub corner_deflection_guard_until_tick: u64,
     /// Fire-once guard for the discrete corner aerial contest. A played-out
     /// lofted corner can't thread the congested box to a specific runner, so
     /// once the cross is struck the engine resolves a single skill-weighted
@@ -536,6 +559,8 @@ impl Ball {
             pending_corner_teleports: Vec::new(),
             pending_restart_teleports: Vec::new(),
             direct_fk_shot_in_flight: false,
+            concede_out_shielded_opponent: None,
+            corner_deflection_guard_until_tick: 0,
             corner_contest_resolved: true,
             last_aerial_contest_tick: 0,
             pending_corner_routine: None,

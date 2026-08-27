@@ -265,24 +265,49 @@ impl<'b> TeamOperationsImpl<'b> {
     /// structurally impossible (contradicting the per-possession cap's
     /// own design note that exists to allow exactly that pattern). The
     /// 2-shots-per-possession cap still applies during rebounds.
+    ///
+    /// 2026-07-28 (Pavel's report): a genuinely open net (no outfield
+    /// blocker, keeper not meaningfully covering the goal-mouth angle —
+    /// see `on_ball_value::open_net_signal`) gets the SAME exemption.
+    /// The 750-tick spacing gate exists to stop desperation-mode spam of
+    /// low-quality speculative shots — it was never meant to make a
+    /// team decline a chance that's already been manufactured just
+    /// because the pacing clock hasn't ticked over, and the previous,
+    /// score-blind, unconditional version did exactly that regardless
+    /// of how clear-cut the chance was. Real teams don't sit on a
+    /// clean, undefended look at goal to "respect the cadence" whether
+    /// they're leading, level, or chasing — game state affects how much
+    /// risk they take to CREATE chances (already modelled via
+    /// `risk_appetite`/`game_management_intensity`), not whether they
+    /// finish one that's already there. The 2-shots-per-possession cap
+    /// still applies.
     pub fn can_shoot(&self) -> bool {
         let current_tick = self.ctx.context.current_tick();
         const REBOUND_WINDOW_TICKS: u64 = 300;
         let rebound_tick = self.ctx.tick_context.ball.last_rebound_tick;
         let rebound_live = rebound_tick > 0
             && current_tick.saturating_sub(rebound_tick) < REBOUND_WINDOW_TICKS;
-        self.coach().can_shoot(current_tick, rebound_live)
+        let (clear_chance, _) =
+            crate::r#match::player::strategies::common::players::ops::on_ball_value::open_net_signal(
+                self.ctx,
+            );
+        self.coach().can_shoot(current_tick, rebound_live, clear_chance)
     }
 
     /// Diagnostic-only twin of `can_shoot()` — see `MatchCoach::can_shoot_debug`.
     #[cfg(feature = "match-logs")]
-    pub fn can_shoot_debug(&self) -> (bool, bool, bool, u64) {
+    pub fn can_shoot_debug(&self) -> (bool, bool, bool, u64, bool) {
         let current_tick = self.ctx.context.current_tick();
         const REBOUND_WINDOW_TICKS: u64 = 300;
         let rebound_tick = self.ctx.tick_context.ball.last_rebound_tick;
         let rebound_live = rebound_tick > 0
             && current_tick.saturating_sub(rebound_tick) < REBOUND_WINDOW_TICKS;
-        self.coach().can_shoot_debug(current_tick, rebound_live)
+        let (clear_chance, _) =
+            crate::r#match::player::strategies::common::players::ops::on_ball_value::open_net_signal(
+                self.ctx,
+            );
+        self.coach()
+            .can_shoot_debug(current_tick, rebound_live, clear_chance)
     }
 
     /// Score difference from this team's perspective (positive =

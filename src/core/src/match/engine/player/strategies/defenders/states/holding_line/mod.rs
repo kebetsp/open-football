@@ -96,7 +96,7 @@ impl StateProcessingHandler for DefenderHoldingLineState {
             // defender engages. Stops the whole back four lunging at
             // the same carrier.
             let is_primary = matches!(
-                ctx.player().defensive().defensive_role_for_ball_carrier(),
+                ctx.player().defensive().defensive_role_for_ball_carrier_unified(),
                 DefensiveRole::Primary
             );
             if distance < 25.0 && is_primary {
@@ -112,7 +112,7 @@ impl StateProcessingHandler for DefenderHoldingLineState {
                 0.0
             };
 
-            match ctx.player().defensive().defensive_role_for_ball_carrier() {
+            match ctx.player().defensive().defensive_role_for_ball_carrier_unified() {
                 DefensiveRole::Primary => {
                     if distance < PRESSING_DISTANCE_THRESHOLD
                         || (counter_press_active && ctx.ball().distance() < counter_press_range)

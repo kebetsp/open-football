@@ -1,12 +1,18 @@
+use crate::r#match::events::Event;
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
+use crate::r#match::player::events::{FoulSeverity, PlayerEvent, ShootingEventContext};
 use crate::r#match::player::strategies::common::players::MatchPlayerIteratorExt;
 use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
 use crate::r#match::player::strategies::common::players::ops::midfielder_skill::MidfielderSkillProfile;
+use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::{
-    ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
+    ConditionContext, MatchPlayerLite, StateChangeResult, StateProcessingContext,
+    StateProcessingHandler,
 };
 use nalgebra::Vector3;
+#[cfg(feature = "match-logs")]
+use std::sync::atomic::Ordering;
 
 #[derive(Default, Clone)]
 pub struct MidfielderPressingState {}
@@ -117,10 +123,47 @@ impl StateProcessingHandler for MidfielderPressingState {
             // same. Requiring `can_attempt_tackle()` here lets a cooldown
             // midfielder fall through to normal Pressing chase/cover
             // behaviour instead of flickering in place.
-            if opponent_distance < 8.0 && ctx.player.can_attempt_tackle() {
+            // D8.2 of docs/defensive-decision-logic-spec.md: gate the
+            // immediate engage on the unified role, mirroring
+            // DefenderRunningState's own already-shipped "only the
+            // designated closer tackles" fix (D2) — the same pileup
+            // risk applies here now that a genuinely closer defender or
+            // another midfielder can outrank this one in the shared
+            // pool. Non-Primary falls through to the normal chase below
+            // (unchanged) rather than lunging.
+            let role = ctx
+                .player()
+                .defensive()
+                .defensive_role_for_ball_carrier_unified();
+            if opponent_distance < 8.0
+                && role == DefensiveRole::Primary
+                && ctx.player.can_attempt_tackle()
+            {
                 return Some(StateChangeResult::with_midfielder_state(
                     MidfielderState::Tackling,
                 ));
+            }
+
+            // D5 of docs/defensive-decision-logic-spec.md: generalizes
+            // D4.6's last-ditch slide from DefenderPressingState — a
+            // midfielder tracking back on a counter, still trailing at
+            // 8-34u out, is exactly the same real scenario (a normal
+            // running stride probably loses the race; a committed slide
+            // covers ground a stride can't). Mirrors the defender wiring
+            // exactly: checked here in the chase itself, before the
+            // 8.0u tackle-transition above (which assumes arrival), with
+            // the same `can_attempt_tackle()`/`is_best_player_to_chase_
+            // ball()` gates so it can't fire on repeat or pile up
+            // multiple midfielders on the same ball.
+            if opponent_distance >= 8.0
+                && opponent_distance <= dv::SLIDE_REACH_DISTANCE
+                && ctx.player.can_attempt_tackle()
+                && ctx.team().is_best_player_to_chase_ball()
+            {
+                let mid_profile = MidfielderSkillProfile::from_ctx(ctx);
+                if dv::desperate_slide_value(ctx, &opponent, mid_profile.tackle_profile) > 0.0 {
+                    return Some(self.attempt_desperate_slide(ctx, &opponent));
+                }
             }
         }
 
@@ -268,5 +311,112 @@ impl MidfielderPressingState {
 
         // Continue pressing if moving toward ball and not many better-positioned teammates
         moving_toward_ball && other_pressing_teammates < 2
+    }
+
+    /// D5 of docs/defensive-decision-logic-spec.md: midfielder mirror of
+    /// `DefenderPressingState::attempt_desperate_slide` — rolls the same
+    /// shared `dv::slide_outcome_probs` table (Success/Partial/Foul/
+    /// OwnRisk/Miss) `desperate_slide_value` used to decide this was
+    /// worth trying, so the decision and the roll can't drift apart. The
+    /// dispatched events (`"DEF_SLIDE_SUCCESS"` etc.) are handled by the
+    /// same generic `handle_shoot_event`/`CommitFoul` branches the
+    /// defender wiring already uses (players.rs) — those branches key
+    /// off `shoot_event_model.from_player_id`/`ctx.player.id`, not the
+    /// player's role, so no execution-side changes were needed for this
+    /// generalization.
+    fn attempt_desperate_slide(
+        &self,
+        ctx: &StateProcessingContext,
+        opponent: &MatchPlayerLite,
+    ) -> StateChangeResult {
+        #[cfg(feature = "match-logs")]
+        crate::tackle_stats::MID_SLIDE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+
+        let tackle_profile = MidfielderSkillProfile::from_ctx(ctx).tackle_profile;
+        let probs = dv::slide_outcome_probs(ctx, opponent, tackle_profile);
+        let rng = &ctx.context.rng;
+        let roll = rng.random_range(0.0f32..1.0);
+
+        let p_success = probs.p_success;
+        let p_partial = p_success + probs.p_partial;
+        let p_foul = p_partial + probs.p_foul;
+        let p_own_risk = p_foul + probs.p_own_risk;
+        // remainder (roll >= p_own_risk) is Miss.
+
+        let mut result = if roll < p_success {
+            // D6 (2026-08-22): same distinction as the defender wiring —
+            // "tackle to get the ball" and "tackle to push the ball
+            // away" are two different decisions. Push toward a boundary
+            // only if the reachability race actually favours it,
+            // otherwise a safe lay-off to the nearest teammate.
+            let push_to_boundary = dv::slide_should_push_to_boundary(ctx);
+            #[cfg(feature = "match-logs")]
+            if push_to_boundary {
+                crate::tackle_stats::MID_SLIDE_SUCCESS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                crate::tackle_stats::MID_SLIDE_SUCCESS_LAYOFF.fetch_add(1, Ordering::Relaxed);
+            }
+            let reason = if push_to_boundary {
+                "DEF_SLIDE_SUCCESS"
+            } else {
+                "DEF_SLIDE_SUCCESS_LAYOFF"
+            };
+            StateChangeResult::with_midfielder_state_and_event(
+                MidfielderState::Standing,
+                Event::PlayerEvent(PlayerEvent::Shoot(
+                    ShootingEventContext::new()
+                        .with_player_id(ctx.player.id)
+                        .with_target(ctx.tick_context.positions.ball.position)
+                        .with_reason(reason)
+                        .build(ctx),
+                )),
+            )
+        } else if roll < p_partial {
+            #[cfg(feature = "match-logs")]
+            crate::tackle_stats::MID_SLIDE_PARTIAL.fetch_add(1, Ordering::Relaxed);
+            StateChangeResult::with_midfielder_state_and_event(
+                MidfielderState::Standing,
+                Event::PlayerEvent(PlayerEvent::Shoot(
+                    ShootingEventContext::new()
+                        .with_player_id(ctx.player.id)
+                        .with_target(ctx.tick_context.positions.ball.position)
+                        .with_reason("DEF_SLIDE_PARTIAL")
+                        .build(ctx),
+                )),
+            )
+        } else if roll < p_foul {
+            #[cfg(feature = "match-logs")]
+            crate::tackle_stats::MID_SLIDE_FOUL.fetch_add(1, Ordering::Relaxed);
+            let severity = if rng.random_range(0.0f32..1.0) < 0.03 {
+                FoulSeverity::Violent
+            } else if rng.random_range(0.0f32..1.0) < 0.35 {
+                FoulSeverity::Reckless
+            } else {
+                FoulSeverity::Normal
+            };
+            StateChangeResult::with_midfielder_state_and_event(
+                MidfielderState::Standing,
+                Event::PlayerEvent(PlayerEvent::CommitFoul(ctx.player.id, severity)),
+            )
+        } else if roll < p_own_risk {
+            #[cfg(feature = "match-logs")]
+            crate::tackle_stats::MID_SLIDE_OWN_RISK.fetch_add(1, Ordering::Relaxed);
+            StateChangeResult::with_midfielder_state_and_event(
+                MidfielderState::Standing,
+                Event::PlayerEvent(PlayerEvent::Shoot(
+                    ShootingEventContext::new()
+                        .with_player_id(ctx.player.id)
+                        .with_target(ctx.tick_context.positions.ball.position)
+                        .with_reason("DEF_SLIDE_OWN_RISK")
+                        .build(ctx),
+                )),
+            )
+        } else {
+            #[cfg(feature = "match-logs")]
+            crate::tackle_stats::MID_SLIDE_MISS.fetch_add(1, Ordering::Relaxed);
+            StateChangeResult::with_midfielder_state(MidfielderState::Standing)
+        };
+        result.start_tackle_cooldown = true;
+        result
     }
 }

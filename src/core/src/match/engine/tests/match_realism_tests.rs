@@ -122,7 +122,10 @@ fn fk_indirect_zero_shot_and_distance_zero_shot() {
         &env,
     );
     assert_eq!(s.direct_shot, 0.0);
-    // Far distance — also no shot.
+    // Far distance — real free kicks from >31.25m almost never become a
+    // direct shot (StatsBomb: 2.9%, 14/479 fouls-won), but "almost never"
+    // is not "never" — a small residual weight is now intentional
+    // (realism-bug, 2026-07-30). It must stay far below Close/Mid/Long.
     let s = score_free_kick_choices(
         FreeKickBand::Far,
         false,
@@ -133,7 +136,7 @@ fn fk_indirect_zero_shot_and_distance_zero_shot() {
         false,
         &env,
     );
-    assert_eq!(s.direct_shot, 0.0);
+    assert!(s.direct_shot > 0.0 && s.direct_shot < 0.05);
 }
 
 #[test]

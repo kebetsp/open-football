@@ -104,7 +104,7 @@ impl StateProcessingHandler for DefenderStandingState {
             // independent foul rolls) and the "running in groups"
             // visual — the whole back line pulled out of shape.
             let is_primary_or_emergency = matches!(
-                ctx.player().defensive().defensive_role_for_ball_carrier(),
+                ctx.player().defensive().defensive_role_for_ball_carrier_unified(),
                 DefensiveRole::Primary
             ) || ctx.player().defensive().is_box_emergency_for_me();
             if distance_to_opponent < TACKLE_DISTANCE && is_primary_or_emergency {
@@ -139,7 +139,7 @@ impl StateProcessingHandler for DefenderStandingState {
                 PRESSING_DISTANCE
             };
 
-            let role = ctx.player().defensive().defensive_role_for_ball_carrier();
+            let role = ctx.player().defensive().defensive_role_for_ball_carrier_unified();
             match role {
                 DefensiveRole::Primary => {
                     // Own-third override: if the ball is in our defensive

@@ -59,6 +59,7 @@ impl StateProcessingHandler for MidfielderDribblingState {
                 let currently_wide = y < field_h * 0.30 || y > field_h * 0.70;
                 let goal_x = ctx.player().opponent_goal_position().x;
                 if currently_wide && (goal_x - ctx.player.position.x).abs() < 40.0 {
+                    match_log_info!("CROSSDIAG TRIG branch=directive role=MID id={}", ctx.player.id);
                     return Some(StateChangeResult::with_midfielder_state(
                         MidfielderState::Crossing,
                     ));
@@ -143,6 +144,11 @@ impl StateProcessingHandler for MidfielderDribblingState {
             let goal_x = ctx.player().opponent_goal_position().x;
             let depth = (goal_x - ctx.player.position.x).abs();
             if currently_wide && depth <= 100.0 {
+                match_log_info!(
+                    "CROSSDIAG TRIG branch=commit_release role=MID id={} y={:.1}",
+                    ctx.player.id,
+                    y
+                );
                 return Some(StateChangeResult::with_midfielder_state(
                     MidfielderState::Crossing,
                 ));

@@ -29,6 +29,14 @@ impl<'b> PlayerTeammatesOperationsImpl<'b> {
         self.teammates_by_position(PlayerFieldPositionGroup::Defender, self.ctx.player.team_id)
     }
 
+    /// D8 (2026-08-22): added so `DefensiveOperationsImpl`'s unified
+    /// Primary/Cover/Help/Hold pool can widen past `.defenders()` alone —
+    /// D7 found 61.1% of real nearest-responders to a wide switch-of-play
+    /// threat are midfielders (RM/LM/CM), not defenders.
+    pub fn midfielders(&'b self) -> impl Iterator<Item = MatchPlayerLite> + 'b {
+        self.teammates_by_position(PlayerFieldPositionGroup::Midfielder, self.ctx.player.team_id)
+    }
+
     pub fn forwards(&'b self) -> impl Iterator<Item = MatchPlayerLite> + 'b {
         self.teammates_by_position(PlayerFieldPositionGroup::Forward, self.ctx.player.team_id)
     }

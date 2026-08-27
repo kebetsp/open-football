@@ -53,6 +53,7 @@ impl StateProcessingHandler for ForwardDribblingState {
                 let y = ctx.player.position.y;
                 let currently_wide = y < field_h * 0.30 || y > field_h * 0.70;
                 if currently_wide && (goal_x - ctx.player.position.x).abs() < 40.0 {
+                    match_log_info!("CROSSDIAG TRIG branch=directive role=FWD id={}", ctx.player.id);
                     return Some(StateChangeResult::with_forward_state(
                         ForwardState::Crossing,
                     ));
@@ -152,7 +153,17 @@ impl StateProcessingHandler for ForwardDribblingState {
         if committing_to_byline {
             let field_h = ctx.context.field_size.height as f32;
             let y = ctx.player.position.y;
-            let currently_wide = y < field_h * 0.38 || y > field_h * 0.62;
+            // realism-bug (2026-08-27): was 0.38/0.62 here, but
+            // `ForwardCrossingState::is_in_wide_position` (the entry gate
+            // of the state this release transitions INTO) requires the
+            // tighter 0.2/0.8 margin. A release at, say, y=190 (wide by
+            // 0.38 but not by 0.2) transitioned into Crossing only to be
+            // bounced straight back to Passing on the very same tick —
+            // measured (temporary match-logs diagnostic, 20 matches):
+            // 112/112 real BOUNCE events had y outside the 0.2 band, 0
+            // exceptions. Tightened to match the state it releases into,
+            // closing the dead zone.
+            let currently_wide = y < field_h * 0.2 || y > field_h * 0.8;
             // realism-bug (2026-07-26): `distance_to_goal` is Euclidean
             // distance to the goal CENTRE, not depth to the goal LINE —
             // for a genuinely wide player that distance stays large from
@@ -165,6 +176,11 @@ impl StateProcessingHandler for ForwardDribblingState {
             let goal_x = ctx.player().opponent_goal_position().x;
             let depth = (goal_x - ctx.player.position.x).abs();
             if currently_wide && depth <= 100.0 {
+                match_log_info!(
+                    "CROSSDIAG TRIG branch=commit_release role=FWD id={} y={:.1}",
+                    ctx.player.id,
+                    y
+                );
                 return Some(StateChangeResult::with_forward_state(
                     ForwardState::Crossing,
                 ));
@@ -228,6 +244,7 @@ impl StateProcessingHandler for ForwardDribblingState {
         // of the attacking half), which would otherwise second-guess
         // and cut short a run before it reaches the intended depth.
         if !committing_to_byline && self.should_cross(ctx) {
+            match_log_info!("CROSSDIAG TRIG branch=should_cross role=FWD id={}", ctx.player.id);
             return Some(StateChangeResult::with_forward_state(
                 ForwardState::Crossing,
             ));

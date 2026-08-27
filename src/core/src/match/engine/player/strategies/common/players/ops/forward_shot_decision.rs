@@ -346,10 +346,10 @@ pub fn evaluate_forward_shot_decision(
             if (25.0..=75.0).contains(&dist) {
                 let ownership_ms = ctx.tick_context.ball.ownership_duration * 10;
                 if ownership_ms >= 300 {
-                    let (shot_spaced, settled, phase_allows, ticks_since_gain) =
+                    let (shot_spaced, settled, phase_allows, ticks_since_gain, clear_chance) =
                         ctx.team().can_shoot_debug();
                     log::info!(
-                        "SHOTDIAG_HARDGATE ms={} pid={} team={} dist={:.1} can_team={} can_player={} shot_spaced={} settled={} phase_allows={} ticks_since_gain={} owner_ms={}",
+                        "SHOTDIAG_HARDGATE ms={} pid={} team={} dist={:.1} can_team={} can_player={} shot_spaced={} settled={} phase_allows={} ticks_since_gain={} owner_ms={} clear_chance={}",
                         ctx.context.total_match_time,
                         ctx.player.id,
                         if ctx.player.id < 200 { "home" } else { "away" },
@@ -361,6 +361,7 @@ pub fn evaluate_forward_shot_decision(
                         phase_allows,
                         ticks_since_gain,
                         ownership_ms,
+                        clear_chance,
                     );
                 }
             }
@@ -526,6 +527,15 @@ pub fn evaluate_forward_shot_decision(
     // Inside-six floor: skill-graded, so a 5/20 player floors near 0.15
     // instead of inheriting the unconditional 0.30 free pass.
     let inside_six_floor = 0.12 + execution_skill * 0.28;
+    // "Genuinely open net" fast path (2026-07-28) — computed once, used
+    // by both the willingness floor and the cap below. See
+    // `on_ball_value::open_net_signal`'s doc comment for the full
+    // rationale; this is deliberately a stricter, separate signal from
+    // `has_clear_shot()` alone (which is intentionally GK-blind).
+    let (is_open_net, _open_net_occlusion) =
+        crate::r#match::player::strategies::common::players::ops::on_ball_value::open_net_signal(
+            ctx,
+        );
     if !inside_six && xg < min_xg {
         #[cfg(feature = "match-logs")]
         helper_diag::HOLD_XG.fetch_add(1, Ordering::Relaxed);
@@ -850,6 +860,20 @@ pub fn evaluate_forward_shot_decision(
         // "runs straight into GK" problem.
         let floor = (0.50 + execution_skill * 0.05).clamp(0.50, 0.55);
         willingness = willingness.max(floor);
+    } else if is_open_net {
+        // Open-net fast path (2026-07-28, Pavel's report): the close-range
+        // floors above stop at 36u, but a genuinely undefended net doesn't
+        // become less "obviously shoot" just because it's 15-25m away
+        // instead of 4m — the previous model had NO floor beyond 36u at
+        // all, so a wide-open chance at range was purely at the mercy of
+        // whatever the base matchup/window/closing formula happened to
+        // compute, with no guarantee it fires quickly. Graded rather than
+        // flat: strong near the box, easing out toward the engine's own
+        // 220u absolute shot-distance ceiling, since a 25m "walk-in" still
+        // takes a beat longer to convert into a strike than a 10m one.
+        let t = ((distance - 36.0) / (220.0 - 36.0)).clamp(0.0, 1.0);
+        let floor = (0.35 - t * 0.23).clamp(0.12, 0.35);
+        willingness = willingness.max(floor);
     }
 
     // Cap trimmed 0.48/0.60 → 0.34/0.44. Floor dropped 0.012 → 0.006,
@@ -862,6 +886,11 @@ pub fn evaluate_forward_shot_decision(
     // from 36u out.
     let mut cap = if distance <= 36.0 {
         0.60
+    } else if is_open_net {
+        // Must sit above the open-net floor's max (0.35) or the clamp
+        // below would silently clip it back down — same "cap raised to
+        // protect the floor" pattern as the distance<=36.0 branch above.
+        0.42
     } else if xg >= 0.35 {
         0.44
     } else {
@@ -940,7 +969,7 @@ fn shotdiag_trace(ctx: &StateProcessingContext, distance: f32, xg: f32, min_xg: 
     // possession-gain on every consult (not just hard-gate blocks) so a
     // before/after batch can directly show the shift in how soon a team
     // shoots after winning the ball — not just infer it from goal counts.
-    let (_, _, _, ticks_since_gain) = ctx.team().can_shoot_debug();
+    let (_, _, _, ticks_since_gain, _) = ctx.team().can_shoot_debug();
     log::info!(
         "SHOTDIAG ms={} pid={} team={} dist={:.1} gk_dist={:.1} angle_c={:.3} press_c={:.3} corr_c={:.3} clarity={:.3} thresh={:.3} clear={} xg={:.3} min_xg={:.3} gate={} ticks_since_gain={}",
         ctx.context.total_match_time,
@@ -1058,17 +1087,31 @@ fn shot_optimal_window(ctx: &StateProcessingContext, distance: f32) -> f32 {
         .map(|g| (g.position - ctx.player.position).magnitude())
         .unwrap_or(200.0);
 
-    // > 75u  : 0.70 — far, advancing strongly improves position
-    // 75→50u : 0.70→1.50 — approaching the window
+    // > 75u  : 1.00 — keeper far from the SHOOTER (dragged out of
+    //          position or hasn't closed down at all) is neutral, never
+    //          worse than the sweet spot — fixed 2026-07-28. Was 0.70,
+    //          a real bug: this curve treated a distant keeper as WORSE
+    //          for the shooter than the 1v1 sweet spot, which is
+    //          backwards when "far" means "hasn't engaged / dragged
+    //          wide" rather than "still on his line and irrelevant"
+    //          (that latter case is the >80u total-distance bypass
+    //          above, already flat 1.0 — this branch just brings the
+    //          45-80u band into line with it). The extreme "genuinely
+    //          open net" case gets its own dedicated floor via
+    //          `open_net_signal` in the caller instead of being modelled
+    //          here — this fix only removes the wrong-direction penalty
+    //          for the softer "keeper somewhat dragged off" case; it
+    //          doesn't add a new reward on top of neutral.
+    // 75→50u : 1.00→1.50 — approaching the window
     // 50→35u : 1.50→2.50 — entering sweet spot
     // 35→22u : 2.50       — peak zone
     // 22→12u : 2.50→0.50 — window closing fast (keeper commits)
     // < 12u  : 0.50→0.20 — keeper can smother
     if gk_dist >= 75.0 {
-        0.70
+        1.00
     } else if gk_dist >= 50.0 {
         let t = (75.0 - gk_dist) / 25.0;
-        0.70 + t * 0.80
+        1.00 + t * 0.50
     } else if gk_dist >= 35.0 {
         let t = (50.0 - gk_dist) / 15.0;
         1.50 + t * 1.00

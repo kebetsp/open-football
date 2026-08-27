@@ -24,6 +24,9 @@ impl StateProcessingHandler for MidfielderCrossingState {
                 MidfielderState::Running,
             ));
         }
+        if ctx.in_state_time == 0 {
+            match_log_info!("CROSSDIAG ENTER role=MID id={}", ctx.player.id);
+        }
 
         // CORNER SET-UP HOLD: wait until ≥2 runners have reached their zones
         // (or the setup window expires) so the delivery has a live target.
@@ -92,6 +95,7 @@ impl StateProcessingHandler for MidfielderCrossingState {
 
             // Open-play cross: use the original target-selection logic.
             if let Some(target) = self.find_cross_target(ctx) {
+                match_log_info!("CROSSDIAG SENT role=MID id={}", ctx.player.id);
                 return Some(StateChangeResult::with_midfielder_state_and_event(
                     MidfielderState::Running,
                     Event::PlayerEvent(PlayerEvent::PassTo(
@@ -104,6 +108,7 @@ impl StateProcessingHandler for MidfielderCrossingState {
                 ));
             }
 
+            match_log_info!("CROSSDIAG NOTARGET role=MID id={}", ctx.player.id);
             return Some(StateChangeResult::with_midfielder_state(
                 MidfielderState::Passing,
             ));
@@ -129,6 +134,8 @@ impl MidfielderCrossingState {
         let goal_pos = ctx.player().opponent_goal_position();
 
         let mut best_target: Option<(MatchPlayerLite, f32)> = None;
+        #[cfg(feature = "match-logs")]
+        let mut diag_in_range = 0u32;
 
         for teammate in ctx.players().teammates().all() {
             // Skip self
@@ -142,16 +149,24 @@ impl MidfielderCrossingState {
             if dist_to_goal > 150.0 {
                 continue;
             }
-
-            // Must have a clear passing lane — EXCEPT on a corner or a
-            // byline-directive delivery, where the ball is lofted over the
-            // packed defenders, so a blocked ground lane doesn't
-            // disqualify a central target.
-            let lofted_delivery = ctx.ball().is_team_attacking_corner()
-                || ctx.player.behavioral_directive == Some(BehavioralDirective::BylineAndCross);
-            if !lofted_delivery && !ctx.player().has_clear_pass(teammate.id) {
-                continue;
+            #[cfg(feature = "match-logs")]
+            {
+                diag_in_range += 1;
             }
+
+            // realism-bug (2026-08-27): every delivery dispatched from
+            // this state is a cross — a lofted ball played specifically
+            // BECAUSE the ground lane into the box is blocked. The old
+            // gate exempted only corner/directive deliveries from a
+            // clear-GROUND-pass-lane requirement, so a plain open-play
+            // cross needed an unobstructed straight line into a crowded
+            // box — measured (temporary match-logs diagnostic, 20
+            // matches): 100% of in-range open-play candidates were
+            // rejected by this exact check. Dropped entirely — see the
+            // forward-state twin for the full measurement. The
+            // downstream opponents-near-the-flight-path scoring penalty
+            // (below) is untouched — that's a real, softer risk signal
+            // for an aerial ball, not a hard ground-lane requirement.
 
             // Check how many opponents are near the cross path (interception risk)
             let pass_vector = teammate.position - ctx.player.position;
@@ -174,14 +189,13 @@ impl MidfielderCrossingState {
                 })
                 .count();
 
-            // Skip crosses with 2+ opponents directly in the path.
-            // Exception: on a corner or byline-directive delivery the ball is
-            // lofted over them — the aerial ball rises above the 2.5u
-            // interception gate in interactions.rs, so ground-lane crowding
-            // is irrelevant for those deliveries.
-            if opponents_in_path >= 2 && !lofted_delivery {
-                continue;
-            }
+            // realism-bug (2026-08-27): this used to hard-reject any
+            // candidate with 2+ opponents directly in the path, exempting
+            // only corner/directive deliveries — the identical mistake as
+            // the ground-lane gate just above (every cross here is
+            // lofted, so ground-path crowding shouldn't hard-disqualify
+            // it). Downgraded to the soft `path_penalty` scoring term
+            // below (unchanged) instead of a hard reject.
 
             // Score: prefer players with good heading skill and proximity to goal center
             let heading_skill = if let Some(player) = ctx.context.players.by_id(teammate.id) {
@@ -224,6 +238,14 @@ impl MidfielderCrossingState {
                 best_target = Some((teammate, score));
             }
         }
+
+        #[cfg(feature = "match-logs")]
+        match_log_info!(
+            "CROSSDIAG TARGETSEARCH role=MID is_corner={} in_range={} found={}",
+            ctx.ball().is_team_attacking_corner(),
+            diag_in_range,
+            best_target.is_some()
+        );
 
         best_target.map(|(t, _)| t)
     }

@@ -9,7 +9,7 @@
 //! role-neutral form; the caller's heuristic target anchors the search so
 //! each role's zone discipline and tactical intent stay intact.
 
-use crate::{PlayerFieldPositionGroup, PlayerPositionType};
+use crate::{MatchTacticType, PlayerFieldPositionGroup, PlayerPositionType, TACTICS_POSITIONS};
 use crate::r#match::player::strategies::common::players::ops::on_ball_value;
 use crate::r#match::{
     BallSideZone, MatchPlayerLite, PitchLane, PlayerSide, StateProcessingContext,
@@ -21,23 +21,74 @@ use nalgebra::Vector3;
 /// defensive mid) return `None` — they don't participate in flank
 /// rotation, only genuinely wide-slotted positions do.
 #[derive(PartialEq, Clone, Copy)]
-enum Side {
+pub(crate) enum Side {
     Left,
     Right,
 }
 
-fn flank_side(pt: PlayerPositionType) -> Option<Side> {
+/// True when `tactic`'s own canonical position table (`TACTICS_POSITIONS`,
+/// the engine's authoritative formation→slots mapping) fields both
+/// `ForwardLeft` and `ForwardRight` with no `ForwardCenter`/`Striker`
+/// between them — a genuine front-two of central strikers (T442, T352),
+/// where `ForwardLeft`/`ForwardRight` denote which strike partner, not a
+/// wide winger. Under a formation that also fields a central forward
+/// (T433: `ForwardLeft`, `ForwardCenter`, `ForwardRight`), the same two
+/// tags genuinely are wide wingers. `PlayerPositionType` has no separate
+/// variant for "central striker, left/right of a strike partner" (only
+/// Left/Center/Right for the whole Forward group), so this reads the
+/// tactic's own table rather than hardcoding a tactic list — found via
+/// raw position-data trace (docs/ball-distribution-fix-plan.md §10
+/// thread 1): under T442, both teams' strikers were being pulled to the
+/// touchline by every `flank_side` consumer (Step 1's `shape_rules`,
+/// Step 2's stretch-credit, and the width-hold override), plausibly
+/// explaining the goals/match drop found while re-verifying the override.
+fn is_front_two_tactic(tactic: MatchTacticType) -> bool {
+    let Some((_, positions)) = TACTICS_POSITIONS.iter().find(|(t, _)| *t == tactic) else {
+        return false;
+    };
+    let has_left = positions.contains(&PlayerPositionType::ForwardLeft);
+    let has_right = positions.contains(&PlayerPositionType::ForwardRight);
+    let has_center_forward = positions.contains(&PlayerPositionType::ForwardCenter)
+        || positions.contains(&PlayerPositionType::Striker);
+    has_left && has_right && !has_center_forward
+}
+
+/// The player's own team's starting tactic, for disambiguating
+/// `ForwardLeft`/`ForwardRight` in `flank_side` (see `is_front_two_tactic`).
+/// Falls back to `T442` — the front-two case — on the (should-never-
+/// happen in this pipeline) `None` case, so an unexpected gap in match
+/// setup fails toward NOT dragging a central striker wide, not the other
+/// way around.
+pub(crate) fn own_tactic(ctx: &StateProcessingContext) -> MatchTacticType {
+    let is_home = ctx.player.team_id == ctx.context.field_home_team_id;
+    let starting = if is_home {
+        ctx.context.starting_home_tactic
+    } else {
+        ctx.context.starting_away_tactic
+    };
+    starting.unwrap_or(MatchTacticType::T442)
+}
+
+/// `pub(crate)`: also reused by `flow::field::setup_player_on_field`
+/// (docs/ball-distribution-fix-plan.md §9 Step 1) to identify which
+/// wide-slotted roles get a default structural width rule, and by
+/// `processor.rs`'s width-hold override (§10 thread 1). Behavior
+/// unchanged for every existing caller for Defender/Midfielder/
+/// AttackingMidfielder/Wingback — those are unambiguously wide in every
+/// tactic this engine supports. Forward is the one ambiguous group; see
+/// `is_front_two_tactic`.
+pub(crate) fn flank_side(pt: PlayerPositionType, tactic: MatchTacticType) -> Option<Side> {
     match pt {
         PlayerPositionType::DefenderLeft
         | PlayerPositionType::MidfielderLeft
         | PlayerPositionType::AttackingMidfielderLeft
-        | PlayerPositionType::WingbackLeft
-        | PlayerPositionType::ForwardLeft => Some(Side::Left),
+        | PlayerPositionType::WingbackLeft => Some(Side::Left),
         PlayerPositionType::DefenderRight
         | PlayerPositionType::MidfielderRight
         | PlayerPositionType::AttackingMidfielderRight
-        | PlayerPositionType::WingbackRight
-        | PlayerPositionType::ForwardRight => Some(Side::Right),
+        | PlayerPositionType::WingbackRight => Some(Side::Right),
+        PlayerPositionType::ForwardLeft if !is_front_two_tactic(tactic) => Some(Side::Left),
+        PlayerPositionType::ForwardRight if !is_front_two_tactic(tactic) => Some(Side::Right),
         _ => None,
     }
 }
@@ -48,12 +99,13 @@ fn flank_side(pt: PlayerPositionType) -> Option<Side> {
 /// by distance is the tie-break when a formation happens to have more
 /// than one same-side wide role.
 fn flank_partner(ctx: &StateProcessingContext) -> Option<MatchPlayerLite> {
-    let my_side = flank_side(ctx.player.tactical_position.current_position)?;
+    let tactic = own_tactic(ctx);
+    let my_side = flank_side(ctx.player.tactical_position.current_position, tactic)?;
     ctx.players()
         .teammates()
         .all()
         .filter(|t| t.id != ctx.player.id)
-        .filter(|t| flank_side(t.tactical_positions) == Some(my_side))
+        .filter(|t| flank_side(t.tactical_positions, tactic) == Some(my_side))
         .min_by(|a, b| {
             let da = (a.position - ctx.player.position).magnitude();
             let db = (b.position - ctx.player.position).magnitude();
@@ -315,6 +367,21 @@ const SHORT_SUPPORT_RADIUS: f32 = 28.0;
 /// Candidates further from the proposed target pay a mild tether cost so
 /// the refinement repositions within the state's intent, never wanders.
 const TETHER_WEIGHT: f32 = 0.15;
+
+/// Step 2 (docs/ball-distribution-fix-plan.md §9, 2026-08-26) — same
+/// scale family as `WEAK_SIDE_PATIENCE_WEIGHT` (a comparable "reward
+/// realistic positioning" nudge), NOT `on_ball_value.rs`'s own [0,1.2]
+/// scale — `central_congestion_discount`'s raw 0.08 would be negligible
+/// on this file's own tens-scale scoring, the exact scale-mismatch trap
+/// this project has hit before (`SHOOT_COMPARISON_SCALE` etc.).
+const STRETCH_CREDIT_WEIGHT: f32 = 18.0;
+/// Matches `teamplay::tactical::spatial_sensor::WIDE_MARKING_PROXIMITY_
+/// RADIUS` (32.0) — a real spatial distance, not a value-scale term, so
+/// reused directly rather than re-derived; hardcoded here (not imported)
+/// to keep this addition self-contained and isolated.
+const STRETCH_CREDIT_RADIUS: f32 = 32.0;
+const WIDTH_PERSISTENCE_RADIUS: f32 = 40.0;
+const WIDTH_PERSISTENCE_WEIGHT: f32 = 12.0;
 
 /// §11.9 hard exclusion radius (~3m at the ~8u/m conversion): no two
 /// teammates may target the same spot or the same small area around it.
@@ -901,6 +968,13 @@ fn score_candidate(
     // above); its job is positioning for a LATER switch of play.
     score += weak_side_patience_adjustment(ctx, position);
 
+    // Step 2 (docs/ball-distribution-fix-plan.md §9): the symmetric
+    // stretch credit + width-persistence pair. See the two functions'
+    // own doc comments for the full reasoning.
+    let field_h = ctx.context.field_size.height as f32;
+    score += stretch_credit(position, field_h, opponents);
+    score += width_persistence_bonus(ctx, position, field_h);
+
     // Tether: stay recognisably within the caller's tactical intent —
     // blended toward the HOLDER's own position as pressure rises PAST the
     // engagement floor. Below the floor this is exactly `proposed`
@@ -953,6 +1027,55 @@ fn rotation_adjustment(ctx: &StateProcessingContext, candidate: Vector3<f32>) ->
     } else {
         ROTATION_WEIGHT * 0.5
     }
+}
+
+/// Step 2 (docs/ball-distribution-fix-plan.md §9, 2026-08-26) — the
+/// symmetric half of `on_ball_value.rs`'s `central_congestion_discount`
+/// (P2). That mechanism already rewards the EXPLOITER of a stretch (a
+/// teammate's central candidate gets a congestion discount when the
+/// team has wide players currently marked elsewhere) but gives zero
+/// credit to the CREATOR of that distortion — the width-holder
+/// themselves. This is a live, per-candidate measurement of the same
+/// underlying signal, not a forecast: is THIS wide candidate genuinely
+/// close enough to a real opponent to be pulling them out of position,
+/// using the same wide-band threshold `rotation_adjustment` above
+/// already establishes for this file (0.0 for a central candidate —
+/// "standing wide" only counts when it's actually distorting someone).
+fn stretch_credit(candidate: Vector3<f32>, field_h: f32, opponents: &[Vector3<f32>]) -> f32 {
+    let is_wide = candidate.y < field_h * 0.30 || candidate.y > field_h * 0.70;
+    if !is_wide {
+        return 0.0;
+    }
+    let marked = opponents
+        .iter()
+        .any(|opp| (opp - candidate).magnitude() <= STRETCH_CREDIT_RADIUS);
+    if marked { STRETCH_CREDIT_WEIGHT } else { 0.0 }
+}
+
+/// Step 2's other half — width-holding persistence. Mirrors the
+/// already-shipped byline-carry `momentum_bonus` in `on_ball_value.rs`'s
+/// `carry_candidates`: reward continuity of an ESTABLISHED wide position
+/// rather than letting a marginally-better central value flicker
+/// re-decide it fresh every tick. Scoped to wide-to-wide continuity
+/// only — a genuinely central candidate never gets this bonus just for
+/// being near the player's current spot, and a player who currently
+/// ISN'T wide gets no persistence credit for staying central either
+/// (this is specifically an anti-abandonment term for width, not a
+/// general inertia bonus).
+fn width_persistence_bonus(
+    ctx: &StateProcessingContext,
+    candidate: Vector3<f32>,
+    field_h: f32,
+) -> f32 {
+    let current = ctx.player.position;
+    let current_is_wide = current.y < field_h * 0.30 || current.y > field_h * 0.70;
+    let candidate_is_wide = candidate.y < field_h * 0.30 || candidate.y > field_h * 0.70;
+    if !current_is_wide || !candidate_is_wide {
+        return 0.0;
+    }
+    let dist = (candidate - current).magnitude();
+    ((WIDTH_PERSISTENCE_RADIUS - dist).max(0.0) / WIDTH_PERSISTENCE_RADIUS)
+        * WIDTH_PERSISTENCE_WEIGHT
 }
 
 /// D3 — central-corridor-priority default shape, defenders only. `0.0`

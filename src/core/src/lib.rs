@@ -426,6 +426,14 @@ pub use crate::r#match::player::strategies::players::ops::forward_shot_decision:
 pub use crate::r#match::player::strategies::players::ops::forward_shot_decision::mid_run_diag;
 #[cfg(feature = "match-logs")]
 pub use crate::r#match::player::strategies::players::ops::forward_shot_decision::time_band_diag;
+#[cfg(feature = "match-logs")]
+pub use crate::r#match::engine::ball::ball::interactions::block_diag;
+#[cfg(feature = "match-logs")]
+pub use crate::r#match::player::strategies::players::ops::defensive::byline_run_diag;
+#[cfg(feature = "match-logs")]
+pub use crate::r#match::engine::engine::tick::aerial_def_diag;
+// (path confirmed: strategies::players re-exports common::players, matching
+// the existing mid_run_diag precedent's own path shape)
 
 static STORE_MATCH_EVENTS_MODE: AtomicBool = AtomicBool::new(false);
 static MATCH_RECORDINGS_MODE: AtomicBool = AtomicBool::new(false);

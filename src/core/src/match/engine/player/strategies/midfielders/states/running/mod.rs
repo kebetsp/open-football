@@ -9,6 +9,7 @@ use crate::r#match::player::strategies::common::players::ops::forward_shot_decis
     ShotDecision, evaluate_forward_shot_decision,
 };
 use crate::r#match::player::strategies::common::players::ops::midfielder_skill::MidfielderSkillProfile;
+use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
     ConditionContext, GamePhase, MatchPlayerLite, PassEvaluator, PlayerSide, StateChangeResult,
@@ -684,15 +685,42 @@ impl StateProcessingHandler for MidfielderRunningState {
             {
                 let opponent_distance = (opponent.position - ctx.player.position).magnitude();
 
-                // Close — tackle regardless (reactive)
-                if opponent_distance < 30.0 {
+                // D8.2 of docs/defensive-decision-logic-spec.md: role-
+                // based shape, mirroring DefenderRunningState's own
+                // already-shipped pattern (line ~180 of that file) —
+                // this is the exact block D0/D7 diagnosed as the source
+                // of the coverage-assignment gap (a distant defender
+                // self-reporting "Primary" via a defenders-only pool
+                // while a genuinely close midfielder had no coordinated
+                // role at all). `Primary` under the unified pool now
+                // correctly identifies whichever position group is
+                // actually closest; `Help` routes to `Guarding` (an
+                // existing, already-tuned state whose own scoring/
+                // movement logic is a close semantic match — pick up an
+                // unmarked dangerous opponent); `Cover`/non-primary
+                // `Hold` fall through unchanged to "stay in running."
+                let role = ctx
+                    .player()
+                    .defensive()
+                    .defensive_role_for_ball_carrier_unified();
+
+                // Close — only the designated closer tackles (removed
+                // the old unconditional "tackle regardless" — same
+                // pileup fix defenders already validated at D2).
+                if opponent_distance < 30.0 && role == DefensiveRole::Primary {
                     return Some(StateChangeResult::with_midfielder_state(
                         MidfielderState::Tackling,
                     ));
                 }
 
-                // Only the best-positioned player presses — prevents team swarming
-                if ctx.team().is_best_player_to_chase_ball() {
+                if role == DefensiveRole::Help {
+                    return Some(StateChangeResult::with_midfielder_state(
+                        MidfielderState::Guarding,
+                    ));
+                }
+
+                // Only the best-positioned Primary presses — prevents team swarming
+                if role == DefensiveRole::Primary && ctx.team().is_best_player_to_chase_ball() {
                     if opponent_distance < 50.0 {
                         return Some(StateChangeResult::with_midfielder_state(
                             MidfielderState::Tackling,
@@ -702,7 +730,7 @@ impl StateProcessingHandler for MidfielderRunningState {
                         MidfielderState::Pressing,
                     ));
                 }
-                // Others: stay in running (will follow waypoints via velocity)
+                // Cover / non-primary Hold: stay in running (will follow waypoints via velocity)
             }
 
             // Teammate has the ball — actively support the attack

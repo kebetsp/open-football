@@ -19,6 +19,40 @@ use nalgebra::Vector3;
 #[cfg(feature = "match-logs")]
 use std::sync::atomic::Ordering;
 
+/// TEMPORARY realism-bug diagnostic (2026-08-26, corner/deflection
+/// investigation) — measures whether the block corridor's geometric
+/// gate (BLOCK_LOOKAHEAD/BLOCK_CORRIDOR) or the post-gate RNG chance is
+/// the binding constraint on the severely-low blocked-shot rate. Removed
+/// once the investigation concludes.
+#[cfg(feature = "match-logs")]
+pub mod block_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static SHOT_LIVE_TICKS: AtomicU64 = AtomicU64::new(0);
+    pub static CANDIDATE_TICKS: AtomicU64 = AtomicU64::new(0);
+    pub static NEAR_MISS_TICKS: AtomicU64 = AtomicU64::new(0);
+    pub static ROLL_PASSED: AtomicU64 = AtomicU64::new(0);
+    pub static SUM_MIN_PERP_X100: AtomicU64 = AtomicU64::new(0);
+    pub static MIN_PERP_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    /// Times `try_intercept` claimed the ball for the DEFENDING side
+    /// while a corner-branch deflection's own guard window was still
+    /// active — i.e., the block's own teammate re-swallowed a deflection
+    /// that was meant to reach the byline for a corner.
+    pub static CORNER_DEFLECTION_RECLAIMED: AtomicU64 = AtomicU64::new(0);
+    pub fn reset() {
+        for c in [
+            &SHOT_LIVE_TICKS,
+            &CANDIDATE_TICKS,
+            &NEAR_MISS_TICKS,
+            &ROLL_PASSED,
+            &SUM_MIN_PERP_X100,
+            &MIN_PERP_SAMPLES,
+            &CORNER_DEFLECTION_RECLAIMED,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 impl Ball {
     /// Opposing players near the ball's flight path can intercept passes.
     /// Interception chance depends on tackling, anticipation, positioning skills
@@ -51,6 +85,15 @@ impl Ball {
         // has no realistic chance to step into an already-in-flight
         // dead-ball strike the way they might read an open-play pass.
         if self.direct_fk_shot_in_flight {
+            return;
+        }
+
+        // realism-bug (2026-08-26): a block's own corner-branch
+        // deflection is still travelling toward the byline — don't let
+        // `try_intercept` treat it as an interceptable pass from the
+        // shooter's team (see the corner branch's own comment for the
+        // full mechanism this closes).
+        if self.current_tick_cached <= self.corner_deflection_guard_until_tick {
             return;
         }
 
@@ -99,6 +142,14 @@ impl Ball {
 
             // Don't let the pass target's team intercept their own pass target
             if Some(player.id) == self.pass_target_player_id {
+                continue;
+            }
+
+            // D3 of docs/defensive-decision-logic-spec.md: the one
+            // opponent this concede-out redirect was dispossessed from
+            // can't reclaim it via this mechanism — see the field's own
+            // doc comment (ball/ball/mod.rs) for why.
+            if Some(player.id) == self.concede_out_shielded_opponent {
                 continue;
             }
 
@@ -177,6 +228,12 @@ impl Ball {
                 // a stationary ball can't roll past the 15u owner-drop
                 // threshold, so it can't cross the goal line unowned.
                 let _ = interceptor_id; // no teleport, keep position as-is
+                #[cfg(feature = "match-logs")]
+                {
+                    if self.current_tick_cached <= self.corner_deflection_guard_until_tick {
+                        block_diag::CORNER_DEFLECTION_RECLAIMED.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 self.current_owner = Some(interceptor_id);
                 self.pass_target_player_id = None;
                 self.flags.in_flight_state = 0;
@@ -275,6 +332,11 @@ impl Ball {
         const BLOCK_LOOKAHEAD: f32 = 40.0; // was 30u
         const BLOCK_CORRIDOR: f32 = 7.0; // was 4u — body + stretched leg
 
+        #[cfg(feature = "match-logs")]
+        block_diag::SHOT_LIVE_TICKS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "match-logs")]
+        let mut min_perp_in_lookahead: Option<f32> = None;
+
         let mut best_blocker: Option<u32> = None;
         let mut best_chance: f32 = 0.0;
 
@@ -305,6 +367,22 @@ impl Ball {
             let perp =
                 (dx - projection * shot_dir_x).powi(2) + (dy - projection * shot_dir_y).powi(2);
             let perp_dist = perp.sqrt();
+            #[cfg(feature = "match-logs")]
+            {
+                // Only count as a genuine "near miss" candidate if the
+                // opponent is also within a plausible real straight-line
+                // closing distance of the ball (60u/7.5m) — otherwise a
+                // defender on the far side of the pitch who happens to
+                // have a nonzero projection along the shot direction
+                // pollutes the average with meaningless outliers.
+                let straight_dist = (dx * dx + dy * dy).sqrt();
+                if straight_dist <= 60.0 {
+                    min_perp_in_lookahead = Some(match min_perp_in_lookahead {
+                        Some(m) if m <= perp_dist => m,
+                        _ => perp_dist,
+                    });
+                }
+            }
             if perp_dist > BLOCK_CORRIDOR {
                 continue;
             }
@@ -360,6 +438,20 @@ impl Ball {
             }
         }
 
+        #[cfg(feature = "match-logs")]
+        {
+            if best_blocker.is_some() {
+                block_diag::CANDIDATE_TICKS.fetch_add(1, Ordering::Relaxed);
+            } else if let Some(mp) = min_perp_in_lookahead {
+                // A defender was ahead of the ball within BLOCK_LOOKAHEAD
+                // but outside BLOCK_CORRIDOR — a genuine geometric near
+                // miss, distinct from "nobody was even ahead of the ball."
+                block_diag::NEAR_MISS_TICKS.fetch_add(1, Ordering::Relaxed);
+                block_diag::SUM_MIN_PERP_X100.fetch_add((mp * 100.0) as u64, Ordering::Relaxed);
+                block_diag::MIN_PERP_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         // RNG threshold instead of deterministic cutoff: a 30% block
         // chance still allows the shot through 70% of the time, which
         // is what we want — defenders block but don't always block.
@@ -367,6 +459,8 @@ impl Ball {
             Some(id) if context.rng.unit_f32() < best_chance.clamp(0.03, 0.38) => id,
             _ => return,
         };
+        #[cfg(feature = "match-logs")]
+        block_diag::ROLL_PASSED.fetch_add(1, Ordering::Relaxed);
 
         // Outcome distribution. Real blocks rarely produce clean
         // possession — they produce loose balls, deflections wide for a
@@ -496,6 +590,30 @@ impl Ball {
             // a covering defender grabs it back (else it never becomes a
             // corner — the whole point of this branch).
             self.claim_cooldown = 16;
+            // realism-bug (2026-08-26): the ball is unowned here
+            // (`current_owner = None`, above), so `claim_cooldown`'s own
+            // gate in `check_ball_ownership` (`claim_cooldown > 0 &&
+            // current_owner.is_some()`) never actually applies to this
+            // deflection — that check exists to stop ping-pong re-claims
+            // of an OWNED ball, not to protect a loose one. The real
+            // protection this branch depends on is `in_flight_state=30`
+            // routing the ball through `try_pass_target_claim` (which
+            // does nothing, since `pass_target_player_id` is also
+            // cleared) instead of `check_ball_ownership` — but
+            // `try_intercept` runs on EVERY tick regardless of
+            // `in_flight_state`, and reads `previous_owner` (still the
+            // ORIGINAL SHOOTER, untouched by this branch) to mean "the
+            // opposing team may intercept this pass" — so the very
+            // defender who just deflected the shot (or a nearby
+            // teammate) routinely re-claims their own deflection via
+            // `try_intercept` within 1-2 ticks, before it can travel
+            // anywhere near the byline. Measured with a raw diagnostic
+            // (temporary `CORNER_DEFLECTION_RECLAIMED` counter): 3 of 4
+            // corner-branch firings across 40 matches were reclaimed
+            // this way — this field is the real, permanent fix,
+            // exempting `try_intercept` for the deflection's own
+            // 30-tick window (matches `in_flight_state`'s duration).
+            self.corner_deflection_guard_until_tick = self.current_tick_cached + 30;
             return;
         }
 

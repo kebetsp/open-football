@@ -1,7 +1,7 @@
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondition};
 use crate::r#match::events::Event;
-use crate::r#match::player::events::{FoulSeverity, PlayerEvent};
+use crate::r#match::player::events::{FoulSeverity, PlayerEvent, ShootingEventContext};
 use crate::r#match::player::strategies::common::players::ops::defender_skill::DefenderSkillProfile;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::{
@@ -129,11 +129,9 @@ impl StateProcessingHandler for DefenderTacklingState {
             // deliberately reusing the existing state-time tracker
             // instead of adding a new persistent per-player field, a
             // smaller and lower-risk choice than D1 originally flagged.
-            // concede_out_value's actual execution mechanism doesn't
-            // exist yet (D3) — until then it's treated the same as
-            // contain_value winning (hold off, keep jockeying): an
-            // honest interim behavior, not a silent no-op pretending to
-            // execute a deflection that isn't built.
+            // concede_out_value winning its own branch below (D3,
+            // 2026-08-21) dispatches a real deliberate poke toward the
+            // nearest boundary — see that branch's own comment.
             //
             // IMPORTANT: when holding off, return `None` (stay in THIS
             // state) rather than transitioning to Pressing. A first cut
@@ -154,11 +152,55 @@ impl StateProcessingHandler for DefenderTacklingState {
             // skips) lets `in_state_time` genuinely accumulate and the
             // urgency term genuinely decay tick over tick.
             use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
-            let tackle_val = dv::tackle_value(ctx, &opponent);
-            let contain_val = dv::contain_value(ctx, &opponent, ctx.in_state_time as f32);
-            let concede_val = dv::concede_out_value(ctx, &opponent);
+            // D5: these three take `tackle_profile` explicitly now so
+            // the same functions work for MidfielderTacklingState too —
+            // `def_profile.tackle_profile` is the identical value this
+            // used to derive internally, so behavior here is unchanged.
+            let def_profile = DefenderSkillProfile::from_ctx(ctx);
+            let tackle_val = dv::tackle_value(ctx, &opponent, def_profile.tackle_profile);
+            let contain_val = dv::contain_value(
+                ctx,
+                &opponent,
+                ctx.in_state_time as f32,
+                def_profile.tackle_profile,
+            );
+            let concede_val = dv::concede_out_value(ctx, &opponent, def_profile.tackle_profile);
 
-            if tackle_val < contain_val || tackle_val < concede_val {
+            // D3 (docs/defensive-decision-logic-spec.md, 2026-08-21):
+            // concede_out_value winning the comparison now actually
+            // executes — a deliberate poke toward the nearest boundary
+            // rather than a committed tackle. `> 0.0` guards against the
+            // degenerate case where BOTH concede_val and contain_val are
+            // gated to exactly 0.0 (not goal-side / not near a line) and
+            // tackle_val is merely very negative — without it, "0.0 is
+            // the max of three" would fire a concede-out that the
+            // function itself already said isn't a real opportunity
+            // (concede_out_value returns 0.0 explicitly when its own
+            // gates fail, same convention contain_value uses).
+            if concede_val > 0.0 && concede_val >= tackle_val && concede_val >= contain_val {
+                #[cfg(feature = "match-logs")]
+                crate::tackle_stats::DEF_CONCEDE_OUT.fetch_add(1, Ordering::Relaxed);
+                let shoot_ctx = ShootingEventContext::new()
+                    .with_player_id(ctx.player.id)
+                    // Discarded by handle_shoot_event's "DEF_CONCEDE_OUT"
+                    // branch, which recomputes the real target (nearest
+                    // boundary edge) fresh at dispatch time — same
+                    // convention FWD_RUN_SAFE_RESTART already uses and
+                    // documents (players.rs) for the identical reason: a
+                    // tick or two of drift between decision and dispatch
+                    // makes a stale target pointless to thread through.
+                    .with_target(ctx.tick_context.positions.ball.position)
+                    .with_reason("DEF_CONCEDE_OUT")
+                    .build(ctx);
+                let mut result = StateChangeResult::with_defender_state_and_event(
+                    DefenderState::Standing,
+                    Event::PlayerEvent(PlayerEvent::Shoot(shoot_ctx)),
+                );
+                result.start_tackle_cooldown = true;
+                return Some(result);
+            }
+
+            if tackle_val < contain_val {
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::DEF_GATE_CONTAIN_OR_CONCEDE.fetch_add(1, Ordering::Relaxed);
                 return None;
@@ -333,7 +375,7 @@ impl DefenderTacklingState {
         // shooting chain at extreme skill gaps).
         let success_chance =
             crate::r#match::player::strategies::common::players::ops::defensive_value::tackle_win_probability(
-                ctx, opponent,
+                ctx, opponent, def_profile.tackle_profile,
             );
 
         let tackle_success = rng.random::<f32>() < success_chance;

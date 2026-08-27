@@ -16,6 +16,9 @@
 //! deferred `best_pass_value_from(P)` term the original spec called for
 //! and B3 explicitly left out, per that function's own docstring.
 
+use crate::r#match::player::strategies::common::players::ops::defensive_value::{
+    CONCEDE_GOAL_SIDE_SATURATION, is_goal_side,
+};
 use crate::r#match::player::strategies::spacing;
 use crate::r#match::{GamePhase, MatchPlayerLite, StateProcessingContext};
 use nalgebra::Vector3;
@@ -925,6 +928,10 @@ fn lane_completion_prob(
     } else {
         Vector3::new(1.0, 0.0, 0.0)
     };
+    // Time for the ball itself to reach the RECEIVER'S endpoint, as
+    // opposed to `ball_time_to_point` below (time to reach wherever a
+    // given opponent's own line-projection happens to land).
+    let ball_time_to_dest = dist / BALL_SPEED;
 
     let mut min_margin = f32::MAX;
     for opp in ctx
@@ -937,7 +944,48 @@ fn lane_completion_prob(
         let closest_point = from_pos + dir * proj;
         let ball_time_to_point = proj / BALL_SPEED;
         let opp_time = time_to_intercept(ctx, &opp, closest_point);
-        let margin = opp_time - ball_time_to_point;
+        let lane_margin = opp_time - ball_time_to_point;
+
+        // World B fix (docs/ball-distribution-fix-plan.md §9 Step 0(b),
+        // 2026-08-26): the lane-projection margin above only credits an
+        // opponent for sitting ON the straight passer-to-receiver line —
+        // a defender genuinely tight-marking the receiver from a
+        // lateral or trailing angle (real, textbook defending, not an
+        // edge case) projects onto a point well short of the receiver,
+        // so their real proximity to the RECEPTION itself was never
+        // tested at all. Verified externally (30-match raw-outcome
+        // diagnostic, scratchpad `step0-central-pass-marking.mjs`):
+        // once a pass-type confound was controlled for, real completion
+        // was flat 93-97% from genuinely tight marking (<2.5m) out to
+        // 18.75m. A follow-up internal trace (temporary, removed)
+        // showed this term only wins ~9% of the time even when an
+        // opponent sits within 30u of the destination — the clamp
+        // already routes most overshoot/at-destination cases through
+        // the SAME `to_pos`-equivalent point, and undershoot cases
+        // (an opponent positioned to intercept mid-flight) were often
+        // already MORE dangerous under the original formula, since
+        // BALL_SPEED >> a defender's max_speed means a small along-line
+        // undershoot shrinks the opponent's own travel time far more
+        // than it shrinks the ball's. So this term is a real, if
+        // modest, correction to a genuine edge case (an opponent whose
+        // closest point on the line lands meaningfully short of the
+        // receiver's own position) — kept as a small, isolated,
+        // mechanism-level improvement to how the AI's OWN target
+        // selection perceives marking risk. It does NOT explain, and
+        // is not expected to fix, the flat post-dispatch completion
+        // rate found in Step 0(b): that measures the REAL physics
+        // outcome of an already-chosen pass (ball flight, `try_
+        // intercept`, defender chase AI) — a separate mechanism this
+        // decision-time value function has no influence over. The
+        // actual DoD-relevant test is whether the AI's OWN choice of
+        // target shifts wider when a central option is tightly marked
+        // (`scripts/ball-distribution-check.mjs`), not this outcome
+        // rate — verified separately, see the plan doc's Step 0(b)
+        // follow-up entry.
+        let dest_time = time_to_intercept(ctx, &opp, to_pos);
+        let dest_margin = dest_time - ball_time_to_dest;
+
+        let margin = lane_margin.min(dest_margin);
         if margin < min_margin {
             min_margin = margin;
         }
@@ -1379,21 +1427,104 @@ pub struct SafeRestartCandidate {
 /// the defender-side geometry, per the spec's explicit instruction that
 /// both sides of the interaction reason about the same boundary-line
 /// shape.
-pub(crate) const SAFE_RESTART_LINE_MARGIN: f32 = 40.0; // ~5m from a byline/touchline
-const SAFE_RESTART_PRESS_MARGIN: f32 = 24.0; // ~3m from the nearest defender
-const SAFE_RESTART_BASE_VALUE: f32 = 0.30;
-
-/// Value of deliberately sending the ball into the nearest opponent to
-/// concede a corner/throw-in/goal-kick instead of risking a turnover.
-/// Deliberately a smooth, continuous falloff on both the line-proximity
-/// and press-proximity terms (a hard cutoff was found, earlier this same
-/// investigation, to create an unrealistic discontinuity in the analogous
-/// `shot_clarity` angle formula) — so the value tapers to zero rather than
-/// jumping, and is ~0 from mid-pitch by construction, with no separate
-/// "don't try this from the middle of the field" gate needed.
 ///
-/// Returns `None` when no opponent is close enough to plausibly be the
-/// target of the deflection at all.
+/// D4 recalibration: widened from a pre-D4 40.0 (~5m) to 130.0 — the
+/// SAME "within 130u (~16m) of the byline they're attacking" figure
+/// this exact spec's own D0 diagnostic already used to define a
+/// "byline 1v1 moment" (docs/defensive-decision-logic-spec.md, D0
+/// results), not an independently-invented number. A temporary raw
+/// match-log trace (`D4DIAG2`, added/used/removed during this stage,
+/// 19,543 real calls across 20 matches) found the OLD 40.0 margin was
+/// itself the real bottleneck, not goal-side awareness or the press
+/// radius: the CLOSEST `ForwardRunningState` ever got to any boundary
+/// with the ball held >12 ticks was 41.2 — never once below the old
+/// 40.0 threshold across the whole sample (median 180.1, p10 127.0). By
+/// the time a carrier is genuinely within ~5m of a line, they've
+/// already transitioned to Crossing/Dribbling (byline-commitment) or
+/// lost the ball — `ForwardRunningState` structurally never observes
+/// that proximity. 130.0 is well inside the range this state DOES
+/// occupy (p10=127.0), so this recalibration is grounded in what the
+/// calling state can actually produce, not an assumption about where a
+/// "real" byline duel happens.
+pub(crate) const SAFE_RESTART_LINE_MARGIN: f32 = 130.0; // ~16m, matches D0's byline-moment radius
+/// D4 (docs/defensive-decision-logic-spec.md): widened from a tight,
+/// pre-D4 24.0 (~3m) to D0's own already-established "engagement range"
+/// (2026-08-20 diagnostic, same doc's D0 results section — the 60u/
+/// ~7.5m radius that measurement used to decide whether a defender is
+/// "genuinely engaged" with a byline 1v1 at all). A temporary raw
+/// match-log trace (`D4DIAG`, added/used/removed during this stage)
+/// found the OLD 24u gate — not goal-side awareness — was the real
+/// bottleneck: across several real matches this function almost never
+/// even reached "any opponent within 24u while near a boundary line" —
+/// by the time a defender closes inside ~3m, the ball carrier has
+/// typically already transitioned out of `ForwardRunningState` (the
+/// only state that calls this) into `ForwardDribblingState` for a
+/// contested duel, which doesn't call this function at all. Widening to
+/// the 60u engagement radius lets this recognize genuine containment (a
+/// defender showing outside at a realistic jockeying distance) while
+/// still in Running, before a literal point-blank duel forces the state
+/// change — also now used as the candidate SEARCH radius, not just the
+/// value falloff, see below.
+const SAFE_RESTART_ENGAGEMENT_RADIUS: f32 = 60.0;
+/// D4 recalibration: raised from a pre-D4 0.30 to 1.2 — the same class
+/// of scale-mismatch `SHOOT_COMPARISON_SCALE` was built to fix on the
+/// shoot side (2026-08-19, same investigation): `line_factor` /
+/// `press_factor` / `goal_side_factor` are each individually ≤1, and
+/// multiplying all three together (deliberate — see the smooth-falloff
+/// note below) crushes the realistic product toward ~0.02-0.10 even in
+/// a genuinely good containment scenario, while `pass_val`/`recycle_
+/// val`/`dribble_val` in the SAME comparison typically sit in the
+/// 0.15-0.4 range. A temporary raw match-log trace (`VALCMP`,
+/// cross-referenced against the fired product distribution, added/
+/// used/removed during this stage) confirmed 0.30 never won the
+/// comparison even once across 100 real nonzero candidates (20
+/// matches); 1.2 wins ~31% of those candidates — a real, non-dominant,
+/// still-occasional rate (candidates themselves are already rare, ~7.5/
+/// match) — without swamping pass/dribble as the default choice. Not
+/// independently sourced against a real-world "how often does an
+/// attacker deliberately concede" rate (none exists, category (d) per
+/// this project's own Realism Diagnosis Framework) — a reasoned,
+/// moderate rescale, not a calibrated target.
+const SAFE_RESTART_BASE_VALUE: f32 = 1.2;
+
+/// Value of deliberately sending the ball into the nearest containing
+/// opponent to concede a corner/throw-in/goal-kick instead of risking a
+/// turnover. Deliberately a smooth, continuous falloff on the
+/// line-proximity, press-proximity, AND (D4) goal-side terms (a hard
+/// cutoff was found, earlier this same investigation, to create an
+/// unrealistic discontinuity in the analogous `shot_clarity` angle
+/// formula) — so the value tapers to zero rather than jumping, and is
+/// ~0 from mid-pitch by construction, with no separate "don't try this
+/// from the middle of the field" gate needed.
+///
+/// D4 (docs/defensive-decision-logic-spec.md): before D1-D3 existed,
+/// this only checked "is *a* defender nearby" (whichever opponent
+/// happened to be geometrically nearest, unconditionally) — measured
+/// (2026-08-20) to fire ~0 times in ~120 real matches. The first D4 cut
+/// added a goal-side requirement on top of that same literal-nearest
+/// opponent and, per a real match-log trace, still fired ~0 times —
+/// because the literal-nearest-opponent selection, gated at a tight
+/// 24u, was ALREADY the dominant bottleneck (see
+/// `SAFE_RESTART_ENGAGEMENT_RADIUS`'s own comment): goal-side was never
+/// even reached. Fixed by restructuring candidate selection itself —
+/// instead of picking whichever opponent is nearest overall and then
+/// checking if THEY happen to be goal-side, search opponents within the
+/// wider engagement radius for the nearest one that IS genuinely
+/// goal-side (via `is_goal_side`, the same primitive `defensive_value.
+/// rs`'s `contain_value`/`concede_out_value` use for the defender's own
+/// decision) and treat that one as the containing defender. This
+/// mirrors `concede_out_value`'s own structure, which has no separate
+/// defender-to-attacker distance gate at all — only line proximity and
+/// goal-side margin — because on the defender side "which opponent"
+/// isn't a search problem (it's whoever owns the ball); on the attacker
+/// side it is, so this restructuring is the minimal change needed to
+/// reuse the same underlying signal correctly. Goal-side positioning
+/// operationalizes "this specific opponent is actually containing me,
+/// not just standing near me" — the actual gap D0 measured (mean
+/// margin -3.0, only 38.4% goal-side when engaged).
+///
+/// Returns `None` when no opponent within engagement range is genuinely
+/// goal-side.
 pub fn safe_restart_value(ctx: &StateProcessingContext) -> Option<SafeRestartCandidate> {
     let pos = ctx.player.position;
     let field_width = ctx.context.field_size.width as f32;
@@ -1409,20 +1540,30 @@ pub fn safe_restart_value(ctx: &StateProcessingContext) -> Option<SafeRestartCan
         return None;
     }
 
-    let nearest_defender = ctx
+    let target_goal = ctx.player().opponent_goal_position();
+    let containing_defender = ctx
         .players()
         .opponents()
         .all()
         .filter(|p| !p.tactical_positions.is_goalkeeper())
-        .map(|p| (p.id, p.position, (p.position - pos).magnitude()))
+        .filter_map(|p| {
+            let dist = (p.position - pos).magnitude();
+            if dist > SAFE_RESTART_ENGAGEMENT_RADIUS {
+                return None;
+            }
+            let margin = is_goal_side(p.position, pos, target_goal);
+            if margin <= 0.0 {
+                return None;
+            }
+            Some((p.id, p.position, dist, margin))
+        })
         .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))?;
-    let (defender_id, defender_pos, defender_dist) = nearest_defender;
-    let press_factor = (1.0 - defender_dist / SAFE_RESTART_PRESS_MARGIN).clamp(0.0, 1.0);
-    if press_factor <= 0.0 {
-        return None;
-    }
+    let (defender_id, defender_pos, defender_dist, margin) = containing_defender;
 
-    let value = SAFE_RESTART_BASE_VALUE * line_factor * press_factor;
+    let press_factor = (1.0 - defender_dist / SAFE_RESTART_ENGAGEMENT_RADIUS).clamp(0.0, 1.0);
+    let goal_side_factor = (margin / CONCEDE_GOAL_SIDE_SATURATION).clamp(0.0, 1.0);
+
+    let value = SAFE_RESTART_BASE_VALUE * line_factor * press_factor * goal_side_factor;
     if value <= 0.0 {
         return None;
     }

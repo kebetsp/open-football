@@ -113,7 +113,7 @@ impl StateProcessingHandler for DefenderMarkingState {
             // role block can reassign us (Primary if we're now closest,
             // Cover if we're goal-side second, Hold otherwise).
             if ctx.players().opponents().with_ball().next().is_some() {
-                let role = ctx.player().defensive().defensive_role_for_ball_carrier();
+                let role = ctx.player().defensive().defensive_role_for_ball_carrier_unified();
                 if role != DefensiveRole::Help {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Standing,

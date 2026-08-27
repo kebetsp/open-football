@@ -1190,9 +1190,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             for p in field.players.iter_mut() {
                 if p.byline_commitment_ticks > 0 {
                     if raw_owner != Some(p.id) {
+                        match_log_info!("CROSSDIAG LOSTBALL id={} ticks_left={}", p.id, p.byline_commitment_ticks);
                         p.byline_commitment_ticks = 0;
                     } else {
                         p.byline_commitment_ticks -= 1;
+                        if p.byline_commitment_ticks == 0 {
+                            match_log_info!("CROSSDIAG TIMEOUT id={}", p.id);
+                        }
                     }
                     continue;
                 }
@@ -1250,7 +1254,159 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     // level timeouts are skipped while committed (see
                     // the dribbling states), so this is the actual bound.
                     p.byline_commitment_ticks = 1200;
+                    match_log_info!(
+                        "CROSSDIAG ARM id={} group={:?} y={:.1} depth={:.1}",
+                        p.id,
+                        group,
+                        y,
+                        depth
+                    );
                 }
+            }
+
+            // realism-bug (2026-08-27): persistent wide-run tracking
+            // assignment. `processor.rs::wide_run_track_override_velocity`
+            // does the actual per-tick STEERING, but without persistence
+            // the "who's the single closest defender" recomputation
+            // reassigns the tracker almost every tick as relative
+            // distances jitter slightly, so no one defender ever commits
+            // to a sustained chase (measured: a real, non-trivial but
+            // modest effect on defensive presence in the byline-approach
+            // zone before this fix). Mirrors byline_commitment_ticks'
+            // own snapshot-then-mutate structure exactly — can't borrow
+            // field.players immutably while iterating it mutably.
+            let wrt_snapshot: Vec<(u32, u32, Vector3<f32>, Vector3<f32>, crate::PlayerFieldPositionGroup)> =
+                field
+                    .players
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.id,
+                            p.team_id,
+                            p.position,
+                            p.velocity,
+                            p.tactical_position.current_position.position_group(),
+                        )
+                    })
+                    .collect();
+            const WRT_REFRESH_TICKS: u16 = 90; // ~0.9s — refreshed every
+            // qualifying tick, so a genuine sustained run keeps the same
+            // defender committed; one that stops decays within under a
+            // second with nothing else needed to clear it.
+            const WRT_ENGAGEMENT_DISTANCE: f32 = 20.0; // matches defensive.rs's ENGAGEMENT_DISTANCE
+            let wrt_field_h = context.field_size.height as f32;
+            let wrt_field_w = context.field_size.width as f32;
+            let wrt_is_dangerous_run = |defender_pos: Vector3<f32>,
+                                        defender_side: Option<PlayerSide>,
+                                        opp_pos: Vector3<f32>,
+                                        opp_vel: Vector3<f32>| {
+                let wide = opp_pos.y < wrt_field_h * 0.35 || opp_pos.y > wrt_field_h * 0.65;
+                if !wide {
+                    return false;
+                }
+                let own_goal_x = match defender_side {
+                    Some(PlayerSide::Left) => 0.0,
+                    Some(PlayerSide::Right) => wrt_field_w,
+                    None => 0.0,
+                };
+                let depth = (own_goal_x - opp_pos.x).abs();
+                if !(20.0..420.0).contains(&depth) {
+                    return false;
+                }
+                if opp_vel.norm() < 0.30 {
+                    return false;
+                }
+                let toward_goal_x = if own_goal_x < wrt_field_w / 2.0 {
+                    opp_vel.x < -0.1
+                } else {
+                    opp_vel.x > 0.1
+                };
+                if !toward_goal_x {
+                    return false;
+                }
+                let _ = defender_pos;
+                true
+            };
+
+            for p in field.players.iter_mut() {
+                if let Some(target_id) = p.wide_run_track_target {
+                    let still_valid = wrt_snapshot
+                        .iter()
+                        .find(|(id, team_id, _, _, _)| *id == target_id && *team_id != p.team_id)
+                        .map(|(_, _, pos, vel, _)| wrt_is_dangerous_run(p.position, p.side, *pos, *vel))
+                        .unwrap_or(false);
+                    if still_valid {
+                        p.wide_run_track_ticks = WRT_REFRESH_TICKS;
+                        continue;
+                    }
+                    if p.wide_run_track_ticks > 0 {
+                        p.wide_run_track_ticks -= 1;
+                        continue;
+                    }
+                    p.wide_run_track_target = None;
+                }
+
+                if p.tactical_position.current_position.position_group()
+                    != crate::PlayerFieldPositionGroup::Defender
+                {
+                    continue;
+                }
+
+                let mut best_id: Option<u32> = None;
+                let mut best_dist = f32::MAX;
+                for (opp_id, opp_team, opp_pos, opp_vel, _grp) in &wrt_snapshot {
+                    if *opp_team == p.team_id {
+                        continue;
+                    }
+                    if !wrt_is_dangerous_run(p.position, p.side, *opp_pos, *opp_vel) {
+                        continue;
+                    }
+                    // Already engaged by another own-team defender/
+                    // midfielder? Mirrors defensive.rs's
+                    // is_opponent_being_engaged (raw snapshot version —
+                    // that helper needs a full StateProcessingContext,
+                    // not available in this raw per-tick loop).
+                    let already_engaged = wrt_snapshot.iter().any(|(tid, tteam, tpos, _, tgrp)| {
+                        *tid != p.id
+                            && *tteam == p.team_id
+                            && matches!(
+                                tgrp,
+                                crate::PlayerFieldPositionGroup::Defender
+                                    | crate::PlayerFieldPositionGroup::Midfielder
+                            )
+                            && (*tpos - *opp_pos).magnitude() < WRT_ENGAGEMENT_DISTANCE
+                    });
+                    if already_engaged {
+                        continue;
+                    }
+                    let d = (*opp_pos - p.position).magnitude();
+                    if d < best_dist {
+                        best_dist = d;
+                        best_id = Some(*opp_id);
+                    }
+                }
+                let Some(runner_id) = best_id else { continue };
+                let runner_pos = wrt_snapshot
+                    .iter()
+                    .find(|(id, ..)| *id == runner_id)
+                    .map(|(_, _, pos, ..)| *pos)
+                    .unwrap();
+
+                // Only the single nearest own-team defender tracks this
+                // runner — otherwise multiple defenders converge on the
+                // same man and the rest of the shape abandons its own
+                // responsibilities.
+                let am_closest = wrt_snapshot.iter().all(|(tid, tteam, tpos, _, tgrp)| {
+                    *tid == p.id
+                        || *tteam != p.team_id
+                        || *tgrp != crate::PlayerFieldPositionGroup::Defender
+                        || (*tpos - runner_pos).magnitude() >= best_dist
+                });
+                if !am_closest {
+                    continue;
+                }
+                p.wide_run_track_target = Some(runner_id);
+                p.wide_run_track_ticks = WRT_REFRESH_TICKS;
             }
 
             // realism-bug (2026-07-27): occasional "round the keeper"

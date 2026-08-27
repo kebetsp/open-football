@@ -104,7 +104,7 @@ impl StateProcessingHandler for DefenderCoveringState {
                     DefenderState::Tackling,
                 ));
             }
-            match ctx.player().defensive().defensive_role_for_ball_carrier() {
+            match ctx.player().defensive().defensive_role_for_ball_carrier_unified() {
                 DefensiveRole::Primary => {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Pressing,

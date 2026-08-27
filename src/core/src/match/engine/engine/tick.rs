@@ -1,6 +1,25 @@
 use super::*;
 use crate::r#match::engine::player::events::players::FoulResolver;
 use nalgebra::Vector3;
+
+/// TEMPORARY realism-bug diagnostic (2026-08-27, cross-deflection
+/// investigation): verifies `resolve_aerial_contest`'s new defensive-win
+/// outcome branch actually fires and its outcome mix matches the
+/// intended calibration. Removed once the investigation concludes.
+#[cfg(feature = "match-logs")]
+pub mod aerial_def_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static GK_CLAIM: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_CLEAN: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_CORNER: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_THROW_IN: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_LOOSE: AtomicU64 = AtomicU64::new(0);
+    pub fn reset() {
+        for c in [&GK_CLAIM, &DEF_CLEAN, &DEF_CORNER, &DEF_THROW_IN, &DEF_LOOSE] {
+            c.store(0, Ordering::Relaxed);
+        }
+    }
+}
 #[cfg(feature = "match-logs")]
 use std::sync::atomic::Ordering;
 
@@ -1407,6 +1426,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         use crate::r#match::midfielders::states::MidfielderState;
         use crate::r#match::player::state::PlayerState;
         use crate::r#match::PlayerSide;
+        use crate::r#match::engine::goal::GOAL_WIDTH;
         use nalgebra::Vector3;
 
         const COOLDOWN_TICKS: u64 = 60; // ~600ms — one contest per genuine delivery
@@ -1469,7 +1489,9 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         let minute = (context.total_match_time / 60_000) as u32;
         let mut best_att: Option<(usize, f32)> = None;
         let mut best_def_score = 0.40_f32;
+        let mut best_def_idx: Option<usize> = None;
         let mut gk_command = 0.35_f32;
+        let mut gk_idx: Option<usize> = None;
         for (i, p) in field.players.iter().enumerate() {
             if (p.position - attacked_goal).magnitude() > CONTEST_RADIUS {
                 continue;
@@ -1484,10 +1506,12 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 gk_command = (p.skills.goalkeeping.command_of_area * 0.6
                     + p.skills.goalkeeping.aerial_reach * 0.4)
                     / 20.0;
+                gk_idx = Some(i);
             } else {
                 let s = sc::aerial_outfield_defender(p, minute);
                 if s > best_def_score {
                     best_def_score = s;
+                    best_def_idx = Some(i);
                 }
             }
         }
@@ -1503,7 +1527,127 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             (0.36 + (att_score - best_def_score) * 0.50 - gk_command * 0.18).clamp(0.10, 0.62);
 
         if !context.rng.bernoulli(att_win) {
-            // Keeper claims / defender clears — the realistic majority.
+            // realism-bug (2026-08-27): the defending side winning this
+            // roll — "the realistic majority" per the comment this
+            // replaces — used to just `return`, leaving the ball's
+            // existing trajectory untouched and letting whoever was
+            // physically nearest claim it afterward (not necessarily the
+            // side that "won" this roll at all). Real football: a
+            // defensive header/clearance against a cross is USUALLY a
+            // clean, controlled action (a centre-back is coached to head
+            // it away, not just anywhere) — but a genuine minority
+            // deflects behind for a corner (a mishit, a near-post
+            // glance) or a throw-in. Sourced from real uncompleted-cross
+            // outcomes (StatsBomb Bundesliga 2023/24, n=430, 45s window):
+            // ~90.5% ball stays in play (clean clearance/defense retains
+            // possession), ~3.7% throw-in, ~1.9% corner for the crossing
+            // team, ~4% other/noise. A GK catch is definitionally clean
+            // (no deflection roll needed) — only an outfield defender's
+            // header/clearance gets the probabilistic outcome, mirroring
+            // `try_block_shot`'s already-proven clean/corner/loose idiom
+            // but calibrated to this much lower real corner rate (a
+            // controlled aerial clearance is far less chaotic than
+            // smothering a goal-bound shot).
+            let gk_claims = match gk_idx {
+                Some(_) => gk_command >= best_def_score,
+                None => false,
+            };
+            if gk_claims {
+                let idx = gk_idx.unwrap();
+                let gk = &field.players[idx];
+                field.ball.position = Vector3::new(gk.position.x, gk.position.y, 0.0);
+                field.ball.velocity = Vector3::zeros();
+                field.ball.current_owner = Some(gk.id);
+                field.ball.previous_owner = Some(gk.id);
+                field.ball.flags.in_flight_state = 0;
+                field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
+                #[cfg(feature = "match-logs")]
+                aerial_def_diag::GK_CLAIM.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            let Some(def_idx) = best_def_idx else { return };
+            let defender = &field.players[def_idx];
+            let def_pos = defender.position;
+            let def_id = defender.id;
+            let composure = (defender.skills.mental.composure / 20.0).clamp(0.0, 1.0);
+            let heading = (defender.skills.technical.heading / 20.0).clamp(0.0, 1.0);
+            // Clamp bounds mirror try_block_shot's own controlled_block_prob
+            // shape (calm, technically-sound defenders clear more cleanly).
+            let clean_prob = (0.85 + composure * 0.06 + heading * 0.06).clamp(0.85, 0.97);
+            let corner_prob = clean_prob + 0.019;
+            let throw_in_prob = corner_prob + 0.037;
+            // remainder (~2-3%): loose knockdown in the box - a genuine
+            // second-ball contest, matching the "other/noise" residual
+            // in the sourced data rather than assuming it away.
+            let roll = context.rng.unit_f32();
+            let own_goal_x_is_left = attacked_goal.x < context.field_size.width as f32 / 2.0;
+
+            if roll < clean_prob {
+                // Clean clearance - away from goal, upfield, a genuine
+                // loose ball either side can win (not an instant hand-back
+                // to the defender - a real header doesn't land at feet).
+                let clear_dir_x = if own_goal_x_is_left { 1.0 } else { -1.0 };
+                let angle: f32 = (context.rng.unit_f32() - 0.5) * 1.2;
+                field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
+                field.ball.velocity = Vector3::new(
+                    clear_dir_x * angle.cos() * 2.6,
+                    angle.sin() * 2.6,
+                    0.0,
+                );
+                field.ball.current_owner = None;
+                field.ball.previous_owner = Some(def_id);
+                field.ball.flags.in_flight_state = 20;
+                #[cfg(feature = "match-logs")]
+                aerial_def_diag::DEF_CLEAN.fetch_add(1, Ordering::Relaxed);
+            } else if roll < corner_prob {
+                // Deflected behind for a corner - mirrors try_block_shot's
+                // own corner-branch geometry (endline_x / wide of the
+                // post), but relative to the DEFENDING team's own goal
+                // (attacked_goal here IS the defending side's own goal).
+                let endline_x = if own_goal_x_is_left { 0.0_f32 } else { field.ball.field_width };
+                let center_y = field.ball.field_height * 0.5;
+                let to_top = def_pos.y < center_y;
+                let wide_y = if to_top {
+                    (center_y - GOAL_WIDTH - field.ball.field_height * 0.05).max(2.0)
+                } else {
+                    (center_y + GOAL_WIDTH + field.ball.field_height * 0.05).min(field.ball.field_height - 2.0)
+                };
+                let dx = endline_x - def_pos.x;
+                let dy = wide_y - def_pos.y;
+                let dist = (dx * dx + dy * dy).sqrt().max(1.0);
+                let speed = 3.5_f32;
+                field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
+                field.ball.velocity = Vector3::new((dx / dist) * speed, (dy / dist) * speed, 0.0);
+                field.ball.current_owner = None;
+                field.ball.previous_owner = Some(def_id);
+                field.ball.flags.in_flight_state = 30;
+                field.ball.claim_cooldown = 16;
+                field.ball.corner_deflection_guard_until_tick = tick + 30;
+                #[cfg(feature = "match-logs")]
+                aerial_def_diag::DEF_CORNER.fetch_add(1, Ordering::Relaxed);
+            } else if roll < throw_in_prob {
+                // Deflected out for a throw-in - sideways, toward the
+                // nearer touchline.
+                let to_top = def_pos.y < field.ball.field_height * 0.5;
+                let sign = if to_top { -1.0 } else { 1.0 };
+                field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
+                field.ball.velocity = Vector3::new(0.0, sign * 3.0, 0.0);
+                field.ball.current_owner = None;
+                field.ball.previous_owner = Some(def_id);
+                field.ball.flags.in_flight_state = 20;
+                #[cfg(feature = "match-logs")]
+                aerial_def_diag::DEF_THROW_IN.fetch_add(1, Ordering::Relaxed);
+            } else {
+                // Loose knockdown - a real second-ball contest in the box.
+                let angle: f32 = context.rng.unit_f32() * std::f32::consts::TAU;
+                field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
+                field.ball.velocity = Vector3::new(angle.cos() * 1.5, angle.sin() * 1.5, 0.0);
+                field.ball.current_owner = None;
+                field.ball.previous_owner = Some(def_id);
+                field.ball.flags.in_flight_state = 25;
+                #[cfg(feature = "match-logs")]
+                aerial_def_diag::DEF_LOOSE.fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
 

@@ -259,7 +259,7 @@ mod positions;
 mod run;
 mod shape;
 mod shootout;
-mod tick;
+pub mod tick;
 mod types;
 
 use crate::r#match::TeamSkillAggregates;

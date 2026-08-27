@@ -369,7 +369,7 @@ impl MatchCoach {
     /// 0-5 and spam-shooting from anywhere). At 500, a losing team
     /// can still fire ~100 times (plenty) but can't rebound-spam the
     /// same possession four times per second.
-    pub fn can_shoot(&self, current_tick: u64, rebound_live: bool) -> bool {
+    pub fn can_shoot(&self, current_tick: u64, rebound_live: bool, clear_chance: bool) -> bool {
         // Per-team shot cadence — see type docs for the full rationale.
         // 500 → 750 ticks (~7.5s spacing). Briefly tried 1000 but it
         // disproportionately hurt weak teams: they shoot rarely already,
@@ -385,8 +385,17 @@ impl MatchCoach {
         // gate blocked EVERY second-chance strike — contradicting the
         // possession-cap design note below, and deleting one of
         // football's core goal patterns (~4-6% of real goals).
-        let shot_spaced =
-            rebound_live || current_tick.saturating_sub(self.last_shot_tick) >= 750;
+        //
+        // `clear_chance` (2026-07-28, Pavel's "wide open goal, no shot"
+        // report — see `TeamOps::can_shoot` / `on_ball_value::
+        // open_net_signal`) gets the same exemption: this cadence gate
+        // exists to stop desperation-mode spam of low-quality
+        // speculative attempts, not to make a team decline a chance
+        // that's already been manufactured because the clock hasn't
+        // ticked over.
+        let shot_spaced = rebound_live
+            || clear_chance
+            || current_tick.saturating_sub(self.last_shot_tick) >= 750;
         // 2026-07-18: build-up "settled" gate REMOVED (test — see
         // engine_lessons_directives memory / CLAUDE.md 2026-07-18 entry).
         // It used a flat, position-blind 1s timer to solve what's really
@@ -417,14 +426,21 @@ impl MatchCoach {
     /// realism-bug investigation into "settled, clear chance, no shot"
     /// reports — checking whether the build-up gate, not xG/clarity, is
     /// the actual blocker right after a corner). Remove once concluded.
+    /// `clear_chance` added 2026-07-28 alongside the real gate above.
     #[cfg(feature = "match-logs")]
-    pub fn can_shoot_debug(&self, current_tick: u64, rebound_live: bool) -> (bool, bool, bool, u64) {
-        let shot_spaced =
-            rebound_live || current_tick.saturating_sub(self.last_shot_tick) >= 750;
+    pub fn can_shoot_debug(
+        &self,
+        current_tick: u64,
+        rebound_live: bool,
+        clear_chance: bool,
+    ) -> (bool, bool, bool, u64, bool) {
+        let shot_spaced = rebound_live
+            || clear_chance
+            || current_tick.saturating_sub(self.last_shot_tick) >= 750;
         let ticks_since_gain = current_tick.saturating_sub(self.last_possession_gain_tick);
         let settled = rebound_live || ticks_since_gain >= 100;
         let phase_allows = self.shots_this_possession < 2;
-        (shot_spaced, settled, phase_allows, ticks_since_gain)
+        (shot_spaced, settled, phase_allows, ticks_since_gain, clear_chance)
     }
 
     /// Record that this team just won possession. Starts the build-up

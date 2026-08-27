@@ -119,6 +119,41 @@ pub mod tackle_stats {
     // tackle/contain/concede-out comparison holds off on a tackle that
     // the old code would have unconditionally attempted.
     pub static DEF_GATE_CONTAIN_OR_CONCEDE: AtomicU64 = AtomicU64::new(0);
+    // D3 of docs/defensive-decision-logic-spec.md: how often
+    // concede_out_value actually wins the comparison and fires a real
+    // deliberate poke toward the boundary (see DefenderTacklingState /
+    // "DEF_CONCEDE_OUT" in players.rs).
+    pub static DEF_CONCEDE_OUT: AtomicU64 = AtomicU64::new(0);
+
+    // D4.6 of docs/defensive-decision-logic-spec.md: the last-ditch
+    // sliding block, fired from DefenderPressingState (see
+    // `attempt_desperate_slide`) before a defender is close enough to
+    // reach the D1-D4 tackle/contain/concede-out comparison. Each
+    // attempt lands in exactly one of these five buckets.
+    pub static DEF_SLIDE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_SLIDE_SUCCESS: AtomicU64 = AtomicU64::new(0);
+    // D6 (docs/defensive-decision-logic-spec.md): a successful slide
+    // whose ball goes to the nearest teammate instead of a boundary,
+    // because the reachability race said the boundary wasn't genuinely
+    // winnable. Sibling to DEF_SLIDE_SUCCESS above, not a replacement.
+    pub static DEF_SLIDE_SUCCESS_LAYOFF: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_SLIDE_PARTIAL: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_SLIDE_FOUL: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_SLIDE_OWN_RISK: AtomicU64 = AtomicU64::new(0);
+    pub static DEF_SLIDE_MISS: AtomicU64 = AtomicU64::new(0);
+
+    // D5 of docs/defensive-decision-logic-spec.md: the same D2/D3/D4.6
+    // counters, mirrored for MidfielderTacklingState/
+    // MidfielderPressingState now that the comparison generalizes there.
+    pub static MID_GATE_CONTAIN_OR_CONCEDE: AtomicU64 = AtomicU64::new(0);
+    pub static MID_CONCEDE_OUT: AtomicU64 = AtomicU64::new(0);
+    pub static MID_SLIDE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    pub static MID_SLIDE_SUCCESS: AtomicU64 = AtomicU64::new(0);
+    pub static MID_SLIDE_SUCCESS_LAYOFF: AtomicU64 = AtomicU64::new(0);
+    pub static MID_SLIDE_PARTIAL: AtomicU64 = AtomicU64::new(0);
+    pub static MID_SLIDE_FOUL: AtomicU64 = AtomicU64::new(0);
+    pub static MID_SLIDE_OWN_RISK: AtomicU64 = AtomicU64::new(0);
+    pub static MID_SLIDE_MISS: AtomicU64 = AtomicU64::new(0);
 
     pub fn reset() {
         for c in [
@@ -139,6 +174,23 @@ pub mod tackle_stats {
             &DEF_GATE_COOLDOWN,
             &DEF_GATE_NOT_BEST,
             &DEF_GATE_CONTAIN_OR_CONCEDE,
+            &DEF_CONCEDE_OUT,
+            &DEF_SLIDE_ATTEMPTS,
+            &DEF_SLIDE_SUCCESS,
+            &DEF_SLIDE_SUCCESS_LAYOFF,
+            &DEF_SLIDE_PARTIAL,
+            &DEF_SLIDE_FOUL,
+            &DEF_SLIDE_OWN_RISK,
+            &DEF_SLIDE_MISS,
+            &MID_GATE_CONTAIN_OR_CONCEDE,
+            &MID_CONCEDE_OUT,
+            &MID_SLIDE_ATTEMPTS,
+            &MID_SLIDE_SUCCESS,
+            &MID_SLIDE_SUCCESS_LAYOFF,
+            &MID_SLIDE_PARTIAL,
+            &MID_SLIDE_FOUL,
+            &MID_SLIDE_OWN_RISK,
+            &MID_SLIDE_MISS,
         ] {
             c.store(0, Ordering::Relaxed);
         }

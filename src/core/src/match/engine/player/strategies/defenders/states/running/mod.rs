@@ -147,7 +147,7 @@ impl StateProcessingHandler for DefenderRunningState {
             // (instinct beats math when the carrier is on top of you).
             if ctx.team().counterpress_window() {
                 if let Some(opponent) = ctx.players().opponents().with_ball().next() {
-                    let role = ctx.player().defensive().defensive_role_for_ball_carrier();
+                    let role = ctx.player().defensive().defensive_role_for_ball_carrier_unified();
                     let immediate = opponent.distance(ctx) < 30.0;
                     let elected = role == DefensiveRole::Primary
                         && ctx.player().pressure().should_counterpress();
@@ -178,7 +178,7 @@ impl StateProcessingHandler for DefenderRunningState {
                     .next()
                     .is_some();
                 if ball_dist > 30.0 && teammate_engaging {
-                    match ctx.player().defensive().defensive_role_for_ball_carrier() {
+                    match ctx.player().defensive().defensive_role_for_ball_carrier_unified() {
                         DefensiveRole::Cover => {
                             return Some(StateChangeResult::with_defender_state(
                                 DefenderState::Covering,
@@ -210,7 +210,7 @@ impl StateProcessingHandler for DefenderRunningState {
             if let Some(opponent) = ctx.players().opponents().with_ball().next() {
                 let ball_dist = ctx.ball().distance();
                 let is_primary = matches!(
-                    ctx.player().defensive().defensive_role_for_ball_carrier(),
+                    ctx.player().defensive().defensive_role_for_ball_carrier_unified(),
                     DefensiveRole::Primary
                 );
                 let is_emergency = ctx.player().defensive().is_box_emergency_for_me();

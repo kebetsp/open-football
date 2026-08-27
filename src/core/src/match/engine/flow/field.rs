@@ -2,6 +2,8 @@ use crate::PlayerFieldPositionGroup;
 use crate::Tactics;
 use crate::club::staff::CoachMatchSnapshot;
 use crate::r#match::ball::Ball;
+use crate::r#match::player::strategies::spacing::flank_side;
+use crate::r#match::player::{ShapeAction, ShapeRule, ShapeTrigger};
 use crate::r#match::{
     FieldSquad, MatchFieldSize, MatchPlayer, MatchSquad, POSITION_POSITIONING, PlayerSide,
     PositionType,
@@ -407,6 +409,10 @@ fn setup_player_on_field(
     let setup_squad = |squad: MatchSquad, side: PlayerSide| {
         let mut players = Vec::with_capacity(squad.main_squad.len());
         let mut subs = Vec::with_capacity(squad.substitutes.len());
+        // Captured before the loop below consumes `squad.main_squad` —
+        // needed by `flank_side` to disambiguate ForwardLeft/Right (see
+        // spacing.rs::is_front_two_tactic, §10 thread 1).
+        let tactic = squad.tactics.tactic_type;
 
         for mut player in squad.main_squad {
             player.side = Some(side);
@@ -427,6 +433,36 @@ fn setup_player_on_field(
                 player.start_position = position;
                 // Shape rules revert to this base (see MatchPlayer docs).
                 player.shape_base = Some(position);
+                // docs/ball-distribution-fix-plan.md §9 Step 1 (2026-08-26):
+                // default structural width — every wide-slotted role
+                // holds width (pinned near the touchline, slightly
+                // advanced) while its own team has the ball, by default,
+                // not only when a manager issues an explicit directive.
+                // Generalizes the Principles-of-Play "width" concept
+                // (attack: penetration/support/width/mobility/
+                // improvisation — see CLAUDE.md's 2026-08-25 decision)
+                // into a real structural anchor instead of leaving width
+                // 100% emergent from per-tick value functions, which
+                // seven prior reward-side steps (F1-G4) already showed
+                // has very limited headroom on its own.
+                //
+                // Pushed here, BEFORE any manager-issued shape_rules a
+                // player already carries from `apply_assignments` are
+                // evaluated — but `apply_assignments` runs on the squad
+                // BEFORE `setup_player_on_field`, so any manager rule is
+                // already earlier in `shape_rules` than this default by
+                // construction. `run.rs`'s "first active rule wins"
+                // iteration order therefore always lets an explicit
+                // directive take priority; this default only fires when
+                // no directive's own trigger is currently active — the
+                // intended layering (this fills a coverage gap, it
+                // never overrides an explicit instruction).
+                if flank_side(player.tactical_position.current_position, tactic).is_some() {
+                    player.shape_rules.push(ShapeRule {
+                        trigger: ShapeTrigger::InPossession,
+                        action: ShapeAction::HoldWidth,
+                    });
+                }
                 players.push(player);
             }
         }

@@ -1,7 +1,8 @@
 use crate::r#match::events::Event;
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
-use crate::r#match::player::events::{FoulSeverity, PlayerEvent};
+use crate::r#match::player::events::{FoulSeverity, PlayerEvent, ShootingEventContext};
+use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
 use crate::r#match::player::strategies::common::players::ops::midfielder_skill::MidfielderSkillProfile;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::{
@@ -122,6 +123,64 @@ impl StateProcessingHandler for MidfielderTacklingState {
                 ));
             }
             if opponent_distance <= TACKLE_DISTANCE_THRESHOLD {
+                // D5 of docs/defensive-decision-logic-spec.md: generalizes
+                // D2/D3's tackle/contain/concede-out comparison from
+                // defenders to midfielders — real doctrine (a central or
+                // wide midfielder showing an opponent down a line rather
+                // than diving in every time is standard jockeying, not
+                // a last-line-only behavior). Mirrors DefenderTacklingState::
+                // process() exactly: `mid_profile.tackle_profile` is the
+                // role-appropriate composite `defensive_value.rs`'s D5
+                // refactor now takes as an explicit parameter (see that
+                // module's own doc comment) instead of a defender-only
+                // internal derivation. Hold-off returns `None` (stays in
+                // THIS state, same "don't reset in_state_time" reasoning
+                // D2 already fixed for defenders — see that fix's own
+                // comment above for why a state CHANGE here would silently
+                // break `contain_value`'s urgency decay).
+                let mid_profile = MidfielderSkillProfile::from_ctx(ctx);
+                let tackle_val = dv::tackle_value(ctx, &opponent, mid_profile.tackle_profile);
+                let contain_val = dv::contain_value(
+                    ctx,
+                    &opponent,
+                    ctx.in_state_time as f32,
+                    mid_profile.tackle_profile,
+                );
+                let concede_val =
+                    dv::concede_out_value(ctx, &opponent, mid_profile.tackle_profile);
+
+                // `> 0.0` guard: same degenerate-case protection D3's own
+                // comment explains for the defender wiring — concede_out_
+                // value returns exactly 0.0 when its own gates fail, so a
+                // merely-very-negative tackle_val can't win by default.
+                if concede_val > 0.0 && concede_val >= tackle_val && concede_val >= contain_val {
+                    #[cfg(feature = "match-logs")]
+                    crate::tackle_stats::MID_CONCEDE_OUT.fetch_add(1, Ordering::Relaxed);
+                    let shoot_ctx = ShootingEventContext::new()
+                        .with_player_id(ctx.player.id)
+                        // Discarded and recomputed fresh at dispatch time
+                        // by handle_shoot_event's "DEF_CONCEDE_OUT" branch
+                        // — the same generic reason string the defender
+                        // wiring uses; the execution side (players.rs)
+                        // has no role-specific logic at all, it just reads
+                        // `shoot_event_model.from_player_id`.
+                        .with_target(ctx.tick_context.positions.ball.position)
+                        .with_reason("DEF_CONCEDE_OUT")
+                        .build(ctx);
+                    let mut result = StateChangeResult::with_midfielder_state_and_event(
+                        MidfielderState::Standing,
+                        Event::PlayerEvent(PlayerEvent::Shoot(shoot_ctx)),
+                    );
+                    result.start_tackle_cooldown = true;
+                    return Some(result);
+                }
+
+                if tackle_val < contain_val {
+                    #[cfg(feature = "match-logs")]
+                    crate::tackle_stats::MID_GATE_CONTAIN_OR_CONCEDE.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::MID_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                 let (tackle_success, committed_foul, foul_severity) =
