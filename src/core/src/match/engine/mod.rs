@@ -41,10 +41,6 @@ pub use flow::rng::MatchRng;
 pub use flow::{context, environment, field, goal, result, rng};
 
 // officiating/
-pub use officiating::management::{
-    CounterAttackThreat, HomeAdvantage, HomeAdvantageDeltas, ProfessionalFoul,
-    ProfessionalFoulCard, StoppageEvent, StoppageTime, TimeWasting, TimeWastingRestart,
-};
 pub use officiating::referee::{ContactLocation, FoulCallContext, RefereeProfile};
 pub use officiating::set_pieces::{
     CornerRoutine, CornerScores, FreeKickBand, FreeKickChoice, FreeKickChoiceScores,
@@ -53,7 +49,7 @@ pub use officiating::set_pieces::{
     recovery_shape_targets, score_corner_routines, score_corner_taker, score_free_kick_choices,
     score_free_kick_taker, score_keeper_save, score_penalty_taker, wall_block_prob, wall_size_for,
 };
-pub use officiating::{management, referee, set_pieces};
+pub use officiating::{referee, set_pieces};
 
 // substitution/ — full-path access only (no glob was exported originally).
 pub use substitution::{sub_scoring, substitutions};

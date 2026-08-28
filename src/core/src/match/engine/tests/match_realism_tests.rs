@@ -10,7 +10,6 @@ use crate::r#match::engine::chemistry::{
     ChemistryInputs, ChemistryMap, Lane, Role, chemistry_modifiers, initial_chemistry,
 };
 use crate::r#match::engine::environment::{MatchEnvironment, Pitch, Weather};
-use crate::r#match::engine::management::{HomeAdvantage, TimeWasting, TimeWastingRestart};
 use crate::r#match::engine::psychology::{
     NegativeEvent, PositiveEvent, PsychState, Psychology, PsychologyState,
 };
@@ -231,36 +230,12 @@ fn chemistry_map_caches_pair_score_symmetric() {
     assert_eq!(m.get(12, 7), Some(0.78));
 }
 
-#[test]
-fn home_advantage_increases_with_crowd_but_stays_modest() {
-    let neutral = MatchEnvironment::default();
-    let big = MatchEnvironment {
-        crowd_intensity: 1.0,
-        home_advantage: 1.0,
-        ..Default::default()
-    };
-    let nd = HomeAdvantage::deltas(&neutral);
-    let bd = HomeAdvantage::deltas(&big);
-    assert!(bd.referee_marginal_call_home_bias > nd.referee_marginal_call_home_bias);
-    // Spec: home buffs stay modest (no arcade-tier additive deltas).
-    assert!(bd.home_confidence_bonus <= 0.05);
-    assert!(bd.home_press_intensity_bonus <= 0.04);
-}
-
-#[test]
-fn time_wasting_kicks_in_when_leading_late_and_can_book() {
-    // No delay before 75'.
-    assert_eq!(
-        TimeWasting::delay_ms(1, 60, TimeWastingRestart::ThrowIn, 12.0),
-        0
-    );
-    // Substitution late while leading produces the longest delay.
-    let sub = TimeWasting::delay_ms(1, 88, TimeWastingRestart::Substitution, 12.0);
-    let throw = TimeWasting::delay_ms(1, 88, TimeWastingRestart::ThrowIn, 12.0);
-    assert!(sub > throw);
-    // Past 45s cumulative + strict referee → non-zero yellow chance.
-    assert!(TimeWasting::yellow_prob(60_000, 0.9, 1) > 0.0);
-}
+// home_advantage_increases_with_crowd_but_stays_modest and
+// time_wasting_kicks_in_when_leading_late_and_can_book were removed
+// 2026-08-28 alongside officiating/management/ (engine audit #3):
+// that whole subsystem had zero real call sites in the running
+// simulation — these two tests exercised its isolated logic in a
+// vacuum, not anything the engine actually does.
 
 #[test]
 fn muddy_pitch_plus_heavy_rain_compounds_first_touch_loss() {

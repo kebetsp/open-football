@@ -54,12 +54,35 @@ impl Ball {
             .and_then(|pid| players.iter().find(|p| p.id == pid))
             .and_then(|p| p.side);
 
+        // realism-bug (2026-08-28, engine audit #2): the old `None => return`
+        // here fell through to `check_boundary_collision`'s "safety net,"
+        // which silently resets the ball's position and zeroes its velocity
+        // with NO restart awarded — a genuine touchline crossing simply
+        // vanishes, and play continues live where the Laws (15) require a
+        // stoppage regardless of whose touch it was. `last_toucher_side`
+        // can only legitimately be `None` when NONE of last_touch/prev/
+        // current owner is set — every real player on the pitch gets
+        // `side = Some(_)` unconditionally at setup and it's never cleared
+        // to `None` afterward (swap_squads only flips an existing value),
+        // so this path is reachable only in the brief post-kickoff/post-
+        // goal/half-time window before anyone has touched the reset ball.
+        // Rather than trust that this is provably unreachable, fail SAFE:
+        // still award a real throw-in, side decided by an unbiased coin
+        // flip (we have no signal on whose touch it "really" was, so
+        // picking deterministically toward either team would be a worse,
+        // silently-biased alternative to acknowledging the genuine
+        // uncertainty).
         let throwing_side = match last_toucher_side {
             Some(PlayerSide::Left) => PlayerSide::Right,
             Some(PlayerSide::Right) => PlayerSide::Left,
             None => {
-                crate::match_log_info!("THROWINDIAG BAIL_NO_SIDE");
-                return; // Safety net: let boundary_collision handle it.
+                let side = if context.rng.bernoulli(0.5) {
+                    PlayerSide::Left
+                } else {
+                    PlayerSide::Right
+                };
+                crate::match_log_info!("THROWINDIAG BAIL_NO_SIDE_RECOVERED side={:?}", side);
+                side
             }
         };
 
