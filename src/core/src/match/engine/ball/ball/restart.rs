@@ -38,6 +38,13 @@ impl Ball {
         if !crossed_top && !crossed_bottom {
             return;
         }
+        crate::match_log_info!(
+            "THROWINDIAG CROSSED y={:.1} last_touch={:?} prev_owner={:?} cur_owner={:?}",
+            self.position.y,
+            self.last_touch_player_id,
+            self.previous_owner,
+            self.current_owner
+        );
 
         // Last toucher's side decides which team gets the throw-in.
         let last_toucher_side = self
@@ -50,7 +57,10 @@ impl Ball {
         let throwing_side = match last_toucher_side {
             Some(PlayerSide::Left) => PlayerSide::Right,
             Some(PlayerSide::Right) => PlayerSide::Left,
-            None => return, // Safety net: let boundary_collision handle it.
+            None => {
+                crate::match_log_info!("THROWINDIAG BAIL_NO_SIDE");
+                return; // Safety net: let boundary_collision handle it.
+            }
         };
 
         // Inset the throw-in slightly inside the touchline so subsequent
