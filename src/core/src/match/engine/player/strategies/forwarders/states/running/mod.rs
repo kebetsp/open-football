@@ -1848,8 +1848,15 @@ impl ForwardRunningState {
             return false;
         }
 
-        // Check if there's space behind defense
-        let defensive_line = self.find_defensive_line(ctx);
+        // Check if there's space behind defense. engine audit Module 3
+        // (2026-08-29): this used to call a private duplicate of
+        // `find_defensive_line` that only counted `is_defender()`-tagged
+        // opponents, missing a deep-sitting midfielder or wing-back who
+        // is actually the deepest outfield player — the exact bug the
+        // shared `defensive.rs::find_defensive_line` already fixed
+        // elsewhere. Now calls that shared, correct implementation
+        // instead of a second, stale copy of the same computation.
+        let defensive_line = ctx.player().defensive().find_defensive_line();
         let space_behind = self.check_space_behind_defense(ctx, defensive_line);
 
         // Check if a teammate has the ball (any teammate, not just good passers)
@@ -1881,45 +1888,6 @@ impl ForwardRunningState {
         }
 
         (space_behind || in_attacking_third) && teammate_has_ball
-    }
-
-    /// Find opponent defensive line position
-    fn find_defensive_line(&self, ctx: &StateProcessingContext) -> f32 {
-        let players_view = ctx.players();
-        let opponents_view = players_view.opponents();
-        let defender_xs = || {
-            opponents_view
-                .all()
-                .filter(|p| p.tactical_positions.is_defender())
-                .map(|p| p.position.x)
-        };
-
-        match ctx.player.side {
-            Some(PlayerSide::Left) => {
-                let max = defender_xs().fold(f32::MIN, f32::max);
-                if max == f32::MIN {
-                    ctx.context.field_size.width as f32 / 2.0
-                } else {
-                    max
-                }
-            }
-            Some(PlayerSide::Right) => {
-                let min = defender_xs().fold(f32::MAX, f32::min);
-                if min == f32::MAX {
-                    ctx.context.field_size.width as f32 / 2.0
-                } else {
-                    min
-                }
-            }
-            None => {
-                let (sum, count) = defender_xs().fold((0.0_f32, 0u32), |(s, c), x| (s + x, c + 1));
-                if count == 0 {
-                    ctx.context.field_size.width as f32 / 2.0
-                } else {
-                    sum / count as f32
-                }
-            }
-        }
     }
 
     /// Check if there's exploitable space behind defense

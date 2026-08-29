@@ -99,24 +99,17 @@ impl StateProcessingHandler for ForwardRunningInBehindState {
         };
         let mut run_target = Vector3::new(opponent_goal.x, channel_y, 0.0);
 
-        // Offside discipline: while a teammate is still ON the ball (the
-        // through-pass hasn't been released), hold the run at the shoulder
-        // of the last defender instead of sprinting to the goal line. The
-        // moment the ball is released (in flight or loose) the clamp lifts
-        // and the sprint beats the line legally. Without this, forwards
-        // camped 40u+ beyond the line during buildup and every delivery
-        // arrived offside (~25 whistles / 10-min match, killing most
-        // attacking moves and dragging goals/match from ~2.5 to ~0.8).
-        let teammate_on_ball = !ctx.ball().is_in_flight()
-            && ctx
-                .ball()
-                .owner_id()
-                .and_then(|id| ctx.context.players.by_id(id))
-                .map_or(false, |o| o.team_id == ctx.player.team_id && o.id != ctx.player.id);
-        run_target.x = ctx
-            .player()
-            .defensive()
-            .onside_hold_x(run_target.x, teammate_on_ball);
+        // engine audit Module 3 (2026-08-29): the offside-line clamp that
+        // used to live here (hold the run at the shoulder of the last
+        // defender while a teammate is still on the ball, release once
+        // the ball is played) is now applied once, universally, by
+        // `processor.rs::offside_line_hold_velocity` after this state's
+        // velocity is computed — see that function's doc comment for the
+        // full rationale. Without SOME clamp, forwards camp 40u+ beyond
+        // the line during buildup and every delivery arrives offside
+        // (~25 whistles/10-min match, dragging goals/match from ~2.5 to
+        // ~0.8 when this was originally missing entirely) — that
+        // constraint is still enforced, just downstream now.
 
         // §11.9: never run into the space the ball carrier is already
         // running into — the carrier owns that space. Shifts the run

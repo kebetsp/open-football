@@ -165,18 +165,13 @@ impl StateProcessingHandler for MidfielderWalkingState {
             && ctx.player.behavioral_directive == Some(BehavioralDirective::RunChannelInBehind)
             && ctx.team().is_control_ball()
         {
+            // engine audit Module 3 (2026-08-29): offside-line discipline
+            // for this run target used to be clamped here directly; it's
+            // now applied once, universally, by
+            // `processor.rs::offside_line_hold_velocity` downstream — see
+            // that function's doc comment for the full rationale.
             let goal = ctx.player().opponent_goal_position();
-            let mut target_x = goal.x;
-            let teammate_on_ball = !ctx.ball().is_in_flight()
-                && ctx
-                    .ball()
-                    .owner_id()
-                    .and_then(|id| ctx.context.players.by_id(id))
-                    .map_or(false, |o| o.team_id == ctx.player.team_id && o.id != ctx.player.id);
-            target_x = ctx
-                .player()
-                .defensive()
-                .onside_hold_x(target_x, teammate_on_ball);
+            let target_x = goal.x;
             let target = Vector3::new(target_x, ctx.player.start_position.y, 0.0);
             let to_target = target - ctx.player.position;
             if to_target.magnitude() > 4.0 {

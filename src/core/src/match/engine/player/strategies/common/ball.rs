@@ -131,6 +131,24 @@ impl<'b> BallOperationsImpl<'b> {
         self.ctx.tick_context.ball.is_in_flight_state > 0
     }
 
+    /// True during a corner kick, throw-in, or goal kick — the three
+    /// restart types IFAB Law 11 explicitly exempts from offside (a
+    /// player cannot be penalised for offside when receiving the ball
+    /// directly from any of these). Used by the universal offside-line
+    /// clamp (`processor.rs::offside_line_hold_velocity`, engine audit
+    /// Module 3, 2026-08-29) so attacking players legitimately staging
+    /// in the box for our own corner, or waiting on a goal kick, don't
+    /// get wrongly restricted mid-setup — a real gap the old per-state
+    /// clamp never had to guard against, since it only ran inside a
+    /// handful of open-play states a dead-ball setup never reaches.
+    pub fn is_offside_exempt_restart(&self) -> bool {
+        use crate::r#match::PassOriginRestart;
+        matches!(
+            self.ctx.tick_context.ball.pass_origin_restart,
+            PassOriginRestart::Corner | PassOriginRestart::ThrowIn | PassOriginRestart::GoalKick
+        )
+    }
+
     #[inline]
     pub fn owner_id(&self) -> Option<u32> {
         self.ctx.tick_context.ball.current_owner

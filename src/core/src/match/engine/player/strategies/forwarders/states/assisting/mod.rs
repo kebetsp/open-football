@@ -77,23 +77,13 @@ impl StateProcessingHandler for ForwardAssistingState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
-        // realism-bug (offside investigation): this Arrived straight at
-        // the opponent goal with zero offside consideration — measured
-        // as the second-largest contributor after TakeBall (3.2% of
-        // real offside calls). Same "hold at the shoulder of the last
-        // defender while a teammate still has the ball" idiom used by
-        // RunningInBehind/Walking/Running.
-        let mut target = ctx.player().opponent_goal_position();
-        let teammate_on_ball = !ctx.ball().is_in_flight()
-            && ctx
-                .ball()
-                .owner_id()
-                .and_then(|id| ctx.context.players.by_id(id))
-                .map_or(false, |o| o.team_id == ctx.player.team_id && o.id != ctx.player.id);
-        target.x = ctx
-            .player()
-            .defensive()
-            .onside_hold_x(target.x, teammate_on_ball);
+        // engine audit Module 3 (2026-08-29): offside-line discipline for
+        // this state's run target used to be clamped here directly; it's
+        // now handled once, universally, by
+        // `processor.rs::offside_line_hold_velocity` after this velocity
+        // is computed — see that function's doc comment for why a
+        // downstream clamp replaces the old per-state opt-in pattern.
+        let target = ctx.player().opponent_goal_position();
         Some(
             SteeringBehavior::Arrive {
                 target,

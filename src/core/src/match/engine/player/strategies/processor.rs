@@ -463,6 +463,16 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
+        // engine audit Module 3 (2026-08-29): universal offside-line
+        // hold. Applied LAST among the velocity overrides so it clamps
+        // whatever the final proposed x-movement is, regardless of which
+        // state or earlier override produced it — see the function's own
+        // doc comment for the full rationale.
+        if let Some(velocity) = Self::offside_line_hold_velocity(&processing_ctx, result.velocity)
+        {
+            result.velocity = Some(velocity);
+        }
+
         // common logic
         let complete_result = |state_results: StateChangeResult,
                                mut result: StateProcessingResult| {
@@ -1176,6 +1186,90 @@ impl<'p> StateProcessor<'p> {
             .skills
             .max_speed_with_condition(player.player_attributes.condition);
         Some(dir * speed)
+    }
+
+    /// Universal offside-line hold — engine audit Module 3 (2026-08-29),
+    /// the codebase's own proposed alternative for offside's flagged "no
+    /// single owner" problem. Applied to EVERY state's velocity, after
+    /// the handler (and every earlier override) has already produced
+    /// one, regardless of which state a player is in.
+    ///
+    /// The old design required each state to individually opt in via
+    /// `onside_hold_x`/`clamp_chase_target_x` — RunningInBehind,
+    /// Assisting, Midfielder Walking/Running, and the 4 TakeBall
+    /// variants did; Intercepting, Pressing, Standing, and everything
+    /// else never did, which is exactly why fixing TakeBall's own gap
+    /// (2026-08-19) immediately made Intercepting grow to ~17% of the
+    /// remaining violations — direct proof the per-state pattern doesn't
+    /// generalize, it just relocates the gap to whichever state wasn't
+    /// checked yet. All 8 of those per-state call sites are removed as
+    /// part of this same change — this function is now the only place
+    /// offside movement discipline is enforced.
+    ///
+    /// A downstream clamp on the FINAL proposed velocity, rather than an
+    /// upstream clamp on each state's own target, is what makes this a
+    /// structural fix instead of one more place to remember: it cannot
+    /// be skipped by a state that never heard of offside, and it still
+    /// correctly composes with an earlier override that already touched
+    /// the same tick's velocity (e.g. width-holding) — only the forward
+    /// (x) component is restricted, so a legitimate lateral/width
+    /// adjustment from an earlier override passes through untouched.
+    /// Placed LAST among the velocity overrides in `process_inner` for
+    /// exactly this reason — it must see the truly final proposed
+    /// velocity, not an intermediate one a later override might still
+    /// replace.
+    ///
+    /// Reuses `clamp_chase_target_x`'s existing line/margin/ball-crossed
+    /// math (translating this tick's proposed x-displacement into an
+    /// equivalent "chase target" and clamping that) rather than
+    /// re-deriving the geometry a third time.
+    ///
+    /// Deliberately does NOT exclude goalkeepers — Law 11 applies to
+    /// every player on the pitch regardless of role, matching the
+    /// existing GK TakeBall clamp this replaces (added per an explicit
+    /// "including GK" scope decision). In practice a GK essentially
+    /// never proposes a velocity that would trip this, since
+    /// `should_force_takeball`'s own 60u claim radius keeps him anchored
+    /// near his own box.
+    fn offside_line_hold_velocity(
+        ctx: &StateProcessingContext,
+        proposed_velocity: Option<Vector3<f32>>,
+    ) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        // Law 11: no offside offense is possible when receiving directly
+        // from a corner, throw-in, or goal kick.
+        if ctx.ball().is_offside_exempt_restart() {
+            return None;
+        }
+        // Ball carrier is exempt — you can't be offside while you hold it.
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None;
+        }
+        // Offside only matters while our own team controls (or is
+        // genuinely about to regain) the ball; if the opponent has it,
+        // there's nothing to be offside FROM. This also structurally
+        // keeps this override from ever competing with
+        // `assignment_override_velocity`'s active press/mark branches —
+        // both of those only fire when the OPPONENT holds the ball — so
+        // no explicit priority re-check against it is needed here the
+        // way most other overrides in this chain require.
+        if !ctx.team().is_control_ball() {
+            return None;
+        }
+        let v = proposed_velocity?;
+        if v.x == 0.0 {
+            return None;
+        }
+        let natural_target_x = player.position.x + v.x;
+        let ball_x = ctx.tick_context.positions.ball.position.x;
+        let clamped_x = ctx
+            .player()
+            .defensive()
+            .clamp_chase_target_x(natural_target_x, ball_x);
+        if (clamped_x - natural_target_x).abs() < 0.01 {
+            return None; // no clamp needed, let the existing velocity stand
+        }
+        Some(Vector3::new(clamped_x - player.position.x, v.y, v.z))
     }
 }
 
