@@ -1004,7 +1004,36 @@ impl PlayerEventDispatcher {
                 }
             }
             PlayerEvent::Offside(player_id, position) => {
-                Self::handle_offside_event(player_id, position, field);
+                if let Some(taker_id) = Self::handle_offside_event(player_id, position, field, context)
+                {
+                    // realism-bug (2026-08-29): `PlayerEvent::Offside`
+                    // itself only reaches this arm as a nested remaining-
+                    // event of `BallEvent::Offside` (one recursion level
+                    // deep in `EventDispatcher::dispatch_iter`), and that
+                    // recursion is hard-capped at exactly one further
+                    // level (`process_remaining_events: false` on the
+                    // recursive call). A `FreeKickAwarded` pushed into
+                    // `remaining_events` HERE would be a second level of
+                    // nesting — silently dropped before any pass ever
+                    // records or re-dispatches it, even though the
+                    // restart itself (ball position/owner, dead-ball
+                    // freeze) already applied correctly inside
+                    // `handle_offside_event` above. Recording directly
+                    // here, rather than routing through the recursive
+                    // event-return mechanism, is the isolated fix — the
+                    // depth cap itself is shared, cross-cutting dispatch
+                    // machinery (Module 11) out of scope for this fix.
+                    if context.logging_enabled {
+                        match_data.add_match_event(
+                            context.total_match_time,
+                            "player",
+                            format!("FreeKickAwarded({})", taker_id),
+                        );
+                    }
+                    remaining_events.push(Event::PlayerEvent(PlayerEvent::FreeKickAwarded(
+                        taker_id,
+                    )));
+                }
             }
             _ => {} // Ignore unsupported events
         }
@@ -5029,23 +5058,119 @@ impl PlayerEventDispatcher {
         })
     }
 
-    /// Count-only, by explicit design decision (2026-08 offside
-    /// investigation): offside is detected and tallied so its real rate
-    /// can be tracked while the underlying player-behavior fixes bed in,
-    /// but does NOT stop play, award a free kick, or change possession
-    /// yet — that consequence is deliberately deferred. Previously this
-    /// stopped the ball and handed possession to the nearest opponent;
-    /// all of that was removed. `try_pass_target_claim` (ownership.rs)
-    /// no longer short-circuits the reception when this fires, so the
-    /// pass completes normally.
+    /// Awards a real indirect free kick for offside — engine audit
+    /// Module 3 (2026-08-29), completing what the 2026-08-19 "count-
+    /// only" decision deliberately deferred. That commit's own comment
+    /// ("Revert this block... to re-enable the free-kick consequence
+    /// once ready") pointed at `ownership.rs`'s `try_pass_target_claim`,
+    /// which already flags the offside and emits `BallEvent::Offside`
+    /// carrying the real Law-11 infringement spot (`OffsideSnapshot`'s
+    /// `receiver_x_at_kick`/`receiver_y_at_kick`) — but even the code
+    /// from before 2026-08-19 never actually staged a restart from that
+    /// event: it only flipped `pass_origin_restart` and returned, with
+    /// no taker, no ball teleport, no dead-ball freeze. This is the
+    /// first time the full restart is actually built, not a revert.
+    ///
+    /// Mirrors `award_restart_for_foul`'s established free-kick staging
+    /// (ball position/ownership fields, direct taker teleport via the
+    /// same `&mut field` idiom, §13.4 dead-ball freeze) but deliberately
+    /// does NOT replicate its wall/crossable-range shape choreography
+    /// (§11.7/§12.2/§12.3) — that's real, tracked future work for the
+    /// Module 4 rework (see docs/engine-audit-results.md's Module 4
+    /// section, which explicitly flags this so it isn't lost), not
+    /// duplicated here under time pressure against an already-large,
+    /// already-fragile function.
+    ///
+    /// Uses `IndirectFreeKick`, not the generic `FreeKick` the pre-
+    /// 2026-08-19 code used — `check_goal` already has real Law-11
+    /// enforcement keyed on this exact variant (a goal scored directly
+    /// off an indirect free kick, with no second touch, is rejected),
+    /// so using the more specific variant activates that enforcement
+    /// for free, correcting a small inaccuracy in the old code.
+    ///
+    /// Returns the taker's id so the caller can emit
+    /// `PlayerEvent::FreeKickAwarded`, matching how `dispatch` already
+    /// handles `FoulOutcome::Called`'s restart.
     fn handle_offside_event(
         offside_player_id: u32,
-        _position: Vector3<f32>,
+        position: Vector3<f32>,
         field: &mut MatchField,
-    ) {
+        context: &mut MatchContext,
+    ) -> Option<u32> {
+        let Some(offside_side) = field
+            .players
+            .iter()
+            .find(|p| p.id == offside_player_id)
+            .and_then(|p| p.side)
+        else {
+            return None;
+        };
         if let Some(player) = field.players.iter_mut().find(|p| p.id == offside_player_id) {
             player.statistics.offsides += 1;
         }
+        let victim_side = match offside_side {
+            PlayerSide::Left => PlayerSide::Right,
+            PlayerSide::Right => PlayerSide::Left,
+        };
+
+        let field_w = context.field_size.width as f32;
+        let field_h = context.field_size.height as f32;
+        let restart_pos = Vector3::new(
+            position.x.clamp(2.0, field_w - 2.0),
+            position.y.clamp(2.0, field_h - 2.0),
+            0.0,
+        );
+
+        let taker_id = Self::pick_free_kick_taker(field, victim_side, restart_pos, None)?;
+        let team_id = field
+            .players
+            .iter()
+            .find(|p| p.id == taker_id)
+            .map(|p| p.team_id)
+            .unwrap_or(0);
+
+        let ball = &mut field.ball;
+        ball.position = restart_pos;
+        ball.velocity = Vector3::zeros();
+        ball.previous_owner = ball.current_owner;
+        ball.current_owner = Some(taker_id);
+        ball.ownership_duration = 0;
+        ball.claim_cooldown = 90;
+        ball.flags.in_flight_state = 60;
+        ball.contested_claim_count = 0;
+        ball.pass_target_player_id = None;
+        ball.recent_passers.clear();
+        ball.cached_shot_target = None;
+        ball.offside_snapshot = None;
+        ball.pass_origin_restart = PassOriginRestart::IndirectFreeKick;
+        ball.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
+        ball.restart_pending_taker = Some(taker_id);
+        ball.free_kick_decided = false; // §12.2 — fresh decision for this restart
+
+        field
+            .ball
+            .record_touch(taker_id, team_id, context.current_tick(), true);
+
+        // Same direct-teleport idiom `award_restart_for_foul` uses: we
+        // hold &mut field here, so the taker can be placed on the ball
+        // immediately rather than via the pending-teleport queue, which
+        // drains too late for a restart awarded mid-tick during event
+        // dispatch.
+        if let Some(idx) = field.player_index(taker_id) {
+            let p = &mut field.players[idx];
+            p.position = restart_pos;
+            p.velocity = Vector3::zeros();
+            p.in_state_time = 0;
+        }
+
+        // §13.4 dead-ball freeze, same timing as an ordinary (non-
+        // penalty) free kick — offside carries no special urgency.
+        context.dead_ball_min_ms = context.total_match_time + 600;
+        context.dead_ball_until_ms =
+            context.total_match_time + context.rng.range_u64(2, 4) * 1000;
+        context.dead_ball_retreat_active = true;
+
+        Some(taker_id)
     }
 
     /// Identify the goalkeeper who is about to clear a shot, if any.
