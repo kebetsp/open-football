@@ -3,11 +3,16 @@
 //! (corner / goal kick) live in `goal.rs` because they share machinery
 //! with the actual goal check.
 //!
-//! Real football rule the ball is restarted by the team that did NOT
+//! Real football rule: the ball is restarted by the team that did NOT
 //! last touch the ball. If we have no record of a touch (kickoff /
 //! genuine bug) we fall back to the team currently holding ownership;
-//! if even that is missing, we leave the boundary inset as the safety
-//! net for `check_boundary_collision`.
+//! if even that is missing, the side is decided by an unbiased coin
+//! flip rather than left unresolved (see `check_throw_in`'s own comment
+//! for why). This module never relies on `check_boundary_collision` as
+//! a fallback — that function was removed entirely (engine audit
+//! Module 1/2 rewrite, 2026-08-28) because it raced this exact logic;
+//! every boundary crossing this module handles is now resolved
+//! exhaustively, in one place, on the tick it happens.
 
 use super::Ball;
 use crate::PlayerFieldPositionGroup;
@@ -206,6 +211,23 @@ fn pick_thrower(
     throwing_side: PlayerSide,
     throw_pos: Vector3<f32>,
 ) -> Option<u32> {
+    // realism-bug (2026-08-28, engine audit Module 2): genuinely
+    // exhaustive per Pavel's sign-off — a throw-in must always find a
+    // taker if ANY eligible (not sent off) player of the throwing side
+    // remains on the pitch. `allow_goalkeeper` runs the same scoring
+    // twice only in the vanishingly rare case where every outfielder is
+    // gone (e.g. mass red cards) — real football has no rule against a
+    // goalkeeper taking a throw-in, it's just never the normal choice.
+    pick_thrower_scored(players, throwing_side, throw_pos, false)
+        .or_else(|| pick_thrower_scored(players, throwing_side, throw_pos, true))
+}
+
+fn pick_thrower_scored(
+    players: &[MatchPlayer],
+    throwing_side: PlayerSide,
+    throw_pos: Vector3<f32>,
+    allow_goalkeeper: bool,
+) -> Option<u32> {
     let mut best: Option<(u32, f32)> = None;
     // Furthest-search radius — a player 200u from the touchline isn't
     // realistically the thrower. We still score them; this just bounds
@@ -219,8 +241,9 @@ fn pick_thrower(
         if p.is_sent_off {
             continue;
         }
-        if p.tactical_position.current_position.position_group()
-            == PlayerFieldPositionGroup::Goalkeeper
+        if !allow_goalkeeper
+            && p.tactical_position.current_position.position_group()
+                == PlayerFieldPositionGroup::Goalkeeper
         {
             continue;
         }

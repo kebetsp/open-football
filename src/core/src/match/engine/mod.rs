@@ -3,6 +3,7 @@ pub mod engine;
 pub mod events;
 pub mod flow;
 pub mod officiating;
+pub mod physics;
 pub mod player;
 pub mod psychology;
 pub mod rating;

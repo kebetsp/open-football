@@ -2016,9 +2016,10 @@ impl PlayerEventDispatcher {
             trajectory_type,
             TrajectoryType::HighArc | TrajectoryType::MediumArc
         ) {
-            const GRAVITY_PER_TICK: f32 = 0.000981; // 9.81 * 0.01^2, matches update_velocity
             const MAX_LOFTED_HORIZONTAL_SPEED: f32 = 3.2; // matches MAX_PASS_VELOCITY below
-            let total_flight_ticks = (2.0 * final_z_velocity / GRAVITY_PER_TICK).max(1.0);
+            let total_flight_ticks = (2.0 * final_z_velocity
+                / crate::r#match::engine::physics::GRAVITY_PER_TICK)
+                .max(1.0);
             let required_speed =
                 (actual_horizontal_distance / total_flight_ticks).clamp(0.3, MAX_LOFTED_HORIZONTAL_SPEED);
             let dir = if horizontal_velocity.norm() > 0.01 {
@@ -2452,11 +2453,12 @@ impl PlayerEventDispatcher {
     /// `position += velocity` has no separate per-tick dt, `velocity.z`
     /// must be stored as real metres-per-tick: `v_z_real * TICK_SECONDS`.
     /// Real ballistics: `v_z_real = sqrt(2 * GRAVITY * height_m)`.
+    /// Thin delegate to the shared `match::engine::physics` conversion
+    /// (engine audit #1, 2026-08-28) — kept as an associated fn here
+    /// (rather than deleted outright) since this file's ~13 call sites
+    /// use it via `Self::`/`PlayerEventDispatcher::`.
     fn z_launch_velocity_for_height(height_m: f32) -> f32 {
-        const GRAVITY: f32 = 9.81;
-        const TICK_SECONDS: f32 = 0.01; // matches the engine's established 100-tick/s rate
-        let v_z_real = (2.0 * GRAVITY * height_m.max(0.0)).sqrt();
-        v_z_real * TICK_SECONDS
+        crate::r#match::engine::physics::z_launch_velocity_for_height(height_m)
     }
 
     fn calculate_trajectory_to_target(
@@ -4277,11 +4279,14 @@ impl PlayerEventDispatcher {
                 } else {
                     field.ball.position.y + final_velocity.y * ticks_to_goal
                 };
-                // Arc approximation: z under gravity (~0.000981 real-metre
-                // u/tick² from update_velocity's 2026-08 height-physics
-                // rewrite — GRAVITY(9.81) * TICK_SECONDS(0.01)²).
+                // Arc approximation: z under gravity (shared
+                // `match::engine::physics::GRAVITY_PER_TICK`, engine
+                // audit #1, 2026-08-28).
                 let goal_line_z = (field.ball.position.z + final_velocity.z * ticks_to_goal
-                    - 0.5 * 0.000981 * ticks_to_goal * ticks_to_goal)
+                    - 0.5
+                        * crate::r#match::engine::physics::GRAVITY_PER_TICK
+                        * ticks_to_goal
+                        * ticks_to_goal)
                     .max(0.0);
                 field.ball.cached_shot_target = Some(ShotTarget {
                     goal_line_y,

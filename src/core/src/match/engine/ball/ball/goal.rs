@@ -1,12 +1,30 @@
-//! Out-of-play resolution: actual goals, over-the-bar goal kicks,
-//! and wide-of-goal corner / goal kick decisions. The wide-of-goal
-//! flow stages the set-piece teleport via `pending_set_piece_teleport`
-//! since the ball can't move other players' positions itself.
+//! Out-of-play resolution: actual goals, and every other endline
+//! crossing (over the bar, wide of the posts, or genuinely IN the goal
+//! frame but not credited as a goal — e.g. a carried ball with no
+//! recent shot attribution) — all resolved by the same real Law-12 rule
+//! (corner if the defending team touched it last, otherwise goal kick),
+//! via the shared `resolve_corner_or_goal_kick`. Both `check_over_goal`
+//! and `check_wide_of_goal` do only their own geometric trigger test and
+//! then hand off to that one resolver — previously `check_over_goal` had
+//! its own, simpler, WRONG logic that always awarded a goal kick
+//! regardless of who touched the ball last, missing the common real case
+//! of a defensive header/clearance going out for a corner over the bar
+//! (engine audit Module 2 rewrite, 2026-08-28).
+//!
+//! The wide-of-goal/over-goal flow stages the set-piece teleport via
+//! `pending_set_piece_teleport` since the ball can't move other players'
+//! positions itself.
+//!
+//! Every one of these functions is now exhaustive by construction: taker
+//! and goalkeeper lookups fall back progressively rather than silently
+//! declining to resolve anything (see `resolve_corner_or_goal_kick`'s
+//! `.or_else` fallbacks) — a genuine crossing must always produce a real
+//! restart, matching the Laws of the Game (a stoppage always happens and
+//! someone always takes it), never a silent freeze.
 
 use super::Ball;
 use crate::r#match::PassOriginRestart;
 use crate::r#match::ball::events::{BallEvent, BallGoalEventMetadata, GoalSide};
-use crate::r#match::engine::goal::GOAL_WIDTH;
 use crate::r#match::engine::set_pieces::{CornerScores, pick_corner_routine};
 use crate::r#match::events::EventCollection;
 use crate::r#match::{MatchContext, MatchPlayer, PlayerSide};
@@ -20,12 +38,31 @@ impl Ball {
             return;
         }
 
-        // Don't detect goals when ball is attached to a player (ball follows owner).
-        // Goals only happen when the ball crosses the line freely (shot, deflection, etc.).
-        // This prevents defenders "carrying" the ball into their own goal via boundary clamping.
-        if self.current_owner.is_some() {
-            return;
-        }
+        // realism-bug (2026-08-28, engine audit Module 2): this used to
+        // return unconditionally whenever `current_owner.is_some()`, to
+        // stop a defender "carrying" the ball into his own goal via an
+        // artifact of the OLD `check_boundary_collision` blind boundary
+        // snap (which could shove an owned ball across the line by
+        // accident, not a genuine deliberate crossing). That snap-back
+        // mechanism is gone — every boundary resolution is now exhaustive
+        // and geometry-driven, so the original false-positive source no
+        // longer exists. Per the real Laws of the Game, the whole ball
+        // crossing the whole line is a goal (or own goal) regardless of
+        // HOW it got there — kicked, deflected, or genuinely carried
+        // (this engine's ball-follows-owner "at the feet" abstraction, per
+        // Pavel's 2026-08-28 sign-off, IS a real physical object under a
+        // player's control, so a player+ball crossing the line together
+        // is exactly what real carrying-it-in looks like). The existing
+        // goalscorer-attribution logic below already treats `current_owner`
+        // as its own top-priority scorer candidate, and an own goal
+        // (`is_auto_goal`) is already exempt from the "requires a recent
+        // shot" gate a few lines down — so removing this early return
+        // lets a genuine carried own goal score correctly, and lets a
+        // carried ATTACKING goal fall through to the same "not a real
+        // goal attempt, resolve as an out-of-play crossing instead" path
+        // every other undeserving crossing already takes (see
+        // `check_wide_of_goal`, which now runs unconditionally on any
+        // unscored endline crossing including this one).
 
         if let Some(goal_side) = context.goal_positions.is_goal(self.position) {
             // Prefer current_owner (e.g. player carrying ball into goal)
@@ -193,14 +230,22 @@ impl Ball {
                 self.goal_scored = true;
                 self.reset();
             }
-            // No scorer found: skip the reset entirely. Ball stays live;
-            // check_wide_of_goal / check_over_goal on the next tick resolve
-            // it as a goal kick.
+            // No scorer found, or the goal-crediting rules above declined
+            // (no recent shot, indirect-FK second-touch rule, etc.): skip
+            // the reset. Ball stays live, `self.goal_scored` stays false,
+            // and `check_wide_of_goal` (which now runs unconditionally on
+            // any unscored endline crossing, not just ones outside the
+            // posts) resolves it as a corner or goal kick on this same
+            // tick, per the real last-toucher rule.
         }
     }
 
-    /// Ball crossed goal line within goal width but above crossbar — goal kick.
-    /// Place ball near the 6-yard box and give it to the defending goalkeeper.
+    /// Ball crossed the goal line within goal width but above crossbar.
+    /// Real Law 12: still decided by who touched last, exactly like any
+    /// other endline crossing — a defensive header/clearance over the
+    /// bar is a CORNER, not automatically a goal kick. Delegates to the
+    /// shared resolver instead of (as before) always handing it straight
+    /// to the defending goalkeeper.
     pub(super) fn check_over_goal(
         &mut self,
         context: &mut MatchContext,
@@ -211,120 +256,72 @@ impl Ball {
             Some(side) => side,
             None => return,
         };
-
-        // Determine which side's goalkeeper defends this goal
-        // GoalSide::Home = left goal (x=0) → defended by PlayerSide::Left
-        // GoalSide::Away = right goal (x=field_width) → defended by PlayerSide::Right
-        let defending_side = match over_side {
-            GoalSide::Home => PlayerSide::Left,
-            GoalSide::Away => PlayerSide::Right,
-        };
-
-        // Find the goalkeeper on the defending side
-        if let Some(gk) = players.iter().find(|p| {
-            p.side == Some(defending_side) && p.tactical_position.current_position.is_goalkeeper()
-        }) {
-            // Place ball at the 6-yard area in front of the goal
-            let goal_kick_x = match over_side {
-                GoalSide::Home => 50.0, // ~6 yards from left goal line
-                GoalSide::Away => self.field_width - 50.0,
-            };
-
-            self.position.x = goal_kick_x;
-            self.position.y = context.goal_positions.left.y; // Center of goal
-            self.position.z = 0.0;
-            self.velocity = Vector3::zeros();
-
-            // Give ball to goalkeeper
-            let gk_id = gk.id;
-            let gk_team = gk.team_id;
-            self.current_owner = Some(gk_id);
-            self.previous_owner = None;
-            self.ownership_duration = 0;
-            self.claim_cooldown = 30; // Protection so no one steals immediately
-            self.flags.in_flight_state = 30;
-            self.pass_target_player_id = None;
-            // Clear the shot target — the shot ended (above the bar) and
-            // is now resolved as a goal kick. Without this clear, the
-            // GK's eventual ClearBall event hits gk_clearing_shot with
-            // a stale `cached_shot_target=Some`, false-crediting a save
-            // for a shot that never reached the keeper.
-            self.cached_shot_target = None;
-            self.recent_passers.clear();
-            self.pass_origin_restart = PassOriginRestart::GoalKick;
-            self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
-            self.restart_pending_taker = Some(gk_id);
-            self.offside_snapshot = None;
-            self.record_touch(gk_id, gk_team, self.current_tick_cached, true);
-
-            #[cfg(feature = "match-logs")]
-            log::info!("CLAIMSITE fn=goal.rs:over_bar_goal_kick id={}", gk_id);
-            events.add_ball_event(BallEvent::Claimed(gk_id));
-
-            // §9.2.1 full-team recovery on the over-the-bar goal kick
-            // too (same mechanism as the wide-of-goal path).
-            self.pending_restart_teleports.extend(
-                crate::r#match::engine::set_pieces::recovery_shape_targets(
-                    players,
-                    defending_side,
-                    self.position,
-                    self.field_width,
-                    true,
-                    &[gk_id],
-                ),
-            );
-
-            // §13.4: real retreat + a real wait-or-exploit window — see
-            // the design note (docs/tactical-system-phase13-13.4-design.md
-            // in The Gaffer repo) for why this differs from the post-goal
-            // freeze above (dead_ball_retreat_active is never set there).
-            context.dead_ball_min_ms = context.total_match_time + 400;
-            context.dead_ball_until_ms =
-                context.total_match_time + context.rng.range_u64(1, 3) * 1000;
-            context.dead_ball_retreat_active = true;
-        }
+        self.resolve_corner_or_goal_kick(context, players, events, over_side);
     }
 
-    /// Ball crossed the endline (x <= 0 or x >= field_width) but OUTSIDE the goal posts.
-    /// In real football this is a goal kick OR a corner kick — depending on
-    /// which team last touched the ball.
+    /// Ball crossed an endline (x <= 0 or x >= field_width) and was NOT
+    /// credited as a goal this tick (either genuinely wide of the posts,
+    /// or within the frame but `check_goal` declined — e.g. a carried
+    /// ball with no recent-shot attribution). In real football this is
+    /// always a goal kick OR a corner kick, decided by which team last
+    /// touched the ball — never silence. `check_over_goal` (run earlier
+    /// this tick) already claims the "over the bar" sub-region, so this
+    /// function only needs to skip that to avoid double-resolving the
+    /// same physical crossing twice in one tick.
     pub(super) fn check_wide_of_goal(
         &mut self,
         context: &mut MatchContext,
         players: &[MatchPlayer],
         events: &mut EventCollection,
     ) {
+        if self.goal_scored {
+            return;
+        }
         let field_width = context.field_size.width as f32;
-        let goal_half_width = GOAL_WIDTH;
 
-        // Check left endline
         let crossed_side = if self.position.x <= 0.0 {
-            let goal_center_y = context.goal_positions.left.y;
-            // Only trigger if OUTSIDE the goal posts (inside is handled by check_goal/check_over_goal)
-            if self.position.y < goal_center_y - goal_half_width
-                || self.position.y > goal_center_y + goal_half_width
-            {
-                Some(GoalSide::Home)
-            } else {
-                None
-            }
+            Some(GoalSide::Home)
         } else if self.position.x >= field_width {
-            let goal_center_y = context.goal_positions.right.y;
-            if self.position.y < goal_center_y - goal_half_width
-                || self.position.y > goal_center_y + goal_half_width
-            {
-                Some(GoalSide::Away)
-            } else {
-                None
-            }
+            Some(GoalSide::Away)
         } else {
             None
         };
-
-        let side = match crossed_side {
-            Some(s) => s,
-            None => return,
+        let Some(side) = crossed_side else {
+            return;
         };
+
+        // Already claimed by check_over_goal this tick (which runs
+        // earlier in the dispatch order — see `mod.rs`): if it fired, it
+        // already relocated the ball off the endline entirely, so this
+        // geometric test would be moot in practice, but guard explicitly
+        // for clarity and defence-in-depth rather than relying on call
+        // order alone.
+        if context.goal_positions.is_over_goal(self.position).is_some() {
+            return;
+        }
+
+        self.resolve_corner_or_goal_kick(context, players, events, side);
+    }
+
+    /// Shared endline-crossing resolver: decide corner vs. goal kick by
+    /// who touched the ball last (real Law 12), then run the full
+    /// calibrated staging for whichever one applies. Called by both
+    /// `check_over_goal` and `check_wide_of_goal` — the single place
+    /// that owns "what happens when the ball goes out over this line."
+    ///
+    /// Every player lookup here (corner taker, goalkeeper) falls back
+    /// progressively rather than silently doing nothing if the ideal
+    /// candidate doesn't exist (e.g. every outfielder sent off) — a real
+    /// restart always gets taken by someone, per Pavel's 2026-08-28
+    /// sign-off on exhaustive boundary resolution.
+    fn resolve_corner_or_goal_kick(
+        &mut self,
+        context: &mut MatchContext,
+        players: &[MatchPlayer],
+        events: &mut EventCollection,
+        side: GoalSide,
+    ) {
+        let field_width = context.field_size.width as f32;
 
         let defending_side = match side {
             GoalSide::Home => PlayerSide::Left,
@@ -367,8 +364,18 @@ impl Ball {
             let corner_y = if near_top { 2.0 } else { field_height - 2.0 };
 
             // Find the attacking team's designated corner taker — score by
-            // (crossing, technique, corners) like SetPieceSetup::choose, but
-            // restricted to players currently on the pitch.
+            // (crossing, technique, corners) like SetPieceSetup::choose,
+            // restricted to players currently on the pitch. Genuine last
+            // resort (should be unreachable outside a fully depleted
+            // side): if no eligible outfielder exists at all, even the
+            // goalkeeper takes it rather than the restart silently
+            // vanishing — real football always has SOMEONE take a
+            // corner, even a makeshift choice.
+            let taker_score = |p: &MatchPlayer| {
+                p.skills.technical.crossing * 0.6
+                    + p.skills.technical.technique * 0.3
+                    + p.skills.technical.corners * 0.1
+            };
             let taker = players
                 .iter()
                 .filter(|p| {
@@ -376,13 +383,19 @@ impl Ball {
                         && !p.tactical_position.current_position.is_goalkeeper()
                 })
                 .max_by(|a, b| {
-                    let sa = a.skills.technical.crossing * 0.6
-                        + a.skills.technical.technique * 0.3
-                        + a.skills.technical.corners * 0.1;
-                    let sb = b.skills.technical.crossing * 0.6
-                        + b.skills.technical.technique * 0.3
-                        + b.skills.technical.corners * 0.1;
-                    sa.partial_cmp(&sb).unwrap_or(Ordering::Equal)
+                    taker_score(a)
+                        .partial_cmp(&taker_score(b))
+                        .unwrap_or(Ordering::Equal)
+                })
+                .or_else(|| {
+                    players
+                        .iter()
+                        .filter(|p| p.side == Some(attacking_side))
+                        .max_by(|a, b| {
+                            taker_score(a)
+                                .partial_cmp(&taker_score(b))
+                                .unwrap_or(Ordering::Equal)
+                        })
                 });
 
             if let Some(taker) = taker {
@@ -402,8 +415,8 @@ impl Ball {
                 self.recent_passers.clear();
                 // Same as goal-kick restart: clear stale shot target so
                 // the eventual clearance/distribution doesn't false-credit
-                // a phantom save (see check_over_goal for the full bug
-                // explanation).
+                // a phantom save (see the goal-kick branch below for the
+                // full bug explanation).
                 self.cached_shot_target = None;
                 self.pass_origin_restart = PassOriginRestart::Corner;
                 self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
@@ -670,13 +683,40 @@ impl Ball {
                 context.dead_ball_retreat_active = true;
                 return;
             }
-            // If no eligible outfielder was found, fall through to goal kick
+            // Structurally unreachable now (the fallback above always
+            // finds a taker if ANY player of the attacking side exists on
+            // the pitch), but keep the fallthrough rather than trust that
+            // completely — an empty attacking side (impossible under this
+            // engine's fixed 11-a-side squads) would fall through to the
+            // goal-kick branch below, which itself falls back to the
+            // nearest defending player if even the goalkeeper is missing.
         }
 
-        // Goal kick: give ball to defending goalkeeper
-        if let Some(gk) = players.iter().find(|p| {
-            p.side == Some(defending_side) && p.tactical_position.current_position.is_goalkeeper()
-        }) {
+        // Goal kick: give ball to defending goalkeeper. Genuine last
+        // resort (should be unreachable — every squad always has exactly
+        // one goalkeeper, never removed from the roster even if sent
+        // off): if no goalkeeper is found, the nearest defending outfield
+        // player takes it instead of the restart silently vanishing.
+        let field_height = context.field_size.height as f32;
+        let center_y = field_height / 2.0;
+        let gk_dist = |p: &MatchPlayer| {
+            let dx = p.position.x - context.goal_positions.left.x;
+            let dy = p.position.y - center_y;
+            (dx * dx + dy * dy).sqrt()
+        };
+        let gk = players
+            .iter()
+            .find(|p| {
+                p.side == Some(defending_side)
+                    && p.tactical_position.current_position.is_goalkeeper()
+            })
+            .or_else(|| {
+                players
+                    .iter()
+                    .filter(|p| p.side == Some(defending_side))
+                    .min_by(|a, b| gk_dist(a).partial_cmp(&gk_dist(b)).unwrap_or(Ordering::Equal))
+            });
+        if let Some(gk) = gk {
             let gk_id = gk.id;
             let gk_team = gk.team_id;
             let goal_kick_x = match side {
@@ -696,9 +736,11 @@ impl Ball {
             self.flags.in_flight_state = 30;
             self.pass_target_player_id = None;
             self.recent_passers.clear();
-            // See check_over_goal for full rationale — clear the shot
-            // target so the eventual GK clearance can't false-credit a
-            // save for a shot that ended out of play.
+            // Clear the shot target — the shot ended out of play and is
+            // now resolved as a goal kick. Without this clear, the GK's
+            // eventual ClearBall event hits gk_clearing_shot with a
+            // stale `cached_shot_target=Some`, false-crediting a save for
+            // a shot that never reached the keeper.
             self.cached_shot_target = None;
             self.pass_origin_restart = PassOriginRestart::GoalKick;
             self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
@@ -707,12 +749,11 @@ impl Ball {
             self.record_touch(gk_id, gk_team, self.current_tick_cached, true);
 
             #[cfg(feature = "match-logs")]
-            log::info!("CLAIMSITE fn=goal.rs:wide_goal_kick id={}", gk_id);
+            log::info!("CLAIMSITE fn=goal.rs:goal_kick id={}", gk_id);
             events.add_ball_event(BallEvent::Claimed(gk_id));
-            // Same as corner kick: put the GK onto the ball so the
-            // distance check in `move_to` doesn't immediately null
-            // ownership because the GK was ~35 units away at the goal
-            // line when the ball crossed the end line.
+            // Put the GK onto the ball so the distance check in `move_to`
+            // doesn't immediately null ownership because the GK was
+            // ~35 units away at the goal line when the ball crossed.
             self.pending_set_piece_teleport = Some((gk_id, self.position));
 
             // §9.2.1 full-team recovery: every outfield player on both

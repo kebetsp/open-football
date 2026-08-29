@@ -848,7 +848,6 @@ impl Ball {
         self.check_over_goal(context, players, events);
         self.check_wide_of_goal(context, players, events);
         self.check_throw_in(context, players, events);
-        self.check_boundary_collision(context);
         self.expire_offside_snapshot(context);
         self.update_landing_cache();
     }
@@ -879,7 +878,6 @@ impl Ball {
         self.check_over_goal(context, players, events);
         self.check_wide_of_goal(context, players, events);
         self.check_throw_in(context, players, events);
-        self.check_boundary_collision(context);
         self.expire_offside_snapshot(context);
         self.update_landing_cache();
     }
@@ -902,13 +900,13 @@ impl Ball {
             return self.position;
         }
 
-        const G_PER_TICK: f32 = 9.81 * 0.01 * 0.01;
+        let g_per_tick = crate::r#match::engine::physics::GRAVITY_PER_TICK;
         let vz = self.velocity.z;
         let h = self.position.z;
 
         // Positive root of ½g·t² − vz·t − h = 0
-        let discriminant = vz * vz + 2.0 * G_PER_TICK * h;
-        let time_to_ground = (vz + discriminant.sqrt()) / G_PER_TICK;
+        let discriminant = vz * vz + 2.0 * g_per_tick * h;
+        let time_to_ground = (vz + discriminant.sqrt()) / g_per_tick;
 
         let landing_x = self.position.x + self.velocity.x * time_to_ground;
         let landing_y = self.position.y + self.velocity.y * time_to_ground;

@@ -99,17 +99,12 @@ impl StateProcessingHandler for DefenderClearingState {
         // 2026-08 height-physics rewrite: `z_base_height_m` is a real
         // target apex in metres for a big hoofed clearance (5-6m is a
         // plausible real height for a defender booting the ball clear
-        // under pressure) — converted through the same real-ballistics
-        // formula as `PlayerEventDispatcher::z_launch_velocity_for_height`
-        // (players.rs), duplicated locally per this codebase's existing
-        // per-file physics-constant pattern (`position.z` is real metres
-        // — flow/goal.rs's live GOAL_HEIGHT=2.44 confirms this).
+        // under pressure) — converted through the shared real-ballistics
+        // helper (`match::engine::physics`, engine audit #1, 2026-08-28).
         let z_base_height_m = if at_boundary { 6.0 } else { 5.0 };
         let z_mult = 0.85 + (ctx.player.skills.technical.technique / 20.0).powf(1.30) * 0.15;
         let height_m = z_base_height_m * z_mult * if poor_clearance { 0.80 } else { 1.0 };
-        const GRAVITY: f32 = 9.81;
-        const TICK_SECONDS: f32 = 0.01;
-        let z_velocity = (2.0 * GRAVITY * height_m.max(0.0)).sqrt() * TICK_SECONDS;
+        let z_velocity = crate::r#match::engine::physics::z_launch_velocity_for_height(height_m);
 
         let ball_velocity = Vector3::new(horizontal_velocity.x, horizontal_velocity.y, z_velocity);
 
