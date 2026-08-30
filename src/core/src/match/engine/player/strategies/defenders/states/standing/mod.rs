@@ -16,7 +16,12 @@ const MARKING_DISTANCE: f32 = 35.0; // Pick up attackers early
 const FIELD_THIRD_THRESHOLD: f32 = 0.33;
 const PRESSING_DISTANCE: f32 = 70.0; // Aggressive pressing range
 const PRESSING_DISTANCE_DEFENSIVE_THIRD: f32 = 60.0; // Very tight in own third
-const TACKLE_DISTANCE: f32 = 40.0; // Engage tackles from further out
+// 2026-08-30 (engine-audit Module 6): the local `TACKLE_DISTANCE = 40.0`
+// this file used to define was the worst mismatch of any of the 8
+// transition sites — 30u looser than Tackling's real 10u gate (plus
+// never checked cooldown). Now routes through the shared
+// `DefensiveOperationsImpl::can_engage_tackle`, same as the box-
+// emergency branch below.
 const BLOCKING_DISTANCE: f32 = 35.0; // Block shots from wider range
 const HEADING_HEIGHT: f32 = 1.5;
 const HEADING_DISTANCE: f32 = 5.0;
@@ -64,7 +69,7 @@ impl StateProcessingHandler for DefenderStandingState {
         if ctx.player().defensive().is_box_emergency_for_me() {
             if let Some(carrier) = ctx.players().opponents().with_ball().next() {
                 let d = carrier.distance(ctx);
-                if d < 25.0 {
+                if ctx.player().defensive().can_engage_tackle(d) {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Tackling,
                     ));
@@ -107,7 +112,12 @@ impl StateProcessingHandler for DefenderStandingState {
                 ctx.player().defensive().defensive_role_for_ball_carrier_unified(),
                 DefensiveRole::Primary
             ) || ctx.player().defensive().is_box_emergency_for_me();
-            if distance_to_opponent < TACKLE_DISTANCE && is_primary_or_emergency {
+            if ctx
+                .player()
+                .defensive()
+                .can_engage_tackle(distance_to_opponent)
+                && is_primary_or_emergency
+            {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Tackling,
                 ));

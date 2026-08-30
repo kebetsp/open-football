@@ -12,7 +12,10 @@ use nalgebra::Vector3;
 const INTERCEPTION_DISTANCE: f32 = 150.0;
 const MARKING_DISTANCE: f32 = 50.0;
 const PRESSING_DISTANCE: f32 = 80.0;
-const TACKLE_DISTANCE: f32 = 25.0;
+// 2026-08-30 (engine-audit Module 6): the local `TACKLE_DISTANCE = 25.0`
+// this file used to define was 15u looser than Tackling's real 10u gate
+// (plus never checked cooldown). Now routes through the shared
+// `DefensiveOperationsImpl::can_engage_tackle`.
 
 #[derive(Default, Clone)]
 pub struct DefenderWalkingState {}
@@ -49,7 +52,11 @@ impl StateProcessingHandler for DefenderWalkingState {
             let distance_to_opponent = ctx.player.position.distance_to(&opponent.position);
 
             // Tackle if very close
-            if distance_to_opponent < TACKLE_DISTANCE {
+            if ctx
+                .player()
+                .defensive()
+                .can_engage_tackle(distance_to_opponent)
+            {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Tackling,
                 ));

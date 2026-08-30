@@ -46,9 +46,27 @@ impl StateProcessingHandler for DefenderReturningState {
             }
         } else {
             if ctx.ball().distance() < 100.0 {
-                if ctx.players().opponents().with_ball().next().is_some() {
+                if let Some(opponent) = ctx.players().opponents().with_ball().next() {
+                    // 2026-08-30 (engine-audit Module 6): was an
+                    // unconditional Tackling transition off a 100u
+                    // ball-distance proxy — the worst mismatch found in
+                    // this whole sweep (90u looser than Tackling's real
+                    // 10u gate), never checked cooldown, and didn't even
+                    // check the actual carrier's distance. Now routes
+                    // through the shared gate; falls back to Pressing
+                    // (closing the gap) when not genuinely in range yet,
+                    // same convention as every other fixed state.
+                    if ctx
+                        .player()
+                        .defensive()
+                        .can_engage_tackle(opponent.distance(ctx))
+                    {
+                        return Some(StateChangeResult::with_defender_state(
+                            DefenderState::Tackling,
+                        ));
+                    }
                     return Some(StateChangeResult::with_defender_state(
-                        DefenderState::Tackling,
+                        DefenderState::Pressing,
                     ));
                 } else {
                     return Some(StateChangeResult::with_defender_state(

@@ -1578,34 +1578,32 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     } else {
                         (shape_away_goals, shape_home_goals)
                     };
+                    // Principles-of-Play plan (2026-08-30): `CompactBackLine`
+                    // needs this player's own team's tactical snapshot
+                    // (`defensive_line_x`/`compactness_target`), so the
+                    // team lookup happens once per player here rather
+                    // than inside `ShapeRule` itself.
+                    let team_tactical = *context.tactical_for_team(p.team_id);
+                    let ball_owned = current_owner_team.is_some();
                     let mut target = base;
+                    let mut rule_active = false;
                     for rule in &p.shape_rules {
-                        use crate::r#match::player::ShapeTrigger as ST;
-                        let active = match rule.trigger {
-                            ST::InPossession => in_possession,
-                            ST::OutOfPossession => {
-                                !in_possession && current_owner_team.is_some()
-                            }
-                            ST::BallLeft => lane == -1,
-                            ST::BallCenter => lane == 0,
-                            ST::BallRight => lane == 1,
-                            ST::Leading => goals_for > goals_against,
-                            ST::Level => goals_for == goals_against,
-                            ST::Trailing => goals_for < goals_against,
-                            ST::AfterMinute(m) => minute_now >= m,
-                            ST::LeadingAfterMinute(m) => {
-                                goals_for > goals_against && minute_now >= m
-                            }
-                            ST::TrailingAfterMinute(m) => {
-                                goals_for < goals_against && minute_now >= m
-                            }
-                        };
-                        if active {
-                            target = rule.target(base, side, w, h);
+                        if rule.is_active(
+                            in_possession,
+                            ball_owned,
+                            lane,
+                            goals_for,
+                            goals_against,
+                            minute_now,
+                            team_tactical,
+                        ) {
+                            target = rule.target(base, side, w, h, team_tactical);
+                            rule_active = true;
                             break;
                         }
                     }
                     p.start_position = target;
+                    p.shape_rule_active = rule_active;
                 }
             }
 

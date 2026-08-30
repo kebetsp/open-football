@@ -9,7 +9,11 @@ use nalgebra::Vector3;
 
 const GUARD_DISTANCE: f32 = 20.0; // Keep a realistic marking distance (don't sit on top of opponent)
 const MAX_GUARD_RANGE: f32 = 80.0; // Give up guarding if attacker moves too far
-const TACKLE_TRANSITION_DISTANCE: f32 = 15.0; // Tackle immediately when guarded opponent receives ball
+// 2026-08-30 (engine-audit Module 6): the local
+// `TACKLE_TRANSITION_DISTANCE = 15.0` this file used to define was 5u
+// looser than Tackling's own 10u gate (plus never checked cooldown) —
+// both use-sites and the box-emergency branch below now route through
+// the shared `DefensiveOperationsImpl::can_engage_tackle`.
 const STAMINA_THRESHOLD: f32 = 15.0; // Guarding is tiring — need minimum stamina
 const HEADING_HEIGHT: f32 = 1.5;
 const HEADING_DISTANCE: f32 = 5.0;
@@ -46,7 +50,7 @@ impl StateProcessingHandler for DefenderGuardingState {
         if ctx.player().defensive().is_box_emergency_for_me() {
             if let Some(carrier) = ctx.players().opponents().with_ball().next() {
                 let d = carrier.distance(ctx);
-                if d < 25.0 {
+                if ctx.player().defensive().can_engage_tackle(d) {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Tackling,
                     ));
@@ -98,7 +102,7 @@ impl StateProcessingHandler for DefenderGuardingState {
         // 2. Ball carrier nearby — engage directly instead of guarding off-ball player
         if let Some(ball_carrier) = ctx.players().opponents().with_ball().next() {
             let dist_to_carrier = ball_carrier.distance(ctx);
-            if dist_to_carrier < TACKLE_TRANSITION_DISTANCE {
+            if ctx.player().defensive().can_engage_tackle(dist_to_carrier) {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Tackling,
                 ));
@@ -130,7 +134,11 @@ impl StateProcessingHandler for DefenderGuardingState {
 
             // 4. If the guarded opponent receives the ball — react immediately
             if opponent.has_ball(ctx) {
-                if distance_to_opponent < TACKLE_TRANSITION_DISTANCE {
+                if ctx
+                    .player()
+                    .defensive()
+                    .can_engage_tackle(distance_to_opponent)
+                {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Tackling,
                     ));

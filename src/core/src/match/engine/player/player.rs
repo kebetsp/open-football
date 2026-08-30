@@ -1,6 +1,7 @@
 use crate::club::player::events::PositionLoad;
 use crate::club::player::traits::{BehavioralDirective, PlayerTrait};
 use crate::r#match::PlayerMatchEndStats;
+use crate::r#match::{BallZone, TeamTacticalState};
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::engine::result::PlayerMatchPhysicalSnapshot;
 use crate::r#match::engine::tactics::TacticalPositions;
@@ -47,6 +48,13 @@ pub enum ShapeTrigger {
     /// after 70 minutes, drop into a mid-block").
     LeadingAfterMinute(u32),
     TrailingAfterMinute(u32),
+    /// Principles-of-Play plan (2026-08-30): active when this player's
+    /// team does NOT have the ball and the ball is in this team's own
+    /// defensive third (`BallZone::DefensiveThird`). The real-football
+    /// case this exists for: a back line that should compress toward a
+    /// shared depth/spread while defending deep, not one that only
+    /// happens to compact as a side effect of individual duel behaviour.
+    DefendingOwnThird,
 }
 
 /// Action half of a shape rule — computed relative to the player's
@@ -62,6 +70,20 @@ pub enum ShapeAction {
     TuckInside,
     /// Drop ~12% of the pitch toward own goal, same lane.
     DropDeeper,
+    /// Principles-of-Play plan (2026-08-30): converge toward the team's
+    /// shared back-line depth (`TeamTacticalState.defensive_line_x`,
+    /// already computed and phase-aware, previously only read — softly
+    /// blended — by `HoldingLineState`, one state among many a defender
+    /// can be in) and squeeze this player's own lane toward the centre
+    /// in proportion to `TeamTacticalState.compactness_target`. Unlike
+    /// the other three actions this genuinely needs team-relational
+    /// input, not just `base`/`side` — passed in as a cheap `Copy` PODs
+    /// value rather than reaching into `field.players` from inside
+    /// `ShapeRule::target`, which would need a very different signature
+    /// (and, per this plan's own explicit design note, real per-teammate
+    /// data isn't actually needed: the two team-level summaries already
+    /// exist).
+    CompactBackLine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -71,13 +93,50 @@ pub struct ShapeRule {
 }
 
 impl ShapeRule {
+    /// Whether this rule's trigger currently holds. `team` is this
+    /// player's own team's already-computed tactical snapshot — cheap
+    /// to pass (plain `Copy` POD), avoids re-deriving ball-zone/
+    /// possession logic that already exists.
+    pub fn is_active(
+        &self,
+        in_possession: bool,
+        ball_owned: bool,
+        lane: i8,
+        goals_for: u8,
+        goals_against: u8,
+        minute_now: u32,
+        team: TeamTacticalState,
+    ) -> bool {
+        match self.trigger {
+            ShapeTrigger::InPossession => in_possession,
+            ShapeTrigger::OutOfPossession => !in_possession && ball_owned,
+            ShapeTrigger::BallLeft => lane == -1,
+            ShapeTrigger::BallCenter => lane == 0,
+            ShapeTrigger::BallRight => lane == 1,
+            ShapeTrigger::Leading => goals_for > goals_against,
+            ShapeTrigger::Level => goals_for == goals_against,
+            ShapeTrigger::Trailing => goals_for < goals_against,
+            ShapeTrigger::AfterMinute(m) => minute_now >= m,
+            ShapeTrigger::LeadingAfterMinute(m) => goals_for > goals_against && minute_now >= m,
+            ShapeTrigger::TrailingAfterMinute(m) => {
+                goals_for < goals_against && minute_now >= m
+            }
+            ShapeTrigger::DefendingOwnThird => {
+                !in_possession && matches!(team.ball_zone, BallZone::DefensiveThird)
+            }
+        }
+    }
+
     /// Target position for this rule's action, relative to `base`.
+    /// `team` is this player's own team's tactical snapshot — only
+    /// consulted by `CompactBackLine`, ignored by the other three.
     pub fn target(
         &self,
         base: Vector3<f32>,
         side: PlayerSide,
         field_width: f32,
         field_height: f32,
+        team: TeamTacticalState,
     ) -> Vector3<f32> {
         let dir = match side {
             PlayerSide::Left => 1.0,
@@ -100,6 +159,29 @@ impl ShapeRule {
             }
             ShapeAction::TuckInside => {
                 Vector3::new(base.x, base.y + (centre - base.y) * 0.55, 0.0)
+            }
+            ShapeAction::CompactBackLine => {
+                // Depth converges to the team-shared line height
+                // (already phase-aware: high in Attack/HighPress, deep
+                // in LowBlock — see TeamTacticalState's own doc
+                // comments). Lateral position squeezes this player's
+                // own lane toward the centre in proportion to
+                // `compactness_target` (0 = keep the formation's own
+                // spread, ~0.6 = squeeze most of the way to the centre
+                // at full compactness) — the same shape
+                // `HoldingLineState::calculate_lateral_position` already
+                // uses locally (`ball_offset * (0.08 + compactness *
+                // 0.18)`), generalized here into a structural rule that
+                // applies regardless of which state a defender happens
+                // to be in, rather than only when one specific state's
+                // own velocity code consults it.
+                let lane_offset = base.y - centre;
+                let squeeze = (0.15 + team.compactness_target * 0.45).clamp(0.15, 0.60);
+                Vector3::new(
+                    team.defensive_line_x.clamp(20.0, field_width - 20.0),
+                    centre + lane_offset * (1.0 - squeeze),
+                    0.0,
+                )
             }
             ShapeAction::DropDeeper => Vector3::new(
                 (base.x - dir * field_width * 0.12).clamp(20.0, field_width - 20.0),
@@ -410,6 +492,19 @@ pub struct MatchPlayer {
     /// after setup and re-captured after the halftime swap — the revert
     /// target for shape rules.
     pub shape_base: Option<Vector3<f32>>,
+    /// True for the current tick iff some rule in `shape_rules` had an
+    /// active trigger (i.e. `start_position` currently holds a computed
+    /// rule target, not just the bare `shape_base`). Set alongside
+    /// `start_position` in the engine loop's shape-rule pass
+    /// (Principles-of-Play plan, 2026-08-30). Exists so
+    /// `processor.rs::shape_rule_override_velocity` can tell "a
+    /// structural rule wants this player somewhere specific right now"
+    /// apart from "this player merely has a rule list" — without it, a
+    /// generalized override reading `start_position` unconditionally
+    /// would also force every rule-holding player back onto their bare
+    /// formation anchor whenever no rule is active, which is much
+    /// broader than intended.
+    pub shape_rule_active: bool,
     /// Team-wide directional attack bias: -1 = manager's left, 1 =
     /// right, 0 = centre. Pass-evaluator weight toward that lateral
     /// third ("build down the left").
@@ -628,6 +723,7 @@ impl MatchPlayer {
             start_anchor_y: None,
             shape_rules: Vec::new(),
             shape_base: None,
+            shape_rule_active: false,
             attack_bias: None,
             directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
@@ -726,6 +822,7 @@ impl MatchPlayer {
             start_anchor_y: None,
             shape_rules: Vec::new(),
             shape_base: None,
+            shape_rule_active: false,
             attack_bias: None,
             directness_bias: 0.0,
             is_force_match_selection,

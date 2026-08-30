@@ -3,6 +3,7 @@ use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondi
 use crate::r#match::events::Event;
 use crate::r#match::player::events::{FoulSeverity, PlayerEvent, ShootingEventContext};
 use crate::r#match::player::strategies::common::players::ops::defender_skill::DefenderSkillProfile;
+use crate::r#match::player::strategies::common::players::ops::defensive::DefensiveOperationsImpl;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::{
     ConditionContext, MatchPlayerLite, PlayerSide, StateChangeResult, StateProcessingContext,
@@ -12,12 +13,14 @@ use nalgebra::Vector3;
 #[cfg(feature = "match-logs")]
 use std::sync::atomic::Ordering;
 
-const TACKLE_DISTANCE_THRESHOLD: f32 = 10.0; // ~1.25m — proper engagement range.
-// Previously 14u (~1.75m). Even with that, attempts ran at 174/team/match
-// because longer possessions in attacking zones create more chances to
-// hit the gate. 10u forces actual contact range — a defender who's
-// still half a stride away has to keep pressing rather than committing
-// to a slide that won't connect.
+// 2026-08-30 (engine-audit Module 6): this file's own attempt-gate
+// distance is now `DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE`
+// (still 10.0 — ~1.25m — proper engagement range; previously 14u/~1.75m,
+// raised because attempts ran at 174/team/match, longer possessions in
+// attacking zones creating more chances to hit the gate; 10u forces
+// actual contact range). Centralized so the 7 outer defender states that
+// transition INTO this one can never drift out of sync with it again —
+// see that constant's own doc comment for the full history.
 const PRESSING_DISTANCE: f32 = 80.0;
 const RETURN_DISTANCE: f32 = 120.0;
 
@@ -82,7 +85,7 @@ impl StateProcessingHandler for DefenderTacklingState {
             }
 
             // If opponent is close but not in tackle range, keep pressing
-            if distance_to_opponent > TACKLE_DISTANCE_THRESHOLD {
+            if distance_to_opponent > DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE {
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::DEF_GATE_NOT_IN_RANGE.fetch_add(1, Ordering::Relaxed);
                 return Some(StateChangeResult::with_defender_state(
@@ -482,7 +485,7 @@ impl DefenderTacklingState {
                 ball_position + ball_velocity.normalize() * ball_travel_distance;
             let player_intercept_distance = (ball_intercept_position - player_position).magnitude();
 
-            player_intercept_distance <= TACKLE_DISTANCE_THRESHOLD
+            player_intercept_distance <= DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE
         } else {
             false
         }

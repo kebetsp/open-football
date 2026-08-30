@@ -3,6 +3,7 @@ use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondi
 use crate::r#match::events::Event;
 use crate::r#match::player::events::{FoulSeverity, PlayerEvent, ShootingEventContext};
 use crate::r#match::player::strategies::common::players::ops::defender_skill::DefenderSkillProfile;
+use crate::r#match::player::strategies::common::players::ops::defensive::DefensiveOperationsImpl;
 use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
 use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
@@ -22,7 +23,12 @@ use std::sync::atomic::Ordering;
 // steering instead of Pressing's lead-time+goalside-bias closing
 // algorithm. Measured: DEF_GATE_NOT_IN_RANGE fired 1800-4700 times/match
 // (vs 5-18 real attempts) because of this exact mismatch.
-const TACKLING_DISTANCE_THRESHOLD: f32 = 10.0;
+//
+// 2026-08-30 (engine-audit Module 6): the local constant this fix
+// introduced is now `DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE`
+// — the same mismatch, independently reintroduced, was found live in 6
+// more defender states that never picked up this fix. One shared source
+// now backs every transition site instead of 8 separate copies.
 const BASE_PRESSING_DISTANCE: f32 = 45.0;
 const MAX_PRESSING_BONUS: f32 = 35.0; // effective range: 45-80
 const BASE_PRESSING_DISTANCE_DEFENSIVE_THIRD: f32 = 40.0;
@@ -87,9 +93,7 @@ impl StateProcessingHandler for DefenderPressingState {
             // to the role-based coordination below (Cover/Marking/
             // HoldingLine) instead — a real defender who just missed a
             // tackle jockeys/covers, he doesn't keep re-lunging.
-            if distance_to_opponent < TACKLING_DISTANCE_THRESHOLD
-                && ctx.player.can_attempt_tackle()
-            {
+            if ctx.player().defensive().can_engage_tackle(distance_to_opponent) {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Tackling,
                 ));
@@ -107,7 +111,7 @@ impl StateProcessingHandler for DefenderPressingState {
             // chase_ball()` conventions the normal engage above already
             // uses, so it can't fire on repeat every tick or pile up
             // multiple defenders on the same ball.
-            if distance_to_opponent >= TACKLING_DISTANCE_THRESHOLD
+            if distance_to_opponent >= DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE
                 && ctx.player.can_attempt_tackle()
                 && ctx.team().is_best_player_to_chase_ball()
                 && dv::desperate_slide_value(ctx, &opponent, def_profile.tackle_profile) > 0.0
@@ -209,7 +213,32 @@ impl StateProcessingHandler for DefenderPressingState {
             let mobility = sc::mobility(ctx.player, minute);
             let press_composite = 0.65 * def_profile.press_profile + 0.35 * mobility;
             let press_boost = (1.40 + (press_composite - 0.50) * 0.50).clamp(1.15, 1.65);
-            let speed = pace * press_boost;
+
+            // realism-bug (2026-08-30, shot/cross-block investigation,
+            // defenders first — see docs/defensive-decision-logic-spec.md):
+            // "block shots and crosses" needs someone to actually get
+            // there before the strike, not just react afterward
+            // (`shot_block_reaction_velocity`, processor.rs) or once
+            // already glued into Tackling range (the D1-D6
+            // tackle/contain/concede-out comparison below). Reuses the
+            // SAME danger primitive `contain_value`/`concede_out_value`
+            // already trust — `value_conceded_if_beaten` (self shot
+            // danger OR best-teammate delivery danger, discounted by
+            // cover) — rather than inventing a second "is this
+            // dangerous" reading: real doctrine is a defender doesn't
+            // close down a harmless sideways ball at the same urgency
+            // as a striker with a live sight of goal. Multiplicative,
+            // bounded to a modest ceiling (comparable to `press_boost`'s
+            // own ±25% spread around its 1.40 base) so this nudges
+            // closing speed rather than producing an implausible sprint.
+            // Reasoned magnitude, category (d) — no dataset publishes
+            // "closing speed vs. shot danger," flagged as an estimate
+            // like every other new constant in this investigation.
+            let danger = dv::value_conceded_if_beaten(ctx, &opponent);
+            const URGENCY_SPEED_BOOST: f32 = 0.35;
+            let urgency_boost = 1.0 + danger * URGENCY_SPEED_BOOST;
+
+            let speed = pace * press_boost * urgency_boost;
 
             // Crude lead time: distance / (our speed). If the carrier is
             // moving quickly, aim ahead along their velocity so we meet

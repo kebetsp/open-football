@@ -41,11 +41,23 @@ impl StateProcessingHandler for DefenderInterceptingState {
             ));
         }
 
-        // Opponent with ball close — switch to tackling
-        if ball_distance < 25.0 {
-            return Some(StateChangeResult::with_defender_state(
-                DefenderState::Tackling,
-            ));
+        // Opponent with ball close — switch to tackling. 2026-08-30
+        // (engine-audit Module 6): this used to check the BALL's own
+        // distance against a bare 25.0 — 15u looser than Tackling's real
+        // 10u gate (so it bounced straight back out), and it never
+        // checked cooldown, AND ball_distance is only an approximation
+        // of the actual carrier's distance. Now checks the real opponent
+        // (matching Tackling's own precondition) through the shared gate.
+        if let Some(ball_carrier) = ctx.players().opponents().with_ball().next() {
+            if ctx
+                .player()
+                .defensive()
+                .can_engage_tackle(ball_carrier.distance(ctx))
+            {
+                return Some(StateChangeResult::with_defender_state(
+                    DefenderState::Tackling,
+                ));
+            }
         }
 
         // Only abandon interception if ball is moving away AND is far

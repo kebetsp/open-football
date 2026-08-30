@@ -308,6 +308,38 @@ impl<'p> DefensiveOperationsImpl<'p> {
         }
     }
 
+    /// Distance at which ANY defender-role state may legally transition
+    /// into `DefenderState::Tackling`. Must exactly match
+    /// `DefenderTacklingState`'s own attempt-gate distance
+    /// (`TACKLE_DISTANCE_THRESHOLD`) — a looser outer-state threshold
+    /// means the transition fires, then bounces straight back out the
+    /// instant `Tackling::process()` runs its own check, repeating every
+    /// tick for as long as the mismatch condition holds (see
+    /// engine-audit-results.md, Module 6).
+    ///
+    /// Centralized 2026-08-30 after the 2026-07-27 Pressing fix (which
+    /// found and corrected exactly this mismatch, 25u vs the real 10u
+    /// gate) turned out to have fixed only 1 of 8 transition sites — the
+    /// identical bug, independently reintroduced, was still live in
+    /// covering/intercepting/marking/guarding/standing/holding_line/
+    /// walking, none of them sharing a constant with Tackling or with
+    /// each other. One source of truth now closes off the whole class,
+    /// not just the instance that happened to get noticed.
+    pub const TACKLE_ENGAGEMENT_DISTANCE: f32 = 10.0;
+
+    /// Whether a defender-role state is close enough, and off cooldown,
+    /// to legally transition into `Tackling` right now. Centralizes
+    /// both halves of the gate `Tackling` itself enforces on entry, so a
+    /// transition only ever fires when it will actually be accepted —
+    /// the previous per-site pattern duplicated the distance check with
+    /// its own local constant (values ranging 15u-40u across the 7
+    /// broken sites) and never checked the cooldown at all, so even a
+    /// distance-correct site could still fire a doomed transition while
+    /// the player was on tackle cooldown.
+    pub fn can_engage_tackle(&self, distance_to_opponent: f32) -> bool {
+        distance_to_opponent < Self::TACKLE_ENGAGEMENT_DISTANCE && self.ctx.player.can_attempt_tackle()
+    }
+
     /// Find the own team's defensive line position — single-pass, zero allocation
     pub fn find_own_defensive_line(&self) -> f32 {
         let (sum, count) = self

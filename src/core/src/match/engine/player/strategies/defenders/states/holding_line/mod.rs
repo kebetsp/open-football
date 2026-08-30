@@ -43,7 +43,7 @@ impl StateProcessingHandler for DefenderHoldingLineState {
         if ctx.player().defensive().is_box_emergency_for_me() {
             if let Some(carrier) = ctx.players().opponents().with_ball().next() {
                 let d = carrier.distance(ctx);
-                if d < 25.0 {
+                if ctx.player().defensive().can_engage_tackle(d) {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Tackling,
                     ));
@@ -99,7 +99,7 @@ impl StateProcessingHandler for DefenderHoldingLineState {
                 ctx.player().defensive().defensive_role_for_ball_carrier_unified(),
                 DefensiveRole::Primary
             );
-            if distance < 25.0 && is_primary {
+            if ctx.player().defensive().can_engage_tackle(distance) && is_primary {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Tackling,
                 ));

@@ -463,6 +463,22 @@ fn setup_player_on_field(
                         action: ShapeAction::HoldWidth,
                     });
                 }
+                // Principles-of-Play plan (2026-08-30, first slice): the
+                // one Principle that never existed in any form —
+                // defensive compactness as a real, enforced, team-level
+                // property, not an emergent side effect of individual
+                // duel/marking behaviour. Mutually exclusive in practice
+                // with the width rule above (its trigger requires being
+                // out of possession with the ball in our own defensive
+                // third; width's requires being in possession), so
+                // pushing it after HoldWidth doesn't change which one
+                // fires when.
+                if player.tactical_position.current_position.is_defender() {
+                    player.shape_rules.push(ShapeRule {
+                        trigger: ShapeTrigger::DefendingOwnThird,
+                        action: ShapeAction::CompactBackLine,
+                    });
+                }
                 players.push(player);
             }
         }

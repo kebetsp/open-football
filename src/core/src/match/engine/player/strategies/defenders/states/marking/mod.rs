@@ -8,7 +8,12 @@ use crate::r#match::{
 };
 use nalgebra::Vector3;
 
-const TACKLING_DISTANCE_THRESHOLD: f32 = 10.0; // Aggressive tackle when marking — don't let attacker turn
+// 2026-08-30 (engine-audit Module 6): the local
+// `TACKLING_DISTANCE_THRESHOLD = 10.0` this file used to define happened
+// to already match Tackling's own gate by coincidence — it still never
+// checked the tackle cooldown, and the box-emergency branch below used
+// an entirely different, unfixed 25.0. Both now route through the
+// shared `DefensiveOperationsImpl::can_engage_tackle`.
 const STAMINA_THRESHOLD: f32 = 20.0; // Minimum stamina to continue marking
 const BALL_PROXIMITY_THRESHOLD: f32 = 15.0; // Increased from 10.0 - react earlier to ball
 const HEADING_HEIGHT: f32 = 1.5;
@@ -26,7 +31,7 @@ impl StateProcessingHandler for DefenderMarkingState {
         if ctx.player().defensive().is_box_emergency_for_me() {
             if let Some(carrier) = ctx.players().opponents().with_ball().next() {
                 let d = carrier.distance(ctx);
-                if d < 25.0 {
+                if ctx.player().defensive().can_engage_tackle(d) {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Tackling,
                     ));
@@ -74,7 +79,11 @@ impl StateProcessingHandler for DefenderMarkingState {
 
             // Priority: If opponent with ball is close, press/tackle immediately
             if opponent.has_ball(ctx) {
-                if distance_to_opponent < TACKLING_DISTANCE_THRESHOLD {
+                if ctx
+                    .player()
+                    .defensive()
+                    .can_engage_tackle(distance_to_opponent)
+                {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Tackling,
                     ));

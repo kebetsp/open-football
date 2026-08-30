@@ -148,10 +148,22 @@ impl StateProcessingHandler for DefenderRunningState {
             if ctx.team().counterpress_window() {
                 if let Some(opponent) = ctx.players().opponents().with_ball().next() {
                     let role = ctx.player().defensive().defensive_role_for_ball_carrier_unified();
-                    let immediate = opponent.distance(ctx) < 30.0;
+                    let distance_to_opponent = opponent.distance(ctx);
+                    let immediate = distance_to_opponent < 30.0;
                     let elected = role == DefensiveRole::Primary
                         && ctx.player().pressure().should_counterpress();
-                    if immediate || elected {
+                    // 2026-08-30 (engine-audit Module 6): `immediate`/
+                    // `elected` decide WHETHER to engage; the transition
+                    // itself still needs the shared distance+cooldown
+                    // gate, or it bounces straight back out of Tackling
+                    // next tick (was a bare `< 30.0`, 20u looser, plus
+                    // `elected` had no distance check at all).
+                    if (immediate || elected)
+                        && ctx
+                            .player()
+                            .defensive()
+                            .can_engage_tackle(distance_to_opponent)
+                    {
                         return Some(StateChangeResult::with_defender_state(
                             DefenderState::Tackling,
                         ));
@@ -209,26 +221,61 @@ impl StateProcessingHandler for DefenderRunningState {
             // them is the right football picture.
             if let Some(opponent) = ctx.players().opponents().with_ball().next() {
                 let ball_dist = ctx.ball().distance();
+                let distance_to_opponent = opponent.distance(ctx);
                 let is_primary = matches!(
                     ctx.player().defensive().defensive_role_for_ball_carrier_unified(),
                     DefensiveRole::Primary
                 );
                 let is_emergency = ctx.player().defensive().is_box_emergency_for_me();
-                // Very close — only the designated closer tackles
-                if ball_dist < 30.0 && (is_primary || is_emergency) {
-                    return Some(StateChangeResult::with_defender_state(
-                        DefenderState::Tackling,
-                    ));
+                // Very close — only the designated closer tackles.
+                // 2026-08-30 (engine-audit Module 6): was `ball_dist <
+                // 30.0` — the BALL's distance, not the carrier's, 20u
+                // looser than Tackling's real 10u gate, no cooldown
+                // check. Now uses the real opponent distance through the
+                // shared gate; falls back to Pressing (closing the gap)
+                // when not genuinely in range yet, same convention as
+                // every other fixed state — preserves this branch's own
+                // 30u "should I even try" band as the Pressing fallback
+                // condition.
+                if is_primary || is_emergency {
+                    if ctx
+                        .player()
+                        .defensive()
+                        .can_engage_tackle(distance_to_opponent)
+                    {
+                        return Some(StateChangeResult::with_defender_state(
+                            DefenderState::Tackling,
+                        ));
+                    }
+                    if ball_dist < 30.0 {
+                        return Some(StateChangeResult::with_defender_state(
+                            DefenderState::Pressing,
+                        ));
+                    }
                 }
-                // Best-positioned chase at medium range
-                if ball_dist < 100.0 && ctx.team().is_best_player_to_chase_ball() {
-                    return Some(StateChangeResult::with_defender_state(
-                        DefenderState::Tackling,
-                    ));
+                // Best-positioned chase at medium range. Was `ball_dist
+                // < 100.0` — a 90u dead zone, the worst mismatch found in
+                // this whole sweep.
+                if ctx.team().is_best_player_to_chase_ball() {
+                    if ctx
+                        .player()
+                        .defensive()
+                        .can_engage_tackle(distance_to_opponent)
+                    {
+                        return Some(StateChangeResult::with_defender_state(
+                            DefenderState::Tackling,
+                        ));
+                    }
+                    if ball_dist < 100.0 {
+                        return Some(StateChangeResult::with_defender_state(
+                            DefenderState::Pressing,
+                        ));
+                    }
                 }
                 // Carrier running AT us — still engage (we're the wall).
                 // Gate this too so a carrier cutting across a line of
-                // defenders doesn't trigger all of them.
+                // defenders doesn't trigger all of them. Was `ball_dist <
+                // 80.0`.
                 if ball_dist < 80.0 && (is_primary || is_emergency) {
                     let carrier_vel = ctx.tick_context.positions.players.velocity(opponent.id);
                     let carrier_speed = carrier_vel.magnitude();
@@ -236,8 +283,17 @@ impl StateProcessingHandler for DefenderRunningState {
                         let to_defender = (ctx.player.position - opponent.position).normalize();
                         let approach = carrier_vel.normalize().dot(&to_defender);
                         if approach > 0.3 {
+                            if ctx
+                                .player()
+                                .defensive()
+                                .can_engage_tackle(distance_to_opponent)
+                            {
+                                return Some(StateChangeResult::with_defender_state(
+                                    DefenderState::Tackling,
+                                ));
+                            }
                             return Some(StateChangeResult::with_defender_state(
-                                DefenderState::Tackling,
+                                DefenderState::Pressing,
                             ));
                         }
                     }
@@ -554,9 +610,26 @@ impl DefenderRunningState {
             // Defensive transition — the one closest defender engages,
             // others recover shape.
             GamePhase::DefensiveTransition => {
+                // 2026-08-30 (engine-audit Module 6): the Tackling
+                // transition here was unconditional on a `ball_dist <
+                // 40.0` proxy — 30u looser than Tackling's real 10u
+                // gate, no cooldown check. Now routes through the shared
+                // gate; falls back to Pressing (closing the gap) inside
+                // the same 40u "should I chase" band otherwise.
                 if ball_dist < 40.0 && ctx.team().is_best_player_to_chase_ball() {
+                    if let Some(opponent) = ctx.players().opponents().with_ball().next() {
+                        if ctx
+                            .player()
+                            .defensive()
+                            .can_engage_tackle(opponent.distance(ctx))
+                        {
+                            return Some(StateChangeResult::with_defender_state(
+                                DefenderState::Tackling,
+                            ));
+                        }
+                    }
                     return Some(StateChangeResult::with_defender_state(
-                        DefenderState::Tackling,
+                        DefenderState::Pressing,
                     ));
                 }
                 if !near_start {

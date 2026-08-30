@@ -7,7 +7,12 @@ use crate::r#match::{
 };
 use nalgebra::Vector3;
 
-const TACKLING_DISTANCE_THRESHOLD: f32 = 2.0;
+// 2026-08-30 (engine-audit Module 6): the local
+// `TACKLING_DISTANCE_THRESHOLD = 2.0` this file used to define was the
+// OPPOSITE mismatch from every other site in this sweep — 8u TIGHTER
+// than Tackling's real 10u gate, meaning a pushed-up defender almost
+// never got to actually challenge (he had to be standing essentially on
+// top of the opponent). Now uses the shared, correct gate.
 const PRESSING_DISTANCE_THRESHOLD: f32 = 20.0;
 const STAMINA_THRESHOLD: f32 = 30.0;
 const FIELD_THIRD_THRESHOLD: f32 = 0.33;
@@ -46,12 +51,22 @@ impl StateProcessingHandler for DefenderPushingUpState {
             if let Some(opponent) = ctx
                 .players()
                 .opponents()
-                .nearby(TACKLING_DISTANCE_THRESHOLD)
+                // 2026-08-30 (engine-audit Module 6): widened from the
+                // old TACKLING_DISTANCE_THRESHOLD (2.0, tighter than the
+                // real 10u tackle gate) to the broader radius this block
+                // already uses for its own Pressing check — otherwise a
+                // genuinely-in-range opponent could be invisible to this
+                // candidate search before the distance check even runs.
+                .nearby(PRESSING_DISTANCE_THRESHOLD)
                 .next()
             {
                 let distance_to_opponent = ctx.tick_context.grid.get(opponent.id, ctx.player.id);
 
-                if distance_to_opponent <= TACKLING_DISTANCE_THRESHOLD {
+                if ctx
+                    .player()
+                    .defensive()
+                    .can_engage_tackle(distance_to_opponent)
+                {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Tackling,
                     ));

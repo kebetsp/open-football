@@ -373,13 +373,24 @@ impl<'p> StateProcessor<'p> {
         // docs/ball-distribution-fix-plan.md §11/§12) — that's an open
         // question about the DoD metrics themselves, not something to
         // resolve by watering down the override for goals' sake.
-        const WIDTH_OVERRIDE_BLEND_WEIGHT: f32 = 1.0;
-        if let Some(velocity) = Self::width_hold_override_velocity(&processing_ctx) {
+        // Principles-of-Play plan (2026-08-30): generalized from
+        // `width_hold_override_velocity` (which only ever pursued the
+        // HoldWidth target) to any currently-active `ShapeRule`, since
+        // `player.start_position` already holds whatever that rule
+        // computed this tick (`engine/run.rs`'s shape-rule pass) —
+        // width and the new back-line-compactness rule both flow
+        // through the same generic pursuit, no per-action branching
+        // needed here. Subsumes the old function outright rather than
+        // running both side by side (double-application risk: both
+        // would fire for the same player/tick under the old width-only
+        // gating, since a wide defender can carry both rules).
+        const SHAPE_OVERRIDE_BLEND_WEIGHT: f32 = 1.0;
+        if let Some(velocity) = Self::shape_rule_override_velocity(&processing_ctx) {
             let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
             let base = result.velocity.unwrap_or_else(Vector3::zeros);
             result.velocity = Some(
-                (base * (1.0 - WIDTH_OVERRIDE_BLEND_WEIGHT)
-                    + velocity * WIDTH_OVERRIDE_BLEND_WEIGHT)
+                (base * (1.0 - SHAPE_OVERRIDE_BLEND_WEIGHT)
+                    + velocity * SHAPE_OVERRIDE_BLEND_WEIGHT)
                     * tempo,
             );
         }
@@ -864,28 +875,34 @@ impl<'p> StateProcessor<'p> {
         None
     }
 
-    /// Step 1-hard experiment (docs/ball-distribution-fix-plan.md §9/§10,
-    /// 2026-08-26) — see this function's call site for the full
-    /// rationale. A genuine velocity OVERRIDE (mirrors
-    /// `assignment_override_velocity`'s press/mark pattern exactly —
-    /// full replacement when active, not a blended nudge; a reward-side
-    /// nudge is exactly the category of fix this plan spent nine
-    /// attempts proving doesn't work here), not a soft anchor nudge:
-    /// for a wide-slotted role, while the player's own team controls
-    /// the ball, steer directly at the touchline point
-    /// `ShapeAction::HoldWidth` already computes (same target, stronger
-    /// enforcement). Exempts the ball carrier — their own on-ball
-    /// decision logic (`carry_candidates`/`pass_value_from`) is a
-    /// separate, more nuanced system this shouldn't fight — and anyone
-    /// without a captured `shape_base` (not yet on the field).
+    /// Originated as a width-only "Step 1-hard experiment"
+    /// (docs/ball-distribution-fix-plan.md §9/§10, 2026-08-26), then
+    /// generalized to any active `ShapeRule`
+    /// (docs/principles-of-play-structural-shape-plan.md, 2026-08-30) —
+    /// see this function's call site for the full rationale. A genuine
+    /// velocity OVERRIDE (mirrors `assignment_override_velocity`'s
+    /// press/mark pattern exactly — full replacement when active, not a
+    /// blended nudge; a reward-side nudge is exactly the category of
+    /// fix the ball-distribution plan spent nine attempts proving
+    /// doesn't work here), not a soft anchor nudge: while a structural
+    /// rule is currently active for this player, steer directly at
+    /// `player.start_position` — whatever that rule computed this tick
+    /// (`ShapeAction::HoldWidth`'s touchline point, `CompactBackLine`'s
+    /// back-line target, or any future action) — same target, stronger
+    /// enforcement than the soft "blend toward it" every state's own
+    /// velocity code otherwise gives it. Exempts the ball carrier —
+    /// their own on-ball decision logic (`carry_candidates`/
+    /// `pass_value_from`) is a separate, more nuanced system this
+    /// shouldn't fight.
     ///
-    /// Scoping (§10 thread 1): the original proof-of-concept fired in
-    /// literally any state, including mid-tackle, which is why it
-    /// needed scoping before shipping. Two exemptions, both checked
-    /// before the touchline pursuit is computed:
+    /// Scoping (§10 thread 1, carried forward unchanged): the original
+    /// width-only proof-of-concept fired in literally any state,
+    /// including mid-tackle, which is why it needed scoping before
+    /// shipping. Two exemptions, both checked before the pursuit is
+    /// computed:
     /// (1) any active Tackling state (any role) — a live 1v1 challenge
-    /// deserves the player's full attention, not being yanked out to
-    /// hold width mid-duel;
+    /// deserves the player's full attention, not being yanked out to a
+    /// structural target mid-duel;
     /// (2) `scan_for_dangerous_runs()` returning `Some` — that function
     /// is already computed relative to *this* player (`opponents().nearby`
     /// scans around `ctx.player.position`) and already excludes runners
@@ -896,17 +913,21 @@ impl<'p> StateProcessor<'p> {
     /// favourable-direction loose ball, not only a firm claim) where a
     /// dangerous opponent may still be live and shouldn't be abandoned
     /// instantly for the touchline.
-    fn width_hold_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+    fn shape_rule_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         let player = ctx.player;
-        let tactic = crate::r#match::player::strategies::common::spacing::own_tactic(ctx);
-        crate::r#match::player::strategies::common::spacing::flank_side(
-            player.tactical_position.current_position,
-            tactic,
-        )?;
-        if ctx.ball().owner_id() == Some(player.id) {
+        // `shape_rule_active` (set in `engine/run.rs` alongside
+        // `start_position` itself) is the load-bearing check: without
+        // it this would also force every rule-holding player back onto
+        // their bare `shape_base` whenever no rule is currently active
+        // (e.g. a wide player who's out of possession, or a defender
+        // with the ball deep in the opponent's third) — far broader
+        // than intended. This is the single condition that replaces
+        // the old function's own `flank_side(...)?` gate: any rule,
+        // for any role, not just HoldWidth for wide roles.
+        if !player.shape_rule_active {
             return None;
         }
-        if !ctx.team().is_control_ball() {
+        if ctx.ball().owner_id() == Some(player.id) {
             return None;
         }
         match ctx.player.state {
@@ -918,14 +939,7 @@ impl<'p> StateProcessor<'p> {
         if ctx.player().defensive().scan_for_dangerous_runs().is_some() {
             return None;
         }
-        let base = player.shape_base?;
-        let field_h = ctx.context.field_size.height as f32;
-        let target_y = if base.y < field_h / 2.0 {
-            28.0
-        } else {
-            field_h - 28.0
-        };
-        let target = Vector3::new(base.x, target_y, 0.0);
+        let target = player.start_position;
         let to_target = target - player.position;
         let dist = to_target.magnitude();
         if dist < 3.0 {

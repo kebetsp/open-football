@@ -29,7 +29,11 @@ impl StateProcessingHandler for DefenderCoveringState {
         if ctx.player().defensive().is_box_emergency_for_me() {
             if let Some(carrier) = ctx.players().opponents().with_ball().next() {
                 let d = carrier.distance(ctx);
-                if d < 25.0 {
+                // 2026-08-30 (engine-audit Module 6): was a bare `d < 25.0`
+                // — 15u looser than Tackling's own 10u attempt gate, so
+                // this fired a transition that immediately bounced back
+                // out, and never checked the tackle cooldown either.
+                if ctx.player().defensive().can_engage_tackle(d) {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Tackling,
                     ));
@@ -98,8 +102,11 @@ impl StateProcessingHandler for DefenderCoveringState {
         // Standing.
         if let Some(opponent_with_ball) = ctx.players().opponents().with_ball().next() {
             let distance = opponent_with_ball.distance(ctx);
-            // Very close — tackle immediately regardless of role.
-            if distance < 20.0 {
+            // Very close — tackle immediately regardless of role. Was a
+            // bare `distance < 20.0` (2026-08-30 engine-audit Module 6);
+            // now uses the shared gate so this can't drift from
+            // Tackling's own 10u attempt distance again.
+            if ctx.player().defensive().can_engage_tackle(distance) {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Tackling,
                 ));
