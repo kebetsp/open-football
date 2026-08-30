@@ -85,8 +85,32 @@ impl Ball {
             // is set at the moment of the shot and isn't touched by that
             // same clearing mechanism, so it survives exactly the case
             // this fallback needs.
+            //
+            // 2026-08-30 (Pavel's explicit instruction, "for this
+            // iteration"): redefined so whoever genuinely touched the
+            // ball LAST is the scorer — `last_touch_player_id` (the same
+            // field `resolve_corner_or_goal_kick` already trusts as "the
+            // true last contact, maintained by `record_touch` on every
+            // control change / block / save") now takes priority over
+            // the old owner-based chain. This is deliberate instrumentation
+            // for the shot/cross-block investigation: a shot or cross that
+            // deflects off a defender into the net should now show up as
+            // that defender's own goal, not silently re-attributed to the
+            // original attacker, so deflection-originated goals become
+            // trivially countable via the `auto_goal` flag. Verified
+            // before making this change that a clean, undeflected shot is
+            // unaffected: `handle_shoot_event` never calls `record_touch`
+            // itself, so `last_touch_player_id` stays on the shooter (set
+            // when he received/controlled the ball) all the way through
+            // an unblocked strike — it only changes when someone else
+            // (a block, parry, interception, keeper touch) genuinely
+            // makes contact, which is exactly the real-world "last touch"
+            // rule. `current_owner`/`previous_owner`/`last_shot_shooter_id`
+            // stay as fallbacks for the rare case `last_touch_player_id`
+            // is `None` (e.g. very start of a passage of play).
             let goalscorer_fallback = self
-                .current_owner
+                .last_touch_player_id
+                .or(self.current_owner)
                 .or(self.previous_owner)
                 .or_else(|| {
                     if self.cached_shot_target.is_some() {
@@ -150,47 +174,19 @@ impl Ball {
                     }
                 }
 
-                // Deflection fix: if this would be an own goal but the player only just
-                // touched the ball (deflection/failed save), credit the goal to the
-                // previous owner (the attacker who actually shot) instead.
-                // A genuine own goal requires the defender to have had meaningful possession.
-                let (final_scorer, final_is_auto_goal) =
-                    if is_auto_goal && self.ownership_duration < 30 {
-                        // Check if previous_owner is from the opposing team (the attacker)
-                        let attacker = if self.current_owner == Some(goalscorer) {
-                            self.previous_owner
-                        } else {
-                            // goalscorer came from previous_owner, check recent_passers
-                            self.recent_passers
-                                .iter()
-                                .rev()
-                                .find(|&&id| id != goalscorer)
-                                .copied()
-                        };
-
-                        if let Some(attacker_id) = attacker {
-                            if let Some(attacker_player) = context.players.by_id(attacker_id) {
-                                // Verify attacker is from the other team
-                                let attacker_would_score = match attacker_player.side {
-                                    Some(PlayerSide::Left) => goal_side != GoalSide::Home,
-                                    Some(PlayerSide::Right) => goal_side != GoalSide::Away,
-                                    _ => false,
-                                };
-                                if attacker_would_score {
-                                    // Credit the attacker — this was a deflection, not a real own goal
-                                    (attacker_id, false)
-                                } else {
-                                    (goalscorer, true)
-                                }
-                            } else {
-                                (goalscorer, true)
-                            }
-                        } else {
-                            (goalscorer, true)
-                        }
-                    } else {
-                        (goalscorer, is_auto_goal)
-                    };
+                // 2026-08-30 (Pavel's explicit instruction, "for this
+                // iteration"): this used to re-credit a short-duration
+                // touch (<300ms) back to the original attacker, on the
+                // theory that a genuine own goal requires the defender to
+                // have had meaningful possession, not just a graze. That's
+                // exactly backwards for what this iteration needs — a
+                // shot/cross that deflects off a defender and loops in is
+                // supposed to be recorded as HIS own goal (see the
+                // `goalscorer_fallback` comment above), so this
+                // re-crediting is disabled: the scorer/own-goal
+                // determination above (driven by `last_touch_player_id`)
+                // now stands as final, unconditionally.
+                let (final_scorer, final_is_auto_goal) = (goalscorer, is_auto_goal);
 
                 // Assist provider: the qualified assister captured at
                 // shot time (§9.1.1). `last_shot_assister_id` is only
