@@ -85,7 +85,27 @@ const ENGAGEMENT_DISTANCE: f32 = 20.0; // Distance at which a defender is consid
 const MIN_MARKING_SEPARATION: f32 = 15.0; // Minimum distance between defenders marking different opponents
 
 // Role assignment thresholds
-const COVER_MAX_DISTANCE: f32 = 45.0; // Too far from carrier to be useful as cover
+//
+// 2026-08-30 (defensive-positioning gap #2, flagged 2026-08-30 alongside
+// the marking-priority fix): measured via a real-match diagnostic
+// (COVERDIAG, temporary, removed after) that the second-closest
+// defender to a ball carrier (rank==1) was BEYOND the old 45u cutoff
+// 85% of the time -- median real distance 87.1u, almost double the
+// threshold, across 33,205 sampled rank-1 instances. That meant the
+// Cover role (a genuine second body between the carrier and goal,
+// exactly what Pavel's "nobody between him and GK" report was missing)
+// was almost never actually assigned -- a recovering defender fell
+// through to Help (chasing an unrelated mark) or Hold instead, every
+// time he was realistically more than ~5.6m from the carrier, which is
+// most of the time in open play. Raised to 180u (~22.5m) -- a real
+// recovery-run range a defender can plausibly still close down in time
+// to matter, per real defensive doctrine (delay/cover duty starts the
+// instant you're not the nearest body, not only once you're already
+// close) -- covering ~66% of the measured real distribution while
+// still excluding the most extreme, clearly-unreachable cases (the
+// measured distribution had no sharp natural cutoff; this is a
+// reasoned, doctrine-bounded choice, not a pure percentile fit).
+const COVER_MAX_DISTANCE: f32 = 180.0;
 const HELP_SCAN_RADIUS: f32 = 28.0; // Range in which Help defender looks for a pass option
 const COVER_GOAL_SIDE_OFFSET: f32 = 12.0; // Cover sits this far goal-side of carrier
 
