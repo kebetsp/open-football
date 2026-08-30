@@ -1437,7 +1437,31 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         if ball.pass_origin_restart == PassOriginRestart::Corner {
             return;
         }
-        if ball.current_owner.is_some() || ball.position.z < 2.0 {
+        // 2026-08-30 (Pavel's direct report, unhedged, corrected after my
+        // first fix targeted the wrong mechanism: "it looked like a
+        // shot... no defender in front of the attacker"): a genuine SHOT
+        // in flight has its own dedicated, calibrated resolution pipeline
+        // (try_block_shot / try_save_shot / check_goal) -- this generic
+        // "who wins the header off a delivery" resolver had no idea a
+        // shot could ever be live at the same time, and would silently
+        // hijack it: teleport the ball to WHATEVER defender scored best
+        // within 135u of the attacked goal (regardless of whether that
+        // defender was anywhere near the shooter) and relaunch it with a
+        // brand-new velocity, all with zero logged event. Root-caused
+        // with a real match trace: a clean, undefended FWD_RUN_VALUE_SHOOT
+        // (player 210, target [840.3,253.5]) flew normally, then at the
+        // exact tick its z crossed above 2.0 the ball's x,y jumped ~68
+        // units to a completely different position with no Claimed/
+        // Intercepted/Blocked event anywhere near it -- matching this
+        // function's own z>=2.0 gate and clean-clearance branch (which
+        // unconditionally overwrites `field.ball.position` to the
+        // "winning" defender's position) exactly. A header shot is
+        // itself already the RESOLUTION of a won aerial duel, so
+        // excluding any live cached_shot_target here is correct for
+        // headers too, not just driven shots -- there's nothing left to
+        // "contest" once a shot exists.
+        if ball.current_owner.is_some() || ball.position.z < 2.0 || ball.cached_shot_target.is_some()
+        {
             return;
         }
         let tick = context.current_tick();
