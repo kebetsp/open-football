@@ -157,7 +157,30 @@ impl StateProcessingHandler for DefenderMarkingState {
                 opponent_to_mark.position + opponent_velocity * prediction_time;
 
             let mark_dist = def_profile.ideal_marking_distance;
-            let goal_side_w = def_profile.goal_side_weight;
+
+            // realism-bug (2026-08-30, deflection-rate investigation): a
+            // temporary diagnostic (`shot_dispatch_diag`, players.rs)
+            // found that at the exact moment a shot is struck, the
+            // globally-nearest opposing outfielder is BEHIND the ball
+            // along the shot direction (structurally incapable of
+            // blocking, not merely mis-angled) in 96% of cases with no
+            // corridor candidate at all — and 88% of those have had at
+            // least ~2 seconds of settled possession beforehand (49.7%
+            // had 5-10s), ruling out "no time to recover" as the
+            // dominant explanation. The skill-based `goal_side_weight`
+            // (0.45-0.85) blends toward the BALL's own position almost
+            // as much as toward goal for an average marker — real
+            // defensive doctrine is unconditional once a mark is inside
+            // realistic shooting range: stay strictly goal-side, jockey
+            // laterally, never let him in behind you. Ramp the blend
+            // toward fully goal-side (no ball-side pull at all) the
+            // closer the mark gets to goal, using the same `80.0`u
+            // shooting-danger threshold `DefenderPressingState`'s own
+            // `shot_zone_bias` already established for an analogous
+            // purpose — reused, not reinvented.
+            let dist_to_goal = (own_goal - opponent_future_position).magnitude();
+            let danger_ramp = (1.0 - (dist_to_goal / 80.0)).clamp(0.0, 1.0);
+            let goal_side_w = def_profile.goal_side_weight + (1.0 - def_profile.goal_side_weight) * danger_ramp;
 
             let to_goal = (own_goal - opponent_future_position).normalize();
             let goal_side_offset = to_goal * mark_dist * goal_side_w;

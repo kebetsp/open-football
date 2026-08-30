@@ -1597,7 +1597,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             minute_now,
                             team_tactical,
                         ) {
-                            target = rule.target(base, side, w, h, team_tactical);
+                            target = rule.target(base, side, w, h, team_tactical, ball_y);
                             rule_active = true;
                             break;
                         }

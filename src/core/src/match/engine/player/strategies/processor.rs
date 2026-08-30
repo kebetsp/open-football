@@ -416,6 +416,17 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
+        // realism-bug (2026-08-30, deflection-rate investigation):
+        // pre-shot corridor cover. Applied AFTER wide-run tracking and
+        // BEFORE the reactive shot-block lunge, so an already-live shot
+        // (a strictly better, real-trajectory signal) still wins outright
+        // — this function also re-checks that itself and hands off
+        // cleanly. No tempo multiplier — getting goal-side of a live
+        // shooting threat is a defensive urgency, not tempo-scaled.
+        if let Some(velocity) = Self::shot_lane_cover_override_velocity(&processing_ctx) {
+            result.velocity = Some(velocity);
+        }
+
         // realism-bug (2026-08-26): reactive shot-block lunge. Applied
         // AFTER the assignment override so an explicit press/mark target
         // still wins outright (also re-checked inside the function
@@ -1039,6 +1050,160 @@ impl<'p> StateProcessor<'p> {
         let max_speed = player
             .skills
             .max_speed_with_condition(player.player_attributes.condition);
+        Some(to_target.normalize() * max_speed)
+    }
+
+    /// realism-bug (2026-08-30, deflection-rate investigation): a
+    /// genuine pre-shot corridor gap, not (only) an in-flight
+    /// reaction-time one. A temporary diagnostic (`shot_dispatch_diag`,
+    /// `player/events/players.rs`) measured the shot corridor at the
+    /// exact instant of dispatch (t=0, before any in-flight reaction
+    /// has a chance to matter): ~83% of open-play shots have NO
+    /// opposing outfielder anywhere near the eventual shot line at all,
+    /// even though a raw "is anyone nearby" control measure shows a
+    /// defender is typically only ~4.7m from the shooter — he's usually
+    /// the player who was just beaten (behind/beside the shooter), not
+    /// one positioned goal-side on the shooting lane.
+    ///
+    /// `DefensiveOperationsImpl::cover_target_position()` already
+    /// computes the right predictive point (goal-side of the carrier,
+    /// on the line toward goal centre — the best guess available before
+    /// the shot direction itself is known) and `DefenderCoveringState`
+    /// already steers toward it — but only softly, from inside a
+    /// specific FSM state a real defender doesn't reliably occupy at
+    /// the moment that matters (role reassignment, a tether blend
+    /// toward the formation anchor, a dampened recovery-run speed).
+    /// This promotes the same target to a hard override — the identical
+    /// "an override wins the tick outright, a state-internal nudge
+    /// doesn't" pattern already proven for width/shape/offside/the
+    /// reactive shot-block lunge just below — so the single best-placed
+    /// (rank-1 `Cover`) defender actually reaches the shot-blocking line
+    /// at full pace, continuously, whenever an opponent is genuinely in
+    /// shooting range, rather than merely being nudged toward it.
+    ///
+    /// Yields cleanly (returns `None`) the instant a shot is actually
+    /// struck — `shot_block_reaction_velocity` below then takes over,
+    /// since it targets the real, live trajectory, a strictly better
+    /// signal than this function's predictive "toward goal centre"
+    /// proxy for where the shot will actually go.
+    fn shot_lane_cover_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None; // an explicit assignment always wins
+        }
+        // Matches `defensive_role_for_ball_carrier_unified`'s own pool
+        // (every defender plus every reachable midfielder) — restricting
+        // this to defenders only would silently starve the override
+        // whenever the true rank-1 covering player is a tracked-back
+        // midfielder, since role is computed per-caller and only one
+        // player can genuinely hold rank 1.
+        let position = player.tactical_position.current_position;
+        if !(position.is_defender() || position.is_midfielder()) {
+            return None;
+        }
+        if matches!(
+            ctx.player.state,
+            Defender(DefenderState::Tackling) | Midfielder(MidfielderState::Tackling)
+        ) {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None; // can't cover the shot line while carrying the ball
+        }
+        if ctx.tick_context.ball.cached_shot_target.is_some() {
+            return None; // a shot is already live — shot_block_reaction_velocity owns this
+        }
+        let carrier = ctx.players().opponents().with_ball().next()?;
+        let own_goal = ctx.ball().direction_to_own_goal();
+        if (own_goal - carrier.position).magnitude() > 220.0 {
+            return None; // matches evaluate_forward_shot_decision's own shooting-range cap
+        }
+        if ctx.player().defensive().defensive_role_for_ball_carrier_unified()
+            != crate::r#match::player::strategies::common::players::ops::defensive::DefensiveRole::Cover
+        {
+            return None; // only the single best-placed covering defender takes this duty
+        }
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        // Lead-adjusted target, not `cover_target_position()`'s raw
+        // instantaneous point. Measured with a temporary diagnostic
+        // (`COVEROVERRIDEDIAG`): the override fired ~2700 ticks/match but
+        // the covering defender's average distance to the un-led target
+        // stayed ~57-58u the whole time — never converging. Root cause,
+        // same class already diagnosed for the 2026-07-27 "round the
+        // keeper" investigation: a carrier running toward goal drags the
+        // "goal-side of the carrier" target along with him at up to his
+        // own full pace, so a defender merely chasing the current point
+        // only closes the gap by the (often near-zero) DIFFERENCE in
+        // their speeds, not his own full speed. Predicting the carrier's
+        // position `lead_ticks` ahead (mirroring `DefenderPressingState`'s
+        // own "crude lead time" pattern) lets the defender aim at where
+        // the corridor will actually be by the time he can get there,
+        // rather than perpetually chasing where it was.
+        let base_dist = (carrier.position - player.position).magnitude();
+        let lead_ticks = if max_speed > 0.01 {
+            (base_dist / max_speed).min(30.0)
+        } else {
+            0.0
+        };
+        let carrier_velocity = carrier.velocity(ctx);
+        let predicted_carrier_pos = carrier.position + carrier_velocity * lead_ticks;
+        let to_goal_dir = (own_goal - predicted_carrier_pos).normalize();
+        // 12.0 mirrors `DefensiveOperationsImpl::COVER_GOAL_SIDE_OFFSET`
+        // (private to defensive.rs) — same real-world "sit a body's
+        // width goal-side of the play" depth, applied to the predicted
+        // point instead of the raw current one.
+        let target = predicted_carrier_pos + to_goal_dir * 12.0;
+        let to_target = target - player.position;
+        let dist = to_target.magnitude();
+        #[cfg(feature = "match-logs")]
+        {
+            use crate::r#match::engine::player::events::players::shot_dispatch_diag as sdd;
+            use crate::r#match::PlayerSide;
+            use std::sync::atomic::Ordering;
+            sdd::COVER_OVERRIDE_TICKS.fetch_add(1, Ordering::Relaxed);
+            sdd::COVER_OVERRIDE_SUM_DIST_X100.fetch_add((dist * 100.0) as u64, Ordering::Relaxed);
+            let (last_id_atomic, run_start_atomic, run_ticks_atomic, my_id) = match player.side {
+                Some(PlayerSide::Left) => (
+                    &sdd::LAST_COVER_ID_HOME,
+                    &sdd::RUN_START_DIST_X100_HOME,
+                    &sdd::RUN_TICKS_HOME,
+                    player.id as u64,
+                ),
+                _ => (
+                    &sdd::LAST_COVER_ID_AWAY,
+                    &sdd::RUN_START_DIST_X100_AWAY,
+                    &sdd::RUN_TICKS_AWAY,
+                    player.id as u64,
+                ),
+            };
+            let prev = last_id_atomic.swap(my_id, Ordering::Relaxed);
+            let run_ticks = if prev == my_id {
+                sdd::COVER_SAME_TICKS.fetch_add(1, Ordering::Relaxed);
+                run_ticks_atomic.fetch_add(1, Ordering::Relaxed) + 1
+            } else {
+                // New run (either a genuine switch or the very first tick
+                // ever) — reset the start-distance baseline and counter.
+                if prev != 0 {
+                    sdd::COVER_SWITCH_TICKS.fetch_add(1, Ordering::Relaxed);
+                }
+                run_start_atomic.store((dist * 100.0) as u64, Ordering::Relaxed);
+                run_ticks_atomic.store(0, Ordering::Relaxed);
+                0
+            };
+            let run_start_dist = run_start_atomic.load(Ordering::Relaxed) as f64 / 100.0;
+            let progress_x100 = ((run_start_dist - dist as f64) * 100.0) as i64;
+            sdd::PROGRESS_SUM_X100.fetch_add(progress_x100, Ordering::Relaxed);
+            sdd::PROGRESS_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            if run_ticks >= 100 {
+                sdd::LATE_PROGRESS_SUM_X100.fetch_add(progress_x100, Ordering::Relaxed);
+                sdd::LATE_PROGRESS_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if dist < 2.0 {
+            return Some(Vector3::zeros());
+        }
         Some(to_target.normalize() * max_speed)
     }
 

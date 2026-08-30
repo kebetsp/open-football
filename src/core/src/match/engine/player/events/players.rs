@@ -27,6 +27,151 @@ use crate::r#match::player::strategies::players::ops::forward_shot_decision::tim
 use log::debug;
 use nalgebra::Vector3;
 
+/// TEMPORARY realism-bug diagnostic (2026-08-30, deflection-rate
+/// investigation): at the exact instant a shot is dispatched, is a
+/// defender already close to / aligned with the chosen shot line, or is
+/// the corridor simply empty from the start? Distinct from
+/// `Ball::interactions::block_diag`, which samples every tick a shot is
+/// LIVE (post-dispatch) — this samples t=0 only, so it isolates whether
+/// pre-shot positioning (not in-flight reaction time) is the bottleneck.
+/// Remove once the investigation concludes.
+#[cfg(feature = "match-logs")]
+pub mod shot_dispatch_diag {
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    pub static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+    /// A defender within the real BLOCK_CORRIDOR (14u) of the shot line,
+    /// within BLOCK_LOOKAHEAD (40u) ahead of the shooter, at t=0.
+    pub static IN_CORRIDOR_AT_DISPATCH: AtomicU64 = AtomicU64::new(0);
+    /// Ahead of the shooter within 40u, within 60u straight-line, but
+    /// outside the 14u corridor — a genuine near-miss at t=0.
+    pub static NEAR_MISS_AT_DISPATCH: AtomicU64 = AtomicU64::new(0);
+    /// Nobody at all ahead of the shooter within 40u/60u straight-line.
+    pub static EMPTY_AT_DISPATCH: AtomicU64 = AtomicU64::new(0);
+    pub static SUM_MIN_PERP_X100: AtomicU64 = AtomicU64::new(0);
+    pub static MIN_PERP_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    /// Nearest opposing outfielder's straight-line distance to the
+    /// shooter at dispatch, regardless of alignment — the "is anyone
+    /// even nearby at all" control measurement.
+    pub static SUM_NEAREST_DIST_X100: AtomicU64 = AtomicU64::new(0);
+    pub static NEAREST_DIST_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    /// How often `shot_lane_cover_override_velocity` (processor.rs) is
+    /// even eligible to fire (a Cover-ranked defender exists, checked
+    /// once per tick), vs. how far its target actually is from the
+    /// player at that moment — lets us tell "the override never
+    /// applies" apart from "it applies but doesn't close the gap."
+    pub static COVER_OVERRIDE_TICKS: AtomicU64 = AtomicU64::new(0);
+    pub static COVER_OVERRIDE_SUM_DIST_X100: AtomicU64 = AtomicU64::new(0);
+    /// Role-thrash check: does the SAME player hold the rank-1 `Cover`
+    /// role for a sustained run of consecutive ticks, or does it flip
+    /// between different defenders tick-to-tick (which would explain why
+    /// `avg_dist_to_target` never converges regardless of lead
+    /// prediction — nobody ever gets enough consecutive ticks pursuing
+    /// the SAME target to close the gap). One tracked player per team
+    /// (home/away), sentinel 0 = "no prior tick recorded yet".
+    pub static LAST_COVER_ID_HOME: AtomicU64 = AtomicU64::new(0);
+    pub static LAST_COVER_ID_AWAY: AtomicU64 = AtomicU64::new(0);
+    pub static COVER_SAME_TICKS: AtomicU64 = AtomicU64::new(0);
+    pub static COVER_SWITCH_TICKS: AtomicU64 = AtomicU64::new(0);
+    /// Convergence check, per side: the distance recorded at the FIRST
+    /// tick of a run (reset whenever the covering player changes), so
+    /// every later tick in that same run can report net progress
+    /// (positive = closing the gap, ~0/negative = a pursuit that isn't
+    /// actually gaining ground — the "chasing a target moving at a
+    /// comparable speed" failure mode already diagnosed once for the
+    /// 2026-07-27 "round the keeper" investigation).
+    pub static RUN_START_DIST_X100_HOME: AtomicU64 = AtomicU64::new(0);
+    pub static RUN_START_DIST_X100_AWAY: AtomicU64 = AtomicU64::new(0);
+    pub static RUN_TICKS_HOME: AtomicU64 = AtomicU64::new(0);
+    pub static RUN_TICKS_AWAY: AtomicU64 = AtomicU64::new(0);
+    pub static PROGRESS_SUM_X100: AtomicI64 = AtomicI64::new(0);
+    pub static PROGRESS_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    /// Same progress measure, restricted to ticks deep into a long run
+    /// (>=100 consecutive ticks by the same player) — isolates whether
+    /// convergence eventually happens given enough time, vs. plateauing
+    /// immediately regardless of run length.
+    pub static LATE_PROGRESS_SUM_X100: AtomicI64 = AtomicI64::new(0);
+    pub static LATE_PROGRESS_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    /// Caps how many raw per-dispatch trace lines get logged per match —
+    /// Core Rule 1 (raw examples, not just aggregates), bounded so a
+    /// full batch run doesn't flood the log.
+    pub static TRACE_LINES_THIS_MATCH: AtomicU64 = AtomicU64::new(0);
+    /// Statistical breakdown of the EMPTY-at-dispatch cases specifically
+    /// (raw examples suggested two distinct sub-patterns — this
+    /// quantifies their real share instead of relying on a handful of
+    /// anecdotes). "Behind" = the globally-nearest opposing outfielder
+    /// has a negative projection along the shot direction — he's
+    /// trailing the play (just beaten), not between the ball and goal,
+    /// so no positioning fix could have made him a candidate. "Ahead"
+    /// = he IS on the right side but still too far/off-line to register
+    /// as a corridor/near-miss candidate.
+    pub static EMPTY_NEAREST_BEHIND: AtomicU64 = AtomicU64::new(0);
+    pub static EMPTY_NEAREST_AHEAD: AtomicU64 = AtomicU64::new(0);
+    pub static EMPTY_NO_OPPONENT: AtomicU64 = AtomicU64::new(0);
+    /// How far the nearest opposing outfielder actually is from his own
+    /// shape anchor (`start_position`) at the moment of dispatch — a
+    /// large gap means he's been dragged out of position (a defensive
+    /// breakdown / transition moment an anchor-based fix can't reach in
+    /// time), not merely steering toward the wrong point.
+    pub static SUM_ANCHOR_GAP_X100: AtomicU64 = AtomicU64::new(0);
+    pub static ANCHOR_GAP_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    /// Is the "trailing defender" pattern concentrated in fast
+    /// transitions (a shot within ~2s of the shooting team winning the
+    /// ball — genuinely too little time for anyone to recover) or does
+    /// it also show up in settled possession (a real defensive-shape
+    /// gap, not just a transition-speed one)? Bucketed on
+    /// `TeamTacticalState::ticks_since_turnover` at the moment of the
+    /// EMPTY+behind dispatch.
+    pub static EMPTY_BEHIND_FAST_TRANSITION: AtomicU64 = AtomicU64::new(0);
+    pub static EMPTY_BEHIND_SETTLED: AtomicU64 = AtomicU64::new(0);
+    /// Finer bands than the single 200-tick cutoff above, to see the
+    /// real shape of the distribution rather than assume a binary split
+    /// is informative. Ticks since the shooting team last won the ball.
+    pub static EB_BAND_0_200: AtomicU64 = AtomicU64::new(0);
+    pub static EB_BAND_200_500: AtomicU64 = AtomicU64::new(0);
+    pub static EB_BAND_500_1000: AtomicU64 = AtomicU64::new(0);
+    pub static EB_BAND_1000_PLUS: AtomicU64 = AtomicU64::new(0);
+    pub fn reset() {
+        for c in [
+            &DISPATCHES,
+            &IN_CORRIDOR_AT_DISPATCH,
+            &NEAR_MISS_AT_DISPATCH,
+            &EMPTY_AT_DISPATCH,
+            &SUM_MIN_PERP_X100,
+            &MIN_PERP_SAMPLES,
+            &SUM_NEAREST_DIST_X100,
+            &NEAREST_DIST_SAMPLES,
+            &COVER_OVERRIDE_TICKS,
+            &COVER_OVERRIDE_SUM_DIST_X100,
+            &LAST_COVER_ID_HOME,
+            &LAST_COVER_ID_AWAY,
+            &COVER_SAME_TICKS,
+            &COVER_SWITCH_TICKS,
+            &RUN_START_DIST_X100_HOME,
+            &RUN_START_DIST_X100_AWAY,
+            &RUN_TICKS_HOME,
+            &RUN_TICKS_AWAY,
+            &PROGRESS_SAMPLES,
+            &LATE_PROGRESS_SAMPLES,
+            &TRACE_LINES_THIS_MATCH,
+            &EMPTY_NEAREST_BEHIND,
+            &EMPTY_NEAREST_AHEAD,
+            &EMPTY_NO_OPPONENT,
+            &SUM_ANCHOR_GAP_X100,
+            &ANCHOR_GAP_SAMPLES,
+            &EMPTY_BEHIND_FAST_TRANSITION,
+            &EMPTY_BEHIND_SETTLED,
+            &EB_BAND_0_200,
+            &EB_BAND_200_500,
+            &EB_BAND_500_1000,
+            &EB_BAND_1000_PLUS,
+        ] {
+            c.store(0, Ordering::Relaxed);
+        }
+        PROGRESS_SUM_X100.store(0, Ordering::Relaxed);
+        LATE_PROGRESS_SUM_X100.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Dev testing knob (2026-07-19), companion to `GAFFER_FORCE_SECOND_YELLOW`
 /// in `engine/run.rs`. See `apply_card_decision` for where this is consumed.
 #[cfg(feature = "match-logs")]
@@ -4281,6 +4426,157 @@ impl PlayerEventDispatcher {
         // been credited by the dispatch site above.
         field.ball.clear_pending_pass_metadata();
         field.ball.velocity = final_velocity;
+
+        // TEMPORARY realism-bug diagnostic (2026-08-30) — see
+        // `shot_dispatch_diag`'s own doc comment above. Pure read-only
+        // measurement at t=0; no effect on match behaviour.
+        #[cfg(feature = "match-logs")]
+        {
+            use std::sync::atomic::Ordering;
+            let vel2d = (final_velocity.x * final_velocity.x
+                + final_velocity.y * final_velocity.y)
+                .sqrt();
+            if vel2d > 0.5 {
+                shot_dispatch_diag::DISPATCHES.fetch_add(1, Ordering::Relaxed);
+                let dir_x = final_velocity.x / vel2d;
+                let dir_y = final_velocity.y / vel2d;
+                const LOOKAHEAD: f32 = 40.0;
+                const CORRIDOR: f32 = 14.0;
+                let mut min_perp_in_lookahead: Option<f32> = None;
+                let mut nearest_dist: Option<f32> = None;
+                let mut nearest_player: Option<&MatchPlayer> = None;
+                for p in field.players.iter() {
+                    if p.team_id == shooter_team_id {
+                        continue;
+                    }
+                    if p.tactical_position.current_position.position_group()
+                        == PlayerFieldPositionGroup::Goalkeeper
+                    {
+                        continue;
+                    }
+                    let dx = p.position.x - shooter_position.x;
+                    let dy = p.position.y - shooter_position.y;
+                    let straight_dist = (dx * dx + dy * dy).sqrt();
+                    let is_new_nearest = match nearest_dist {
+                        Some(m) => straight_dist < m,
+                        None => true,
+                    };
+                    if is_new_nearest {
+                        nearest_dist = Some(straight_dist);
+                        nearest_player = Some(p);
+                    }
+                    let projection = dx * dir_x + dy * dir_y;
+                    if projection < 1.0 || projection > LOOKAHEAD || straight_dist > 60.0 {
+                        continue;
+                    }
+                    let perp = (dx - projection * dir_x).powi(2)
+                        + (dy - projection * dir_y).powi(2);
+                    let perp_dist = perp.sqrt();
+                    min_perp_in_lookahead = Some(match min_perp_in_lookahead {
+                        Some(m) if m <= perp_dist => m,
+                        _ => perp_dist,
+                    });
+                }
+                if let Some(nd) = nearest_dist {
+                    shot_dispatch_diag::SUM_NEAREST_DIST_X100
+                        .fetch_add((nd * 100.0) as u64, Ordering::Relaxed);
+                    shot_dispatch_diag::NEAREST_DIST_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                }
+                let outcome = match min_perp_in_lookahead {
+                    Some(mp) if mp <= CORRIDOR => {
+                        shot_dispatch_diag::IN_CORRIDOR_AT_DISPATCH
+                            .fetch_add(1, Ordering::Relaxed);
+                        "IN_CORRIDOR"
+                    }
+                    Some(mp) => {
+                        shot_dispatch_diag::NEAR_MISS_AT_DISPATCH.fetch_add(1, Ordering::Relaxed);
+                        shot_dispatch_diag::SUM_MIN_PERP_X100
+                            .fetch_add((mp * 100.0) as u64, Ordering::Relaxed);
+                        shot_dispatch_diag::MIN_PERP_SAMPLES.fetch_add(1, Ordering::Relaxed);
+                        "NEAR_MISS"
+                    }
+                    None => {
+                        shot_dispatch_diag::EMPTY_AT_DISPATCH.fetch_add(1, Ordering::Relaxed);
+                        match nearest_player {
+                            Some(np) => {
+                                let dx = np.position.x - shooter_position.x;
+                                let dy = np.position.y - shooter_position.y;
+                                let projection = dx * dir_x + dy * dir_y;
+                                if projection < 1.0 {
+                                    shot_dispatch_diag::EMPTY_NEAREST_BEHIND
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    // ~200 ticks = ~2s of real match time —
+                                    // genuinely too little for a defender
+                                    // to have recovered any distance yet,
+                                    // vs. a settled attack where the
+                                    // defense should have long since
+                                    // reorganized.
+                                    let ticks_since_turnover = context
+                                        .tactical_for_team(shooter_team_id)
+                                        .ticks_since_turnover;
+                                    if ticks_since_turnover < 200 {
+                                        shot_dispatch_diag::EMPTY_BEHIND_FAST_TRANSITION
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    } else {
+                                        shot_dispatch_diag::EMPTY_BEHIND_SETTLED
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    let band = if ticks_since_turnover < 200 {
+                                        &shot_dispatch_diag::EB_BAND_0_200
+                                    } else if ticks_since_turnover < 500 {
+                                        &shot_dispatch_diag::EB_BAND_200_500
+                                    } else if ticks_since_turnover < 1000 {
+                                        &shot_dispatch_diag::EB_BAND_500_1000
+                                    } else {
+                                        &shot_dispatch_diag::EB_BAND_1000_PLUS
+                                    };
+                                    band.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    shot_dispatch_diag::EMPTY_NEAREST_AHEAD
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                let agx = np.position.x - np.start_position.x;
+                                let agy = np.position.y - np.start_position.y;
+                                let anchor_gap = (agx * agx + agy * agy).sqrt();
+                                shot_dispatch_diag::SUM_ANCHOR_GAP_X100
+                                    .fetch_add((anchor_gap * 100.0) as u64, Ordering::Relaxed);
+                                shot_dispatch_diag::ANCHOR_GAP_SAMPLES
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            None => {
+                                shot_dispatch_diag::EMPTY_NO_OPPONENT
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        "EMPTY"
+                    }
+                };
+                // Raw examples (Core Rule 1), capped to avoid flooding a
+                // full batch run: shooter/nearest-defender geometry AND
+                // that defender's own anchor (`start_position`) — lets us
+                // tell "the anchor points the wrong way" apart from "the
+                // anchor is fine but he hasn't reached it."
+                if shot_dispatch_diag::TRACE_LINES_THIS_MATCH.fetch_add(1, Ordering::Relaxed) < 8 {
+                    if let Some(np) = nearest_player {
+                        log::info!(
+                            "SHOTDISPATCHTRACE outcome={} shooter=({:.1},{:.1}) shot_dir=({:.2},{:.2}) nearest_id={} nearest_pos=({:.1},{:.1}) nearest_anchor=({:.1},{:.1}) nearest_dist={:.1}",
+                            outcome,
+                            shooter_position.x, shooter_position.y,
+                            dir_x, dir_y,
+                            np.id,
+                            np.position.x, np.position.y,
+                            np.start_position.x, np.start_position.y,
+                            nearest_dist.unwrap_or(-1.0),
+                        );
+                    } else {
+                        log::info!(
+                            "SHOTDISPATCHTRACE outcome={} shooter=({:.1},{:.1}) shot_dir=({:.2},{:.2}) nearest_id=NONE",
+                            outcome, shooter_position.x, shooter_position.y, dir_x, dir_y,
+                        );
+                    }
+                }
+            }
+        }
 
         // Shorter flight protection for shots — allows defenders/GK to claim sooner
         field.ball.flags.in_flight_state = 40;

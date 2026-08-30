@@ -130,6 +130,8 @@ impl ShapeRule {
     /// Target position for this rule's action, relative to `base`.
     /// `team` is this player's own team's tactical snapshot — only
     /// consulted by `CompactBackLine`, ignored by the other three.
+    /// `ball_y` (raw field Y, not side-corrected) is likewise only
+    /// consulted by `CompactBackLine`.
     pub fn target(
         &self,
         base: Vector3<f32>,
@@ -137,6 +139,7 @@ impl ShapeRule {
         field_width: f32,
         field_height: f32,
         team: TeamTacticalState,
+        ball_y: f32,
     ) -> Vector3<f32> {
         let dir = match side {
             PlayerSide::Left => 1.0,
@@ -175,11 +178,35 @@ impl ShapeRule {
                 // applies regardless of which state a defender happens
                 // to be in, rather than only when one specific state's
                 // own velocity code consults it.
+                //
+                // realism-bug (2026-08-30, deflection-rate investigation):
+                // the squeeze-toward-centre above compacts the LANE
+                // WIDTH, but on its own it re-centres the whole back
+                // line on the pitch's fixed midline regardless of where
+                // the ball actually is — dropping the other half of
+                // `HoldingLineState`'s own pattern this action was meant
+                // to generalize, the ball-side SHIFT
+                // (`ball_offset * (0.08 + compactness * 0.18)`, added to
+                // the anchor rather than used to compute a squeeze
+                // fraction). A temporary diagnostic (`shot_dispatch_diag`,
+                // player/events/players.rs) measured that at the instant
+                // a shot is struck, opposing outfielders are generally
+                // nearby (~4.7m on average — this squeeze IS working)
+                // but almost never aligned with the actual shot corridor
+                // — exactly what a back line compact around the pitch's
+                // permanent centre, rather than shifted toward the
+                // ball's actual side, would produce. Applied to the
+                // squeezed lane position (not `base.y` directly) so the
+                // compactness and ball-side effects compound the way
+                // they already do in `HoldingLineState`.
                 let lane_offset = base.y - centre;
                 let squeeze = (0.15 + team.compactness_target * 0.45).clamp(0.15, 0.60);
+                let squeezed_y = centre + lane_offset * (1.0 - squeeze);
+                let ball_offset = ball_y - centre;
+                let ball_shift = ball_offset * (0.08 + team.compactness_target * 0.18);
                 Vector3::new(
                     team.defensive_line_x.clamp(20.0, field_width - 20.0),
-                    centre + lane_offset * (1.0 - squeeze),
+                    (squeezed_y + ball_shift).clamp(20.0, field_height - 20.0),
                     0.0,
                 )
             }
