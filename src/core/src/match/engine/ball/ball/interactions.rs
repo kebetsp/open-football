@@ -329,8 +329,27 @@ impl Ball {
         // through unopposed. Real football blocks ~18-22% of shots
         // (2-3 blocks per team per match from ~13 shots); we were
         // below that with the tight window.
+        //
+        // 2026-08-30 (shot/cross-block investigation, Pavel's own
+        // framing): "defenders who are in the ball line can easier
+        // block a shot, but those further from the line still attempt
+        // to block — they just have more chance to miss it, or end up
+        // with a deflection/corner rather than a perfect block." The
+        // corridor was previously a hard binary cliff (in = a real
+        // attempt with a graduated `perp_factor` chance; out = no
+        // attempt at all, regardless of how close). Widened 7u→14u
+        // (~0.9m→1.75m at this project's 8u/m scale — roughly a
+        // standing body width vs. a genuine stretched-leg reach, the
+        // real physiological ceiling for this) so a defender who's
+        // close but not perfectly on the line still gets a real,
+        // lower-odds chance instead of none. The graduation itself
+        // (worse odds AND a worse outcome mix the further out the
+        // contact was) is `perp_factor`/`contact_quality` below — no
+        // separate mechanism needed, this widening just lets that
+        // existing continuous term actually apply to more real cases
+        // instead of being gated out before it ever runs.
         const BLOCK_LOOKAHEAD: f32 = 40.0; // was 30u
-        const BLOCK_CORRIDOR: f32 = 7.0; // was 4u — body + stretched leg
+        const BLOCK_CORRIDOR: f32 = 14.0; // was 7u, before that 4u
 
         #[cfg(feature = "match-logs")]
         block_diag::SHOT_LIVE_TICKS.fetch_add(1, Ordering::Relaxed);
@@ -339,6 +358,11 @@ impl Ball {
 
         let mut best_blocker: Option<u32> = None;
         let mut best_chance: f32 = 0.0;
+        // Carried out of the loop alongside best_blocker/best_chance so
+        // the outcome section below can discount clean-recovery
+        // probability by how marginal the winning contact actually was
+        // (2026-08-30, see the BLOCK_CORRIDOR comment above).
+        let mut best_perp_factor: f32 = 1.0;
 
         for player in players {
             // Only opposing outfielders block (GK save pipeline handles
@@ -435,6 +459,7 @@ impl Ball {
             if chance > best_chance {
                 best_chance = chance;
                 best_blocker = Some(player.id);
+                best_perp_factor = perp_factor;
             }
         }
 
@@ -496,12 +521,28 @@ impl Ball {
         // shot) is untouched. Reasoned, not sourced — this is the same
         // genuinely niche behaviour the plan itself flags as having no
         // findable real-world rate to calibrate against.
+        // 2026-08-30 (shot/cross-block investigation): a contact further
+        // from the exact shot line is a scrappier, less-controlled
+        // connection — a leg thrown out, not a clean body block — so it
+        // should skew toward a deflection outcome, not a comfortable
+        // recovery. Reuses `best_perp_factor` (1.0 dead on the line,
+        // down to 0.5 at the new corridor's outer edge) rather than
+        // inventing a second geometry term; the freed share goes to the
+        // corner-deflection branch specifically (the real-world
+        // "blocked shot squirts behind for a corner" case Pavel's
+        // framing is about), everything else in the split untouched.
+        let contact_quality = best_perp_factor.clamp(0.0, 1.0);
+        let marginal_corner_bump = (1.0 - contact_quality) * 0.15;
         let p_controlled = if shot_target.is_safe_restart {
             controlled_block_prob * 0.5
         } else {
-            controlled_block_prob
+            controlled_block_prob * (0.5 + 0.5 * contact_quality)
         };
-        let corner_bump = if shot_target.is_safe_restart { 0.12 } else { 0.0 };
+        let corner_bump = if shot_target.is_safe_restart {
+            0.12
+        } else {
+            marginal_corner_bump
+        };
 
         let roll = context.rng.unit_f32();
         let p_corner = p_controlled + 0.23 + corner_bump;
