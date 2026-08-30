@@ -821,7 +821,34 @@ impl<'p> DefensiveOperationsImpl<'p> {
             })
     }
 
-    /// Calculate danger score for an opponent
+    /// Calculate danger score for an opponent.
+    ///
+    /// 2026-08-30 (Pavel's direct report, unhedged): defenders were
+    /// repeatedly abandoning a genuinely dangerous mark (a stationary,
+    /// unmarked attacker just outside the box) to go cover a much less
+    /// dangerous one (further out, but currently moving and near the
+    /// ball) -- e.g. "red #5 next to blue #10... suddenly moves up to
+    /// cover blue #6 closer to the central circle, leaving blue #10 all
+    /// alone in front of the box." Verified this formula genuinely
+    /// produces exactly that swap before touching it (not just a
+    /// plausible story): a stationary attacker 140u from goal, ball 80u
+    /// away, scored 82.0; a running, ball-side attacker 300u from goal
+    /// scored 120.0 -- the distant, active one wins under the old
+    /// weights every time this pattern occurs, which is backwards from
+    /// real defensive doctrine (a marker's first priority is who is
+    /// closest to goal and unmarked; movement/reception-likelihood are
+    /// tie-breakers among similarly-positioned opponents, not able to
+    /// override a large goal-proximity gap). Rebalanced: distance-to-
+    /// goal's max contribution raised 100->200 (divisor 5.0->2.5),
+    /// movement and ball-proximity's caps roughly halved (50->20 each)
+    /// so distance-to-goal decisively dominates while the other two
+    /// still break ties between similarly-dangerous opponents. Re-ran
+    /// the same two representative cases with the new weights: 148.0 vs
+    /// 112.0 -- the stationary, closer-to-goal attacker now correctly
+    /// wins. Reasoned rebalance, category (d) -- no dataset publishes
+    /// exact marking-priority weights; the magnitude was chosen to flip
+    /// the specific reported failure case, not tuned against a broader
+    /// sourced target.
     fn calculate_opponent_danger_score(
         &self,
         opponent: &MatchPlayerLite,
@@ -829,29 +856,31 @@ impl<'p> DefensiveOperationsImpl<'p> {
     ) -> f32 {
         let mut score = 0.0;
 
-        // Distance to our goal (closer = more dangerous)
+        // Distance to our goal (closer = more dangerous) -- the
+        // dominant term, see the doc comment above.
         let distance_to_goal = (opponent.position - own_goal).magnitude();
-        score += (500.0 - distance_to_goal.min(500.0)) / 5.0;
+        score += (500.0 - distance_to_goal.min(500.0)) / 2.5;
 
         // Has the ball
         if opponent.has_ball(self.ctx) {
             score += 150.0;
         }
 
-        // Running toward goal
+        // Running toward goal -- a tie-breaker, not able to override a
+        // large goal-proximity gap on its own (see doc comment above).
         let velocity = opponent.velocity(self.ctx);
         if velocity.norm() > 2.0 {
             let to_goal = (own_goal - opponent.position).normalize();
             let alignment = velocity.normalize().dot(&to_goal);
             if alignment > 0.5 {
-                score += alignment * 50.0;
+                score += alignment * 20.0;
             }
         }
 
-        // Close to ball (potential receiver)
+        // Close to ball (potential receiver) -- same tie-breaker role.
         let ball_distance =
             (opponent.position - self.ctx.tick_context.positions.ball.position).magnitude();
-        score += (100.0 - ball_distance.min(100.0)) / 2.0;
+        score += (100.0 - ball_distance.min(100.0)) / 5.0;
 
         score
     }
