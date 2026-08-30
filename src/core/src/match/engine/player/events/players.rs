@@ -2647,7 +2647,22 @@ impl PlayerEventDispatcher {
         }
         // CLAIM COOLDOWN: Prevent rapid ping-pong between players
         // If the ball was just claimed by someone else, reject this claim
-        const CLAIM_COOLDOWN_TICKS: u32 = 15; // ~250ms at 60fps - time before ball can change hands
+        //
+        // 2026-08-30 (yo-yo investigation): raised 15->25 ticks (150ms->
+        // 250ms at this engine's real 10ms/tick, not the "60fps" the old
+        // comment assumed). Root cause of a genuine repeating loop found
+        // in a real match trace (Intercepted(208,101) -> Claimed(101) ->
+        // PassTo -> Intercepted(208,101) -> ... three times over): once
+        // this 15-tick cooldown expired, `check_ball_ownership`'s own
+        // ambient per-tick contest (a SEPARATE stability gate, keyed on
+        // `ownership_duration < min_ownership_duration` where
+        // min_ownership_duration is 25) could re-engage while
+        // `ownership_duration` was still under 25 -- a real 10-tick gap
+        // between this function's protection and that one's. Matching
+        // the two windows closes the gap instead of leaving the two
+        // systems disagreeing about how long a fresh claim should be
+        // safe.
+        const CLAIM_COOLDOWN_TICKS: u32 = 25;
 
         // IN-FLIGHT CHECK: If ball was just passed, only allow the intended receiver to claim
         // This prevents the passer from reclaiming via a stale ClaimBall event that was
@@ -2773,6 +2788,32 @@ impl PlayerEventDispatcher {
     // Snaps the ball to the winner's feet and zeros velocity — prevents
     // residual velocity from carrying it into the winner's own goal
     // after a tackle/interception/block.
+    //
+    // 2026-08-30 (Pavel's direct, unhedged report — "the ball briefly
+    // leaves the attacker, then jumps back, and then the real shot may
+    // happen... very frequent"): root-caused with a raw match trace, not
+    // guessed. A tackle win (`handle_tackling_ball_event`, the other
+    // caller here) dispatches `TacklingBall` -> `secure_ball_for`, which
+    // grants ownership but — unlike its sibling `handle_claim_ball_event`
+    // a few lines above, which explicitly sets both fields — never reset
+    // `ownership_duration` or set `claim_cooldown`. `check_ball_
+    // ownership`'s very first lines gate ALL re-contest logic on
+    // `claim_cooldown > 0` (its own comment: "prevents rapid ping-pong
+    // between players"), and its stability check further down requires
+    // `ownership_duration < min_ownership_duration` before a takeover is
+    // even considered. With both left unset (and `ownership_duration`
+    // often carrying a stale, already-large value from the PREVIOUS
+    // possession), a ball secured by a tackle win has neither guard
+    // active — the just-dispossessed attacker, still standing right
+    // where he lost it, can win the very next generic proximity contest
+    // and reclaim it within ~150-300ms, producing exactly the reported
+    // "ball leaves, then jumps back" reversal. Verified in a real match
+    // trace: player 207 tackled by 101 at t=97540/97550 (ball snaps
+    // away, an emergency pass fires to 102), then `Claimed(207)` fires
+    // again at t=97900 and the ball's own raw position samples reverse
+    // direction right back toward 207. Fix: the same two lines the
+    // sibling function already uses (same 15-tick/~150ms cooldown,
+    // matching its own `CLAIM_COOLDOWN_TICKS`, not a new value).
     fn secure_ball_for(player_id: u32, field: &mut MatchField) {
         if let Some(player) = field.players.iter().find(|p| p.id == player_id) {
             field.ball.position = player.position;
@@ -2781,6 +2822,8 @@ impl PlayerEventDispatcher {
         field.ball.previous_owner = field.ball.current_owner;
         field.ball.current_owner = Some(player_id);
         field.ball.pass_target_player_id = None;
+        field.ball.ownership_duration = 0;
+        field.ball.claim_cooldown = 25; // matches CLAIM_COOLDOWN_TICKS's post-2026-08-30 value
         field.ball.velocity = Vector3::zeros();
         field.ball.flags.in_flight_state = 0;
         field.ball.cached_shot_target = None;
