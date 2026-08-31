@@ -536,6 +536,15 @@ impl StateProcessingHandler for ForwardRunningState {
                 let base_hold = coach.min_possession_ticks();
                 let gm_hold = (gm_intensity * 80.0) as u32;
                 let min_hold = base_hold.max(gm_hold);
+                // docs/principles-of-play-phase2-plan.md §1 (2026-08-31):
+                // tempo's second named consumer. A genuinely fast-tempo
+                // moment (transition, high press, attacking phase — see
+                // `compute_tempo`) should trim even a game-management
+                // hold, not force the same patience regardless of how
+                // urgent the moment feels. Bounded — never overrides the
+                // GM stretch outright (max 25% trim), just shortens it.
+                let tempo = ctx.team().tempo();
+                let min_hold = (min_hold as f32 * (1.0 - tempo * 0.25)) as u32;
                 let ownership_ticks = ctx.tick_context.ball.ownership_duration;
                 if ownership_ticks < min_hold {
                     return None;

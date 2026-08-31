@@ -1183,6 +1183,20 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 if p.lane_residency_lane == lane {
                     p.lane_residency_ticks = p.lane_residency_ticks.saturating_add(1);
                 } else {
+                    // docs/principles-of-play-phase2-plan.md §4 (2026-08-31):
+                    // log the dwell duration that just ended (not a periodic
+                    // sample) -- gives a direct distribution of "how long did
+                    // this player hold one lane before moving," the raw
+                    // signal the Mobility ablation check is measuring.
+                    let group = p.tactical_position.current_position.position_group();
+                    if group != PlayerFieldPositionGroup::Goalkeeper {
+                        match_log_info!(
+                            "MOBILITYDIAG id={} group={:?} dwell_ticks={}",
+                            p.id,
+                            group,
+                            p.lane_residency_ticks
+                        );
+                    }
                     p.lane_residency_lane = lane;
                     p.lane_residency_ticks = 0;
                 }

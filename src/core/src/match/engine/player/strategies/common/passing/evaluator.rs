@@ -473,6 +473,22 @@ impl PassEvaluator {
         let risk_forward_bias = 0.7 + risk_appetite * 0.6; // 0.7..1.3
         let risk_backward_bias = 1.4 - risk_appetite * 0.8; // 1.4..0.6
 
+        // docs/principles-of-play-phase2-plan.md §1 (2026-08-31): tempo
+        // — how direct/fast the team's CURRENT possession situation
+        // calls for — was computed every tick (blended from tactic
+        // style, `GamePhase`, and game-management drag) and never
+        // consumed anywhere. Distinct from `risk_appetite` just above
+        // (score/clock-driven chasing urgency) and from `directness`
+        // below (a static, manager-set pre-match dial): tempo answers
+        // "is this a fast-transition moment right now," which can be
+        // true or false independent of both the scoreline and the
+        // manager's system. Small multiplicative nudge composed onto
+        // the existing risk bias, same magnitude family, not a
+        // redesign — 0.90..1.10 vs risk_appetite's own 0.7..1.3.
+        let tempo = ctx.team().tempo();
+        let risk_forward_bias = risk_forward_bias * (0.90 + tempo * 0.20);
+        let risk_backward_bias = risk_backward_bias * (1.10 - tempo * 0.20);
+
         // Manager-set directness dial (-2 possession .. +2 direct, 0
         // neutral). Distinct from `risk_appetite` (match-state driven,
         // forward vs backward) — this is a pre-match tactics-board input

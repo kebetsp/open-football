@@ -320,11 +320,82 @@ const TACKLE_WIN_VALUE: f32 = 0.5;
 const TACKLE_FOUL_RISK_COST_BASE: f32 = 0.15;
 const TACKLE_FOUL_RISK_COST_OWN_BOX_MULT: f32 = 2.0; // a foul in the box risks a penalty
 
+/// Balance (docs/principles-of-play-phase2-plan.md §2, 2026-08-31): is
+/// there a SECOND genuinely dangerous opponent — not the one we're
+/// about to engage — closer to our own goal than we are, with fewer
+/// covering teammates nearby than there are such opponents? Moved here
+/// (converted from a dead `&self` method on `DefensiveOperationsImpl`,
+/// `defensive.rs`, zero callers anywhere) rather than kept there, to
+/// match this file's own calling convention (`has_covering_teammate`
+/// just below is the same "reimplement here, don't cross-import the
+/// struct" pattern already established for a related concept) and to
+/// sit next to its one real consumer, `tackle_value`. Logic unchanged
+/// from the original — a real, well-formed check that simply had
+/// nowhere to plug in before this.
+// docs/principles-of-play-phase2-plan.md §2 (2026-08-31): the original
+// (dead, so never empirically checked) 40.0u (~5m) scan radius produced
+// ZERO fires across 16 live matches (~700+ tackle_value evaluations) —
+// too tight to ever catch a real 2-v-1, closer to "goalmouth scramble"
+// than a general exposure check. Widened to a real-world-reasoned 15m
+// (120u); `EXPOSURE_COVER_RADIUS` (how close a teammate must be to
+// count as genuinely covering) left unchanged — a covering teammate
+// should still be meaningfully closer than the scan radius that spots
+// the danger in the first place.
+const EXPOSURE_SCAN_RADIUS: f32 = 120.0;
+const EXPOSURE_COVER_RADIUS: f32 = 50.0;
+
+pub fn would_leave_space_uncovered(
+    ctx: &StateProcessingContext,
+    target_opponent: &MatchPlayerLite,
+) -> bool {
+    let own_goal = ctx.ball().direction_to_own_goal();
+    let my_pos = ctx.player.position;
+
+    let dangerous_nearby = ctx
+        .players()
+        .opponents()
+        .nearby(EXPOSURE_SCAN_RADIUS)
+        .filter(|opp| {
+            opp.id != target_opponent.id && {
+                let distance_to_goal = (opp.position - own_goal).magnitude();
+                let my_distance_to_goal = (my_pos - own_goal).magnitude();
+                distance_to_goal < my_distance_to_goal
+            }
+        })
+        .count();
+
+    if dangerous_nearby < 2 {
+        return false;
+    }
+
+    let covering_defenders = ctx
+        .players()
+        .teammates()
+        .defenders()
+        .filter(|d| {
+            d.id != ctx.player.id
+                && (d.position - my_pos).norm_squared() < EXPOSURE_COVER_RADIUS * EXPOSURE_COVER_RADIUS
+        })
+        .count();
+
+    covering_defenders < dangerous_nearby
+}
+
+/// Reasoned estimate (category (d) — no sourced real-world figure for
+/// this structural concept exists, same treatment this project already
+/// applies to comparable unsourced constants). Same magnitude family as
+/// the other cost terms below (`TACKLE_FOUL_RISK_COST_BASE * MULT` maxes
+/// at 0.30) — a flat cost, not scaled by `(1 - p)` like the lose-only
+/// terms, because the exposure risk is real for the duration of the
+/// engagement regardless of whether the tackle itself is won.
+const EXPOSURE_COST: f32 = 0.20;
+
 /// `tackle_value = win_prob * WIN_VALUE - (1 - win_prob) * (foul_risk +
-/// value_conceded_if_beaten)` — the existing coin-flip, reframed as a
-/// comparable value rather than the only outcome that can happen. Does
-/// NOT touch `tackle_win_probability`'s calibration; only adds cost
-/// terms alongside it. `tackle_profile`: see `tackle_win_probability`.
+/// value_conceded_if_beaten) - exposure_cost` — the existing coin-flip,
+/// reframed as a comparable value rather than the only outcome that can
+/// happen. Does NOT touch `tackle_win_probability`'s calibration; only
+/// adds cost terms alongside it. `tackle_profile`: see
+/// `tackle_win_probability`.
 pub fn tackle_value(
     ctx: &StateProcessingContext,
     opponent: &MatchPlayerLite,
@@ -341,7 +412,12 @@ pub fn tackle_value(
         TACKLE_FOUL_RISK_COST_BASE
     };
     let conceded = value_conceded_if_beaten(ctx, opponent);
-    p * TACKLE_WIN_VALUE - (1.0 - p) * (foul_risk_cost + conceded)
+    let exposure_cost = if would_leave_space_uncovered(ctx, opponent) {
+        EXPOSURE_COST
+    } else {
+        0.0
+    };
+    p * TACKLE_WIN_VALUE - (1.0 - p) * (foul_risk_cost + conceded) - exposure_cost
 }
 
 /// Range within which a teammate's converging movement counts as genuine

@@ -429,38 +429,6 @@ impl<'p> DefensiveOperationsImpl<'p> {
             && !self.ctx.team().is_control_ball()
     }
 
-    /// Check if should mark an opponent
-    pub fn should_mark_opponent(&self, opponent: &MatchPlayerLite, marking_distance: f32) -> bool {
-        let distance = (opponent.position - self.ctx.player.position).magnitude();
-
-        if distance > marking_distance {
-            return false;
-        }
-
-        // Mark if opponent is in dangerous position
-        let opponent_distance_to_goal =
-            (opponent.position - self.ctx.ball().direction_to_own_goal()).magnitude();
-        let own_distance_to_goal =
-            (self.ctx.player.position - self.ctx.ball().direction_to_own_goal()).magnitude();
-
-        // Opponent is closer to our goal than we are
-        opponent_distance_to_goal < own_distance_to_goal + 10.0
-    }
-
-    /// Get the nearest opponent to mark
-    pub fn find_opponent_to_mark(&self, max_distance: f32) -> Option<MatchPlayerLite> {
-        self.ctx
-            .players()
-            .opponents()
-            .nearby(max_distance)
-            .filter(|opp| self.should_mark_opponent(opp, max_distance))
-            .min_by(|a, b| {
-                let dist_a = a.distance(self.ctx);
-                let dist_b = b.distance(self.ctx);
-                dist_a.total_cmp(&dist_b)
-            })
-    }
-
     /// True when this attacker is sitting beyond the opposing defensive
     /// line AND their team doesn't have possession — i.e. stranded in an
     /// offside position with nothing to do. Forwards use this to trigger
@@ -903,46 +871,6 @@ impl<'p> DefensiveOperationsImpl<'p> {
         score += (100.0 - ball_distance.min(100.0)) / 5.0;
 
         score
-    }
-
-    /// Check if engaging this opponent would leave a dangerous space uncovered
-    pub fn would_leave_space_uncovered(&self, target_opponent: &MatchPlayerLite) -> bool {
-        let own_goal = self.ctx.ball().direction_to_own_goal();
-        let my_pos = self.ctx.player.position;
-
-        // Find other dangerous opponents near our current position
-        let dangerous_nearby = self
-            .ctx
-            .players()
-            .opponents()
-            .nearby(40.0)
-            .filter(|opp| {
-                opp.id != target_opponent.id && {
-                    let distance_to_goal = (opp.position - own_goal).magnitude();
-                    let my_distance_to_goal = (my_pos - own_goal).magnitude();
-                    // Opponent is in a more dangerous position than where we are
-                    distance_to_goal < my_distance_to_goal
-                }
-            })
-            .count();
-
-        // If there are multiple dangerous opponents nearby and no other defender covering
-        if dangerous_nearby >= 2 {
-            // Check if other defenders are available to cover
-            let covering_defenders = self
-                .ctx
-                .players()
-                .teammates()
-                .defenders()
-                .filter(|d| {
-                    d.id != self.ctx.player.id && (d.position - my_pos).norm_squared() < 50.0 * 50.0
-                })
-                .count();
-
-            return covering_defenders < dangerous_nearby;
-        }
-
-        false
     }
 
     /// Get the number of defenders currently engaging opponents within a distance

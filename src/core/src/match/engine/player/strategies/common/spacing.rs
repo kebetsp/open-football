@@ -198,6 +198,20 @@ const MOBILITY_RESIDENCY_THRESHOLD_TICKS: u16 = 300;
 const MOBILITY_RESIDENCY_FULL_TICKS: u16 = 900;
 const MOBILITY_BONUS_WEIGHT: f32 = 12.0;
 
+/// docs/principles-of-play-phase2-plan.md §4 (2026-08-31) — same-binary
+/// ablation toggle for the "Mobility" principle's four terms
+/// (`mobility_adjustment`, `rotation_adjustment`, `third_man_adjustment`,
+/// the inline decoy-value term in `score_candidate`), so a clean before/
+/// after comparison can run without a build-difference confound (same
+/// idiom as `flow::context`'s `OF_SCORE_BLIND` env toggle). Diagnostic
+/// only — inert unless `MOBILITY_ABLATE` is set, and not read anywhere
+/// else in this file.
+fn mobility_ablated() -> bool {
+    use std::sync::OnceLock;
+    static ABLATED: OnceLock<bool> = OnceLock::new();
+    *ABLATED.get_or_init(|| std::env::var("MOBILITY_ABLATE").is_ok())
+}
+
 /// Scoped to non-defenders only — mirrors D3's defender-only gate, in
 /// reverse. Measured (A/B, this phase's own verification): applying
 /// this term to defenders too pushed goals/match to ~5.3-6.2, a real,
@@ -921,16 +935,25 @@ fn score_candidate(
     // 3): here the two terms must NOT gate each other, or shipping
     // reachability scoring would mechanically zero out decoy-run value,
     // which is exactly the risk the PRD calls out.
-    let gk_pos = ctx
-        .players()
-        .opponents()
-        .goalkeeper()
-        .next()
-        .map(|g| g.position);
-    let danger = (on_ball_value::effective_open_angle(ctx, position, gk_pos) / 1.31).clamp(0.0, 1.0);
-    let marking_pressure =
-        (on_ball_value::congestion_risk(ctx, position) / on_ball_value::CONGESTION_CAP).clamp(0.0, 1.0);
-    score += danger * marking_pressure * DECOY_WEIGHT;
+    // §4 ablation gate (docs/principles-of-play-phase2-plan.md): the four
+    // Mobility terms below (decoy, rotation, mobility/residency, third-man)
+    // are skipped entirely when MOBILITY_ABLATE is set, for a clean
+    // same-binary before/after comparison. Every other term in this
+    // function is untouched either way.
+    let mobility_ablated = mobility_ablated();
+
+    if !mobility_ablated {
+        let gk_pos = ctx
+            .players()
+            .opponents()
+            .goalkeeper()
+            .next()
+            .map(|g| g.position);
+        let danger = (on_ball_value::effective_open_angle(ctx, position, gk_pos) / 1.31).clamp(0.0, 1.0);
+        let marking_pressure =
+            (on_ball_value::congestion_risk(ctx, position) / on_ball_value::CONGESTION_CAP).clamp(0.0, 1.0);
+        score += danger * marking_pressure * DECOY_WEIGHT;
+    }
 
     // Milestone 7 — flank rotation: two teammates on the same flank (e.g.
     // a wide fullback and the winger ahead of him) should recognise which
@@ -938,7 +961,9 @@ fn score_candidate(
     // independently reacting to ball-side and potentially stacking on the
     // same touchline. Scoped to genuinely wide candidates only — this is
     // purely about the wide-vs-tuck decision, not overall shape.
-    score += rotation_adjustment(ctx, position);
+    if !mobility_ablated {
+        score += rotation_adjustment(ctx, position);
+    }
 
     // P1 (A1) — lane-occupancy-diversity: penalise a candidate that would
     // put more than `on_ball_value::LANE_OCCUPANCY_CAPACITY` teammates in
@@ -955,12 +980,16 @@ fn score_candidate(
 
     // P5 (A3) — mobility/residency: reward moving to a genuinely
     // different lane after holding the current one for a while.
-    score += mobility_adjustment(ctx, position);
+    if !mobility_ablated {
+        score += mobility_adjustment(ctx, position);
+    }
 
     // P5 (A4) — vacated-space/third-man credit: a genuine attacking
     // threat with no local congestion, while some other teammate is
     // currently tying up a marker elsewhere.
-    score += third_man_adjustment(ctx, position, opponents, teammates);
+    if !mobility_ablated {
+        score += third_man_adjustment(ctx, position, opponents, teammates);
+    }
 
     // Milestone 12 — weak-side off-ball patience: a candidate on the
     // opposite lateral side from the ball isn't judged on immediate

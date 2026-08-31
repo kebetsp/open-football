@@ -353,12 +353,6 @@ pub struct TeamTacticalState {
     pub side_density_left: u8,
     pub side_density_center: u8,
     pub side_density_right: u8,
-    /// Count of own outfield players (excl. GK, sent-off) in each of the
-    /// 5 standard positional-play lanes — see `PitchLane`. Index 0 =
-    /// `TouchlineNear` (low y), 4 = `TouchlineFar` (high y). Read-only
-    /// sensor as of P0 (`docs/attacking-defensive-decision-rebuild-plan.md`)
-    /// — nothing branches on this yet; A1 is the first planned consumer.
-    pub lane_occupancy: [u8; 5],
     /// Count of own outfield players currently BOTH in a wide lane
     /// (`PitchLane::is_wide`) AND within
     /// `spatial_sensor::WIDE_MARKING_PROXIMITY_RADIUS` of some opponent —
@@ -370,17 +364,12 @@ pub struct TeamTacticalState {
     /// Derived scalar: how much a central point's congestion cost
     /// *should* be discounted because teammates elsewhere are genuinely
     /// stretching the defense. Computed from `wide_marked_count` via
-    /// `spatial_sensor`'s constants. Not consumed by anything until A2
-    /// (§2.2 of the plan) — P0 only proves the sensor is honest.
+    /// `spatial_sensor`'s constants, consumed by
+    /// `on_ball_value::pass_value_from`'s `central_congestion_discount`
+    /// read — live, unlike its own P0-era "not consumed until A2"
+    /// framing suggested (`docs/principles-of-play-phase2-plan.md` §1,
+    /// 2026-08-31: confirmed live and corrected here).
     pub central_congestion_discount: f32,
-    /// Lateral (y-axis) spread of THIS team's own outfield line(s) — max
-    /// minus min y among outfield, non-sent-off players, in engine units.
-    /// Cheap compactness proxy (§4 of the plan explicitly rejects full
-    /// Voronoi/pitch-control modelling as premature). A consumer reads
-    /// the OPPONENT's copy of this field to answer "how compact is the
-    /// team we're attacking against" — feeds A2's distortion credit and
-    /// D3's central-priority default shape.
-    pub defensive_compactness_spread: f32,
 }
 
 impl TeamTacticalState {
@@ -405,10 +394,8 @@ impl TeamTacticalState {
             side_density_left: 4,
             side_density_center: 3,
             side_density_right: 4,
-            lane_occupancy: [0, 0, 0, 0, 0],
             wide_marked_count: 0,
             central_congestion_discount: 0.0,
-            defensive_compactness_spread: 0.0,
         }
     }
 
@@ -835,18 +822,20 @@ impl TeamTacticalState {
         away.side_density_center = a_center.min(11) as u8;
         away.side_density_right = a_right.min(11) as u8;
 
-        // ── P0 spatial sensor: 5-lane occupancy, distortion credit,
-        // defensive compactness (docs/attacking-defensive-decision-
-        // rebuild-plan.md §2.1). Read-only instrumentation — nothing
-        // branches on these fields yet. Outfield (non-GK, non-sent-off)
-        // players only, since a goalkeeper's lane occupancy has no
-        // bearing on width/lane-diversity doctrine.
-        let mut home_lanes = [0u8; 5];
-        let mut away_lanes = [0u8; 5];
-        let mut home_min_y = f32::MAX;
-        let mut home_max_y = f32::MIN;
-        let mut away_min_y = f32::MAX;
-        let mut away_max_y = f32::MIN;
+        // ── P0 spatial sensor: distortion credit (docs/attacking-
+        // defensive-decision-rebuild-plan.md §2.1). Outfield (non-GK,
+        // non-sent-off) players only, since a goalkeeper's positioning
+        // has no bearing on width/lane-diversity doctrine.
+        // docs/principles-of-play-phase2-plan.md §1 (2026-08-31):
+        // this pass used to also populate `TeamTacticalState.
+        // lane_occupancy`/`defensive_compactness_spread` — both
+        // confirmed to have zero readers anywhere in the crate and
+        // deleted; their named intended consumers (A1, D3) were built
+        // independently elsewhere (`spacing.rs::lane_occupancy_
+        // adjustment` recomputes lane occupancy fresh per-candidate;
+        // `spacing.rs::central_corridor_priority_adjustment` doesn't
+        // read this team-level field either), so this loop now only
+        // computes what `wide_marked_count` below still needs.
         // (position, is_wide_lane) per outfield player, kept for the
         // second, marking-proximity pass below.
         let mut home_outfield: Vec<(nalgebra::Vector3<f32>, bool)> = Vec::with_capacity(11);
@@ -860,29 +849,11 @@ impl TeamTacticalState {
             let lane = PitchLane::for_y(field_height, p.position.y);
             let is_home = p.team_id == inputs.home_team_id;
             if is_home {
-                home_lanes[lane.index()] = home_lanes[lane.index()].saturating_add(1);
-                home_min_y = home_min_y.min(p.position.y);
-                home_max_y = home_max_y.max(p.position.y);
                 home_outfield.push((p.position, lane.is_wide()));
             } else {
-                away_lanes[lane.index()] = away_lanes[lane.index()].saturating_add(1);
-                away_min_y = away_min_y.min(p.position.y);
-                away_max_y = away_max_y.max(p.position.y);
                 away_outfield.push((p.position, lane.is_wide()));
             }
         }
-        home.lane_occupancy = home_lanes;
-        away.lane_occupancy = away_lanes;
-        home.defensive_compactness_spread = if home_outfield.is_empty() {
-            0.0
-        } else {
-            (home_max_y - home_min_y).max(0.0)
-        };
-        away.defensive_compactness_spread = if away_outfield.is_empty() {
-            0.0
-        } else {
-            (away_max_y - away_min_y).max(0.0)
-        };
 
         // Distortion credit: for each side's wide-lane outfield players,
         // count how many sit within marking-proximity of ANY opponent
