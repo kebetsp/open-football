@@ -469,14 +469,32 @@ fn setup_player_on_field(
                 // property, not an emergent side effect of individual
                 // duel/marking behaviour. Mutually exclusive in practice
                 // with the width rule above (its trigger requires being
-                // out of possession with the ball in our own defensive
-                // third; width's requires being in possession), so
-                // pushing it after HoldWidth doesn't change which one
-                // fires when.
+                // out of possession while settled defending; width's
+                // requires being in possession), so pushing it after
+                // HoldWidth doesn't change which one fires when.
+                //
+                // Positional-play/defensive-block rewrite (2026-08-31,
+                // Chunk 1, `docs/positional-play-and-defensive-block-
+                // rewrite.md`): a genuine block is TWO coordinated
+                // lines, not one — midfielders now get the same
+                // treatment, converging to `TeamTacticalState.
+                // midfield_line_x` (a real gap ahead of the back line)
+                // instead of holding no coordinated shape at all while
+                // defending. Both share the same `SettledDefending`
+                // trigger (broadened from the old `DefendingOwnThird`,
+                // which only ever matched `LowBlock` and left the whole
+                // `MidBlock` phase with zero coordinated back-line shape
+                // either).
                 if player.tactical_position.current_position.is_defender() {
                     player.shape_rules.push(ShapeRule {
-                        trigger: ShapeTrigger::DefendingOwnThird,
+                        trigger: ShapeTrigger::SettledDefending,
                         action: ShapeAction::CompactBackLine,
+                    });
+                }
+                if player.tactical_position.current_position.is_midfielder() {
+                    player.shape_rules.push(ShapeRule {
+                        trigger: ShapeTrigger::SettledDefending,
+                        action: ShapeAction::CompactMidfieldLine,
                     });
                 }
                 players.push(player);

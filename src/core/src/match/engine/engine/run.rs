@@ -1559,6 +1559,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 let h = context.field_size.height as f32;
                 let third = h / 3.0;
                 let ball_y = field.ball.position.y;
+                let ball_x = field.ball.position.x;
                 // Score/time trigger inputs (Phase 7.3). The displayed
                 // minute maps the compressed match clock onto 0-90.
                 let shape_home_id = field.home_team_id;
@@ -1601,6 +1602,16 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     let ball_owned = current_owner_team.is_some();
                     let mut target = base;
                     let mut rule_active = false;
+                    // `fired_action` lets `processor.rs::
+                    // shape_rule_override_velocity` pick a leash SHAPE
+                    // matching which action is actually enforcing this
+                    // player's target (positional-play/defensive-block
+                    // rewrite, 2026-08-31, Chunk 1) — a single fixed
+                    // leash shape can't be simultaneously right for
+                    // `HoldWidth` (tight lateral) and `CompactBackLine`/
+                    // `CompactMidfieldLine` (tight depth, the opposite
+                    // axis).
+                    let mut fired_action = None;
                     for rule in &p.shape_rules {
                         if rule.is_active(
                             in_possession,
@@ -1611,13 +1622,16 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             minute_now,
                             team_tactical,
                         ) {
-                            target = rule.target(base, side, w, h, team_tactical, ball_y);
+                            target =
+                                rule.target(base, side, w, h, team_tactical, ball_y, ball_x);
                             rule_active = true;
+                            fired_action = Some(rule.action);
                             break;
                         }
                     }
                     p.start_position = target;
                     p.shape_rule_active = rule_active;
+                    p.active_shape_action = fired_action;
                 }
             }
 

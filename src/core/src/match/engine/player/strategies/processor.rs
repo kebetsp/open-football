@@ -1,4 +1,5 @@
 use crate::PlayerFieldPositionGroup;
+use crate::r#match::player::ShapeAction;
 use crate::r#match::common_states::CommonInjuredState;
 use crate::r#match::defenders::states::{DefenderState, DefenderStrategies};
 use crate::r#match::events::{Event, EventCollection};
@@ -947,6 +948,25 @@ impl<'p> StateProcessor<'p> {
     /// symptom itself at ~1.3 incidents/match before this fix, dropping to
     /// ~0.3/match after — same-binary A/B, `git stash` isolated to this
     /// file, 6 matches per side.
+    /// (4) real bug (2026-08-31, Pavel: wide players "go to the wings and
+    /// do not move" — "prefer wing over center" was never meant to mean
+    /// "stand on one exact spot"). The old code corrected all the way
+    /// down to a 3.0-unit tolerance and then forced velocity to literal
+    /// zero — a pinpoint, not a preference — so once a wide player
+    /// arrived he froze there for as long as `shape_rule_active` stayed
+    /// true, since the target itself (`HoldWidth`'s old formula) never
+    /// moved either. Fixed on both ends: `HoldWidth`'s target now tracks
+    /// the ball's depth (`player.rs::ShapeRule::target`), so the "home"
+    /// point itself advances/retreats with play; and the tolerance below
+    /// is widened into a real leash that returns `None` (not a zeroed
+    /// velocity) once the player is already close enough, handing
+    /// movement back to the player's own state (tracking runs, support
+    /// positioning, off-ball spacing) instead of holding it hostage.
+    /// The override still wins outright — undiluted, full strength —
+    /// the moment a player drifts outside the leash, which is what
+    /// actually keeps the width preference real rather than reintroducing
+    /// the soft-nudge dilution this whole investigation already ruled
+    /// out (`docs/ball-distribution-fix-plan.md` §10-13).
     fn shape_rule_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         let player = ctx.player;
         // `shape_rule_active` (set in `engine/run.rs` alongside
@@ -979,9 +999,51 @@ impl<'p> StateProcessor<'p> {
         }
         let target = player.start_position;
         let to_target = target - player.position;
-        let dist = to_target.magnitude();
-        if dist < 3.0 {
-            return Some(Vector3::zeros());
+        // Split-axis leash (2026-08-31 follow-up), replacing the first
+        // isotropic 45-unit leash above. Measured regression from that
+        // version (same-binary A/B, `scripts/ball-distribution-check.mjs`,
+        // n=24/side): near-any-boundary 42.29%->33.70%, deflections/match
+        // 1.417->0.583 — a real cost, because a single circular tolerance
+        // lets a player drift just as far off the TIGHT width axis (y —
+        // `HoldWidth`'s target sits ~28u from the touchline, and this is
+        // exactly what the DoD metrics measure) as off the loose DEPTH
+        // axis (x — advancing/retreating with play, which is what was
+        // actually frozen and is fine to leave generously loose). An
+        // elliptical tolerance — tight on y, loose on x — keeps movement
+        // free on the axis that needed it without giving up discipline on
+        // the axis that didn't. When violated, the correction still steers
+        // toward the full target (both axes) rather than one axis alone —
+        // only the TRIGGER for when to correct is anisotropic.
+        //
+        // Positional-play/defensive-block rewrite (2026-08-31, Chunk 1):
+        // the 130/20 (x/y) shape above is specifically HoldWidth's own
+        // doctrine (loose depth, tight width) — but `CompactBackLine`/
+        // `CompactMidfieldLine` need the OPPOSITE anisotropy: real
+        // coaching doctrine is strict about a defensive LINE's DEPTH
+        // ("keep the line") and loose about lateral jockeying (a
+        // defender shifting to cover a run shouldn't fight the leash to
+        // do it). Before `active_shape_action` existed to distinguish
+        // them, every shape-rule action was silently enforced with
+        // HoldWidth's leash shape — meaning `CompactBackLine`'s own
+        // depth discipline (the entire point of a coordinated block) was
+        // being held to a loose ±130u tolerance while its lateral axis
+        // was pinned to ±20u, backwards from what the action exists to
+        // enforce.
+        let (leash_x, leash_y) = match player.active_shape_action.unwrap_or(ShapeAction::HoldWidth)
+        {
+            ShapeAction::HoldWidth => (130.0, 20.0),
+            ShapeAction::CompactBackLine | ShapeAction::CompactMidfieldLine => (20.0, 130.0),
+            // No established doctrine or measured baseline distinguishes
+            // the axes for these three yet — a moderate, symmetric
+            // default rather than either extreme.
+            ShapeAction::StepIntoMidfield | ShapeAction::TuckInside | ShapeAction::DropDeeper => {
+                (60.0, 60.0)
+            }
+        };
+        let scaled_dist =
+            ((to_target.x / leash_x).powi(2) + (to_target.y / leash_y).powi(2)).sqrt();
+        if scaled_dist < 1.0 {
+            return None;
         }
         let max_speed = player
             .skills

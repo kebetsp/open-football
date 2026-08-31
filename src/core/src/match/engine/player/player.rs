@@ -1,7 +1,7 @@
 use crate::club::player::events::PositionLoad;
 use crate::club::player::traits::{BehavioralDirective, PlayerTrait};
 use crate::r#match::PlayerMatchEndStats;
-use crate::r#match::{BallZone, TeamTacticalState};
+use crate::r#match::TeamTacticalState;
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::engine::result::PlayerMatchPhysicalSnapshot;
 use crate::r#match::engine::tactics::TacticalPositions;
@@ -48,13 +48,24 @@ pub enum ShapeTrigger {
     /// after 70 minutes, drop into a mid-block").
     LeadingAfterMinute(u32),
     TrailingAfterMinute(u32),
-    /// Principles-of-Play plan (2026-08-30): active when this player's
-    /// team does NOT have the ball and the ball is in this team's own
-    /// defensive third (`BallZone::DefensiveThird`). The real-football
-    /// case this exists for: a back line that should compress toward a
-    /// shared depth/spread while defending deep, not one that only
-    /// happens to compact as a side effect of individual duel behaviour.
-    DefendingOwnThird,
+    /// Active whenever this player's team does NOT have the ball AND
+    /// the team has settled into either `GamePhase::LowBlock` or
+    /// `GamePhase::MidBlock` (`TeamTacticalState::is_settled_defending`)
+    /// — i.e. a genuine coordinated defending spell, not just "the ball
+    /// happens to be deep this instant". Originally `DefendingOwnThird`
+    /// (2026-08-30, gated on `BallZone::DefensiveThird` alone, which
+    /// only matches `LowBlock`) — broadened and renamed in the
+    /// positional-play/defensive-block rewrite (2026-08-31,
+    /// `docs/positional-play-and-defensive-block-rewrite.md` Chunk 1):
+    /// a coordinated two-line block is real football's answer to BOTH a
+    /// mid-block and a low block, not only the deepest case, and the
+    /// old trigger meant `CompactBackLine` silently never fired at all
+    /// during `MidBlock` — the back line held no coordinated shape for
+    /// the entire "settle in and defend the middle third" phase of a
+    /// match. Drives both `CompactBackLine` (defenders) and the new
+    /// `CompactMidfieldLine` (midfielders) — the two halves of one
+    /// coordinated shape, sharing one trigger.
+    SettledDefending,
 }
 
 /// Action half of a shape rule — computed relative to the player's
@@ -84,6 +95,15 @@ pub enum ShapeAction {
     /// data isn't actually needed: the two team-level summaries already
     /// exist).
     CompactBackLine,
+    /// Positional-play/defensive-block rewrite (2026-08-31, Chunk 1) —
+    /// the midfield-line mirror of `CompactBackLine`: converges toward
+    /// `TeamTacticalState.midfield_line_x` (a real, sourced gap ahead of
+    /// the back line — see `midfield_line_gap_units`'s doc comment) and
+    /// squeezes this player's own lane toward the centre, looser than
+    /// the back line's own squeeze since a real midfield line screens
+    /// passing lanes across more of the pitch's width rather than
+    /// condensing as tightly as the back four.
+    CompactMidfieldLine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -121,17 +141,15 @@ impl ShapeRule {
             ShapeTrigger::TrailingAfterMinute(m) => {
                 goals_for < goals_against && minute_now >= m
             }
-            ShapeTrigger::DefendingOwnThird => {
-                !in_possession && matches!(team.ball_zone, BallZone::DefensiveThird)
-            }
+            ShapeTrigger::SettledDefending => !in_possession && team.is_settled_defending(),
         }
     }
 
     /// Target position for this rule's action, relative to `base`.
     /// `team` is this player's own team's tactical snapshot — only
     /// consulted by `CompactBackLine`, ignored by the other three.
-    /// `ball_y` (raw field Y, not side-corrected) is likewise only
-    /// consulted by `CompactBackLine`.
+    /// `ball_y` (raw field Y, not side-corrected) is consulted by
+    /// `CompactBackLine`; `ball_x` (raw field X) by `HoldWidth`.
     pub fn target(
         &self,
         base: Vector3<f32>,
@@ -140,6 +158,7 @@ impl ShapeRule {
         field_height: f32,
         team: TeamTacticalState,
         ball_y: f32,
+        ball_x: f32,
     ) -> Vector3<f32> {
         let dir = match side {
             PlayerSide::Left => 1.0,
@@ -154,8 +173,22 @@ impl ShapeRule {
             ),
             ShapeAction::HoldWidth => {
                 let ty = if base.y < centre { 28.0 } else { field_height - 28.0 };
+                // (2026-08-31) Pavel: wide players were "magnetised" to
+                // one fixed point and never moved — the old target here
+                // was `base.x` (this player's static kickoff/formation
+                // anchor) plus a constant offset, so it never reflected
+                // where play actually was. A real winger/fullback holds
+                // the touchline but advances and retreats WITH the run
+                // of play. Blend the lane anchor with the ball's actual
+                // depth so the discipline point itself moves — combined
+                // with the leash in `shape_rule_override_velocity`
+                // (processor.rs), which stops correcting once the player
+                // is already close enough, this restores real movement
+                // without giving up the width preference.
+                const BALL_TRACK_WEIGHT: f32 = 0.45;
+                let tracked_x = base.x * (1.0 - BALL_TRACK_WEIGHT) + ball_x * BALL_TRACK_WEIGHT;
                 Vector3::new(
-                    (base.x + dir * field_width * 0.05).clamp(20.0, field_width - 20.0),
+                    (tracked_x + dir * field_width * 0.05).clamp(20.0, field_width - 20.0),
                     ty,
                     0.0,
                 )
@@ -206,6 +239,24 @@ impl ShapeRule {
                 let ball_shift = ball_offset * (0.08 + team.compactness_target * 0.18);
                 Vector3::new(
                     team.defensive_line_x.clamp(20.0, field_width - 20.0),
+                    (squeezed_y + ball_shift).clamp(20.0, field_height - 20.0),
+                    0.0,
+                )
+            }
+            ShapeAction::CompactMidfieldLine => {
+                // Same squeeze/ball-shift mechanism as CompactBackLine,
+                // converging to `midfield_line_x` instead, and looser on
+                // the squeeze (0.10-0.45 vs the back line's 0.15-0.60) —
+                // a settled midfield line holds a bit more width to
+                // screen passing lanes across the pitch than the back
+                // four condenses to.
+                let lane_offset = base.y - centre;
+                let squeeze = (0.10 + team.compactness_target * 0.35).clamp(0.10, 0.45);
+                let squeezed_y = centre + lane_offset * (1.0 - squeeze);
+                let ball_offset = ball_y - centre;
+                let ball_shift = ball_offset * (0.08 + team.compactness_target * 0.18);
+                Vector3::new(
+                    team.midfield_line_x.clamp(20.0, field_width - 20.0),
                     (squeezed_y + ball_shift).clamp(20.0, field_height - 20.0),
                     0.0,
                 )
@@ -532,6 +583,19 @@ pub struct MatchPlayer {
     /// formation anchor whenever no rule is active, which is much
     /// broader than intended.
     pub shape_rule_active: bool,
+    /// Which action fired this tick's active shape rule, if any — set
+    /// alongside `shape_rule_active`/`start_position` in the same
+    /// engine-loop pass. Positional-play/defensive-block rewrite
+    /// (2026-08-31, Chunk 1): `processor.rs::shape_rule_override_velocity`
+    /// needs this to pick the right leash SHAPE — `HoldWidth` needs a
+    /// tight lateral / loose depth leash, while `CompactBackLine`/
+    /// `CompactMidfieldLine` need the opposite (real coaching doctrine
+    /// is strict about holding a defensive LINE's depth, loose about
+    /// lateral jockeying) — a single fixed leash shape for every action
+    /// silently enforced the wrong axis for the line-discipline actions
+    /// from the moment `CompactBackLine` shipped until this field
+    /// existed to tell them apart.
+    pub active_shape_action: Option<ShapeAction>,
     /// Team-wide directional attack bias: -1 = manager's left, 1 =
     /// right, 0 = centre. Pass-evaluator weight toward that lateral
     /// third ("build down the left").
@@ -751,6 +815,7 @@ impl MatchPlayer {
             shape_rules: Vec::new(),
             shape_base: None,
             shape_rule_active: false,
+            active_shape_action: None,
             attack_bias: None,
             directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
@@ -850,6 +915,7 @@ impl MatchPlayer {
             shape_rules: Vec::new(),
             shape_base: None,
             shape_rule_active: false,
+            active_shape_action: None,
             attack_bias: None,
             directness_bias: 0.0,
             is_force_match_selection,
