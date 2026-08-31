@@ -909,7 +909,7 @@ impl<'p> StateProcessor<'p> {
     /// Scoping (§10 thread 1, carried forward unchanged): the original
     /// width-only proof-of-concept fired in literally any state,
     /// including mid-tackle, which is why it needed scoping before
-    /// shipping. Two exemptions, both checked before the pursuit is
+    /// shipping. Three exemptions, all checked before the pursuit is
     /// computed:
     /// (1) any active Tackling state (any role) — a live 1v1 challenge
     /// deserves the player's full attention, not being yanked out to a
@@ -923,7 +923,30 @@ impl<'p> StateProcessor<'p> {
     /// after regaining the ball (`is_control_ball()` can go true off a
     /// favourable-direction loose ball, not only a firm claim) where a
     /// dangerous opponent may still be live and shouldn't be abandoned
-    /// instantly for the touchline.
+    /// instantly for the touchline;
+    /// (3) real bug (2026-08-31, Pavel: "red #11 winger is frozen, the
+    /// ball lands a few metres from him and he doesn't even try to get
+    /// it") — TakeBall (any role). `shape_rule_active` is derived from
+    /// `in_possession`, a phase-level flag that can lag a beat behind the
+    /// literal instant the ball goes loose (e.g. a heavy touch, a
+    /// deflection near a still-nominally-"in possession" team), while
+    /// `should_force_takeball` (`engine/run.rs`'s dispatch-time override)
+    /// separately and carefully designates the single strictly-closest
+    /// teammate to claim it, with its own hysteresis against thrash. Before
+    /// this exemption, that designation was won at the state level (the
+    /// player's `PlayerState` really did flip to TakeBall) but then
+    /// silently overwritten back to the touchline anchor by this function
+    /// one step later in the same tick — the state machine said "go get
+    /// it," the velocity pipeline said "no, hold width," and the velocity
+    /// pipeline always won (`SHAPE_OVERRIDE_BLEND_WEIGHT=1.0`, full
+    /// replacement). Verified with raw data before fixing (temporary
+    /// `SHAPEFREEZE_DIAG` trace, since removed): the collision fires
+    /// ~7,350 times per match on average — a genuinely common, not rare,
+    /// interaction. An external raw-position check (settled ball 20-90u
+    /// away, player closes <8u of it over the next 1.2s) found the strict
+    /// symptom itself at ~1.3 incidents/match before this fix, dropping to
+    /// ~0.3/match after — same-binary A/B, `git stash` isolated to this
+    /// file, 6 matches per side.
     fn shape_rule_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         let player = ctx.player;
         // `shape_rule_active` (set in `engine/run.rs` alongside
@@ -945,6 +968,10 @@ impl<'p> StateProcessor<'p> {
             Defender(DefenderState::Tackling)
             | Midfielder(MidfielderState::Tackling)
             | Forward(ForwardState::Tackling) => return None,
+            Goalkeeper(GoalkeeperState::TakeBall)
+            | Defender(DefenderState::TakeBall)
+            | Midfielder(MidfielderState::TakeBall)
+            | Forward(ForwardState::TakeBall) => return None,
             _ => {}
         }
         if ctx.player().defensive().scan_for_dangerous_runs().is_some() {
