@@ -492,29 +492,8 @@ impl TeamTacticalState {
         matches!(self.phase, GamePhase::DefensiveTransition)
     }
 
-    /// Also true during `DefensiveTransition` (2026-09-01, Pavel's
-    /// direct report: "if the attackers break through, midfielders do
-    /// not even bother to come back... other defenders as well").
-    /// `DefensiveTransition`'s own doc comment already states the
-    /// intended design — "the rest drop toward shape" — and
-    /// `defensive_line_x`/`midfield_line_gap_units` already compute the
-    /// SAME target depth for `DefensiveTransition` as for `MidBlock`
-    /// (they're grouped together in every phase-keyed match above) —
-    /// this was the one place that forgot to actually gate the
-    /// `CompactBackLine`/`CompactMidfieldLine` shape rules on it, so
-    /// the recovery pull those targets were computed for never fired
-    /// during exactly the "just lost the ball, breakthrough in
-    /// progress" window real football calls a recovery run. See
-    /// `shape_rule_override_velocity`'s own Pressing/Intercepting
-    /// exemption (processor.rs) for how the "nearest 2-3 counter-press,
-    /// the rest drop toward shape" split is preserved — this trigger
-    /// broadening pulls the RESISTANCE-FREE MAJORITY back, not the
-    /// players actively engaging the ball-carrier.
     pub fn is_settled_defending(&self) -> bool {
-        matches!(
-            self.phase,
-            GamePhase::MidBlock | GamePhase::LowBlock | GamePhase::DefensiveTransition
-        )
+        matches!(self.phase, GamePhase::MidBlock | GamePhase::LowBlock)
     }
 
     /// True if this team is in the build-up phase (own ball, own third).
