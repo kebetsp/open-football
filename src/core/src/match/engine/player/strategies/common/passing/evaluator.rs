@@ -6,7 +6,6 @@ use crate::r#match::engine::chemistry::chemistry_modifiers;
 use crate::r#match::engine::psychology::Psychology;
 use crate::r#match::player::strategies::common::players::ops::defensive_value::is_goal_side;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
-use crate::r#match::player::strategies::spacing;
 use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
     BallSideZone, GamePhase, MatchPlayer, MatchPlayerLite, PassOriginRestart, PitchLane,
@@ -672,38 +671,6 @@ impl PassEvaluator {
             0.0
         };
 
-        // Role-gated width preference for the PASSER himself (2026-08-31,
-        // Pavel: skew a genuinely wide-slotted player's own passing
-        // preference toward continuing to exploit the flank — a decision
-        // bias, not a positional pin). Narrower than the two bonuses just
-        // above, which fire for the whole `PlayerFieldPositionGroup`
-        // (Defender/Forward — including central CBs and strikers): this
-        // is gated on `spacing::flank_side`, a real wide SLOT
-        // (winger/fullback), so a central defender's or striker's own
-        // passing decisions are completely untouched by it. Stacks
-        // additively in the same unweighted family, on the reasoning
-        // that a term this narrowly scoped doesn't need to survive next
-        // to `forward_value`'s 0.32 weight the way a universal width
-        // term does (see `on_ball_value.rs::role_wide_preference`'s doc
-        // comment for the full rationale/history).
-        // Chunk 3 (2026-09-01): re-keyed from "is this player's static
-        // slot wide" to "does the team's LIVE ball_side currently make
-        // this player's flank the active one" — see
-        // `spacing::pattern_role`'s own doc comment. `FarSideWidthHold`
-        // gets a reduced bonus (background width-holding, not the
-        // point of the play this instant).
-        let passer_wide_role_bonus = if receiver_width_ratio > 0.4 {
-            // Chunk 3 (2026-09-01): raised from 0.35/0.14, same reasoning
-            // as `on_ball_value.rs::ROLE_WIDE_CARRY_SCALE`.
-            match spacing::pattern_role(ctx) {
-                Some(spacing::PatternRole::IsolatedWideTarget) => 0.6,
-                Some(spacing::PatternRole::FarSideWidthHold) => 0.24,
-                None => 0.0,
-            }
-        } else {
-            0.0
-        };
-
         let width_bonus = if receiver_width_ratio > 0.7 {
             // Very wide (near touchline) - excellent for stretching play
             0.5 + spreading_play_bonus + midfielder_width_bonus
@@ -1209,7 +1176,6 @@ impl PassEvaluator {
             open_wide_bonus +                 // F4: flat, same family as cutback_bonus
             defender_width_bonus_unweighted + // /goal 2026-07-26: flat, same family as cutback_bonus
             forward_width_bonus_unweighted +  // /goal 2026-07-26: flat, same family as cutback_bonus
-            passer_wide_role_bonus +          // 2026-08-31: role-gated, passer-side only
             build_up_recycle_bonus +
             stalled_recycle_bonus +
             directness_length_bias +
