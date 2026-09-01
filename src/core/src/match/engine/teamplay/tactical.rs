@@ -298,17 +298,6 @@ pub struct TeamTacticalState {
     /// Approximates the "defensive line" a tactical manager sets: high
     /// when we're pressing forward, low when we're in a low block.
     pub defensive_line_x: f32,
-    /// Target x-coordinate for the midfield line (shared by all
-    /// midfielders), advanced from `defensive_line_x` by a real,
-    /// phase-aware gap (`midfield_line_gap_units`). Positional-play/
-    /// defensive-block rewrite (2026-08-31,
-    /// `docs/positional-play-and-defensive-block-rewrite.md` Chunk 1):
-    /// this is the missing second line of a genuine two-line block — a
-    /// back four AND a midfield line holding related, coordinated
-    /// depths, not just an isolated back line. Consumed by
-    /// `ShapeAction::CompactMidfieldLine`, the midfield mirror of
-    /// `CompactBackLine`.
-    pub midfield_line_x: f32,
     /// 0.0 = play normally; 1.0 = full "park the bus / waste time" mode.
     /// Rises when leading, late in the game, and/or when we are the
     /// weaker side. Read by pass selection (prefer safe backward /
@@ -393,7 +382,6 @@ impl TeamTacticalState {
             ball_side: BallSideZone::Center,
             in_possession: false,
             defensive_line_x: 0.0,
-            midfield_line_x: 0.0,
             game_management_intensity: 0.0,
             press_intensity: 0.5,
             compactness_target: 0.5,
@@ -667,16 +655,6 @@ impl TeamTacticalState {
         away.defensive_line_x = (away_base_line + away_line_drop_units - away_gk_lift
             + away_gm_drop)
             .clamp(0.0, field_width);
-
-        // Midfield line: advanced from the back line by a real,
-        // phase-aware gap (see `midfield_line_gap_units`'s doc comment
-        // for sourcing). Home attacks toward increasing x (own goal at
-        // x=0), so its midfield line sits at a LARGER x than its back
-        // line; away is the mirror image.
-        let home_mid_gap = Self::midfield_line_gap_units(home.phase, field_width);
-        let away_mid_gap = Self::midfield_line_gap_units(away.phase, field_width);
-        home.midfield_line_x = (home.defensive_line_x + home_mid_gap).clamp(0.0, field_width);
-        away.midfield_line_x = (away.defensive_line_x - away_mid_gap).clamp(0.0, field_width);
 
         // ── Phase-dependent signals ──────────────────────────────────
         home.press_intensity = Self::compute_press_intensity(
@@ -1013,35 +991,6 @@ impl TeamTacticalState {
             BallZone::DefensiveThird => GamePhase::LowBlock,
             _ => GamePhase::MidBlock,
         }
-    }
-
-    /// Real-world-sourced gap (engine units, 8u/m) between the back line
-    /// and the midfield line, by phase. Positional-play/defensive-block
-    /// rewrite (2026-08-31, Chunk 1) — sourced via WebSearch, no single
-    /// peer-reviewed tracking-data figure found, so this is a reasoned
-    /// band across several independent coaching/analytics sources
-    /// rather than one authoritative number (flagged per this project's
-    /// own Realism Diagnosis Framework, category (b)/(d)): a compact low
-    /// block keeps "distances between lines never exceeding 10-15m"
-    /// (the-footballanalyst.com/kharasportsdaily.com low-block
-    /// explainers); a driblab/Inter-Milan-style coaching heuristic cites
-    /// "8-12m between back line and midfield" as ideal; a looser general
-    /// compactness ceiling of "never exceed 20-25m" is cited for the
-    /// wider mid-block case. Values below sit at the midpoint of each
-    /// cited band, widening as the phase itself gets less compact — if
-    /// the gap compresses further than this, that's a mid/high-press
-    /// signature, not a coordinated settled block; if it's wider, that's
-    /// "no coordinated block at all", the exact symptom this rewrite
-    /// targets.
-    fn midfield_line_gap_units(phase: GamePhase, field_width: f32) -> f32 {
-        let gap_m: f32 = match phase {
-            GamePhase::LowBlock => 11.0,
-            GamePhase::MidBlock | GamePhase::DefensiveTransition => 18.0,
-            GamePhase::HighPress => 22.0,
-            GamePhase::BuildUp | GamePhase::Progression => 24.0,
-            GamePhase::Attack | GamePhase::AttackingTransition => 28.0,
-        };
-        gap_m * (field_width / 105.0)
     }
 
     /// Game-management intensity from this team's perspective.
