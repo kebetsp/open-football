@@ -992,6 +992,21 @@ impl<'p> StateProcessor<'p> {
             | Defender(DefenderState::TakeBall)
             | Midfielder(MidfielderState::TakeBall)
             | Forward(ForwardState::TakeBall) => return None,
+            // (2026-09-01) `SettledDefending`'s broadened `DefensiveTransition`
+            // coverage (tactical.rs) means this override now also fires
+            // while the ball is loose right after a turnover — but that
+            // phase's own doc comment specifically wants "the nearest 2-3
+            // players counter-press; the rest drop toward shape". Without
+            // this exemption, a player actively pressing/intercepting the
+            // ball-carrier would get yanked backward toward the recovery
+            // line mid-press, fighting the exact behaviour that's supposed
+            // to win the ball back before a deep recovery is even needed.
+            Defender(DefenderState::Pressing)
+            | Midfielder(MidfielderState::Pressing)
+            | Forward(ForwardState::Pressing)
+            | Defender(DefenderState::Intercepting)
+            | Midfielder(MidfielderState::Intercepting)
+            | Forward(ForwardState::Intercepting) => return None,
             _ => {}
         }
         if ctx.player().defensive().scan_for_dangerous_runs().is_some() {

@@ -171,11 +171,20 @@ impl StateProcessingHandler for MidfielderGuardingState {
 
             let direction = to_desired.normalize();
 
-            // Speed based on how far off position we are
-            let base_speed = ctx.player.skills.physical.pace * 0.4;
+            // Speed based on how far off position we are. Was
+            // `pace * 0.4` (2026-09-01 fix) — the raw 1-20 `pace` skill
+            // used directly as a velocity, the same unit-scale bug this
+            // project has hit repeatedly elsewhere (e.g. §13.4's
+            // restart-retreat, real speed range ~0.36-0.6 u/tick, not
+            // 1-20). Real max speed, scaled by urgency, matches every
+            // other genuine-movement function in this codebase.
+            let max_speed = ctx
+                .player
+                .skills
+                .max_speed_with_condition(ctx.player.player_attributes.condition);
             let urgency = (distance / GUARD_DISTANCE).clamp(0.4, 1.0);
 
-            Some(direction * base_speed * urgency)
+            Some(direction * max_speed * urgency)
         } else {
             Some(Vector3::zeros())
         }
