@@ -140,6 +140,46 @@ fn structural_lane_risk(ctx: &StateProcessingContext, point: Vector3<f32>) -> f3
     excess * STRUCTURAL_LANE_SCALE
 }
 
+/// Role-gated width preference for the CARRIER himself (2026-08-31,
+/// Pavel: skew a genuinely wide-slotted player's own carry/dribble
+/// preference toward the flank — not a positional pin, a decision bias).
+/// Gated on `spacing::flank_side` — a real wide SLOT (winger/fullback),
+/// zero for every central role — unlike `structural_lane_risk` above
+/// (which penalises every player's central candidates identically), this
+/// only ever changes a wide-role player's OWN carry-target ranking. That
+/// scoping matters: `docs/ball-distribution-fix-plan.md` §9-13 logs nine
+/// separate universal width/reward-tuning attempts landing as near-nulls
+/// on the aggregate ball-distribution metric, because any term strong
+/// enough to matter for everyone starts fighting `forward_value`'s 0.32
+/// weight and the defender's 2.6x forward multiplier — large, load-
+/// bearing terms this project can't afford to distort. A role-gated term
+/// never has to survive that fight: it's invisible to a central
+/// defender's or striker's own decisions, so it can carry real weight
+/// for the specific subpopulation (wide-slotted players' own choices)
+/// this is actually meant to influence.
+// Chunk 3 (2026-09-01): doubled from 0.4 now that this term is
+// correctly role-gated (`pattern_role`, not a static formation slot) —
+// it can no longer dilute a central player's own carry decisions, so it
+// doesn't need to stay small the way a universal width term would.
+const ROLE_WIDE_CARRY_SCALE: f32 = 0.8;
+fn role_wide_preference(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
+    // Chunk 3 (2026-09-01): re-keyed from "is this player's static slot
+    // wide" to "does the team's LIVE ball_side currently make this
+    // player's flank the active one" — see
+    // `spacing::pattern_role`'s own doc comment. `FarSideWidthHold`
+    // gets a reduced scale (background width-holding, not the point of
+    // the play this instant).
+    let scale = match spacing::pattern_role(ctx) {
+        Some(spacing::PatternRole::IsolatedWideTarget) => 1.0,
+        Some(spacing::PatternRole::FarSideWidthHold) => 0.4,
+        None => return 0.0,
+    };
+    let field_height = ctx.context.field_size.height as f32;
+    let lateral_center = field_height / 2.0;
+    let width_ratio = ((point.y - lateral_center).abs() / (field_height / 2.0)).clamp(0.0, 1.0);
+    width_ratio * ROLE_WIDE_CARRY_SCALE * scale
+}
+
 /// Ticks for `opponent` to reach `point`: their real, condition-adjusted
 /// max speed (u/tick) plus the reaction-time floor. This is the single
 /// primitive Component B (carry) and Component C (pass completion, B3)
@@ -413,7 +453,8 @@ pub fn carry_value(ctx: &StateProcessingContext, point: Vector3<f32>) -> f32 {
     let risk = risk_penalty(ctx, point);
     let congestion = congestion_risk(ctx, point);
     let lane_diversity = lane_occupancy_adjustment(ctx, point);
-    cp * sv.max(pv) - risk - congestion + lane_diversity
+    let role_wide = role_wide_preference(ctx, point);
+    cp * sv.max(pv) - risk - congestion + lane_diversity + role_wide
 }
 
 /// Half-width of the goal in game units — same constant `flow/goal.rs`

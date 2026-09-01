@@ -52,6 +52,53 @@ pub enum GamePhase {
     HighPress,
 }
 
+/// Which real, named attacking pattern (if any) this team is currently
+/// running against the opponent's shape. Positional-play/defensive-
+/// block rewrite, Part B (2026-08-31,
+/// `docs/positional-play-and-defensive-block-rewrite.md` Chunk 2) — the
+/// missing "what is our team currently TRYING to do" layer named as the
+/// second of two coupled architectural gaps in that doc (Part A, the
+/// two-line block, shipped in Chunk 1). Recomputed every tactical
+/// refresh from already-computed team state (`side_density_*`,
+/// `ball_side`, possession/transition), NOT stored per-player — a
+/// player's own live role within the pattern is derived fresh from this
+/// plus the player's own position (`spacing::pattern_role`), the same
+/// "derive, don't store" convention `flank_side` already established.
+/// Only meaningful while `in_possession` — `None` while defending (a
+/// distinct concept from `GamePhase`'s own defending phases).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttackPattern {
+    /// A lone wide player (or a wide pair — fullback + winger sharing
+    /// one flank) has real room: few of our own players have committed
+    /// to that flank, so nobody's cluttering the space we want a 1v1
+    /// duel in. Doc's pattern #1 — the first fully wired (Chunk 3).
+    WideIsolation,
+    /// Several of our players have committed to one flank — dragging
+    /// the opponent's block across before a switch to the now-stretched
+    /// far side. Doc's pattern #2 — detection only so far (Chunk 2);
+    /// role assignment/consumption is Chunk 4.
+    OverloadAndSwitch,
+    /// A small group (a fullback/winger pair, or similar) working one
+    /// flank together — the doc's pattern #3, needing a "timed run
+    /// relative to a teammate's possession" primitive the plan itself
+    /// flags as the highest-uncertainty piece, deliberately last
+    /// (Chunk 4). Detection only so far.
+    UnderlapOverlapCombination,
+    /// Ball is central, or no wide picture has opened up yet — genuine
+    /// patient circulation while probing for one of the patterns above.
+    /// Doc's pattern #4; the eventual fallback once nothing else is
+    /// live (Chunk 5 replaces the current always-on progression
+    /// pressure with genuine patience here).
+    PatientCirculation,
+    /// The `AttackingTransition` phase (just won the ball, sprinting)
+    /// — patterns 1-3 don't apply to a fast break because the opponent
+    /// hasn't organized a block to manipulate yet. Doc's pattern #5;
+    /// already reasonably covered by existing transition machinery, so
+    /// this variant mainly exists to make sure patterns 1-3 correctly
+    /// do NOT fire during a genuine break.
+    DirectBreak,
+}
+
 /// Which third of the pitch the ball is in, from the *attacking*
 /// perspective of a given team. A team attacks toward the opposite
 /// goal, so `BallZone::for_side(left, ...)` returns `AttackingThird`
@@ -309,6 +356,10 @@ pub struct TeamTacticalState {
     /// `ShapeAction::CompactMidfieldLine`, the midfield mirror of
     /// `CompactBackLine`.
     pub midfield_line_x: f32,
+    /// Which named attacking pattern (if any) this team is currently
+    /// running — see `AttackPattern`'s own doc comment. `None` whenever
+    /// out of possession.
+    pub attack_pattern: Option<AttackPattern>,
     /// 0.0 = play normally; 1.0 = full "park the bus / waste time" mode.
     /// Rises when leading, late in the game, and/or when we are the
     /// weaker side. Read by pass selection (prefer safe backward /
@@ -372,6 +423,20 @@ pub struct TeamTacticalState {
     /// relational signal no existing static per-candidate width bonus
     /// captures.
     pub wide_marked_count: u8,
+    /// Per-side (absolute low-y/high-y half — matches `BallSideZone::
+    /// Left/Right`) count of our own wide-lane outfield players who are
+    /// NOT within `spatial_sensor::WIDE_MARKING_PROXIMITY_RADIUS` of any
+    /// opponent — i.e. a genuinely open outlet on that flank right now.
+    /// Positional-play/defensive-block rewrite, Chunk 2 (2026-09-01,
+    /// `docs/positional-play-and-defensive-block-rewrite.md`):
+    /// `wide_marked_count` above aggregates BOTH flanks together, which
+    /// a first-cut `compute_attack_pattern` verification found couldn't
+    /// distinguish "this specific flank is open" from "the OTHER flank
+    /// happens to be open/crowded" — this is the per-side split that
+    /// signal needed. Reuses the exact same radius/opponent test, just
+    /// bucketed by absolute half instead of collapsed across both.
+    pub wide_open_count_left: u8,
+    pub wide_open_count_right: u8,
     /// Derived scalar: how much a central point's congestion cost
     /// *should* be discounted because teammates elsewhere are genuinely
     /// stretching the defense. Computed from `wide_marked_count` via
@@ -394,6 +459,7 @@ impl TeamTacticalState {
             in_possession: false,
             defensive_line_x: 0.0,
             midfield_line_x: 0.0,
+            attack_pattern: None,
             game_management_intensity: 0.0,
             press_intensity: 0.5,
             compactness_target: 0.5,
@@ -407,6 +473,8 @@ impl TeamTacticalState {
             side_density_center: 3,
             side_density_right: 4,
             wide_marked_count: 0,
+            wide_open_count_left: 0,
+            wide_open_count_right: 0,
             central_congestion_discount: 0.0,
         }
     }
@@ -909,6 +977,38 @@ impl TeamTacticalState {
         home.wide_marked_count = count_marked_wide(&home_outfield, true);
         away.wide_marked_count = count_marked_wide(&away_outfield, false);
 
+        // Chunk 2's per-side split of the same signal — see
+        // `wide_open_count_left/right`'s own doc comment. `want_left`
+        // buckets by absolute half (y < field_height/2.0); safe because
+        // `is_wide` (checked first) already excludes the Centre lane, so
+        // a wide-lane player is always unambiguously in the near two-
+        // fifths (y < 0.4H) or far two-fifths (y > 0.6H), never near the
+        // 0.5H boundary itself.
+        let count_unmarked_wide_side = |own: &[(nalgebra::Vector3<f32>, bool)],
+                                         is_home_side: bool,
+                                         want_left: bool|
+         -> u8 {
+            let mut n = 0u8;
+            for (pos, is_wide) in own.iter() {
+                if !*is_wide || (pos.y < field_height / 2.0) != want_left {
+                    continue;
+                }
+                let marked = field.players.iter().filter(|p| !p.is_sent_off).any(|opp| {
+                    let opp_is_home = opp.team_id == inputs.home_team_id;
+                    opp_is_home != is_home_side
+                        && (opp.position - pos).magnitude_squared() <= radius_sq
+                });
+                if !marked {
+                    n = n.saturating_add(1);
+                }
+            }
+            n
+        };
+        home.wide_open_count_left = count_unmarked_wide_side(&home_outfield, true, true);
+        home.wide_open_count_right = count_unmarked_wide_side(&home_outfield, true, false);
+        away.wide_open_count_left = count_unmarked_wide_side(&away_outfield, false, true);
+        away.wide_open_count_right = count_unmarked_wide_side(&away_outfield, false, false);
+
         // P6 — AI lever: `spatialBias.widthEmphasis`, 1.0 = neutral. Set
         // identically on every player of a team (same convention as the
         // existing `attack_bias` field) — any one player's copy reads
@@ -933,6 +1033,24 @@ impl TeamTacticalState {
             * spatial_sensor::DISCOUNT_PER_WIDE_MARKED_PLAYER
             * away_width_emphasis)
             .min(spatial_sensor::MAX_CENTRAL_CONGESTION_DISCOUNT);
+
+        // Positional-play/defensive-block rewrite, Part B (Chunk 2):
+        // attacking-pattern selection. Placed last since it reads
+        // `side_density_*`/`ball_side`/`phase`, all computed above.
+        home.attack_pattern = Self::compute_attack_pattern(
+            home.in_possession,
+            home.is_attacking_transition(),
+            home.ball_side,
+            home.side_density_left,
+            home.side_density_right,
+        );
+        away.attack_pattern = Self::compute_attack_pattern(
+            away.in_possession,
+            away.is_attacking_transition(),
+            away.ball_side,
+            away.side_density_left,
+            away.side_density_right,
+        );
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -1042,6 +1160,64 @@ impl TeamTacticalState {
             GamePhase::Attack | GamePhase::AttackingTransition => 28.0,
         };
         gap_m * (field_width / 105.0)
+    }
+
+    /// Pure classifier for `AttackPattern` — Chunk 2's selector.
+    /// Density-only, `side_density_left/right` (ALL 11 players, any
+    /// role, GK included, in that absolute pitch third — a numbers-on-
+    /// the-flank signal, not per-player marking detail).
+    ///
+    /// Thresholds recalibrated 2026-09-01 against raw in-engine data
+    /// (`docs/positional-play-and-defensive-block-rewrite.md` Chunk 2
+    /// verification), NOT invented round numbers — the original 0-1/2-
+    /// 3/4+ split was checked first and found to make `WideIsolation`
+    /// almost unreachable (0.03% of wide-ball ticks, 20-match sample):
+    /// `side_density` counts the ball carrier himself, so density=0 is
+    /// structurally impossible and density=1 requires a winger with
+    /// literally zero teammates — including any overlapping full-back —
+    /// anywhere in that third of the pitch, a near-degenerate case in
+    /// this engine's default shape. A fresh 25-match measurement of the
+    /// real achievable range (n=16183 wide-ball, in-possession, non-
+    /// transition team-ticks) found density=2 is the actual practical
+    /// floor (32.4% of ticks — carrier + at most one supporting player,
+    /// e.g. an overlapping full-back — the closest this engine's shape
+    /// gets to "minimal clutter"), density=3 the modal case (47.3% —
+    /// a third player has joined, a genuine combination developing),
+    /// and density 4+ a real, comparatively rare numerical commitment
+    /// (~20%). The three bands below map directly onto those three
+    /// empirical population bands instead of an unreachable, an
+    /// overcrowded, and a merely-modal one. A per-side unmarked-wide-
+    /// player signal (`wide_open_count_left/right`) was built and
+    /// measured alongside this (open=0 only 3.13% of the time, vs.
+    /// open 2-3 the modal case) as a candidate refinement, but layering
+    /// it into the decision itself is deliberately deferred — the
+    /// density-only recalibration alone already tracks real population
+    /// bands; adding a second input without first checking whether it
+    /// changes anything is exactly the premature-complexity this
+    /// project's Realism Diagnosis Framework warns against.
+    fn compute_attack_pattern(
+        in_possession: bool,
+        is_attacking_transition: bool,
+        ball_side: BallSideZone,
+        side_density_left: u8,
+        side_density_right: u8,
+    ) -> Option<AttackPattern> {
+        if !in_possession {
+            return None;
+        }
+        if is_attacking_transition {
+            return Some(AttackPattern::DirectBreak);
+        }
+        let my_side_density = match ball_side {
+            BallSideZone::Left => side_density_left,
+            BallSideZone::Right => side_density_right,
+            BallSideZone::Center => return Some(AttackPattern::PatientCirculation),
+        };
+        Some(match my_side_density {
+            0..=2 => AttackPattern::WideIsolation,
+            3 => AttackPattern::UnderlapOverlapCombination,
+            _ => AttackPattern::OverloadAndSwitch,
+        })
     }
 
     /// Game-management intensity from this team's perspective.

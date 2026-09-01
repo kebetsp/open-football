@@ -2,11 +2,11 @@ use crate::PlayerFieldPositionGroup;
 use crate::Tactics;
 use crate::club::staff::CoachMatchSnapshot;
 use crate::r#match::ball::Ball;
-use crate::r#match::player::strategies::spacing::flank_side;
+use crate::r#match::player::strategies::spacing::{Side, flank_side};
 use crate::r#match::player::{ShapeAction, ShapeRule, ShapeTrigger};
 use crate::r#match::{
-    FieldSquad, MatchFieldSize, MatchPlayer, MatchSquad, POSITION_POSITIONING, PlayerSide,
-    PositionType,
+    BallSideZone, FieldSquad, MatchFieldSize, MatchPlayer, MatchSquad, POSITION_POSITIONING,
+    PlayerSide, PositionType,
 };
 use nalgebra::Vector3;
 use std::collections::{HashMap, HashSet};
@@ -457,9 +457,22 @@ fn setup_player_on_field(
                 // no directive's own trigger is currently active — the
                 // intended layering (this fills a coverage gap, it
                 // never overrides an explicit instruction).
-                if flank_side(player.tactical_position.current_position, tactic).is_some() {
+                // Positional-play/defensive-block rewrite, Chunk 3
+                // (2026-09-01): trigger changed from the old, always-on
+                // `InPossession` to `AttackingMyFlank`, baked with this
+                // player's own absolute flank at setup time (a formation
+                // slot's side doesn't change mid-match) — see
+                // `ShapeTrigger::AttackingMyFlank`'s own doc comment for
+                // why. The rule now only ever fires while the ball is
+                // genuinely on THIS player's own side of the pitch.
+                if let Some(side) = flank_side(player.tactical_position.current_position, tactic)
+                {
+                    let my_flank = match side {
+                        Side::Left => BallSideZone::Left,
+                        Side::Right => BallSideZone::Right,
+                    };
                     player.shape_rules.push(ShapeRule {
-                        trigger: ShapeTrigger::InPossession,
+                        trigger: ShapeTrigger::AttackingMyFlank(my_flank),
                         action: ShapeAction::HoldWidth,
                     });
                 }

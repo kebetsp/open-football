@@ -460,14 +460,19 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             &inputs,
         );
 
-        // TEMPORARY Chunk-0 diagnostic (positional-play/defensive-block
-        // rewrite, docs/positional-play-and-defensive-block-rewrite.md)
-        // — raw ground truth for the two questions the rewrite exists to
-        // answer: does the back line genuinely occupy its own box during
-        // a settled defending spell, and is there a real, coordinated
-        // gap between the back line and midfield line. Removed once the
-        // rewrite's Chunk 1 verification is done — not a permanent
-        // counter like `tackle_stats`/`spacing_stats`.
+        // Chunk-0 diagnostic (positional-play/defensive-block rewrite,
+        // docs/positional-play-and-defensive-block-rewrite.md) — raw
+        // ground truth the rewrite's own later chunks keep re-checking
+        // against (does the back line genuinely occupy its own box
+        // during a settled defending spell; is there a real, coordinated
+        // gap between the back line and midfield line). Kept permanent,
+        // like `tackle_stats`/`spacing_stats` — but the WHOLE block is
+        // `#[cfg]`-gated, not just the final `match_log_info!` call, so
+        // the box-occupancy/averaging work costs nothing in a plain
+        // production build (the macro alone compiling to nothing still
+        // left the computed locals unused, i.e. real, if small, wasted
+        // work plus compiler warnings in that build).
+        #[cfg(feature = "match-logs")]
         {
             // No throttle: `refresh_tactical_states` (the caller, run.rs)
             // already only fires every 10-25 ticks on its own
@@ -553,6 +558,43 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 away_def_in_box,
                 away_def_total,
                 away_mid_avg_x,
+            );
+
+            // Chunk-2 diagnostic (positional-play/defensive-block
+            // rewrite, docs/positional-play-and-defensive-block-
+            // rewrite.md Part B) — verifies the attacking-pattern
+            // selector picks sensible patterns against real match
+            // situations, not just that it compiles. Logs the whole
+            // input the classifier actually reads
+            // (`ball_side`/`side_density_left/right`/
+            // `is_attacking_transition`) alongside its output
+            // (`attack_pattern`) so a raw-data check can confirm the
+            // decision boundary (density 0-1 -> WideIsolation, 2-3 ->
+            // UnderlapOverlapCombination, 4+ -> OverloadAndSwitch,
+            // Center -> PatientCirculation, transition ->
+            // DirectBreak) actually held for real matches, and — since
+            // this is log-only per Chunk 2's own scope — nothing here
+            // feeds any decision yet.
+            match_log_info!(
+                "CHUNK2DIAG home pat={:?} in_poss={} transition={} ball_side={:?} dens_l={} dens_r={} marked={} open_l={} open_r={} | away pat={:?} in_poss={} transition={} ball_side={:?} dens_l={} dens_r={} marked={} open_l={} open_r={}",
+                context.tactical_home.attack_pattern,
+                context.tactical_home.in_possession,
+                context.tactical_home.is_attacking_transition(),
+                context.tactical_home.ball_side,
+                context.tactical_home.side_density_left,
+                context.tactical_home.side_density_right,
+                context.tactical_home.wide_marked_count,
+                context.tactical_home.wide_open_count_left,
+                context.tactical_home.wide_open_count_right,
+                context.tactical_away.attack_pattern,
+                context.tactical_away.in_possession,
+                context.tactical_away.is_attacking_transition(),
+                context.tactical_away.ball_side,
+                context.tactical_away.side_density_left,
+                context.tactical_away.side_density_right,
+                context.tactical_away.wide_marked_count,
+                context.tactical_away.wide_open_count_left,
+                context.tactical_away.wide_open_count_right,
             );
         }
 

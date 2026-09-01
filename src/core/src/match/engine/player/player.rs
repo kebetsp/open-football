@@ -1,7 +1,7 @@
 use crate::club::player::events::PositionLoad;
 use crate::club::player::traits::{BehavioralDirective, PlayerTrait};
 use crate::r#match::PlayerMatchEndStats;
-use crate::r#match::TeamTacticalState;
+use crate::r#match::{BallSideZone, TeamTacticalState};
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::engine::result::PlayerMatchPhysicalSnapshot;
 use crate::r#match::engine::tactics::TacticalPositions;
@@ -66,6 +66,31 @@ pub enum ShapeTrigger {
     /// `CompactMidfieldLine` (midfielders) — the two halves of one
     /// coordinated shape, sharing one trigger.
     SettledDefending,
+    /// Positional-play/defensive-block rewrite, Chunk 3 (2026-09-01,
+    /// `docs/positional-play-and-defensive-block-rewrite.md`) — replaces
+    /// `InPossession` as the trigger for the default `HoldWidth` rule.
+    /// Pavel's own explicit correction to the earlier chunks: the old
+    /// rule fired unconditionally whenever the team had the ball,
+    /// regardless of whether the ball was anywhere near this player's
+    /// flank — a static property of the formation slot, not a genuine
+    /// tactical read, and the direct cause of the still-central-biased
+    /// play this whole investigation kept measuring. Fires while this
+    /// player's team is in possession, UNLESS the ball is clearly on
+    /// the OPPOSITE absolute half of the pitch (`BallSideZone`) from
+    /// this player's own flank — i.e. it covers "the ball's genuinely
+    /// on my side" AND "the ball's central, nothing's decided yet", and
+    /// only backs off when play has genuinely been worked to the other
+    /// flank. First cut (2026-09-01) used an exact-match condition
+    /// (`ball_side == my_side` only) — measured on a fresh batch and
+    /// found far too narrow: it excluded the (larger) central-ball
+    /// population entirely, and near-any-boundary occupancy dropped
+    /// BELOW its pre-Chunk-3 level (25.84% vs 36.8%) rather than
+    /// improving, confirming the trigger needed the "not opposite"
+    /// boundary, not "exact match". The payload is baked in once at
+    /// rule-creation time (`flow::field::setup_player_on_field`, from
+    /// `spacing::flank_side`), since a player's own formation-slot side
+    /// doesn't change mid-match.
+    AttackingMyFlank(BallSideZone),
 }
 
 /// Action half of a shape rule — computed relative to the player's
@@ -142,6 +167,14 @@ impl ShapeRule {
                 goals_for < goals_against && minute_now >= m
             }
             ShapeTrigger::SettledDefending => !in_possession && team.is_settled_defending(),
+            ShapeTrigger::AttackingMyFlank(my_side) => {
+                let opposite = match my_side {
+                    BallSideZone::Left => BallSideZone::Right,
+                    BallSideZone::Right => BallSideZone::Left,
+                    BallSideZone::Center => BallSideZone::Center,
+                };
+                in_possession && team.ball_side != opposite
+            }
         }
     }
 

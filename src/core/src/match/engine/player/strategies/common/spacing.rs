@@ -93,6 +93,62 @@ pub(crate) fn flank_side(pt: PlayerPositionType, tactic: MatchTacticType) -> Opt
     }
 }
 
+/// A wide-slotted player's LIVE role in the team's current flank
+/// picture — positional-play/defensive-block rewrite, Chunk 3
+/// (2026-09-01, `docs/positional-play-and-defensive-block-rewrite.md`).
+/// Replaces the "is this player in a wide formation slot" gate every
+/// width-related decision term in this codebase used before this —
+/// Pavel's own direct correction to the earlier chunks: a static
+/// formation slot fires the same width preference all game regardless
+/// of where the ball actually is, which is exactly the "players going
+/// too much to the center instead of utilising flanks properly"
+/// pattern this rewrite exists to fix. This is derived fresh every call
+/// from `TeamTacticalState::ball_side` (never stored per-player), the
+/// same "derive, don't store" convention `flank_side` itself follows.
+#[derive(PartialEq, Clone, Copy)]
+pub(crate) enum PatternRole {
+    /// The ball is genuinely on THIS player's flank right now — the
+    /// active outlet a real winger/full-back should be exploiting
+    /// (dribble at the defender, look for the byline/cutback).
+    IsolatedWideTarget,
+    /// The ball is on the OPPOSITE flank. Real doctrine still wants
+    /// width held here (to keep the block stretched for a switch), but
+    /// it's a background job, not the point of the play this instant —
+    /// every consumer of this role weights it well below
+    /// `IsolatedWideTarget`.
+    FarSideWidthHold,
+}
+
+/// `None` for a central role, a team not currently in possession, or a
+/// central ball position (`BallSideZone::Center` — no flank is "live"
+/// when the ball's in the middle third, so neither side gets a role).
+pub(crate) fn pattern_role(ctx: &StateProcessingContext) -> Option<PatternRole> {
+    let tactic = own_tactic(ctx);
+    let my_side = flank_side(ctx.player.tactical_position.current_position, tactic)?;
+    let team = *ctx.team().tactical();
+    if !team.in_possession {
+        return None;
+    }
+    // "Not clearly on the opposite flank" (matches `ShapeTrigger::
+    // AttackingMyFlank`'s own corrected boundary, player.rs) — a ball
+    // that's genuinely on my side OR still central (nothing decided
+    // yet) both count as `IsolatedWideTarget`; only a ball clearly
+    // worked to the OTHER flank drops this player to the background
+    // `FarSideWidthHold` role. An exact-match-only version (ball must
+    // be on MY side specifically) was measured first and found to gut
+    // occupancy — it excluded the much larger central-ball population
+    // entirely.
+    let opposite = match my_side {
+        Side::Left => BallSideZone::Right,
+        Side::Right => BallSideZone::Left,
+    };
+    Some(if team.ball_side == opposite {
+        PatternRole::FarSideWidthHold
+    } else {
+        PatternRole::IsolatedWideTarget
+    })
+}
+
 /// The teammate who shares my flank (e.g. the winger ahead of a wide
 /// fullback, or vice versa) — `None` if I'm not in a wide-slotted role
 /// myself, or if nobody else on the team is on the same flank. Nearest
@@ -1003,6 +1059,7 @@ fn score_candidate(
     let field_h = ctx.context.field_size.height as f32;
     score += stretch_credit(position, field_h, opponents);
     score += width_persistence_bonus(ctx, position, field_h);
+    score += role_wide_offball_preference(ctx, position, field_h);
 
     // Tether: stay recognisably within the caller's tactical intent —
     // blended toward the HOLDER's own position as pressure rises PAST the
@@ -1105,6 +1162,45 @@ fn width_persistence_bonus(
     let dist = (candidate - current).magnitude();
     ((WIDTH_PERSISTENCE_RADIUS - dist).max(0.0) / WIDTH_PERSISTENCE_RADIUS)
         * WIDTH_PERSISTENCE_WEIGHT
+}
+
+/// Role-gated width preference for the OFF-BALL MOVER himself (2026-08-31,
+/// Pavel: skew a genuinely wide-slotted player's own movement preference
+/// toward the flank, not just his positional anchor — "prefer the wing
+/// over the centre" as a decision bias, applied to passing/dribbling/
+/// moving without the ball alike). Gated on `flank_side` — a real wide
+/// SLOT (winger/fullback) — zero for every central role, so a central
+/// defender's or midfielder's own off-ball candidate scoring is
+/// completely untouched. Distinct from `stretch_credit`/
+/// `width_persistence_bonus` above, which reward width FOR THE TEAM
+/// regardless of who's moving (any player earns them for occupying a
+/// wide/stretched point); this specifically rewards a wide-role player
+/// for choosing to stay wide himself, mirroring the same role-gated
+/// carry (`on_ball_value.rs::role_wide_preference`) and pass
+/// (`evaluator.rs`'s `passer_wide_role_bonus`) terms added alongside it.
+// Chunk 3 (2026-09-01): raised from 25.0, same reasoning as
+// `on_ball_value.rs::ROLE_WIDE_CARRY_SCALE` — now genuinely role-gated
+// (`pattern_role`), so it can carry real weight without diluting a
+// central player's own off-ball positioning.
+const ROLE_WIDE_OFFBALL_WEIGHT: f32 = 45.0;
+fn role_wide_offball_preference(
+    ctx: &StateProcessingContext,
+    candidate: Vector3<f32>,
+    field_h: f32,
+) -> f32 {
+    // Chunk 3 (2026-09-01): re-keyed from "is this player's static slot
+    // wide" to "does the team's LIVE ball_side currently make this
+    // player's flank the active one" — see `pattern_role`'s own doc
+    // comment. `FarSideWidthHold` gets a reduced scale (background
+    // width-holding, not the point of the play this instant).
+    let scale = match pattern_role(ctx) {
+        Some(PatternRole::IsolatedWideTarget) => 1.0,
+        Some(PatternRole::FarSideWidthHold) => 0.4,
+        None => return 0.0,
+    };
+    let centre = field_h / 2.0;
+    let width_ratio = ((candidate.y - centre).abs() / (field_h / 2.0)).clamp(0.0, 1.0);
+    width_ratio * ROLE_WIDE_OFFBALL_WEIGHT * scale
 }
 
 /// D3 — central-corridor-priority default shape, defenders only. `0.0`
