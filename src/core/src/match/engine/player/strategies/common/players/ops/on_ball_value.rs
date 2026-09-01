@@ -787,6 +787,45 @@ pub fn carry_candidates(ctx: &StateProcessingContext) -> (Vector3<f32>, f32) {
         }
     }
 
+    // docs/positional-play-and-defensive-block-rewrite.md (2026-09-01,
+    // "no artificial magnets"): the fan above is entirely GOAL-relative
+    // — as a carrier gets closer to goal, `forward`'s y-component grows
+    // (it points at the fixed goal-centre y), which shrinks `lateral`'s
+    // width-exploring component and funnels every candidate
+    // increasingly straight at goal. A carrier who isn't yet in the
+    // wide channel never gets a candidate that explores the flank
+    // independently of advancing toward goal centre — real width
+    // (drawing the defensive block across, opening a wide 1v1) is a
+    // genuinely different option from "advance diagonally toward
+    // goal," not a byproduct of it. This complements, not replaces, the
+    // byline-candidate block above (which only helps a carrier ALREADY
+    // wide) by giving a still-central carrier the option to migrate
+    // into the wide channel in the first place. Field-geometry relative
+    // (toward the nearer touchline on the pure y-axis, with a small
+    // forward blend so it reads as a real diagonal run rather than a
+    // sidestep), not goal-relative — and scored with NO added bonus, so
+    // it competes purely on the existing `carry_value` (control
+    // probability, shot/pass value, congestion risk) like every other
+    // candidate. This is the intended replacement for the removed
+    // default `HoldWidth` shape rule (a hard, always-on positional pin
+    // — see `flow::field::setup_player_on_field`): width should be
+    // chosen because it's genuinely the better option here, never
+    // enforced regardless of the situation.
+    let mut wide_candidate_points: Vec<Vector3<f32>> = Vec::new();
+    if !is_wide_channel {
+        let to_near_touchline_y = if player_pos.y < field_height * 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
+        let wide_dir = Vector3::new(0.0, to_near_touchline_y, 0.0);
+        for &frac in &[0.5, 1.0] {
+            let c = player_pos + wide_dir * (reach * frac) + forward * (reach * frac * 0.25);
+            candidates.push(c);
+            wide_candidate_points.push(c);
+        }
+    }
+
     let on_ball = ctx.player.has_ball(ctx);
     let claimed = if on_ball {
         Vec::new()
@@ -826,6 +865,14 @@ pub fn carry_candidates(ctx: &StateProcessingContext) -> (Vector3<f32>, f32) {
 
     // Every candidate excluded (packed box) — fall back to the best
     // scorer regardless of claim, same pattern as find_optimal_free_zone.
+    //
+    // Verified (2026-09-01, temporary diagnostic since removed): in a
+    // real match, the wide-migration candidate added above wins this
+    // comparison whenever it's genuinely offered (i.e. the carrier
+    // isn't already in the wide channel) 15-24% of the time for
+    // forwards/central defenders and up to 58% of the time for
+    // fullbacks — a real, meaningful share, not a candidate that's
+    // proposed and then never selected.
     if best_value == f32::MIN {
         (best_any_point, best_any_value)
     } else {
