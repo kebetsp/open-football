@@ -1214,6 +1214,99 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     }
                     continue;
                 }
+                // Chunk 5 (docs/zone-staged-possession-progression.md):
+                // a genuine "meeting a defender" contact event, already
+                // classified as WideIsolation by
+                // TeamTacticalState::refresh_positional_attack
+                // (contact-gated, not continuous — see that function's
+                // own doc comment), commits the CARRIER to trying to
+                // beat his marker and reach the byline. Deliberately a
+                // SEPARATE branch from the ambient arm gate below, not
+                // an extra condition on it: that gate requires an EMPTY
+                // flank (`has_room`, zero opponents within 9u) and can
+                // therefore structurally never fire for a genuine 1v1
+                // isolation — there IS a defender there, that's the
+                // whole point of the pattern. Reuses the same downstream
+                // field/mechanism (`byline_commitment_ticks`), not a
+                // second, competing one.
+                // Real, documented risk, guarded explicitly rather than
+                // assumed harmless: the reverted rewrite's own fatal
+                // regression was a corner-taker dribbling from the flag
+                // instead of delivering. A corner/free-kick/throw-in/
+                // penalty taker IS the ball owner and often IS in the
+                // wide channel at the exact moment this branch would
+                // otherwise check — `PassOriginRestart::OpenPlay` is
+                // the same field `is_team_attacking_corner()` itself
+                // reads (`common/ball.rs`), so this arm can only ever
+                // fire during genuine open-play advancing, never during
+                // any restart's own dedicated, already-tuned delivery
+                // logic.
+                if field.ball.pass_origin_restart == crate::r#match::PassOriginRestart::OpenPlay {
+                if let Some(owner_id) = raw_owner {
+                    if owner_id == p.id {
+                        let team_tactical = if p.team_id == context.field_home_team_id {
+                            &context.tactical_home
+                        } else {
+                            &context.tactical_away
+                        };
+                        if team_tactical.positional_attack_active()
+                            && team_tactical.positional_attack_pattern
+                                == Some(crate::r#match::AttackPattern::WideIsolation)
+                        {
+                            let group = p.tactical_position.current_position.position_group();
+                            let h = context.field_size.height as f32;
+                            let y = p.position.y;
+                            let wide = y < h * 0.38 || y > h * 0.62;
+                            if wide
+                                && matches!(
+                                    group,
+                                    crate::PlayerFieldPositionGroup::Forward
+                                        | crate::PlayerFieldPositionGroup::Midfielder
+                                )
+                            {
+                                // Deliberately more modest than the
+                                // ambient gate's 0.88-1.0 (a genuine 1v1
+                                // against a real, present marker is
+                                // harder to commit to than an empty
+                                // flank) — reasoned estimate, same
+                                // sourcing status as every other
+                                // unsourced Zone-1/Chunk-5 constant in
+                                // this codebase, flagged as such rather
+                                // than invented silently.
+                                let pace01 =
+                                    ((p.skills.physical.pace - 1.0) / 19.0).clamp(0.0, 1.0);
+                                let dribble01 =
+                                    ((p.skills.technical.dribbling - 1.0) / 19.0).clamp(0.0, 1.0);
+                                let prob = (0.45 + pace01 * 0.15 + dribble01 * 0.15)
+                                    .clamp(0.45, 0.75);
+                                if context.rng.range_u64(0, 10000) < (prob * 10000.0) as u64 {
+                                    p.byline_commitment_ticks = 1200;
+                                    // Verification-only field, temporary:
+                                    // confirms this arm is firing under
+                                    // genuine defender proximity (the
+                                    // whole point of the pattern), not
+                                    // coincidentally an already-empty
+                                    // flank the ambient gate below would
+                                    // have covered anyway.
+                                    let nearest_opp = opponent_positions
+                                        .iter()
+                                        .filter(|(team_id, _)| *team_id != p.team_id)
+                                        .map(|(_, pos)| (*pos - p.position).magnitude())
+                                        .fold(f32::MAX, f32::min);
+                                    match_log_info!(
+                                        "CHUNK5DIAG wide_isolation_arm id={} group={:?} y={:.1} nearest_opp={:.1}",
+                                        p.id,
+                                        group,
+                                        y,
+                                        nearest_opp
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                }
                 // realism-bug: arming at ownership_duration<=3 (within
                 // 30ms of reception) meant committing before the ball is
                 // genuinely settled — this engine's own shot logic treats

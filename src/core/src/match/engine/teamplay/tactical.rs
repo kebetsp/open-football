@@ -275,6 +275,30 @@ pub struct TacticalRefreshInputs<'a> {
     pub home_edge: f32,
 }
 
+/// Chunk 5 (docs/zone-staged-possession-progression.md) / the reverted
+/// `docs/positional-play-and-defensive-block-rewrite.md` — the
+/// attacking-pattern vocabulary for a "positional attack" started once
+/// the team's Zone-1 carrier meets genuine defensive resistance.
+/// Classified once, at the instant contact arms the window (see
+/// `TeamTacticalState::positional_attack_ticks_remaining`), from the
+/// SAME density thresholds the reverted rewrite's own Chunk 2 measured
+/// and recalibrated against this engine's real distribution (density
+/// 0..=2 is the achievable floor -> `WideIsolation`, 3 is modal ->
+/// `UnderlapOverlapCombination`, 4+ is a real, comparatively rare
+/// elevated commitment -> `OverloadAndSwitch`) — that reasoning is
+/// reused verbatim even though the reverted CODE itself is gone
+/// (`git revert`'d, confirmed absent from this tree). Only
+/// `WideIsolation` is wired to an actual behavior change so far (see
+/// `run.rs`'s contact-triggered `byline_commitment_ticks` arm) — the
+/// other two variants are classified and logged but not yet consumed,
+/// an honest, incremental scope limit, not an oversight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttackPattern {
+    WideIsolation,
+    UnderlapOverlapCombination,
+    OverloadAndSwitch,
+}
+
 /// Team-level tactical context, shared across all eleven players. Cheap
 /// to copy (plain POD).
 #[derive(Debug, Clone, Copy)]
@@ -370,6 +394,21 @@ pub struct TeamTacticalState {
     /// framing suggested (`docs/principles-of-play-phase2-plan.md` §1,
     /// 2026-08-31: confirmed live and corrected here).
     pub central_congestion_discount: f32,
+    /// Chunk 5: ticks remaining in an active "positional attack"
+    /// window — armed (not incremented) when this team's ball carrier
+    /// meets genuine defensive resistance while progressing through
+    /// Zone 1 (`DefensiveThird`/`MiddleThird`), decayed every refresh
+    /// otherwise. This is the deliberate fix for the reverted rewrite's
+    /// own stated failure mode ("ran continuously/every tick... which
+    /// is plausibly part of why it read as artificial") — a real
+    /// hysteresis window after a genuine contact EVENT, not a fresh
+    /// per-refresh re-decision. See `refresh_positional_attack`'s own
+    /// doc comment for the exact trigger and window length.
+    pub positional_attack_ticks_remaining: u16,
+    /// Which pattern is live while the window above is open. Always
+    /// `None` when the window is closed — a stale pattern from a
+    /// just-expired window must never be read as still active.
+    pub positional_attack_pattern: Option<AttackPattern>,
 }
 
 impl TeamTacticalState {
@@ -396,7 +435,16 @@ impl TeamTacticalState {
             side_density_right: 4,
             wide_marked_count: 0,
             central_congestion_discount: 0.0,
+            positional_attack_ticks_remaining: 0,
+            positional_attack_pattern: None,
         }
+    }
+
+    /// Chunk 5: is a positional-attack pattern currently live for this
+    /// team? `positional_attack_pattern` is only ever meaningful when
+    /// this is true.
+    pub fn positional_attack_active(&self) -> bool {
+        self.positional_attack_ticks_remaining > 0
     }
 
     /// In an attacking transition: the window that opens right after
@@ -911,6 +959,130 @@ impl TeamTacticalState {
             * spatial_sensor::DISCOUNT_PER_WIDE_MARKED_PLAYER
             * away_width_emphasis)
             .min(spatial_sensor::MAX_CENTRAL_CONGESTION_DISCOUNT);
+
+        // Chunk 5 (docs/zone-staged-possession-progression.md):
+        // positional-attack trigger, checked once per refresh (~every
+        // 10-25 ticks, this function's own adaptive cadence — see
+        // `run.rs::play_inner`) against the CURRENT ball carrier, not
+        // evaluated continuously regardless of context.
+        Self::refresh_positional_attack(home, field, true, inputs.home_team_id, inputs.tick_interval);
+        Self::refresh_positional_attack(away, field, false, inputs.home_team_id, inputs.tick_interval);
+    }
+
+    /// Real-world-grounded "is a defender directly blocking forward
+    /// progress" check — replicates `spacing::carrier_blocked_ahead`'s
+    /// exact definition (18u radius, cos(60°) forward cone) rather than
+    /// a second, independently-drifting threshold. Duplicated here, not
+    /// imported: that function takes a `StateProcessingContext` (the
+    /// per-player decision layer); this runs at the team-tactical layer
+    /// against raw `MatchPlayer` data, a genuinely different call shape.
+    const CONTACT_BLOCK_RADIUS: f32 = 18.0;
+    const CONTACT_BLOCK_FORWARD_COS: f32 = 0.5;
+
+    fn carrier_meets_defender(
+        field: &MatchField,
+        carrier_id: u32,
+        carrier_team_id: u32,
+        carrier_side: Option<PlayerSide>,
+    ) -> bool {
+        let Some(carrier) = field.players.iter().find(|p| p.id == carrier_id) else {
+            return false;
+        };
+        let attacking_dir: f32 = match carrier_side {
+            Some(PlayerSide::Left) => 1.0,
+            Some(PlayerSide::Right) => -1.0,
+            None => return false,
+        };
+        field
+            .players
+            .iter()
+            .filter(|opp| opp.team_id != carrier_team_id && !opp.is_sent_off)
+            .any(|opp| {
+                let to_opp = opp.position - carrier.position;
+                let dist = (to_opp.x * to_opp.x + to_opp.y * to_opp.y).sqrt();
+                if !(1.0..=Self::CONTACT_BLOCK_RADIUS).contains(&dist) {
+                    return false;
+                }
+                (to_opp.x / dist) * attacking_dir > Self::CONTACT_BLOCK_FORWARD_COS
+            })
+    }
+
+    /// See `AttackPattern`'s own doc comment for the sourcing of these
+    /// thresholds (reused verbatim from the reverted rewrite's own
+    /// measured Chunk 2 recalibration).
+    fn classify_attack_pattern(side_density: u8) -> AttackPattern {
+        match side_density {
+            0..=2 => AttackPattern::WideIsolation,
+            3 => AttackPattern::UnderlapOverlapCombination,
+            _ => AttackPattern::OverloadAndSwitch,
+        }
+    }
+
+    /// Chunk 5's own window length: how long the positional-attack
+    /// window stays open after the last genuine contact, in ticks
+    /// (~6s @ 10ms/tick) — long enough for a real sequence (carry,
+    /// combination attempt, cross/shot) to play out, short enough that
+    /// it genuinely closes once the moment has passed rather than
+    /// lingering as a stale label. Same order of magnitude as this
+    /// codebase's other "sustained window" constants
+    /// (`byline_commitment_ticks`' 1200-tick budget, the Zone-1
+    /// anti-oscillation exemption's 600 ticks) — a reasoned estimate,
+    /// not sourced (no dataset exists for "how long does a real
+    /// positional-attack sequence last").
+    const POSITIONAL_ATTACK_WINDOW_TICKS: u16 = 600;
+
+    /// Zone 1 only (`DefensiveThird`/`MiddleThird`) — this is
+    /// specifically about ending BLIND PROGRESSION
+    /// (docs/zone-staged-possession-progression.md's own framing), not
+    /// a final-third mechanic (Zone 2's own rework is that doc's
+    /// Chunk 6, untouched here). Flank-only (`BallSideZone != Center`)
+    /// — every consuming mechanism this pattern reuses
+    /// (`weak_side_patience_adjustment`, `wide_marked_count`, the
+    /// byline-commitment machinery) is itself flank-oriented; a central
+    /// contact simply doesn't arm a pattern in this first slice, an
+    /// honest scope limit, not an oversight.
+    fn refresh_positional_attack(
+        team: &mut Self,
+        field: &MatchField,
+        is_home: bool,
+        home_team_id: u32,
+        tick_interval: u32,
+    ) {
+        let in_zone1 = matches!(team.ball_zone, BallZone::DefensiveThird | BallZone::MiddleThird);
+        let contact = team.in_possession
+            && in_zone1
+            && !matches!(team.ball_side, BallSideZone::Center)
+            && field
+                .ball
+                .current_owner
+                .and_then(|id| field.players.iter().find(|p| p.id == id))
+                .filter(|p| (p.team_id == home_team_id) == is_home)
+                .map(|p| Self::carrier_meets_defender(field, p.id, p.team_id, p.side))
+                .unwrap_or(false);
+        if contact {
+            let density = match team.ball_side {
+                BallSideZone::Left => team.side_density_left,
+                BallSideZone::Right => team.side_density_right,
+                BallSideZone::Center => 0, // unreachable — guarded above
+            };
+            let pattern = Self::classify_attack_pattern(density);
+            crate::match_log_info!(
+                "CHUNK5DIAG contact is_home={} density={} pattern={:?} was_already_active={}",
+                is_home,
+                density,
+                pattern,
+                team.positional_attack_active()
+            );
+            team.positional_attack_pattern = Some(pattern);
+            team.positional_attack_ticks_remaining = Self::POSITIONAL_ATTACK_WINDOW_TICKS;
+        } else {
+            team.positional_attack_ticks_remaining = team
+                .positional_attack_ticks_remaining
+                .saturating_sub(tick_interval.min(u16::MAX as u32) as u16);
+            if team.positional_attack_ticks_remaining == 0 {
+                team.positional_attack_pattern = None;
+            }
+        }
     }
 
     // ──────────────────────────────────────────────────────────────────
