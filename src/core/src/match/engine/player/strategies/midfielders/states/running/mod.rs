@@ -23,6 +23,24 @@ const MAX_SHOOTING_DISTANCE: f32 = 88.0; // Edge-of-box / arriving-midfielder st
 const STANDARD_SHOOTING_DISTANCE: f32 = 52.0; // Standard shooting range for midfielders
 const POINT_BLANK_DISTANCE: f32 = 20.0; // ~10m - must shoot, goalkeeper is right there
 
+// Zone 1 (docs/zone-staged-possession-progression.md) open-space scan
+// constants — hoisted here so `zone1_open_space_heading` (carrier's own
+// scan, needs a winning HEADING) and `zone1_max_open_distance` (Chunk 3
+// teammate-openness scan, needs only the best VALUE) share one
+// definition instead of two independently-drifting copies.
+const ZONE1_HEADING_ANGLES_DEG: [f32; 7] = [-70.0, -45.0, -20.0, 0.0, 20.0, 45.0, 70.0];
+const ZONE1_MIN_OPEN_SPACE: f32 = 45.0; // reasoned estimate, not sourced — see zone1_open_space_heading's doc comment
+const ZONE1_SCAN_MAX: f32 = 140.0;
+// Chunk 3: "if there is a teammate who has roughly the same amount of
+// free area — go there." Reasoned tolerance (no sourced data for this
+// specific comparison), ~14% of the scan range — a teammate doesn't
+// need to be STRICTLY as open, just close enough to count as "more or
+// less" the same.
+const ZONE1_OPENNESS_TOLERANCE: f32 = 20.0;
+// Same "real, actionable nearby pass option" radius this file already
+// uses elsewhere (`find_draw_and_release_pass`, `find_one_two_return`).
+const ZONE1_TEAMMATE_SEARCH_RADIUS: f32 = 200.0;
+
 #[derive(Default, Clone)]
 pub struct MidfielderRunningState {}
 
@@ -448,12 +466,72 @@ impl StateProcessingHandler for MidfielderRunningState {
             // composite). Replaces the ad-hoc dribbling+composure+pace
             // blend with the unified midfielder profile.
             let field_width = ctx.context.field_size.width as f32;
-            if goal_dist > POINT_BLANK_DISTANCE
-                && goal_dist < field_width * 0.45
-                && self.has_open_space_ahead_zoned(ctx)
-                && mid_profile.allows_carry_into_space()
-            {
-                return None;
+            // Zone 1: no extra distance cap — `has_open_space_ahead_zoned`
+            // already gates correctly on the real `BallZone` boundary, so
+            // this reflex should cover the WHOLE zone, not a narrow
+            // near-goal quarter. Chunk 2 of docs/zone-staged-possession-
+            // progression.md found the old flat `goal_dist <
+            // field_width*0.45` (378u) bound meant Pavel's own quoted
+            // scenario — "an attacker gets the ball next to the middle
+            // line" — never even reached this gate (goal_dist there is
+            // ~420u, already past the old cap). Zone 2 keeps the old
+            // bound unchanged (still goal-relative, deferred to Chunk 6),
+            // so this doesn't touch Zone 2's existing behaviour at all.
+            let upper_bound_ok = if self.in_zone1(ctx) {
+                true
+            } else {
+                goal_dist < field_width * 0.45
+            };
+            if goal_dist > POINT_BLANK_DISTANCE && upper_bound_ok && mid_profile.allows_carry_into_space() {
+                if self.in_zone1(ctx) {
+                    // Chunk 3 (docs/zone-staged-possession-progression.md):
+                    // the gate becomes a real decision point here —
+                    // "if there is a teammate who has roughly the same
+                    // amount of free area, go there. But if not, carry
+                    // the ball all the way you can." — not just a
+                    // boolean feeding a blind `return None` (Chunk 1
+                    // conflict check item 6). `my_open >=
+                    // ZONE1_MIN_OPEN_SPACE` is the same condition
+                    // `has_open_space_ahead_zoned` checked before, just
+                    // computed once here so its value is available for
+                    // the teammate comparison too.
+                    let my_open = self.zone1_max_open_distance(ctx, ctx.player.position);
+                    if my_open >= ZONE1_MIN_OPEN_SPACE {
+                        // Same-binary ablation toggle for Chunk 3's
+                        // teammate-open-space comparison specifically
+                        // (mirrors `spacing.rs::mobility_ablated`'s own
+                        // `OF_SCORE_BLIND` idiom) — Pavel asked for a
+                        // way to isolate this one mechanism ("is it
+                        // skewing everything too much to the centre")
+                        // for later chunks to be A/B'd against, without
+                        // a git-stash/rebuild cycle each time. Inert
+                        // (Chunk 3 fully active) unless
+                        // `ZONE1_CHUNK3_ABLATE` is set; when set, this
+                        // reverts to exactly Chunk 1/2's behaviour —
+                        // carry as far as space allows, no teammate
+                        // comparison. Kept permanently, zero cost in
+                        // normal play.
+                        if !Self::zone1_chunk3_ablated() {
+                            if let Some(target) = self.zone1_similarly_open_teammate(ctx, my_open) {
+                                return Some(StateChangeResult::with_midfielder_state_and_event(
+                                    MidfielderState::Standing,
+                                    Event::PlayerEvent(PlayerEvent::PassTo(
+                                        PassingEventContext::new()
+                                            .with_from_player_id(ctx.player.id)
+                                            .with_to_player_id(target.id)
+                                            .with_reason("MID_ZONE1_SIMILARLY_OPEN_TEAMMATE")
+                                            .build(ctx),
+                                    )),
+                                ));
+                            }
+                        }
+                        return None; // no similarly-open teammate (or ablated) — carry as far as space allows
+                    }
+                    // No real space in any direction — fall through to
+                    // should_dribble/pass logic below, same as before.
+                } else if self.has_open_space_ahead_goalcone(ctx) {
+                    return None; // Zone 2, unchanged — deferred to Chunk 6
+                }
             }
 
             // Minimum carry time before considering passes — let midfielders run with the ball
@@ -855,7 +933,28 @@ impl StateProcessingHandler for MidfielderRunningState {
 
         // ANTI-OSCILLATION: If carrying ball too long without acting, force a decision
         // POSSESSION RETENTION: Allow longer holding when team is comfortable
-        let anti_oscillation_threshold = if self.should_retain_possession(ctx) {
+        //
+        // Idea-to-code conflict check follow-up (2026-09-01): this
+        // threshold is keyed on `in_state_time` (ticks since entering
+        // Running at all), not "ticks since the carry stopped making
+        // progress" — so a genuinely still-open Zone 1 carry
+        // (docs/zone-staged-possession-progression.md) was getting cut
+        // off at a hard 1.5-2.5s regardless of how much real space
+        // remained, the exact "carry the ball all the way you can"
+        // idea this mechanism exists for. A player still advancing
+        // into real open space isn't oscillating — the anti-
+        // oscillation net is meant for a player who's genuinely stuck,
+        // not one who's making progress. Raised, not disabled: still a
+        // real, finite safety valve (600 ticks/6s) against a
+        // pathological case where `has_open_space_ahead_zoned` never
+        // clears — self-terminating in normal play anyway, since
+        // advancing into more contested territory or crossing into
+        // Zone 2 (`in_zone1` false) both end the exemption on their
+        // own.
+        let in_open_zone1_carry = self.in_zone1(ctx) && self.has_open_space_ahead_zoned(ctx);
+        let anti_oscillation_threshold = if in_open_zone1_carry {
+            600
+        } else if self.should_retain_possession(ctx) {
             250
         } else {
             150
@@ -996,13 +1095,29 @@ impl StateProcessingHandler for MidfielderRunningState {
             // to keep ball and tire opponents instead of always charging forward
             if self.should_retain_possession(ctx) {
                 Some(self.calculate_possession_retention_movement(ctx))
-            } else if self.in_zone1(ctx) {
+            } else if self.in_zone1(ctx) && MidfielderSkillProfile::from_ctx(ctx).allows_carry_into_space() {
                 // Zone 1 (build-up/progression): goal-blind carrying —
                 // move along the best open heading, never toward a
                 // fixed goal point (docs/zone-staged-possession-
                 // progression.md, Chunk 1). Zone 2 (attacking third)
                 // keeps the old goal-relative movement below, unchanged
                 // until that chunk of the plan is implemented.
+                //
+                // Idea-to-code conflict check follow-up (2026-09-01,
+                // per Pavel's direct request): `process()`'s own
+                // carry-forward branch already gates on
+                // `allows_carry_into_space()` — but `velocity()` never
+                // consulted it, so a low-skill/fatigued player who
+                // reached this branch via a DIFFERENT `return None`
+                // (coach tempo / patient possession holding, which
+                // return before ever reaching the carry-forward gate)
+                // still got the new open-space movement regardless.
+                // The gate only ever blocked one of several
+                // equal-outcome paths, never the movement itself — a
+                // pre-existing gap (the old, goal-relative
+                // `calculate_simple_ball_movement` had the identical
+                // hole), now closed by checking it here too, at the
+                // one place that actually decides the movement.
                 Some(self.calculate_open_space_movement(ctx))
             } else {
                 Some(self.calculate_simple_ball_movement(ctx))
@@ -1716,29 +1831,37 @@ impl MidfielderRunningState {
             None => return None,
         };
 
-        // Fan of headings relative to the attacking direction: a
-        // genuine forward cone plus both flanks. Never collapses to a
-        // single point the way `to_goal` does.
-        const HEADING_ANGLES_DEG: [f32; 7] = [-70.0, -45.0, -20.0, 0.0, 20.0, 45.0, 70.0];
-        const MIN_OPEN_SPACE: f32 = 45.0; // reasoned estimate — see doc comment above
-        const SCAN_MAX: f32 = 140.0;
+        // Tie-break: among headings tied for the best open distance —
+        // very often several/all 7, since Zone 1 build-up play is
+        // rarely fully congested — prefer whichever is most aligned
+        // with the carrier's OWN current momentum (`ctx.player.velocity`,
+        // already tracked every tick, no new plumbing needed), falling
+        // back to a fair reservoir sample only when there's no
+        // established direction yet (just received the ball, near-
+        // stationary).
+        //
+        // A flat "50% chance to swap on tie" was tried first and
+        // rejected on two grounds, both measured, not assumed: (1) it's
+        // not even a fair N-way tie-break (the last-processed candidate
+        // won 50% of the time vs ~1.6% for the first — a real +16.6°
+        // mean bias toward the array's later entries); (2) even fixed
+        // with a proper 1/N reservoir sample, re-rolling a fresh RNG
+        // winner independently every tick zig-zagged the chosen heading
+        // wildly call to call (raw trace, real match, player 107:
+        // -45°,-70°,-20°,-45°,-45°,-45°,-70°,-70°,-20°,-45°,+70°,-70°...
+        // — a jittery random walk, not a purposeful run, and the exact
+        // oscillation risk docs/zone-staged-possession-progression.md's
+        // own guardrail calls out). Anchoring to momentum instead is a
+        // real football behaviour (a carrier holds their line unless
+        // the picture genuinely changes) and needs no persistent
+        // per-player state — it's a deterministic secondary sort key
+        // over the SAME tied candidates, not a memory of past ticks.
+        let momentum_dir = (ctx.player.velocity.magnitude() > 0.05)
+            .then(|| ctx.player.velocity.normalize());
 
-        // `tie_count` makes this a proper reservoir sample over
-        // whichever headings are currently tied for the best open
-        // distance — a flat "50% chance to swap on tie" (tried first,
-        // measured, and rejected: it gives the LAST-processed tied
-        // candidate a 50% win share vs ~1.6% for the first, a real,
-        // measured +16.6° mean bias toward the array's later/positive
-        // entries) is not a fair N-way tie-break. This is: on a new
-        // strictly-better heading, reset and take it outright; on a
-        // tie, accept the new one with probability 1/tie_count — the
-        // standard "uniform pick among ties seen so far" algorithm, so
-        // every genuinely-tied heading (very often all 7, on a fully
-        // clear scan) has an equal chance of being chosen, not a
-        // one-sided one.
         let mut best: Option<(Vector3<f32>, f32)> = None;
         let mut tie_count: u32 = 0;
-        for &angle_deg in HEADING_ANGLES_DEG.iter() {
+        for &angle_deg in ZONE1_HEADING_ANGLES_DEG.iter() {
             let angle = angle_deg.to_radians();
             let heading = Vector3::new(
                 attack_dir * angle.cos(),
@@ -1747,20 +1870,7 @@ impl MidfielderRunningState {
             )
             .normalize();
 
-            // Nearest opponent roughly along this heading (within a
-            // generous cone, dot > 0.75) caps how much room it offers;
-            // an empty heading scores the full scan radius.
-            let open_dist = ctx
-                .players()
-                .opponents()
-                .nearby(SCAN_MAX)
-                .filter(|opp| {
-                    let to_opp = opp.position - player_pos;
-                    let dist = to_opp.magnitude();
-                    dist > 1.0 && to_opp.normalize().dot(&heading) > 0.75
-                })
-                .map(|opp| (opp.position - player_pos).magnitude())
-                .fold(SCAN_MAX, f32::min);
+            let open_dist = Self::open_dist_for_heading(ctx, player_pos, heading);
 
             match best {
                 None => {
@@ -1771,9 +1881,19 @@ impl MidfielderRunningState {
                     best = Some((heading, open_dist));
                     tie_count = 1;
                 }
-                Some((_, best_dist)) if (open_dist - best_dist).abs() <= 0.5 => {
+                Some((best_heading, best_dist)) if (open_dist - best_dist).abs() <= 0.5 => {
                     tie_count += 1;
-                    if ctx.context.rng.unit_f32() < 1.0 / tie_count as f32 {
+                    let replace = match momentum_dir {
+                        // Deterministic argmax-by-momentum-alignment
+                        // over the tied set — correctly converges to
+                        // the single best-aligned tied heading by the
+                        // end of the loop regardless of scan order.
+                        Some(m) => heading.dot(&m) > best_heading.dot(&m),
+                        // No established direction yet — fall back to
+                        // the fair 1/tie_count reservoir sample.
+                        None => ctx.context.rng.unit_f32() < 1.0 / tie_count as f32,
+                    };
+                    if replace {
                         best = Some((heading, open_dist));
                     }
                 }
@@ -1781,7 +1901,104 @@ impl MidfielderRunningState {
             }
         }
 
-        best.and_then(|(heading, dist)| (dist >= MIN_OPEN_SPACE).then_some(heading))
+        best.and_then(|(heading, dist)| (dist >= ZONE1_MIN_OPEN_SPACE).then_some(heading))
+    }
+
+    /// Nearest opponent roughly along `heading` from `origin` (within a
+    /// generous cone, dot > 0.75) caps how much room that heading
+    /// offers; an empty heading scores the full scan radius. The one
+    /// per-heading scan shared by `zone1_open_space_heading` (origin =
+    /// the carrier's own position, needs the winning HEADING for
+    /// movement) and `zone1_max_open_distance` (Chunk 3, origin = a
+    /// candidate teammate's position, needs only the best VALUE) — a
+    /// single definition so the two can't silently drift apart.
+    /// `origin` may be off the carrier's own position, so this uses
+    /// `nearby_at`, not `nearby`.
+    fn open_dist_for_heading(
+        ctx: &StateProcessingContext,
+        origin: Vector3<f32>,
+        heading: Vector3<f32>,
+    ) -> f32 {
+        ctx.players()
+            .opponents()
+            .nearby_at(origin, ZONE1_SCAN_MAX)
+            .filter(|opp| {
+                let to_opp = opp.position - origin;
+                let dist = to_opp.magnitude();
+                dist > 1.0 && to_opp.normalize().dot(&heading) > 0.75
+            })
+            .map(|opp| (opp.position - origin).magnitude())
+            .fold(ZONE1_SCAN_MAX, f32::min)
+    }
+
+    /// Chunk 3 (docs/zone-staged-possession-progression.md): the best
+    /// open distance available to a HYPOTHETICAL carrier standing at
+    /// `origin` — same fan, same scan, as `zone1_open_space_heading`,
+    /// just evaluated from someone else's position and returning the
+    /// VALUE, not a chosen direction (no tie-break needed — every tied
+    /// heading has the identical value by definition). Used to ask "how
+    /// open is this teammate," genuinely goal-blind, without touching
+    /// `pass_value_from`/`evaluator.rs` (see the Chunk 3 conflict check
+    /// in the design doc for why those were deliberately left alone —
+    /// shared, cross-cutting, dominated by their own goal-relative
+    /// terms).
+    fn zone1_max_open_distance(&self, ctx: &StateProcessingContext, origin: Vector3<f32>) -> f32 {
+        let attack_dir: f32 = match ctx.player.side {
+            Some(PlayerSide::Left) => 1.0,
+            Some(PlayerSide::Right) => -1.0,
+            None => return 0.0,
+        };
+        ZONE1_HEADING_ANGLES_DEG
+            .iter()
+            .map(|&angle_deg| {
+                let angle = angle_deg.to_radians();
+                let heading = Vector3::new(attack_dir * angle.cos(), attack_dir * angle.sin(), 0.0)
+                    .normalize();
+                Self::open_dist_for_heading(ctx, origin, heading)
+            })
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// Same-binary ablation toggle for Chunk 3's teammate-open-space
+    /// comparison ONLY — `zone1_open_space_heading`/
+    /// `calculate_open_space_movement`/the widened Zone 1 bound (Chunks
+    /// 1/2) are untouched by this flag; only whether a similarly-open
+    /// teammate can redirect the ball away from carrying. Mirrors
+    /// `spacing.rs::mobility_ablated`'s own `OF_SCORE_BLIND` idiom —
+    /// diagnostic/comparison only, inert unless `ZONE1_CHUNK3_ABLATE`
+    /// is set, checked once and cached. Kept permanently (not a
+    /// temporary diagnostic) so any later chunk can be A/B'd with
+    /// Chunk 3 on vs. off without a rebuild/git-stash cycle.
+    fn zone1_chunk3_ablated() -> bool {
+        use std::sync::OnceLock;
+        static ABLATED: OnceLock<bool> = OnceLock::new();
+        *ABLATED.get_or_init(|| std::env::var("ZONE1_CHUNK3_ABLATE").is_ok())
+    }
+
+    /// Chunk 3: "if there is a teammate who has roughly the same amount
+    /// of free area — go there. But if not, carry the ball all the way
+    /// you can." `my_open` is the carrier's own already-computed open
+    /// distance (`zone1_max_open_distance` at their own position).
+    /// Considers any real, nearby, passable teammate — not
+    /// position-restricted to "central," per the design doc's own
+    /// generalisation of Pavel's illustrative example — and returns
+    /// whichever qualifying teammate is most open, or `None` if nobody
+    /// clears the "more or less as open" bar.
+    fn zone1_similarly_open_teammate<'a>(
+        &self,
+        ctx: &StateProcessingContext<'a>,
+        my_open: f32,
+    ) -> Option<MatchPlayerLite> {
+        ctx.players()
+            .teammates()
+            .nearby(ZONE1_TEAMMATE_SEARCH_RADIUS)
+            .filter(|t| ctx.player().has_clear_pass(t.id))
+            .filter_map(|t| {
+                let their_open = self.zone1_max_open_distance(ctx, t.position);
+                (their_open + ZONE1_OPENNESS_TOLERANCE >= my_open).then_some((t, their_open))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+            .map(|(t, _)| t)
     }
 
     /// Zone 1 goal-blind carrying movement. Moves along the best open
