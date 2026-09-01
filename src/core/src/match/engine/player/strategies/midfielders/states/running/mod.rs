@@ -12,8 +12,8 @@ use crate::r#match::player::strategies::common::players::ops::midfielder_skill::
 use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::player::strategies::players::skills::SkillCurve;
 use crate::r#match::{
-    ConditionContext, GamePhase, MatchPlayerLite, PassEvaluator, PlayerSide, StateChangeResult,
-    StateProcessingContext, StateProcessingHandler, SteeringBehavior,
+    BallZone, ConditionContext, GamePhase, MatchPlayerLite, PassEvaluator, PlayerSide,
+    StateChangeResult, StateProcessingContext, StateProcessingHandler, SteeringBehavior,
 };
 use nalgebra::Vector3;
 use std::cmp::Ordering;
@@ -450,7 +450,7 @@ impl StateProcessingHandler for MidfielderRunningState {
             let field_width = ctx.context.field_size.width as f32;
             if goal_dist > POINT_BLANK_DISTANCE
                 && goal_dist < field_width * 0.45
-                && self.has_open_space_ahead(ctx)
+                && self.has_open_space_ahead_zoned(ctx)
                 && mid_profile.allows_carry_into_space()
             {
                 return None;
@@ -996,6 +996,14 @@ impl StateProcessingHandler for MidfielderRunningState {
             // to keep ball and tire opponents instead of always charging forward
             if self.should_retain_possession(ctx) {
                 Some(self.calculate_possession_retention_movement(ctx))
+            } else if self.in_zone1(ctx) {
+                // Zone 1 (build-up/progression): goal-blind carrying —
+                // move along the best open heading, never toward a
+                // fixed goal point (docs/zone-staged-possession-
+                // progression.md, Chunk 1). Zone 2 (attacking third)
+                // keeps the old goal-relative movement below, unchanged
+                // until that chunk of the plan is implemented.
+                Some(self.calculate_open_space_movement(ctx))
             } else {
                 Some(self.calculate_simple_ball_movement(ctx))
             }
@@ -1220,7 +1228,12 @@ impl MidfielderRunningState {
         PassEvaluator::find_best_pass_option(ctx, 300.0)
     }
 
-    /// Simplified ball carrying movement
+    /// Simplified ball carrying movement. Zone 2 (attacking third)
+    /// only now — `velocity()` routes Zone 1 to
+    /// `calculate_open_space_movement` instead. Still goal-relative;
+    /// the final-third rework is Chunk 6 of
+    /// docs/zone-staged-possession-progression.md, deliberately out of
+    /// scope for Chunk 1.
     fn calculate_simple_ball_movement(&self, ctx: &StateProcessingContext) -> Vector3<f32> {
         let goal_pos = ctx.player().opponent_goal_position();
         let player_pos = ctx.player.position;
@@ -1456,10 +1469,16 @@ impl MidfielderRunningState {
             return false;
         }
 
-        // Don't retain in attacking third - keep pressing forward
-        let goal_dist = ctx.ball().distance_to_opponent_goal();
-        let field_width = ctx.context.field_size.width as f32;
-        if goal_dist < field_width * 0.35 {
+        // Don't retain in the attacking third — keep pressing forward.
+        // Uses the same canonical `BallZone::AttackingThird` boundary
+        // every other zone-aware signal in the engine already agrees
+        // on (`TeamTacticalState.ball_zone`), replacing a private,
+        // slightly different 0.35-of-field-width threshold this
+        // function used to compute on its own
+        // (docs/zone-staged-possession-progression.md, Chunk 1
+        // conflict check item 3 — a second, uncoordinated zone
+        // boundary in the same file).
+        if self.in_zone2(ctx) {
             return false;
         }
 
@@ -1470,7 +1489,7 @@ impl MidfielderRunningState {
         }
 
         // Don't retain if open space ahead — advance to create tension
-        if self.has_open_space_ahead(ctx) {
+        if self.has_open_space_ahead_zoned(ctx) {
             return false;
         }
 
@@ -1478,40 +1497,36 @@ impl MidfielderRunningState {
         ctx.team().is_control_ball()
     }
 
-    /// Movement for possession retention mode: slower, more lateral, controlled tempo
+    /// Movement for possession retention mode: slower, more lateral,
+    /// controlled tempo. Only ever reached in Zone 1 —
+    /// `should_retain_possession` now bails out unconditionally in
+    /// `BallZone::AttackingThird` — so this is goal-blind by
+    /// construction: no `opponent_goal_position()`/`mid_y` pull toward
+    /// a fixed central channel anywhere in this function
+    /// (docs/zone-staged-possession-progression.md, Chunk 1 conflict
+    /// check item 2 — "it doesn't let me dribble in any direction,
+    /// only to the center").
     fn calculate_possession_retention_movement(
         &self,
         ctx: &StateProcessingContext,
     ) -> Vector3<f32> {
-        let goal_pos = ctx.player().opponent_goal_position();
         let player_pos = ctx.player.position;
-        let field_height = ctx.context.field_size.height as f32;
+        let attack_dir: f32 = match ctx.player.side {
+            Some(PlayerSide::Left) => 1.0,
+            Some(PlayerSide::Right) => -1.0,
+            None => 0.0,
+        };
 
-        // Move laterally rather than directly toward goal
-        // Wider sinusoidal sway with slower forward progress
-        let to_goal = (goal_pos - player_pos).normalize();
+        // Slow forward drift along the generic attacking direction +
+        // a wide lateral sway — same controlled-tempo character as
+        // before, just with no fixed goal point or mid_y anchor to
+        // drift/re-centre toward.
         let phase = (ctx.in_state_time as f32) * std::f32::consts::TAU / 100.0; // Slower period
         let sway = phase.sin() * 0.5; // Wider lateral sway
-        let lateral = Vector3::new(-to_goal.y * sway, to_goal.x * sway, 0.0);
-
-        // Move toward a midfield position rather than directly at goal
-        // Blend between lateral movement and slight forward progress
-        let mid_y = if player_pos.y < field_height / 2.0 {
-            field_height * 0.35
-        } else {
-            field_height * 0.65
-        };
-        let retention_target = Vector3::new(
-            player_pos.x + to_goal.x * 15.0, // Slow forward drift
-            mid_y,
-            0.0,
-        );
-
-        let blended_target =
-            player_pos + (retention_target - player_pos).normalize() * 20.0 + lateral * 10.0;
+        let target = player_pos + Vector3::new(attack_dir * 15.0, sway * 20.0, 0.0);
 
         SteeringBehavior::Arrive {
-            target: blended_target,
+            target,
             slowing_distance: 30.0,
         }
         .calculate(ctx.player)
@@ -1619,9 +1634,15 @@ impl MidfielderRunningState {
         best_target.map(|(t, _)| t)
     }
 
-    /// Check if player is stuck in a corner/boundary with multiple players around
-    /// Check if there's open space ahead toward the opponent goal
-    fn has_open_space_ahead(&self, ctx: &StateProcessingContext) -> bool {
+    /// Zone 2 (attacking third) only — check if there's open space
+    /// ahead toward the opponent goal. Kept goal-relative and
+    /// unchanged; still narrows toward a single point, exactly the
+    /// thing `docs/zone-staged-possession-progression.md` objects to,
+    /// but fixing the final third is that plan's own Chunk 6 (Zone 2
+    /// rework), deliberately scoped out of Chunk 1. Zone 1 uses
+    /// `zone1_open_space_heading` instead — see
+    /// `has_open_space_ahead_zoned` for the dispatch.
+    fn has_open_space_ahead_goalcone(&self, ctx: &StateProcessingContext) -> bool {
         let player_pos = ctx.player.position;
         let goal_pos = ctx.player().opponent_goal_position();
         let to_goal = (goal_pos - player_pos).normalize();
@@ -1638,6 +1659,162 @@ impl MidfielderRunningState {
             .count();
 
         blockers == 0
+    }
+
+    /// Which zone (`docs/zone-staged-possession-progression.md`'s
+    /// stage boundary) this player's team is currently in, on-ball
+    /// decision-relevant. Zone 2 = `BallZone::AttackingThird`; Zone 1
+    /// = everything else (`DefensiveThird`/`MiddleThird`).
+    fn in_zone2(&self, ctx: &StateProcessingContext) -> bool {
+        matches!(
+            ctx.team().tactical().ball_zone,
+            BallZone::AttackingThird
+        )
+    }
+
+    fn in_zone1(&self, ctx: &StateProcessingContext) -> bool {
+        !self.in_zone2(ctx)
+    }
+
+    /// Dispatches the open-space check by zone. Both call sites of the
+    /// old, single `has_open_space_ahead` (the carry-forward gate in
+    /// `process()` and `should_retain_possession`) now route through
+    /// this, so Zone 1 becomes goal-blind everywhere at once rather
+    /// than in only one of the two places
+    /// (docs/zone-staged-possession-progression.md, Chunk 1 conflict
+    /// check item 1).
+    fn has_open_space_ahead_zoned(&self, ctx: &StateProcessingContext) -> bool {
+        if self.in_zone1(ctx) {
+            self.zone1_open_space_heading(ctx).is_some()
+        } else {
+            self.has_open_space_ahead_goalcone(ctx)
+        }
+    }
+
+    /// Zone 1 (build-up/progression) open-space scan — goal-blind by
+    /// design. Samples a fan of headings relative to the generic
+    /// attacking direction (never a specific goal point — "no
+    /// opponent_goal_position() anywhere in this zone's on-ball
+    /// movement/carry decision"), covering both a genuine forward
+    /// cone AND wide options, and measures how far each heading is
+    /// clear of opponents. Returns the best heading if it clears a
+    /// real minimum worth carrying into; `None` when nothing ahead
+    /// offers genuine room, so callers fall through to the existing
+    /// pass/dribble logic below instead of forcing a carry.
+    ///
+    /// `MIN_OPEN_SPACE`/the scan radius are reasoned estimates, not
+    /// sourced against real tracking data — flagged per this project's
+    /// own calibration discipline (docs/zone-staged-possession-
+    /// progression.md's own guardrail: "source real numbers... flag as
+    /// a reasoned estimate if no dataset exists, don't invent
+    /// silently").
+    fn zone1_open_space_heading(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player_pos = ctx.player.position;
+        let attack_dir: f32 = match ctx.player.side {
+            Some(PlayerSide::Left) => 1.0,
+            Some(PlayerSide::Right) => -1.0,
+            None => return None,
+        };
+
+        // Fan of headings relative to the attacking direction: a
+        // genuine forward cone plus both flanks. Never collapses to a
+        // single point the way `to_goal` does.
+        const HEADING_ANGLES_DEG: [f32; 7] = [-70.0, -45.0, -20.0, 0.0, 20.0, 45.0, 70.0];
+        const MIN_OPEN_SPACE: f32 = 45.0; // reasoned estimate — see doc comment above
+        const SCAN_MAX: f32 = 140.0;
+
+        // `tie_count` makes this a proper reservoir sample over
+        // whichever headings are currently tied for the best open
+        // distance — a flat "50% chance to swap on tie" (tried first,
+        // measured, and rejected: it gives the LAST-processed tied
+        // candidate a 50% win share vs ~1.6% for the first, a real,
+        // measured +16.6° mean bias toward the array's later/positive
+        // entries) is not a fair N-way tie-break. This is: on a new
+        // strictly-better heading, reset and take it outright; on a
+        // tie, accept the new one with probability 1/tie_count — the
+        // standard "uniform pick among ties seen so far" algorithm, so
+        // every genuinely-tied heading (very often all 7, on a fully
+        // clear scan) has an equal chance of being chosen, not a
+        // one-sided one.
+        let mut best: Option<(Vector3<f32>, f32)> = None;
+        let mut tie_count: u32 = 0;
+        for &angle_deg in HEADING_ANGLES_DEG.iter() {
+            let angle = angle_deg.to_radians();
+            let heading = Vector3::new(
+                attack_dir * angle.cos(),
+                attack_dir * angle.sin(),
+                0.0,
+            )
+            .normalize();
+
+            // Nearest opponent roughly along this heading (within a
+            // generous cone, dot > 0.75) caps how much room it offers;
+            // an empty heading scores the full scan radius.
+            let open_dist = ctx
+                .players()
+                .opponents()
+                .nearby(SCAN_MAX)
+                .filter(|opp| {
+                    let to_opp = opp.position - player_pos;
+                    let dist = to_opp.magnitude();
+                    dist > 1.0 && to_opp.normalize().dot(&heading) > 0.75
+                })
+                .map(|opp| (opp.position - player_pos).magnitude())
+                .fold(SCAN_MAX, f32::min);
+
+            match best {
+                None => {
+                    best = Some((heading, open_dist));
+                    tie_count = 1;
+                }
+                Some((_, best_dist)) if open_dist > best_dist + 0.5 => {
+                    best = Some((heading, open_dist));
+                    tie_count = 1;
+                }
+                Some((_, best_dist)) if (open_dist - best_dist).abs() <= 0.5 => {
+                    tie_count += 1;
+                    if ctx.context.rng.unit_f32() < 1.0 / tie_count as f32 {
+                        best = Some((heading, open_dist));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        best.and_then(|(heading, dist)| (dist >= MIN_OPEN_SPACE).then_some(heading))
+    }
+
+    /// Zone 1 goal-blind carrying movement. Moves along the best open
+    /// heading found by `zone1_open_space_heading`; falls back to a
+    /// plain attack-direction advance (never a goal point) when no
+    /// heading clears the open-space bar, so the carrier keeps moving
+    /// forward rather than freezing.
+    fn calculate_open_space_movement(&self, ctx: &StateProcessingContext) -> Vector3<f32> {
+        let player_pos = ctx.player.position;
+        let heading = self.zone1_open_space_heading(ctx).unwrap_or_else(|| {
+            let attack_dir: f32 = match ctx.player.side {
+                Some(PlayerSide::Left) => 1.0,
+                Some(PlayerSide::Right) => -1.0,
+                None => 0.0,
+            };
+            Vector3::new(attack_dir, 0.0, 0.0)
+        });
+
+        // Same smooth sinusoidal lateral sway as the old goal-relative
+        // version, just relative to the chosen heading instead of a
+        // fixed goal point.
+        let phase = (ctx.in_state_time as f32) * std::f32::consts::TAU / 60.0;
+        let sway = phase.sin() * 0.2;
+        let lateral = Vector3::new(-heading.y * sway, heading.x * sway, 0.0);
+
+        let target = player_pos + (heading + lateral).normalize() * 40.0;
+
+        SteeringBehavior::Arrive {
+            target,
+            slowing_distance: 20.0,
+        }
+        .calculate(ctx.player)
+        .velocity
     }
 
     fn is_congested_near_boundary(&self, ctx: &StateProcessingContext) -> bool {
