@@ -832,8 +832,38 @@ impl StateProcessingHandler for MidfielderRunningState {
                 // width gives 64u overlap so there's always at least one
                 // midfielder in zone for any ball position.
                 let ball_y = ctx.tick_context.positions.ball.position.y;
-                let in_lateral_zone =
+                let base_in_lateral_zone =
                     (ball_y - ctx.player.start_position.y).abs() < 100.0;
+
+                // Chunk 4 (docs/zone-staged-possession-progression.md):
+                // "let your teammates run into their positions in the
+                // center and on the other flank" while a real carry is
+                // progressing. Measured first, per the doc's own chunk-
+                // order item 4, before writing this: of every off-ball
+                // tick where `base_in_lateral_zone` is false (a player
+                // structurally held out of AttackSupporting/CreatingSpace
+                // by the zone-band gate above), 6.2% correspond to a
+                // teammate genuinely carrying — real open space ahead
+                // (Chunk 1/3's own `zone1_max_open_distance` bar),
+                // sustained (ownership_duration > 60 ticks, past every
+                // "quick touch" window already used elsewhere in this
+                // file — `should_dribble`'s 5..60, `find_one_two_return`'s
+                // 10..=30), and still genuinely moving with it (the
+                // HOLDER's own velocity, not the ball's — `ball.velocity`
+                // is zeroed on every claim in `ownership.rs` and only
+                // means anything mid-flight). A real, non-trivial (not
+                // near-universal) minority of situations — exactly the
+                // gap Pavel described, not a hypothetical one.
+                //
+                // Widening `in_lateral_zone` for this specific case is
+                // enough: `AttackSupportingState`/`CreatingSpaceState`
+                // already compute central-support and opposite-flank-
+                // free-zone targets respectively, purely from live ball/
+                // holder position — they were simply never being entered
+                // by an out-of-zone player. No new positioning logic
+                // needed, only this eligibility widening.
+                let in_lateral_zone = base_in_lateral_zone
+                    || (!Self::zone4_ablated() && self.teammate_open_carry_active(ctx).is_some());
 
                 // Only attack when ball is in our lateral zone
                 if goal_dist < field_width * 0.4 && ball_distance < 300.0 && in_lateral_zone {
@@ -1973,6 +2003,58 @@ impl MidfielderRunningState {
         use std::sync::OnceLock;
         static ABLATED: OnceLock<bool> = OnceLock::new();
         *ABLATED.get_or_init(|| std::env::var("ZONE1_CHUNK3_ABLATE").is_ok())
+    }
+
+    /// Same-binary ablation toggle for Chunk 4's off-ball reaction
+    /// widening ONLY — Chunks 1-3's own mechanisms are untouched by
+    /// this flag. Mirrors `zone1_chunk3_ablated`'s exact idiom. When
+    /// set, `in_lateral_zone` reverts to exactly its pre-Chunk-4 value
+    /// (`base_in_lateral_zone`), i.e. only players whose own start-
+    /// position band already overlaps the ball's current lateral
+    /// position can react.
+    fn zone4_ablated() -> bool {
+        use std::sync::OnceLock;
+        static ABLATED: OnceLock<bool> = OnceLock::new();
+        *ABLATED.get_or_init(|| std::env::var("ZONE4_ABLATE").is_ok())
+    }
+
+    /// Chunk 4: is a TEAMMATE (never `ctx.player` themselves — this is
+    /// only ever called from the off-ball branch, where that's already
+    /// guaranteed) currently carrying the ball through a genuine,
+    /// sustained, still-open Zone-1 advance? See the call site's own
+    /// comment for the measured rationale behind each of the three
+    /// conditions below (real space, sustained hold, still moving) —
+    /// none of the three constants here are new inventions: the space
+    /// bar is Chunk 1's own `ZONE1_MIN_OPEN_SPACE`, and the duration/
+    /// speed bars are reasoned estimates in the same spirit as this
+    /// file's other unsourced Zone-1 constants (flagged as such, not
+    /// silently invented — no dataset exists for "how long must a
+    /// carry be sustained before teammates should react to it").
+    fn teammate_open_carry_active(
+        &self,
+        ctx: &StateProcessingContext,
+    ) -> Option<MatchPlayerLite> {
+        if !self.in_zone1(ctx) {
+            return None;
+        }
+        let owner_id = ctx.ball().owner_id()?;
+        let owner = ctx.context.players.by_id(owner_id)?;
+        if owner.team_id != ctx.player.team_id {
+            return None;
+        }
+        let holder = ctx.player().get(owner_id);
+        if self.zone1_max_open_distance(ctx, holder.position) < ZONE1_MIN_OPEN_SPACE {
+            return None;
+        }
+        const OPEN_CARRY_MIN_DURATION_TICKS: u32 = 60; // ~600ms — past every "quick touch" window elsewhere in this file
+        if ctx.tick_context.ball.ownership_duration <= OPEN_CARRY_MIN_DURATION_TICKS {
+            return None;
+        }
+        const OPEN_CARRY_MIN_HOLDER_SPEED: f32 = 0.10; // u/tick — genuinely still moving, not standing on it
+        if holder.velocity(ctx).magnitude() <= OPEN_CARRY_MIN_HOLDER_SPEED {
+            return None;
+        }
+        Some(holder)
     }
 
     /// Chunk 3: "if there is a teammate who has roughly the same amount
