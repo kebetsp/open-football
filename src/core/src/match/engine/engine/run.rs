@@ -1172,6 +1172,16 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 .iter()
                 .map(|p| (p.team_id, p.position))
                 .collect();
+            // Chunk 5b: same "can't borrow field.players immutably
+            // while iterating it mutably" constraint as
+            // opponent_positions above, but needing the player id and
+            // sent-off flag too (to find a specific nearby teammate to
+            // lay off to, not just check whether anyone's nearby).
+            let all_player_snapshot: Vec<(u32, u32, Vector3<f32>, bool)> = field
+                .players
+                .iter()
+                .map(|p| (p.id, p.team_id, p.position, p.is_sent_off))
+                .collect();
             // P5 (A3, docs/attacking-defensive-decision-rebuild-plan.md
             // §2.1/§2.2) — lane-residency tracking, a separate pass so
             // it runs for every player every tick regardless of the
@@ -1202,6 +1212,38 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 }
             }
             for p in field.players.iter_mut() {
+                // Chunk 5b: decay, unconditional every tick regardless
+                // of any other commitment field's state below — kept
+                // independent (not gated by byline_commitment_ticks'
+                // own early `continue`) so an unrelated active
+                // commitment on the same player can never accidentally
+                // suppress this.
+                if p.combo_partner_ticks > 0 {
+                    if raw_owner != Some(p.id) {
+                        // The bias is only meaningful while he's still
+                        // deciding what to do WITH the ball — cleared
+                        // immediately once it's left his feet (passed
+                        // away or lost), whether or not the lay-off
+                        // window had ticks left.
+                        p.combo_partner = None;
+                        p.combo_partner_ticks = 0;
+                    } else {
+                        p.combo_partner_ticks -= 1;
+                        if p.combo_partner_ticks == 0 {
+                            p.combo_partner = None;
+                        }
+                    }
+                }
+                if p.give_and_go_run_ticks > 0 && raw_owner != Some(p.id) {
+                    // Only counts down once the ball has actually left
+                    // his feet — the run hasn't started yet while he's
+                    // still deciding whether/when to lay it off, so the
+                    // budget shouldn't drain away before he's released
+                    // it. Self-resolves harmlessly (never fires, per
+                    // give_and_go_run_velocity's own ball-ownership
+                    // gate) if he ends up never passing at all.
+                    p.give_and_go_run_ticks -= 1;
+                }
                 if p.byline_commitment_ticks > 0 {
                     if raw_owner != Some(p.id) {
                         match_log_info!("CROSSDIAG LOSTBALL id={} ticks_left={}", p.id, p.byline_commitment_ticks);
@@ -1301,6 +1343,130 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                                         nearest_opp
                                     );
                                     continue;
+                                }
+                            }
+                        }
+                        // Chunk 5b (docs/zone-staged-possession-
+                        // progression.md): the give-and-go, sibling to
+                        // the WideIsolation branch above — same contact
+                        // trigger, different pattern, different action.
+                        // "There is a lot of wide open space behind
+                        // him... play a 1-2" (Pavel, 2026-09-02): the
+                        // carrier lays it off to a genuinely close
+                        // teammate (`combo_partner`, biases HIS OWN
+                        // pass preference — evaluator.rs) then commits
+                        // to a run into the space he was trying to
+                        // exploit (`give_and_go_run_ticks`, consumed by
+                        // `give_and_go_run_velocity` in processor.rs).
+                        // Deliberately does not try to arm a symmetric
+                        // "look for the return" bias on the teammate —
+                        // that would need a second, simultaneous
+                        // mutable borrow of another player from inside
+                        // this same `iter_mut()` loop, which this
+                        // codebase has no established safe pattern for
+                        // yet; the run itself making him genuinely open
+                        // is trusted to do that job instead (same
+                        // "lean on already-verified machinery" call as
+                        // Chunk 4's own off-ball reaction).
+                        // realism-bug (caught via CHUNK5BDIAG raw data
+                        // before shipping, same session): without the
+                        // `combo_partner_ticks == 0` gate, this rolled
+                        // fresh every tick the conditions kept holding
+                        // — 665 arms across 15 matches, many for the
+                        // SAME player on consecutive ticks — compounding
+                        // a per-tick probability into near-certainty and
+                        // continuously overwriting the supposedly-frozen
+                        // run target, the exact class of bug
+                        // `gk1v1_decision_made`'s own one-shot-per-
+                        // possession lock exists to prevent elsewhere in
+                        // this codebase.
+                        if team_tactical.positional_attack_active()
+                            && team_tactical.positional_attack_pattern
+                                == Some(
+                                    crate::r#match::AttackPattern::UnderlapOverlapCombination,
+                                )
+                            && p.combo_partner_ticks == 0
+                        {
+                            let group = p.tactical_position.current_position.position_group();
+                            if matches!(
+                                group,
+                                crate::PlayerFieldPositionGroup::Forward
+                                    | crate::PlayerFieldPositionGroup::Midfielder
+                            ) {
+                                let attacking_dir: f32 = match p.side {
+                                    Some(crate::r#match::PlayerSide::Left) => 1.0,
+                                    Some(crate::r#match::PlayerSide::Right) => -1.0,
+                                    None => 0.0,
+                                };
+                                if attacking_dir != 0.0 {
+                                    // A real lay-off is a few metres,
+                                    // not a long diagonal switch —
+                                    // deliberately much tighter than
+                                    // Chunk 3's own
+                                    // ZONE1_TEAMMATE_SEARCH_RADIUS
+                                    // (200u). Reasoned estimate, not
+                                    // sourced (no dataset exists for
+                                    // "how far is a real give-and-go
+                                    // lay-off").
+                                    const COMBO_PARTNER_MAX_DIST: f32 = 70.0;
+                                    let nearest_teammate = all_player_snapshot
+                                        .iter()
+                                        .filter(|&&(qid, qteam, _, qsent_off)| {
+                                            qteam == p.team_id && qid != p.id && !qsent_off
+                                        })
+                                        .map(|&(qid, _, qpos, _)| {
+                                            (qid, (qpos - p.position).magnitude())
+                                        })
+                                        .filter(|&(_, d)| d <= COMBO_PARTNER_MAX_DIST)
+                                        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                                    if let Some((partner_id, partner_dist)) = nearest_teammate {
+                                        // Same reasoned-estimate status
+                                        // as WideIsolation's own
+                                        // probability above — this is a
+                                        // passing+movement combination,
+                                        // so scaled by passing/off-the-
+                                        // ball skills instead of pace/
+                                        // dribbling.
+                                        let passing01 = ((p.skills.technical.passing - 1.0)
+                                            / 19.0)
+                                            .clamp(0.0, 1.0);
+                                        let off_ball01 = ((p.skills.mental.off_the_ball
+                                            - 1.0)
+                                            / 19.0)
+                                            .clamp(0.0, 1.0);
+                                        let prob = (0.45
+                                            + passing01 * 0.15
+                                            + off_ball01 * 0.15)
+                                            .clamp(0.45, 0.75);
+                                        if context.rng.range_u64(0, 10000)
+                                            < (prob * 10000.0) as u64
+                                        {
+                                            const COMBO_BIAS_TICKS: u16 = 300;
+                                            const RUN_TICKS: u16 = 500;
+                                            const RUN_FORWARD_DISTANCE: f32 = 70.0;
+                                            const RUN_LATERAL_PULL: f32 = 0.35;
+                                            p.combo_partner = Some(partner_id);
+                                            p.combo_partner_ticks = COMBO_BIAS_TICKS;
+                                            let center_y =
+                                                context.field_size.height as f32 / 2.0;
+                                            let field_w = context.field_size.width as f32;
+                                            p.give_and_go_run_target_x = (p.position.x
+                                                + attacking_dir * RUN_FORWARD_DISTANCE)
+                                                .clamp(0.0, field_w);
+                                            p.give_and_go_run_target_y = p.position.y
+                                                + (center_y - p.position.y)
+                                                    * RUN_LATERAL_PULL;
+                                            p.give_and_go_run_ticks = RUN_TICKS;
+                                            match_log_info!(
+                                                "CHUNK5BDIAG combo_arm id={} partner={} partner_dist={:.1} target=({:.1},{:.1})",
+                                                p.id,
+                                                partner_id,
+                                                partner_dist,
+                                                p.give_and_go_run_target_x,
+                                                p.give_and_go_run_target_y
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }

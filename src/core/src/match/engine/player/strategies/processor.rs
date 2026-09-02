@@ -405,6 +405,20 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
+        // Chunk 5b (docs/zone-staged-possession-progression.md): the
+        // "go" half of a give-and-go. Applied AFTER the assignment
+        // override so an explicit press/mark target still wins outright
+        // (also re-checked inside the function itself), and BEFORE the
+        // defensive wide-run-tracking/shot-block/rebound overrides below
+        // so any genuine defensive or reactive duty still takes priority
+        // over an attacking off-ball run. Tempo-scaled like ordinary
+        // attacking movement, unlike the defensive/legal overrides below
+        // which are deliberately full-urgency regardless of tempo.
+        if let Some(velocity) = Self::give_and_go_run_velocity(&processing_ctx) {
+            let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
+            result.velocity = Some(velocity * tempo);
+        }
+
         // realism-bug (2026-08-27): defensive wide-run tracking. Applied
         // AFTER the assignment override so an explicit press/mark target
         // still wins outright (also re-checked inside the function
@@ -1072,6 +1086,57 @@ impl<'p> StateProcessor<'p> {
         let to_target = shadow_point - player.position;
         let dist = to_target.magnitude();
         if dist < 2.0 {
+            return Some(Vector3::zeros());
+        }
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some(to_target.normalize() * max_speed)
+    }
+
+    /// Chunk 5b (docs/zone-staged-possession-progression.md): the "go"
+    /// half of a give-and-go started under
+    /// `AttackPattern::UnderlapOverlapCombination`. `run.rs`'s arm
+    /// branch (sibling to Chunk 5's own `WideIsolation` one) pairs
+    /// `give_and_go_run_ticks`/`give_and_go_run_target_x/y` with the
+    /// pass-preference bias `combo_partner` (`evaluator.rs`) — this
+    /// function only steers, using the SAME frozen-at-arm-time target
+    /// pattern as `round_keeper_target_x/y` (a real player commits to a
+    /// route decided at the moment he releases the ball, not one that
+    /// keeps drifting) and the SAME real-pace conversion
+    /// `wide_run_track_override_velocity` above uses
+    /// (`max_speed_with_condition`, not the raw skill value
+    /// `rebound_crash_velocity` below still has as a known, separately
+    /// flagged bug).
+    ///
+    /// Deliberately does NOT force a return pass to this player — see
+    /// `give_and_go_run_ticks`'s own doc comment (player.rs) for why
+    /// that's an honest scope limit, not an oversight: the run itself
+    /// is what makes him genuinely open, and the already-verified
+    /// pass-value machinery rewards feeding an open teammate on its
+    /// own.
+    fn give_and_go_run_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None; // an explicit assignment always wins
+        }
+        if player.give_and_go_run_ticks == 0 {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None; // he's got the ball again — normal state machine drives him
+        }
+        if !ctx.team().is_control_ball() {
+            return None; // we lost it — no reason to keep sprinting for a return that can't come
+        }
+        let target = Vector3::new(
+            player.give_and_go_run_target_x,
+            player.give_and_go_run_target_y,
+            0.0,
+        );
+        let to_target = target - player.position;
+        let dist = to_target.magnitude();
+        if dist < 3.0 {
             return Some(Vector3::zeros());
         }
         let max_speed = player

@@ -397,6 +397,44 @@ pub struct MatchPlayer {
     /// decision, not a target that keeps receding as the keeper recovers.
     pub round_keeper_target_x: f32,
     pub round_keeper_target_y: f32,
+    /// Chunk 5b (docs/zone-staged-possession-progression.md): the
+    /// "give" half of a give-and-go started under
+    /// `AttackPattern::UnderlapOverlapCombination` (`run.rs`'s arm
+    /// branch, sibling to Chunk 5's own `WideIsolation` one) — biases
+    /// THIS player's own pass-target preference toward the named
+    /// teammate, mirroring `link_target`'s exact evaluator treatment
+    /// (`evaluator.rs`, two sites) but as a separate, self-decaying
+    /// field so a temporary tactical nudge can never clobber or be
+    /// clobbered by a manager-issued "link with X" pairing on either
+    /// player. Only the PASSER's own field is ever read (same as
+    /// `link_target`), so arming this on the carrier alone is
+    /// sufficient — no second-player mutation needed from the per-tick
+    /// loop that arms it.
+    pub combo_partner: Option<u32>,
+    /// Ticks remaining on `combo_partner` (0 = inactive). Cleared
+    /// immediately once this player no longer owns the ball (passed it
+    /// away or lost it) — the bias is only meaningful while he's still
+    /// deciding what to do WITH the ball.
+    pub combo_partner_ticks: u16,
+    /// Chunk 5b: the "go" half — ticks remaining on a committed
+    /// off-ball run into the space the carrier was trying to exploit,
+    /// armed at the same moment as `combo_partner`/`combo_partner_ticks`
+    /// above but consumed AFTER the ball has left his feet (the
+    /// override that reads this, `give_and_go_run_velocity` in
+    /// `processor.rs`, only fires while he does NOT own the ball).
+    /// Deliberately does not try to force a return pass — the runner
+    /// becomes genuinely more open by making a real run, and the
+    /// already-verified pass-value machinery
+    /// (`pass_value_from`/`receiver_runway_value`) rewards feeding an
+    /// open teammate on its own, the same "trust what's already built"
+    /// reasoning Chunk 4's off-ball reaction used.
+    pub give_and_go_run_ticks: u16,
+    /// Frozen at arm time (not recomputed live), same pattern as
+    /// `round_keeper_target_x/y` above and for the identical reason —
+    /// a real player commits to a run decided at the moment he lays
+    /// the ball off, not one that keeps drifting as he moves.
+    pub give_and_go_run_target_x: f32,
+    pub give_and_go_run_target_y: f32,
     /// realism-bug (2026-07-27): one-shot-per-possession lock so the
     /// round-keeper probability roll (in the engine loop) fires at most
     /// once per continuous spell of ball ownership, not every tick the
@@ -735,6 +773,11 @@ impl MatchPlayer {
             round_keeper_commitment_ticks: 0,
             round_keeper_target_x: 0.0,
             round_keeper_target_y: 0.0,
+            combo_partner: None,
+            combo_partner_ticks: 0,
+            give_and_go_run_ticks: 0,
+            give_and_go_run_target_x: 0.0,
+            give_and_go_run_target_y: 0.0,
             gk1v1_decision_made: false,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,
@@ -834,6 +877,11 @@ impl MatchPlayer {
             round_keeper_commitment_ticks: 0,
             round_keeper_target_x: 0.0,
             round_keeper_target_y: 0.0,
+            combo_partner: None,
+            combo_partner_ticks: 0,
+            give_and_go_run_ticks: 0,
+            give_and_go_run_target_x: 0.0,
+            give_and_go_run_target_y: 0.0,
             gk1v1_decision_made: false,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,

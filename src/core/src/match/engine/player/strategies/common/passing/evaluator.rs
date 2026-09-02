@@ -128,6 +128,19 @@ impl PassEvaluator {
         } else {
             0.0
         };
+        // Chunk 5b (docs/zone-staged-possession-progression.md): the
+        // "give" half of a give-and-go — a temporary, self-decaying
+        // sibling of `link_target` above, armed by
+        // `AttackPattern::UnderlapOverlapCombination`'s contact-gated
+        // trigger (`run.rs`) rather than a manager instruction. Same
+        // magnitude and same additive-to-success-probability treatment
+        // as `link_delta`, deliberately kept separate so it can never
+        // interact with a manager-issued "link with X" pairing.
+        let combo_delta = if passer.combo_partner == Some(receiver.id) {
+            0.05
+        } else {
+            0.0
+        };
         // "Block passes into X" (wishlist #8): an opposing interceptor
         // assigned to this receiver, currently within range of them,
         // makes the pass genuinely harder to complete.
@@ -145,6 +158,7 @@ impl PassEvaluator {
             + psych_delta
             + chemistry_delta
             + link_delta
+            + combo_delta
             + intercept_delta)
             .clamp(0.1, 0.99);
 
@@ -1975,6 +1989,19 @@ impl PassEvaluator {
                 1.0
             };
 
+            // Chunk 5b: the "give" half of a give-and-go, selection side
+            // — same multiplicative idiom and same magnitude as
+            // `link_modifier` above (this project's own established
+            // lesson: a probability nudge alone is invisible against
+            // this multiplier chain), but a separate, self-decaying
+            // field armed by `AttackPattern::UnderlapOverlapCombination`
+            // rather than a manager instruction.
+            let combo_modifier = if ctx.player.combo_partner == Some(teammate.id) {
+                1.5
+            } else {
+                1.0
+            };
+
             // "Feed X" directed supply (wishlist #9): the named target is
             // a preferred receiver — long balls into them especially.
             let supply_modifier = if ctx.player.supply_target == Some(teammate.id) {
@@ -2023,6 +2050,7 @@ impl PassEvaluator {
                 * gm_modifier
                 * bias_modifier
                 * link_modifier
+                * combo_modifier
                 * supply_modifier
                 * intercept_modifier
                 * throw_in_preferred_modifier;
