@@ -1007,6 +1007,87 @@ impl TeamTacticalState {
             })
     }
 
+    /// Widened form of `carrier_meets_defender`'s own geometry — the
+    /// same forward cone (`CONTACT_BLOCK_FORWARD_COS`) but reaching out
+    /// to `ZONE1_MIN_OPEN_SPACE` (`midfielders/states/running/mod.rs`,
+    /// reused verbatim, not reinvented — the exact distance the
+    /// carrier's own Chunk 1-3 open-space scan already treats as
+    /// "genuinely clear") instead of the tight 18u contact radius.
+    /// Counts every opponent in that wider cone, including the one
+    /// making contact — so a lone, isolated defender counts as 1, and a
+    /// second opponent within that same "clear running room" distance
+    /// pushes it to 2+.
+    const COVER_CHECK_RADIUS: f32 = 45.0;
+
+    fn opponents_in_the_picture(
+        field: &MatchField,
+        carrier_pos: nalgebra::Vector3<f32>,
+        carrier_team_id: u32,
+        attacking_dir: f32,
+    ) -> u8 {
+        field
+            .players
+            .iter()
+            .filter(|opp| opp.team_id != carrier_team_id && !opp.is_sent_off)
+            .filter(|opp| {
+                let to_opp = opp.position - carrier_pos;
+                let dist = (to_opp.x * to_opp.x + to_opp.y * to_opp.y).sqrt();
+                if !(1.0..=Self::COVER_CHECK_RADIUS).contains(&dist) {
+                    return false;
+                }
+                (to_opp.x / dist) * attacking_dir > Self::CONTACT_BLOCK_FORWARD_COS
+            })
+            .count() as u8
+    }
+
+    /// Pavel's own correction (2026-09-02,
+    /// docs/zone-staged-possession-progression.md): meeting ANY
+    /// defender must not automatically start a positional attack —
+    /// "there is a lot of wide open space behind him... the reasonable
+    /// thing to do is to dribble [or play a simple combination], not
+    /// start the positional attack." A lone, isolated defender with
+    /// real room beyond him is exactly the case the carrier's own
+    /// Zone-1 open-space carry logic (Chunks 1-3 — goal-blind heading
+    /// scan + teammate-open-space comparison) already handles well on
+    /// its own; it doesn't need this team-level machinery to escalate
+    /// at all. This only fires once a SECOND opponent is also
+    /// genuinely in the picture — real cover, or a real numbers
+    /// disadvantage — not just proximity to the one defender who made
+    /// contact. Deliberately a NUMBERS gate, not a raw open-space
+    /// distance gate: Pavel's own explicit framing was "I am not
+    /// saying we should only rely on open area behind the defender" —
+    /// the open-space bar is reused as the search radius (so this
+    /// can't disagree with the carrier's own scan about what "open"
+    /// means), but the actual decision is "how many opponents are
+    /// there," which also captures a covered-but-nearby situation a
+    /// pure distance check could miss.
+    fn carrier_needs_positional_attack(
+        field: &MatchField,
+        carrier_id: u32,
+        carrier_team_id: u32,
+        carrier_side: Option<PlayerSide>,
+        carrier_pos: nalgebra::Vector3<f32>,
+    ) -> bool {
+        if !Self::carrier_meets_defender(field, carrier_id, carrier_team_id, carrier_side) {
+            return false;
+        }
+        let attacking_dir: f32 = match carrier_side {
+            Some(PlayerSide::Left) => 1.0,
+            Some(PlayerSide::Right) => -1.0,
+            None => return false,
+        };
+        let nearby =
+            Self::opponents_in_the_picture(field, carrier_pos, carrier_team_id, attacking_dir);
+        let needs_plan = nearby >= 2;
+        crate::match_log_info!(
+            "CHUNK5GATEDIAG carrier_id={} nearby={} needs_plan={}",
+            carrier_id,
+            nearby,
+            needs_plan
+        );
+        needs_plan
+    }
+
     /// See `AttackPattern`'s own doc comment for the sourcing of these
     /// thresholds (reused verbatim from the reverted rewrite's own
     /// measured Chunk 2 recalibration).
@@ -1057,7 +1138,15 @@ impl TeamTacticalState {
                 .current_owner
                 .and_then(|id| field.players.iter().find(|p| p.id == id))
                 .filter(|p| (p.team_id == home_team_id) == is_home)
-                .map(|p| Self::carrier_meets_defender(field, p.id, p.team_id, p.side))
+                .map(|p| {
+                    Self::carrier_needs_positional_attack(
+                        field,
+                        p.id,
+                        p.team_id,
+                        p.side,
+                        p.position,
+                    )
+                })
                 .unwrap_or(false);
         if contact {
             let density = match team.ball_side {
