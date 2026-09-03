@@ -1453,8 +1453,31 @@ impl PassEvaluator {
         // nearby teammate (a real lay-off or drop-back-and-reset) is
         // ever a candidate; every other passing decision is unaffected.
         const FREE_KICK_RECYCLE_MAX_DISTANCE: f32 = 160.0;
+        // OverloadAndSwitch (docs/zone-staged-possession-progression.md):
+        // a genuine cross-field switch of play (e.g. touchline to
+        // touchline) can exceed this function's own default 300u search
+        // radius (RunningState's own call) — the loop below
+        // (`nearby(max_distance)`) is the SOLE candidate gate, so a
+        // teammate genuinely out on the far side never even enters
+        // consideration, regardless of how well the already-shipped
+        // `underload_switch_bonus`/`overload_bonus` scoring below would
+        // reward passing to him once considered. `combo_partner` is only
+        // ever armed by `run.rs`'s contact-triggered positional-attack
+        // branches (WideIsolation's near lay-off target OR
+        // OverloadAndSwitch's far weak-side target); widening here is
+        // harmless for the former (its own target is always ≤70u,
+        // already inside 300u) and is what makes the latter's target
+        // reachable at all. Mirrors the free-kick clamp immediately
+        // above — same established pattern, widening instead of
+        // narrowing. `OVERLOAD_SWITCH_MAX_DISTANCE` is a reasoned
+        // estimate (no sourced dataset for "how far is a real switch of
+        // play"), sized to comfortably cover a full-width diagonal on
+        // this engine's 840x545 pitch.
+        const OVERLOAD_SWITCH_MAX_DISTANCE: f32 = 450.0;
         let max_distance = if ctx.player.free_kick_pass_pending > 0 {
             max_distance.min(FREE_KICK_RECYCLE_MAX_DISTANCE)
+        } else if ctx.player.combo_partner.is_some() {
+            max_distance.max(OVERLOAD_SWITCH_MAX_DISTANCE)
         } else {
             max_distance
         };

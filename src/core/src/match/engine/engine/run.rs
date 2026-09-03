@@ -1470,6 +1470,165 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                                 }
                             }
                         }
+                        // OverloadAndSwitch (docs/zone-staged-possession-
+                        // progression.md): third sibling pattern — same
+                        // contact trigger, `side_density` 4+ on the
+                        // ball's own flank (a genuine overload of OUR
+                        // OWN players there), real football response is
+                        // to switch play to the underloaded far side,
+                        // not force a combination through the crowd.
+                        // Reuses `combo_partner`/`combo_partner_ticks`
+                        // (Chunk 5b's own fields, not new plumbing —
+                        // mutually exclusive with UnderlapOverlapCombination
+                        // since only one AttackPattern is active per
+                        // team at a time) to bias the carrier's OWN pass
+                        // preference toward a genuine weak-side
+                        // teammate. `evaluator.rs`'s own
+                        // `underload_switch_bonus`/`overload_bonus`
+                        // (Milestone 7/8, already shipped) already
+                        // REWARD a real switch once a candidate is
+                        // considered — this only makes sure a genuinely
+                        // far switch target actually enters
+                        // consideration at all (see
+                        // `find_best_pass_option`'s own widened
+                        // `max_distance` for `combo_partner`-armed
+                        // players). Deliberately does NOT set
+                        // `give_and_go_run_*` — a real switch of play
+                        // doesn't have the passer follow the ball into
+                        // space the way a short lay-off/1-2 does; the
+                        // target is picked once, the bias alone does
+                        // the rest via already-correct scoring.
+                        if team_tactical.positional_attack_active()
+                            && team_tactical.positional_attack_pattern
+                                == Some(crate::r#match::AttackPattern::OverloadAndSwitch)
+                            && p.combo_partner_ticks == 0
+                        {
+                            let group = p.tactical_position.current_position.position_group();
+                            if matches!(
+                                group,
+                                crate::PlayerFieldPositionGroup::Forward
+                                    | crate::PlayerFieldPositionGroup::Midfielder
+                            ) {
+                                let field_h = context.field_size.height as f32;
+                                let carrier_side =
+                                    crate::r#match::BallSideZone::for_y(field_h, p.position.y);
+                                // realism-bug (caught via OASDIAG raw
+                                // data before shipping): the first cut
+                                // required only `!= carrier_side`, which
+                                // a goalkeeper — almost always sitting
+                                // dead-center on the goal line
+                                // (`BallSideZone::Center`), unmarked —
+                                // trivially satisfies every time. 6/6
+                                // sampled arms picked the GK outright.
+                                // The genuine football pattern is
+                                // flank-to-flank, not "anywhere that
+                                // isn't my own zone" — require the
+                                // OPPOSITE flank specifically, which also
+                                // structurally excludes Center (and
+                                // hence the keeper) without needing a
+                                // position-group check this raw
+                                // per-tick loop doesn't otherwise have.
+                                let Some(target_side) = (match carrier_side {
+                                    crate::r#match::BallSideZone::Left => {
+                                        Some(crate::r#match::BallSideZone::Right)
+                                    }
+                                    crate::r#match::BallSideZone::Right => {
+                                        Some(crate::r#match::BallSideZone::Left)
+                                    }
+                                    // Unreachable in practice — the arm
+                                    // gate (`refresh_positional_attack`)
+                                    // already requires a non-Center
+                                    // `ball_side` for the whole window —
+                                    // but the carrier can drift slightly
+                                    // between classification and this
+                                    // tick, so handled explicitly rather
+                                    // than assumed impossible.
+                                    crate::r#match::BallSideZone::Center => None,
+                                }) else {
+                                    continue;
+                                };
+                                // Kept in sync with evaluator.rs's own
+                                // OVERLOAD_SWITCH_MAX_DISTANCE — both
+                                // answer the same "can this pass
+                                // realistically reach" question.
+                                const SWITCH_SEARCH_MAX_DIST: f32 = 450.0;
+                                // "Free man on the far side" proxy — same
+                                // order of magnitude as
+                                // TeamTacticalState::COVER_CHECK_RADIUS
+                                // (45.0, teamplay/tactical.rs), hardcoded
+                                // locally rather than imported across
+                                // modules since this loop only has raw
+                                // field data, not a
+                                // StateProcessingContext.
+                                const NEARBY_OPPONENT_RADIUS: f32 = 45.0;
+                                let target = all_player_snapshot
+                                    .iter()
+                                    .filter(|&&(qid, qteam, _, qsent_off)| {
+                                        qteam == p.team_id && qid != p.id && !qsent_off
+                                    })
+                                    .map(|&(qid, _, qpos, _)| (qid, qpos))
+                                    .filter(|&(_, qpos)| {
+                                        let d = (qpos - p.position).magnitude();
+                                        d > 1.0
+                                            && d <= SWITCH_SEARCH_MAX_DIST
+                                            && crate::r#match::BallSideZone::for_y(field_h, qpos.y)
+                                                == target_side
+                                    })
+                                    .map(|(qid, qpos)| {
+                                        let nearby_opp = opponent_positions
+                                            .iter()
+                                            .filter(|(oteam, opos)| {
+                                                *oteam != p.team_id
+                                                    && (*opos - qpos).magnitude()
+                                                        <= NEARBY_OPPONENT_RADIUS
+                                            })
+                                            .count();
+                                        (qid, nearby_opp)
+                                    })
+                                    .min_by_key(|&(_, nearby_opp)| nearby_opp);
+                                if let Some((partner_id, nearby_opp)) = target {
+                                    // Vision/passing-scaled — a genuine
+                                    // long diagonal switch is a vision/
+                                    // technique play, distinct from
+                                    // WideIsolation's pace/dribbling and
+                                    // UnderlapOverlapCombination's
+                                    // passing/off-the-ball scaling. Same
+                                    // reasoned-estimate status as every
+                                    // other Chunk-5-family probability
+                                    // constant.
+                                    let vision01 =
+                                        ((p.skills.mental.vision - 1.0) / 19.0).clamp(0.0, 1.0);
+                                    let passing01 = ((p.skills.technical.passing - 1.0) / 19.0)
+                                        .clamp(0.0, 1.0);
+                                    let prob = (0.40 + vision01 * 0.20 + passing01 * 0.15)
+                                        .clamp(0.40, 0.75);
+                                    if context.rng.range_u64(0, 10000) < (prob * 10000.0) as u64 {
+                                        const SWITCH_BIAS_TICKS: u16 = 300;
+                                        let partner_pos = all_player_snapshot
+                                            .iter()
+                                            .find(|&&(qid, _, _, _)| qid == partner_id)
+                                            .map(|&(_, _, qpos, _)| qpos);
+                                        let dist = partner_pos
+                                            .map(|qp| (qp - p.position).magnitude())
+                                            .unwrap_or(-1.0);
+                                        p.combo_partner = Some(partner_id);
+                                        p.combo_partner_ticks = SWITCH_BIAS_TICKS;
+                                        match_log_info!(
+                                            "OASDIAG switch_arm id={} carrier_y={:.1} carrier_side={:?} partner={} partner_y={:.1} target_side={:?} dist={:.1} nearby_opp={}",
+                                            p.id,
+                                            p.position.y,
+                                            carrier_side,
+                                            partner_id,
+                                            partner_pos.map(|qp| qp.y).unwrap_or(-1.0),
+                                            target_side,
+                                            dist,
+                                            nearby_opp
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 }
