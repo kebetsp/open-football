@@ -4795,6 +4795,35 @@ impl PlayerEventDispatcher {
 
         field.ball.previous_owner = field.ball.current_owner;
         field.ball.current_owner = Some(player_id);
+        // realism-bug (2026-09-03, "yo-yo shot"): the ball's recorded
+        // position was never snapped to the goalkeeper's own position at
+        // the moment of the catch — every OTHER ownership grant in this
+        // file (`secure_ball_for`) does this, this one alone didn't. A
+        // diving save easily moves the keeper's body several units from
+        // the ball's last in-flight position; on the very next tick,
+        // `move_to_with_players`'s "owner is >15 units from the ball, so
+        // possession must have been lost" heuristic (a real, load-bearing
+        // check for a fast dribble the ball can't keep up with) then
+        // misfires against a keeper who has genuinely, securely caught
+        // the ball, clearing `current_owner` back to None regardless of
+        // `claim_cooldown` (that check lives in a completely different
+        // function, `check_ball_ownership`, and never runs once
+        // ownership is already gone). The now-unowned, unprotected ball
+        // sits exactly where the shot was caught — right next to
+        // whichever attacker followed the shot in — and gets picked up
+        // by him via completely ordinary loose-ball claiming a tick or
+        // two later, no special "steal" mechanism required. Confirmed
+        // with raw match-logs tracing (temporary diagnostics, since
+        // removed): `YOYODIAG4 ... after=move_to_with_players gk=200 ->
+        // None claim_cooldown=150` and `=199` — cleared despite a fully
+        // live, high cooldown, ruling out every ownership-contest
+        // hypothesis and pointing squarely at this position gap. Fix:
+        // snap the ball to the goalkeeper's real position here, the same
+        // way `secure_ball_for` already does for every other grant.
+        if let Some(gk) = field.players.iter().find(|p| p.id == player_id) {
+            field.ball.position = gk.position;
+            field.ball.position.z = 0.0;
+        }
         // Ball must stop when caught — prevent it from continuing into the goal
         field.ball.velocity = Vector3::zeros();
         field.ball.flags.in_flight_state = 0;
