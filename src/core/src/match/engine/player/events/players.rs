@@ -5529,6 +5529,35 @@ impl PlayerEventDispatcher {
             p.position = restart_pos;
             p.velocity = Vector3::zeros();
             p.in_state_time = 0;
+            // realism-bug (2026-09-04, "set-piece dribble/self-reclaim"
+            // follow-up): `resolve_free_kick` — the function that arms
+            // `free_kick_pass_pending` and drives the whole direct-FK
+            // shot/cross/short-routine decision — is hard-gated on
+            // `pass_origin_restart == PassOriginRestart::DirectFreeKick`
+            // (engine/tick.rs) and returns immediately for anything
+            // else, so it NEVER runs for an offside-awarded restart
+            // (this function sets `IndirectFreeKick`, a real, load-
+            // bearing distinct variant — goal.rs's own goal-detection
+            // logic uses it to enforce the real Law 15 rule that an
+            // indirect free kick can't score without a second touch;
+            // swapping it to `DirectFreeKick` would let this restart
+            // score directly, a genuine Law violation). Net effect: the
+            // taker was placed on the ball correctly but left with zero
+            // forced urgency — no shot/cross/short-routine decision, no
+            // forced-Passing override — and his own generic state
+            // machine was free to sit on the ball indefinitely. Raw
+            // trace, one confirmed example: a Defender-role taker held
+            // the ball in continuous lockstep with zero PassTo/Shoot/
+            // ClearBall events for the full 10-second trace window.
+            // Fix: arm the same forced-release window every OTHER
+            // restart type already uses, without touching
+            // `pass_origin_restart` — `free_kick_pass_override`
+            // (processor.rs) already covers Forward/Midfielder/
+            // Defender/Goalkeeper and only ever forces a PASS, never a
+            // shot, which is actually the legally correct behaviour for
+            // an indirect free kick anyway (it can never be a direct
+            // shot), not just a safe workaround.
+            p.free_kick_pass_pending = 600;
         }
 
         // §13.4 dead-ball freeze, same timing as an ordinary (non-
