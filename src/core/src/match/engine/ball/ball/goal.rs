@@ -360,39 +360,82 @@ impl Ball {
             let corner_y = if near_top { 2.0 } else { field_height - 2.0 };
 
             // Find the attacking team's designated corner taker — score by
-            // (crossing, technique, corners) like SetPieceSetup::choose,
-            // restricted to players currently on the pitch. Genuine last
-            // resort (should be unreachable outside a fully depleted
-            // side): if no eligible outfielder exists at all, even the
-            // goalkeeper takes it rather than the restart silently
-            // vanishing — real football always has SOMEONE take a
-            // corner, even a makeshift choice.
+            // (crossing, technique, corners) like SetPieceSetup::choose.
+            //
+            // realism-bug (2026-09-04, "set-piece dribble" report): this
+            // used to be restricted only to non-goalkeeper outfielders —
+            // no role check at all — so a central defender with decent
+            // crossing/technique could legitimately win the max_by score
+            // and become "the taker." Real football never does this: a
+            // corner is taken by a genuine attacking-minded player (a
+            // winger, an attacking full-back), never a centre-back or
+            // holding defender — a real defensive/tactical-doctrine
+            // violation, not just an unlikely edge case. It also turned
+            // out to be architecturally fatal: Forward/Midfielder states
+            // have a dedicated `has_ball && is_team_attacking_corner →
+            // Crossing` transition that actually delivers the ball
+            // (`pick_corner_delivery`); Defender states have NO
+            // equivalent — the closest thing, `DefenderWalkingState`'s
+            // `AttackingCorner` transition, is explicitly gated `!has_ball`
+            // (it's for a centre-back attacking SOMEONE ELSE's delivery,
+            // not taking his own). A defender who wins this selection
+            // therefore has no path to ever cross the ball — he just
+            // falls through to ordinary defensive AI (a generic short
+            // pass, an aimless hold, or a clearance) while holding the
+            // ball at the corner flag, and the attack dissolves without
+            // a delivery. Measured (25+20-match samples,
+            // `SETPIECEDIAG_CORNER_TAKER`): ~7% of corners were awarded
+            // to a Defender-role taker, and 0/84 real `CornerDelivery`
+            // events across a 20-match sample were EVER attributed to
+            // one of those ids — a 100% failure rate for exactly the
+            // population this fix removes from the primary pool.
+            //
+            // Fix: three-tier fallback. Primary pool is Forward/
+            // Midfielder outfielders only (the roles that can actually
+            // deliver). Falls back to any non-GK outfielder (the old
+            // behaviour, including defenders) only if the primary pool
+            // is empty — e.g. every forward/midfielder has been sent
+            // off. Genuine last resort (should be unreachable outside a
+            // fully depleted side): if no eligible outfielder exists at
+            // all, even the goalkeeper takes it rather than the restart
+            // silently vanishing — real football always has SOMEONE
+            // take a corner, even a makeshift choice.
             let taker_score = |p: &MatchPlayer| {
                 p.skills.technical.crossing * 0.6
                     + p.skills.technical.technique * 0.3
                     + p.skills.technical.corners * 0.1
             };
-            let taker = players
-                .iter()
-                .filter(|p| {
+            fn best_scored<'a>(
+                iter: impl Iterator<Item = &'a MatchPlayer>,
+                score: impl Fn(&MatchPlayer) -> f32,
+            ) -> Option<&'a MatchPlayer> {
+                iter.max_by(|a, b| {
+                    score(a).partial_cmp(&score(b)).unwrap_or(Ordering::Equal)
+                })
+            }
+            let taker = best_scored(
+                players.iter().filter(|p| {
                     p.side == Some(attacking_side)
-                        && !p.tactical_position.current_position.is_goalkeeper()
-                })
-                .max_by(|a, b| {
-                    taker_score(a)
-                        .partial_cmp(&taker_score(b))
-                        .unwrap_or(Ordering::Equal)
-                })
-                .or_else(|| {
-                    players
-                        .iter()
-                        .filter(|p| p.side == Some(attacking_side))
-                        .max_by(|a, b| {
-                            taker_score(a)
-                                .partial_cmp(&taker_score(b))
-                                .unwrap_or(Ordering::Equal)
-                        })
-                });
+                        && (p.tactical_position.current_position.is_forward()
+                            || p.tactical_position.current_position.is_midfielder())
+                }),
+                taker_score,
+            )
+            .or_else(|| {
+                best_scored(
+                    players.iter().filter(|p| {
+                        p.side == Some(attacking_side)
+                            && !p.tactical_position.current_position.is_goalkeeper()
+                    }),
+                    taker_score,
+                )
+            })
+            .or_else(|| {
+                best_scored(
+                    players.iter().filter(|p| p.side == Some(attacking_side)),
+                    taker_score,
+                )
+            });
 
             if let Some(taker) = taker {
                 let taker_id = taker.id;
@@ -448,6 +491,15 @@ impl Ball {
 
                 #[cfg(feature = "match-logs")]
                 log::info!("CLAIMSITE fn=goal.rs:corner id={}", taker_id);
+                #[cfg(feature = "match-logs")]
+                if let Some(taker_player) = players.iter().find(|p| p.id == taker_id) {
+                    log::info!(
+                        "SETPIECEDIAG_CORNER_TAKER id={} role={:?} score={:.2}",
+                        taker_id,
+                        taker_player.tactical_position.current_position.position_group(),
+                        taker_score(taker_player)
+                    );
+                }
                 events.add_ball_event(BallEvent::Claimed(taker_id));
                 // Teleport the taker onto the ball so `move_to`'s
                 // distance check doesn't immediately null ownership
