@@ -1169,6 +1169,17 @@ impl PlayerEventDispatcher {
                     // depth cap itself is shared, cross-cutting dispatch
                     // machinery (Module 11) out of scope for this fix.
                     if context.logging_enabled {
+                        // realism-bug (2026-09-05): record-only, so the
+                        // app layer can show "Offside" instead of the
+                        // generic "Free kick" text for this specific
+                        // restart cause — same idiom as `CornerDelivery`/
+                        // `FoulCalled`/`FreeKickPlan` elsewhere in this
+                        // file.
+                        match_data.add_match_event(
+                            context.total_match_time,
+                            "player",
+                            format!("Offside({})", player_id),
+                        );
                         match_data.add_match_event(
                             context.total_match_time,
                             "player",
@@ -5558,6 +5569,57 @@ impl PlayerEventDispatcher {
             // an indirect free kick anyway (it can never be a direct
             // shot), not just a safe workaround.
             p.free_kick_pass_pending = 600;
+        }
+
+        // realism-bug (2026-09-05, Pavel: "there are two players on
+        // practically the same spot (an attacker and a defender) ... you
+        // don't even understand who is performing the free kick"): every
+        // OTHER restart type that awards a free kick
+        // (`award_restart_for_foul`'s direct-FK branch, plus corners/
+        // goal-kicks/throw-ins each in their own way) pushes opponents
+        // to the real Law 15 minimum distance (9.15m/73u) via
+        // `restart_retreat_target` — this function never did. Since
+        // `dead_ball_retreat_active` makes the per-tick loop `continue`
+        // for every player without a `restart_retreat_target` set
+        // (engine/run.rs), the offside-side player standing right where
+        // the offside was flagged — often within a metre of the last
+        // defender, by the very nature of a close offside call — stayed
+        // frozen there, overlapping, for the whole 2-4s stoppage. Fix:
+        // the same generic "push anyone inside 73u out to 78u" retreat
+        // `award_restart_for_foul`'s direct-FK branch already uses for
+        // "everyone else defending" — no wall needed here (an indirect
+        // free kick from offside is never a genuine shooting chance),
+        // just the same minimum separation so it's clear who's taking
+        // the restart.
+        {
+            let is_gk = |p: &MatchPlayer| {
+                p.tactical_position.current_position.position_group()
+                    == PlayerFieldPositionGroup::Goalkeeper
+            };
+            let goal_x = match offside_side {
+                PlayerSide::Left => 0.0_f32,
+                PlayerSide::Right => field_w,
+            };
+            let mid_y = field_h * 0.5;
+            let fallback_dir = {
+                let d = Vector3::new(goal_x - restart_pos.x, mid_y - restart_pos.y, 0.0);
+                let m = (d.x * d.x + d.y * d.y).sqrt();
+                if m > 1.0 { d / m } else { Vector3::new(1.0, 0.0, 0.0) }
+            };
+            for p in field.players.iter_mut() {
+                if p.side != Some(offside_side) || p.is_sent_off || is_gk(p) {
+                    continue;
+                }
+                let d = p.position - restart_pos;
+                let dist = (d.x * d.x + d.y * d.y).sqrt();
+                if dist < 73.0 {
+                    let out_dir = if dist > 1.0 { d / dist } else { fallback_dir };
+                    let mut pos = restart_pos + out_dir * 78.0;
+                    pos.x = pos.x.clamp(2.0, field_w - 2.0);
+                    pos.y = pos.y.clamp(2.0, field_h - 2.0);
+                    p.restart_retreat_target = Some(pos);
+                }
+            }
         }
 
         // §13.4 dead-ball freeze, same timing as an ordinary (non-
