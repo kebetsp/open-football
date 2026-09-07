@@ -1220,14 +1220,27 @@ fn weak_side_patience_adjustment(ctx: &StateProcessingContext, candidate: Vector
     // does NOT change when/whether a pattern starts, only what the
     // weak side does while one is genuinely live); falls back to the
     // ambient target the rest of the time.
+    //
+    // `OverloadAndSwitch` shares the identical doctrine (added same
+    // session, same reasoning): the weak side isn't just "not crowded"
+    // during a live overload, it's the literal TARGET of the switch
+    // pass (`run.rs`'s own `OverloadAndSwitch` arm branch already
+    // searches the opposite flank for the free man to switch to) --
+    // real width there is what makes the switch dangerous once it
+    // arrives, not just tidy off-ball shape.
     let width_target = if tactical.positional_attack_active()
-        && tactical.positional_attack_pattern == Some(crate::r#match::AttackPattern::WideIsolation)
+        && matches!(
+            tactical.positional_attack_pattern,
+            Some(crate::r#match::AttackPattern::WideIsolation)
+                | Some(crate::r#match::AttackPattern::OverloadAndSwitch)
+        )
     {
         crate::match_log_info!(
-            "WIDEISOSTRETCH id={} cand_y={:.1} ambient_target={:.2}",
+            "WIDEISOSTRETCH id={} cand_y={:.1} ambient_target={:.2} pattern={:?}",
             ctx.player.id,
             candidate.y,
-            tactical.team_width_target
+            tactical.team_width_target,
+            tactical.positional_attack_pattern
         );
         1.0
     } else {
