@@ -2,8 +2,8 @@ use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondition};
 use crate::r#match::player::PlayerSide;
 use crate::r#match::{
-    ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
-    SteeringBehavior,
+    ConditionContext, GamePhase, StateChangeResult, StateProcessingContext,
+    StateProcessingHandler, SteeringBehavior,
 };
 use nalgebra::Vector3;
 
@@ -138,6 +138,29 @@ impl StateProcessingHandler for DefenderPushingUpState {
 
 impl DefenderPushingUpState {
     /// Check if this push-up is an overlapping run (wide defender, ball on same flank)
+    ///
+    /// docs/positional-football-master-plan.md Stage 1 finding, closed
+    /// 2026-09-07: this was a bare 3-check gate (wide, team has ball,
+    /// same flank) with NONE of the safety checks
+    /// `DefenderRunningState::should_overlap` (a genuinely different
+    /// state, same underlying decision) already has — no rest-defense
+    /// count, no phase gate, no "am I actually behind the carrier"
+    /// check. Since PushingUpState is a completely separate code path
+    /// from RunningState, `should_overlap`'s own protection never
+    /// covered this state at all: measured directly (Stage 1, raw
+    /// coordinate-collision data) at 90% near-duplicate teammate
+    /// targets for one of the two bypass branches this exact class of
+    /// gap produces elsewhere, and the design comment on the sibling
+    /// gate spells out the real-football failure mode this reproduces —
+    /// "both fullbacks would routinely vacate the back line on the same
+    /// possession, and a single counter-attack pass landed straight
+    /// behind the team." Fixed by adding the SAME two dominant safety
+    /// checks from `should_overlap` here (rest-defense count, phase
+    /// gate) — deliberately not the full 7-check gate (late-lead/width-
+    /// target/skill-profile refinements are secondary; this fix targets
+    /// the specific, already-diagnosed failure mode, not a full merge
+    /// of the two states) and deliberately not touching
+    /// `should_overlap` itself, which is already correctly tuned.
     fn is_overlap_run(&self, ctx: &StateProcessingContext) -> bool {
         let field_height = ctx.context.field_size.height as f32;
         let start_y = ctx.player.start_position.y;
@@ -153,8 +176,48 @@ impl DefenderPushingUpState {
         let ball_pos = ctx.tick_context.positions.ball.position;
         let player_on_left = start_y < field_height * 0.5;
         let ball_on_left = ball_pos.y < field_height * 0.5;
+        if player_on_left != ball_on_left {
+            return false;
+        }
 
-        player_on_left == ball_on_left
+        // Phase gate — mirrors DefenderRunningState::should_overlap:
+        // overlapping in a fragile transition/build-up phase invites a
+        // 2v1 the other way the moment the move breaks down.
+        let phase = ctx.team().phase();
+        if !matches!(phase, GamePhase::Attack | GamePhase::Progression) {
+            return false;
+        }
+
+        // Rest-defence gate — mirrors DefenderRunningState::should_overlap
+        // exactly (same `rest_defense_count` primitive, same +1/late-lead
+        // math): need at least `rest_defense_count + 1` teammates
+        // genuinely behind the ball before this defender may push up.
+        let side = match ctx.player.side {
+            Some(s) => s,
+            None => return false,
+        };
+        let field_width = ctx.context.field_size.width as f32;
+        let ball_progress = side.attacking_progress_x(ball_pos.x, field_width);
+        let behind_threshold = ball_progress - 0.03;
+        let behind_ball_count = ctx
+            .players()
+            .teammates()
+            .all()
+            .filter(|t| {
+                if t.id == ctx.player.id {
+                    return false;
+                }
+                let progress = side.attacking_progress_x(t.position.x, field_width);
+                progress < behind_threshold
+            })
+            .count();
+        let mut required_behind = ctx.team().rest_defense_count() as usize + 1;
+        let minute = (ctx.context.total_match_time as f32) / 60_000.0;
+        if minute > 75.0 && ctx.team().score_diff() > 0 {
+            required_behind += 1;
+        }
+
+        behind_ball_count >= required_behind
     }
 
     /// Calculate overlap target: ahead of ball carrier, wide on touchline
