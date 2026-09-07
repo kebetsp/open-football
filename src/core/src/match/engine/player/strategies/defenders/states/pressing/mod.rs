@@ -9,7 +9,7 @@ use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::{
     ConditionContext, MatchPlayerLite, StateChangeResult, StateProcessingContext,
-    StateProcessingHandler,
+    StateProcessingHandler, SteeringBehavior,
 };
 use nalgebra::Vector3;
 #[cfg(feature = "match-logs")]
@@ -235,6 +235,86 @@ impl StateProcessingHandler for DefenderPressingState {
             // "closing speed vs. shot danger," flagged as an estimate
             // like every other new constant in this investigation.
             let danger = dv::value_conceded_if_beaten(ctx, &opponent);
+
+            // docs/defensive-delay-and-engagement-timing.md, Stage 3
+            // Chunk 1 (docs/positional-football-master-plan.md,
+            // 2026-09-07): real jockeying doctrine, WebSearch-sourced
+            // this session (soccertoolbox.net "1v1 Defense", sportsession
+            // planner.com "Delay - 1st defender"): a defender sprints to
+            // close space while it's genuinely open, but once within
+            // roughly 5 yards (36u @ 8u/m) of the ball carrier they
+            // DECELERATE and shuffle/backpedal to hold a working
+            // distance — roughly 2-3 yards (14.6-21.9u; 20u midpoint
+            // used below) — rather than keep closing all the way in,
+            // until a real trigger justifies committing further. This
+            // state previously had no such phase at all: it closed at
+            // full press pace toward the predicted intercept point
+            // regardless of distance — exactly Pavel's own complaint
+            // ("they actively meet him... lose the duel... now running
+            // behind chasing"). Three trigger conditions end delay and
+            // fall through to the existing full-speed closing logic
+            // below unchanged: genuine shot/cross danger (reuses the
+            // SAME `danger` value the urgency boost below already
+            // trusts, so a defender never passively jockeys a live
+            // shooting threat), a heavy/loose touch (the ball has
+            // separated from the carrier's feet beyond a real close-
+            // control gap), and the carrier running out of room (near a
+            // touchline). Deliberately does NOT touch the tackle/dribble
+            // duel model, and does not attempt the midfield-cover
+            // linkage — both explicitly out of scope for this chunk per
+            // the design doc's own guardrails/open questions.
+            const JOCKEY_ZONE_OUTER: f32 = 36.0; // ~5 yards
+            const JOCKEY_HOLD_DISTANCE: f32 = 20.0; // ~2.5 yards
+            const JOCKEY_DANGER_OVERRIDE: f32 = 0.15;
+            const JOCKEY_HEAVY_TOUCH_GAP: f32 = 12.0;
+            let jockey_field_height = ctx.context.field_size.height as f32;
+            let touchline_margin = jockey_field_height * 0.12;
+            let carrier_near_touchline = opponent.position.y < touchline_margin
+                || opponent.position.y > jockey_field_height - touchline_margin;
+            let ball_carrier_gap =
+                (ctx.tick_context.positions.ball.position - opponent.position).magnitude();
+            let should_jockey = distance_to_opponent
+                > DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE
+                && distance_to_opponent <= JOCKEY_ZONE_OUTER
+                && danger < JOCKEY_DANGER_OVERRIDE
+                && !carrier_near_touchline
+                && ball_carrier_gap < JOCKEY_HEAVY_TOUCH_GAP;
+
+            if should_jockey {
+                // realism-bug (caught via raw DELAYJOCKEY trace before
+                // finalizing this chunk, same session): a first version
+                // steered at a raw constant speed toward the hold point,
+                // which — since a state's returned velocity is only
+                // clamped DOWN to real max speed downstream
+                // (`player/state.rs`), never scaled up or decelerated
+                // near arrival — consistently overshot the intended 20u
+                // hold distance and settled oscillating at 11-13u,
+                // barely outside the tackle-engagement boundary, not
+                // actually holding ground at all. `SteeringBehavior::
+                // Arrive` (already used elsewhere in this codebase for
+                // exactly this "approach then hold" need, e.g. the
+                // byline-commitment release) decelerates smoothly on
+                // approach instead.
+                let own_goal = ctx.ball().direction_to_own_goal();
+                let to_own_goal = (own_goal - opponent.position).normalize();
+                let jockey_target = opponent.position + to_own_goal * JOCKEY_HOLD_DISTANCE;
+                let jockey_velocity = SteeringBehavior::Arrive {
+                    target: jockey_target,
+                    slowing_distance: 18.0,
+                }
+                .calculate(ctx.player)
+                .velocity;
+                let jockey_separation = ctx.player().separation_velocity() * 0.15;
+                crate::match_log_info!(
+                    "DELAYJOCKEY hold id={} dist={:.1} danger={:.2} gap={:.1}",
+                    ctx.player.id,
+                    distance_to_opponent,
+                    danger,
+                    ball_carrier_gap
+                );
+                return Some(jockey_velocity + jockey_separation);
+            }
+
             const URGENCY_SPEED_BOOST: f32 = 0.35;
             let urgency_boost = 1.0 + danger * URGENCY_SPEED_BOOST;
 
