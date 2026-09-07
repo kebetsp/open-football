@@ -1129,6 +1129,56 @@ impl StateProcessingHandler for MidfielderRunningState {
             }
         }
 
+        // docs/defensive-delay-and-engagement-timing.md, Stage 3 Chunk 3
+        // (docs/positional-football-master-plan.md, 2026-09-07): the
+        // midfield-cover linkage. The unified defensive-role pool
+        // (defensive.rs, D8.2) already correctly identifies a Cover-role
+        // midfielder — genuinely closer than any defender to a
+        // dangerous ball carrier — but this state's own `process()`
+        // comment for that exact branch admits "Cover/non-primary Hold:
+        // stay in running (will follow waypoints via velocity)":
+        // nothing here actually POSITIONED a Cover-role midfielder at a
+        // real cover point, they just ran generic waypoint-following —
+        // the connective tissue this design doc's item 4 asked for was
+        // missing. Fixed by reusing `cover_target_position()` (already
+        // built, already consumed by DefenderCoveringState — no new
+        // engine plumbing needed, directly answering that doc's own
+        // open question about whether this would require new
+        // machinery). realism-bug caught before finalizing, via a raw
+        // COVERROLEDIAG trace: a first version placed this check deep
+        // inside the out-of-possession `else` branch below, well AFTER
+        // the `should_follow_waypoints` early return a few lines down —
+        // that check intercepted essentially every call before this one
+        // was ever reached (0 fires across 10 matches despite midfielder
+        // Cover assignments happening ~3800/match). Moved here, before
+        // waypoint-following, so it can actually take effect — matching
+        // this codebase's own "an explicit role override beats generic
+        // shape-following" convention used everywhere else. Not
+        // touched: DefensiveRole::Help (already routes to Guarding
+        // elsewhere in `process()`) and Primary/Hold (already correctly
+        // handled); the RunChannelInBehind directive check above keeps
+        // priority over this, matching "an explicit manager directive
+        // always wins" too.
+        if !ctx.player.has_ball(ctx) && !ctx.team().is_control_ball() {
+            let role = ctx
+                .player()
+                .defensive()
+                .defensive_role_for_ball_carrier_unified();
+            if role == DefensiveRole::Cover {
+                if let Some(cover_point) = ctx.player().defensive().cover_target_position() {
+                    return Some(
+                        SteeringBehavior::Arrive {
+                            target: cover_point,
+                            slowing_distance: 20.0,
+                        }
+                        .calculate(ctx.player)
+                        .velocity
+                            + ctx.player().separation_velocity() * 0.15,
+                    );
+                }
+            }
+        }
+
         // Simplified waypoint following
         if ctx.player.should_follow_waypoints(ctx) {
             let waypoints = ctx.player.get_waypoints_as_vectors();
