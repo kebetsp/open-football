@@ -1189,7 +1189,10 @@ fn lane_occupancy_adjustment(
 /// replacement for any of them.
 fn weak_side_patience_adjustment(ctx: &StateProcessingContext, candidate: Vector3<f32>) -> f32 {
     let field_h = ctx.context.field_size.height as f32;
-    let ball_side = ctx.team().tactical().ball_side;
+    // `TeamTacticalState` is plain POD, `Copy` -- avoids a temporary-
+    // borrow lifetime issue from `ctx.team()`'s owned return value.
+    let tactical = *ctx.team().tactical();
+    let ball_side = tactical.ball_side;
     if matches!(ball_side, BallSideZone::Center) {
         return 0.0;
     }
@@ -1202,7 +1205,34 @@ fn weak_side_patience_adjustment(ctx: &StateProcessingContext, candidate: Vector
         return 0.0;
     }
 
-    let width_target = ctx.team().tactical().team_width_target.clamp(0.0, 1.0);
+    // docs/positional-football-master-plan.md Stage 4, item 6
+    // (2026-09-07): while a genuine `WideIsolation` is live on the
+    // strong side, the weak side's real job in real football is to
+    // hold MAXIMUM width -- keep the block stretched so the isolated
+    // flank stays genuinely isolated. This is Part B of the reverted
+    // rewrite's own original design for this exact pattern ("far-side
+    // shape holds width to keep the block stretched... reuses
+    // weak_side_patience_adjustment, already built") --
+    // docs/positional-play-and-defensive-block-rewrite.md. Overrides
+    // the general, ambient `team_width_target` specifically for this
+    // situational case (still gated on the same contact-triggered arm
+    // as every other consumer of `positional_attack_pattern` -- this
+    // does NOT change when/whether a pattern starts, only what the
+    // weak side does while one is genuinely live); falls back to the
+    // ambient target the rest of the time.
+    let width_target = if tactical.positional_attack_active()
+        && tactical.positional_attack_pattern == Some(crate::r#match::AttackPattern::WideIsolation)
+    {
+        crate::match_log_info!(
+            "WIDEISOSTRETCH id={} cand_y={:.1} ambient_target={:.2}",
+            ctx.player.id,
+            candidate.y,
+            tactical.team_width_target
+        );
+        1.0
+    } else {
+        tactical.team_width_target.clamp(0.0, 1.0)
+    };
     let center_y = field_h / 2.0;
     let half_h = field_h / 2.0;
     let dist_from_center = ((candidate.y - center_y).abs() / half_h).clamp(0.0, 1.0);
