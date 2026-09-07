@@ -258,11 +258,15 @@ impl StateProcessingHandler for DefenderPressingState {
             // trusts, so a defender never passively jockeys a live
             // shooting threat), a heavy/loose touch (the ball has
             // separated from the carrier's feet beyond a real close-
-            // control gap), and the carrier running out of room (near a
-            // touchline). Deliberately does NOT touch the tackle/dribble
-            // duel model, and does not attempt the midfield-cover
-            // linkage — both explicitly out of scope for this chunk per
-            // the design doc's own guardrails/open questions.
+            // control gap), the carrier running out of room (near a
+            // touchline), and — the 4th trigger, added Stage 4
+            // (docs/defensive-delay-and-engagement-timing.md's own open
+            // "cover has arrived" question, docs/positional-football-
+            // master-plan.md 2026-09-07) — a teammate already stationed
+            // near the Cover position (`cover_is_ready()`), so committing
+            // to the challenge no longer risks leaving nobody behind.
+            // Deliberately does NOT touch the tackle/dribble duel model
+            // — explicitly out of scope per the design doc.
             const JOCKEY_ZONE_OUTER: f32 = 36.0; // ~5 yards
             const JOCKEY_HOLD_DISTANCE: f32 = 20.0; // ~2.5 yards
             const JOCKEY_DANGER_OVERRIDE: f32 = 0.15;
@@ -273,12 +277,14 @@ impl StateProcessingHandler for DefenderPressingState {
                 || opponent.position.y > jockey_field_height - touchline_margin;
             let ball_carrier_gap =
                 (ctx.tick_context.positions.ball.position - opponent.position).magnitude();
+            let cover_ready = ctx.player().defensive().cover_is_ready();
             let should_jockey = distance_to_opponent
                 > DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE
                 && distance_to_opponent <= JOCKEY_ZONE_OUTER
                 && danger < JOCKEY_DANGER_OVERRIDE
                 && !carrier_near_touchline
-                && ball_carrier_gap < JOCKEY_HEAVY_TOUCH_GAP;
+                && ball_carrier_gap < JOCKEY_HEAVY_TOUCH_GAP
+                && !cover_ready;
 
             if should_jockey {
                 // realism-bug (caught via raw DELAYJOCKEY trace before
@@ -306,13 +312,24 @@ impl StateProcessingHandler for DefenderPressingState {
                 .velocity;
                 let jockey_separation = ctx.player().separation_velocity() * 0.15;
                 crate::match_log_info!(
-                    "DELAYJOCKEY hold id={} dist={:.1} danger={:.2} gap={:.1}",
+                    "DELAYJOCKEY hold id={} dist={:.1} danger={:.2} gap={:.1} cover_ready={}",
                     ctx.player.id,
                     distance_to_opponent,
                     danger,
-                    ball_carrier_gap
+                    ball_carrier_gap,
+                    cover_ready
                 );
                 return Some(jockey_velocity + jockey_separation);
+            } else if cover_ready
+                && distance_to_opponent > DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE
+                && distance_to_opponent <= JOCKEY_ZONE_OUTER
+            {
+                crate::match_log_info!(
+                    "DELAYJOCKEY cover_arrived_commit id={} dist={:.1} danger={:.2}",
+                    ctx.player.id,
+                    distance_to_opponent,
+                    danger
+                );
             }
 
             const URGENCY_SPEED_BOOST: f32 = 0.35;

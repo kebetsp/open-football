@@ -272,11 +272,19 @@ impl StateProcessingHandler for MidfielderPressingState {
             let ball_carrier_gap =
                 (ctx.tick_context.positions.ball.position - opponent.position).magnitude();
             let danger = dv::value_conceded_if_beaten(ctx, &opponent);
+            // 4th delay-exit trigger, added Stage 4 (docs/defensive-
+            // delay-and-engagement-timing.md's own open "cover has
+            // arrived" question, docs/positional-football-master-plan.md
+            // 2026-09-07): mirrors DefenderPressingState's own Chunk-1
+            // wiring exactly — see that file's comment for the full
+            // doctrine.
+            let cover_ready = ctx.player().defensive().cover_is_ready();
             let should_jockey = distance_to_opponent > JOCKEY_ZONE_INNER
                 && distance_to_opponent <= JOCKEY_ZONE_OUTER
                 && danger < JOCKEY_DANGER_OVERRIDE
                 && !carrier_near_touchline
-                && ball_carrier_gap < JOCKEY_HEAVY_TOUCH_GAP;
+                && ball_carrier_gap < JOCKEY_HEAVY_TOUCH_GAP
+                && !cover_ready;
 
             if should_jockey {
                 let jockey_target = opponent.position + to_own_goal * JOCKEY_HOLD_DISTANCE;
@@ -288,13 +296,24 @@ impl StateProcessingHandler for MidfielderPressingState {
                 .velocity;
                 let jockey_separation = ctx.player().separation_velocity() * 0.15;
                 crate::match_log_info!(
-                    "DELAYJOCKEY hold id={} dist={:.1} danger={:.2} gap={:.1}",
+                    "DELAYJOCKEY hold id={} dist={:.1} danger={:.2} gap={:.1} cover_ready={}",
                     ctx.player.id,
                     distance_to_opponent,
                     danger,
-                    ball_carrier_gap
+                    ball_carrier_gap,
+                    cover_ready
                 );
                 return Some(jockey_velocity + jockey_separation);
+            } else if cover_ready
+                && distance_to_opponent > JOCKEY_ZONE_INNER
+                && distance_to_opponent <= JOCKEY_ZONE_OUTER
+            {
+                crate::match_log_info!(
+                    "DELAYJOCKEY cover_arrived_commit id={} dist={:.1} danger={:.2}",
+                    ctx.player.id,
+                    distance_to_opponent,
+                    danger
+                );
             }
 
             let intercept_target = predicted + to_own_goal * goalside_bias + jockey_offset;

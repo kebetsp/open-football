@@ -109,6 +109,21 @@ const COVER_MAX_DISTANCE: f32 = 180.0;
 const HELP_SCAN_RADIUS: f32 = 28.0; // Range in which Help defender looks for a pass option
 const COVER_GOAL_SIDE_OFFSET: f32 = 12.0; // Cover sits this far goal-side of carrier
 
+// docs/defensive-delay-and-engagement-timing.md's 4th delay-exit trigger
+// (docs/positional-football-master-plan.md, Stage 4, 2026-09-07): "the
+// defender's own cover has arrived (a teammate is now goal-side and
+// ready, so committing to a challenge no longer risks leaving nobody
+// behind)". A covering teammate doesn't need to stand on the exact
+// `cover_target_position()` point to count as "ready" -- real doctrine
+// treats it as a zone, not a pixel, the same way `JOCKEY_HOLD_DISTANCE`/
+// `COVER_GOAL_SIDE_OFFSET` are themselves target zones elsewhere in this
+// file. No sourced real-world "how close counts as arrived" figure
+// exists (category (d), flagged estimate) -- chosen close to
+// `JOCKEY_ZONE_OUTER`'s own 36u so "cover has arrived" and "I'm still
+// within jockeying range of the carrier" describe a comparable real
+// scale of ground.
+const COVER_ARRIVED_RADIUS: f32 = 30.0;
+
 /// D8.1 (2026-08-22): reachability window for including a midfielder in
 /// the unified Primary/Cover/Help/Hold pool for a given ball-carrier
 /// threat. Reuses `on_ball_value::time_to_intercept`'s own
@@ -773,6 +788,33 @@ impl<'p> DefensiveOperationsImpl<'p> {
         }
         let dir = to_goal / to_goal_dist;
         Some(ball_carrier.position + dir * COVER_GOAL_SIDE_OFFSET)
+    }
+
+    /// Has a teammate arrived at (or near) the Cover position for the
+    /// current ball carrier? The 4th delay-exit trigger from
+    /// docs/defensive-delay-and-engagement-timing.md -- lets a delaying
+    /// Primary defender/midfielder commit to a challenge once a genuine
+    /// second line is in place, rather than jockeying forever even after
+    /// cover has shown up. Deliberately does NOT recompute
+    /// `defensive_role_for_ball_carrier_unified` for every teammate
+    /// (expensive, and the wrong question anyway -- a teammate standing
+    /// near the ideal cover spot for some OTHER reason still provides
+    /// the same real safety net) -- instead reuses the grid-backed
+    /// `nearby_at` lookup already used elsewhere in this codebase for a
+    /// cheap spatial check, per this design doc's own open question
+    /// about avoiding a full-team scan. `self.ctx.player.id` is excluded
+    /// so a Primary defender can't read his own proximity to a point
+    /// well behind himself as "cover has arrived".
+    pub fn cover_is_ready(&self) -> bool {
+        let Some(cover_point) = self.cover_target_position() else {
+            return false;
+        };
+        let my_id = self.ctx.player.id;
+        self.ctx
+            .players()
+            .teammates()
+            .nearby_at(cover_point, COVER_ARRIVED_RADIUS)
+            .any(|t| t.id != my_id)
     }
 
     /// Most dangerous non-ball-carrier opponent within Help scan radius
