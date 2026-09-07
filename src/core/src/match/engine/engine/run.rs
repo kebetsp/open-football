@@ -1244,11 +1244,58 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     // gate) if he ends up never passing at all.
                     p.give_and_go_run_ticks -= 1;
                 }
+                // Stage 2 item 3 (docs/positional-football-master-plan.md,
+                // 2026-09-07): decay, unconditional every tick, same
+                // idiom/placement as combo_partner_ticks above (checked
+                // BEFORE the byline_commitment_ticks `continue` below so
+                // it isn't accidentally skipped while a commitment is
+                // still active — a reset bias armed the instant an old
+                // commitment aborts must survive into the very next tick,
+                // not be starved by the early `continue`). Cleared
+                // immediately once the ball has left this player's feet —
+                // the bias only matters while he's still deciding what to
+                // do WITH the ball.
+                if p.blocked_wide_attack_reset_ticks > 0 {
+                    if raw_owner != Some(p.id) {
+                        p.blocked_wide_attack_reset_ticks = 0;
+                    } else {
+                        p.blocked_wide_attack_reset_ticks -= 1;
+                    }
+                }
                 if p.byline_commitment_ticks > 0 {
                     if raw_owner != Some(p.id) {
                         match_log_info!("CROSSDIAG LOSTBALL id={} ticks_left={}", p.id, p.byline_commitment_ticks);
                         p.byline_commitment_ticks = 0;
                     } else {
+                        // Stage 2 item 3: mirror the exact genuine-2-man-
+                        // press condition ForwardDribblingState/
+                        // MidfielderDribblingState themselves abort a
+                        // byline-committed run on — `close_defenders >= 2`
+                        // within 8u (the forward's own unconditional
+                        // threshold; the midfielder's own
+                        // `committing_to_byline` press_radius, same
+                        // value). Armed here, one tick ahead of the state
+                        // machine's own abort (which re-checks the
+                        // identical live condition independently and will
+                        // reach the same Passing transition this tick or
+                        // next), so the very next pass decision already
+                        // sees `blocked_wide_attack_reset_ticks` set. A
+                        // 1-tick lead/lag either way is harmless since the
+                        // field decays over ~0.9s (90 ticks), not a single
+                        // tick.
+                        let close_defenders = opponent_positions
+                            .iter()
+                            .filter(|(team_id, _)| *team_id != p.team_id)
+                            .filter(|(_, pos)| (*pos - p.position).magnitude() <= 8.0)
+                            .count();
+                        if close_defenders >= 2 {
+                            p.blocked_wide_attack_reset_ticks = 90;
+                            match_log_info!(
+                                "BLOCKEDRESETDIAG arm id={} close_defenders={}",
+                                p.id,
+                                close_defenders
+                            );
+                        }
                         p.byline_commitment_ticks -= 1;
                         if p.byline_commitment_ticks == 0 {
                             match_log_info!("CROSSDIAG TIMEOUT id={}", p.id);

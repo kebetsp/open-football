@@ -2302,8 +2302,15 @@ impl MidfielderRunningState {
             return false;
         }
 
-        // Must be in attacking third
-        let goal_dist = ctx.ball().distance_to_opponent_goal();
+        // Must be in attacking third. Stage 2 item 4
+        // (docs/positional-football-master-plan.md, 2026-09-07): same
+        // Euclidean-to-goal-CENTRE bug as the two forward-state
+        // `should_cross` variants fixed the same session — for a
+        // genuinely wide player the y-offset alone inflates this past
+        // the intended attacking-third cutoff before x is even
+        // considered. Fixed to real depth (x-distance to the goal line).
+        let goal_x = ctx.player().opponent_goal_position().x;
+        let goal_dist = (goal_x - ctx.player.position.x).abs();
         let field_width = ctx.context.field_size.width as f32;
         if goal_dist > field_width * 0.35 {
             return false;

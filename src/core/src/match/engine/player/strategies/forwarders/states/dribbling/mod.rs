@@ -402,9 +402,26 @@ impl ForwardDribblingState {
             return false;
         }
 
-        let distance_to_goal = ctx.ball().distance_to_opponent_goal();
+        // Stage 2 item 4 (docs/positional-football-master-plan.md,
+        // 2026-09-07): `ctx.ball().distance_to_opponent_goal()` is
+        // Euclidean distance to the goal CENTRE, not depth to the goal
+        // LINE — the same bug already fixed once in this file's own
+        // byline-commitment release check (see the 2026-07-26 comment on
+        // that block) and never applied here. For a genuinely wide
+        // player the y-offset alone inflates this well past 300u even at
+        // a real x-depth well inside the intended range (e.g. y near the
+        // touchline vs. a ~272 goal-centre y is already 250u+ away
+        // before x is even considered) — this check was structurally
+        // starved for exactly the widest, most cross-ready positions.
+        // Measured before fixing: 0 FWD_CROSS/MID_CROSS dispatches
+        // across 80 matches, all real crosses instead coming from the
+        // separate, deliberate byline_commitment_ticks mechanism.
+        // Fixed to real depth (x-distance to the goal line), same
+        // measure `run.rs`'s arm logic already uses.
+        let goal_x = ctx.player().opponent_goal_position().x;
+        let depth = (goal_x - ctx.player.position.x).abs();
         // In attacking area but not too close to goal
-        if distance_to_goal > 300.0 || distance_to_goal < 60.0 {
+        if depth > 300.0 || depth < 60.0 {
             return false;
         }
 

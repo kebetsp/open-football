@@ -997,6 +997,48 @@ impl PassEvaluator {
             0.0
         };
 
+        // === BLOCKED WIDE-ATTACK RESET BONUS ===
+        // docs/positional-football-master-plan.md Stage 2 item 3
+        // (2026-09-07): a byline-committed carrier who's just been
+        // genuinely boxed in by a 2-man press
+        // (`blocked_wide_attack_reset_ticks`, armed in run.rs's per-tick
+        // loop the instant that abort happens, mirroring the exact
+        // `close_defenders >= 2` condition the Dribbling states
+        // themselves abort a run on) had no positive reward anywhere for
+        // the obviously-correct real-football response — get the ball
+        // to a considered outlet and let the attack reset. The two
+        // existing recycle bonuses above don't cover this scenario:
+        // `build_up_recycle_bonus` requires a CB/DM/GK receiver (a real
+        // reset here is just as often a central mid or the opposite
+        // flank, not the back line), `stalled_recycle_bonus` requires
+        // ~20s of continuous possession a quick byline dash never
+        // reaches. Deliberately NOT gated on `receiver_is_recycle_target`
+        // for that reason. Gated on the pass genuinely not continuing
+        // the same failed forward push (`forward_progress` — the same
+        // signed ratio the sideways/backward penalties above already
+        // use) and on the receiver being reasonably uncontested — no
+        // reward for recycling straight into a second crowd. A pure
+        // absence-of-reward gap, not a fix to any existing penalty (the
+        // §12.6 "backward pass out of a genuine chance" penalty is
+        // gated to a central position near goal and structurally can't
+        // fire for a wide/byline carrier — confirmed by reading it, not
+        // assumed).
+        let blocked_wide_attack_reset_bonus = if ctx.player.blocked_wide_attack_reset_ticks > 0
+            && pass_distance >= 15.0
+            && forward_progress <= 0.15
+        {
+            let receiver_opps = ctx.tick_context.grid.opponents(receiver.id, 15.0).count();
+            if receiver_opps == 0 {
+                0.25
+            } else if receiver_opps == 1 {
+                0.12
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
         // === COUNTER-PRESS DIRECT-FIRST-PASS BONUS ===
         // After winning the ball back, the first pass should be direct
         // — feed a forward making a run. Gated additionally on the
@@ -1192,6 +1234,7 @@ impl PassEvaluator {
             forward_width_bonus_unweighted +  // /goal 2026-07-26: flat, same family as cutback_bonus
             build_up_recycle_bonus +
             stalled_recycle_bonus +
+            blocked_wide_attack_reset_bonus +
             directness_length_bias +
             counter_first_pass_bonus +
             same_side_density_penalty +

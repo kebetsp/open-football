@@ -435,6 +435,18 @@ pub struct MatchPlayer {
     /// the ball off, not one that keeps drifting as he moves.
     pub give_and_go_run_target_x: f32,
     pub give_and_go_run_target_y: f32,
+    /// docs/positional-football-master-plan.md Stage 2 item 3 (2026-09-07):
+    /// armed in `run.rs`'s per-tick loop the instant a byline-committed
+    /// carrier meets the exact genuine-2-man-press condition the forward/
+    /// midfielder Dribbling states themselves abort a run on
+    /// (`close_defenders >= 2` within 8u) — a real "this wide attack just
+    /// failed, look for a considered reset" moment that previously had no
+    /// positive reward anywhere: `build_up_recycle_bonus` requires a CB/DM/
+    /// GK receiver, `stalled_recycle_bonus` requires ~20s of continuous
+    /// possession a quick byline dash never reaches. Ticks remaining (0 =
+    /// inactive); self-decaying like every other transient bias field on
+    /// this struct, consumed by `evaluator.rs`'s `blocked_wide_attack_reset_bonus`.
+    pub blocked_wide_attack_reset_ticks: u16,
     /// realism-bug (2026-07-27): one-shot-per-possession lock so the
     /// round-keeper probability roll (in the engine loop) fires at most
     /// once per continuous spell of ball ownership, not every tick the
@@ -778,6 +790,7 @@ impl MatchPlayer {
             give_and_go_run_ticks: 0,
             give_and_go_run_target_x: 0.0,
             give_and_go_run_target_y: 0.0,
+            blocked_wide_attack_reset_ticks: 0,
             gk1v1_decision_made: false,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,
@@ -882,6 +895,7 @@ impl MatchPlayer {
             give_and_go_run_ticks: 0,
             give_and_go_run_target_x: 0.0,
             give_and_go_run_target_y: 0.0,
+            blocked_wide_attack_reset_ticks: 0,
             gk1v1_decision_made: false,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,

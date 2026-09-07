@@ -1525,8 +1525,17 @@ impl ForwardRunningState {
             return false;
         }
 
-        // Must be close enough to the opponent goal to justify a cross
-        let dist_to_goal = ctx.ball().distance_to_opponent_goal();
+        // Must be close enough to the opponent goal to justify a cross.
+        // Stage 2 item 4 (docs/positional-football-master-plan.md,
+        // 2026-09-07): same Euclidean-to-goal-CENTRE bug as
+        // ForwardDribblingState::should_cross (fixed there the same
+        // session) — for a genuinely wide player the y-offset alone
+        // exceeds this check's own 130u ceiling before x is even
+        // considered, so it was structurally near-unreachable for real
+        // byline-adjacent positions. Fixed to real depth (x-distance to
+        // the goal line).
+        let goal_x = ctx.player().opponent_goal_position().x;
+        let dist_to_goal = (goal_x - ctx.player.position.x).abs();
         if dist_to_goal > 130.0 || dist_to_goal < 15.0 {
             return false;
         }
