@@ -245,6 +245,58 @@ impl StateProcessingHandler for MidfielderPressingState {
                 ctx.player.defensive_show_outside,
             );
             let jockey_offset = Vector3::new(0.0, jockey_sign * dv::JOCKEY_SHOW_OUTSIDE_BIAS, 0.0);
+
+            // docs/defensive-delay-and-engagement-timing.md, Stage 3
+            // Chunk 2 (docs/positional-football-master-plan.md,
+            // 2026-09-07): mirrors DefenderPressingState's own Chunk 1
+            // delay/jockey phase (same doc, same sourced doctrine) —
+            // extends the fix to midfielders specifically because
+            // Pavel's own complaint named the midfield collapse as a
+            // direct consequence of the defensive line losing duels too
+            // early ("if defenders are not even defending, where do you
+            // think the midfield is? Also somewhere behind the
+            // attacking midfield because they lost their duel"). Same
+            // 36u outer / 8u inner zone (8u matches this state's own
+            // MidfielderTacklingState engagement threshold, used inline
+            // a few lines above in process() rather than a shared
+            // constant), same 20u hold distance, same three triggers.
+            const JOCKEY_ZONE_OUTER: f32 = 36.0;
+            const JOCKEY_ZONE_INNER: f32 = 8.0;
+            const JOCKEY_HOLD_DISTANCE: f32 = 20.0;
+            const JOCKEY_DANGER_OVERRIDE: f32 = 0.15;
+            const JOCKEY_HEAVY_TOUCH_GAP: f32 = 12.0;
+            let jockey_field_height = ctx.context.field_size.height as f32;
+            let touchline_margin = jockey_field_height * 0.12;
+            let carrier_near_touchline = opponent.position.y < touchline_margin
+                || opponent.position.y > jockey_field_height - touchline_margin;
+            let ball_carrier_gap =
+                (ctx.tick_context.positions.ball.position - opponent.position).magnitude();
+            let danger = dv::value_conceded_if_beaten(ctx, &opponent);
+            let should_jockey = distance_to_opponent > JOCKEY_ZONE_INNER
+                && distance_to_opponent <= JOCKEY_ZONE_OUTER
+                && danger < JOCKEY_DANGER_OVERRIDE
+                && !carrier_near_touchline
+                && ball_carrier_gap < JOCKEY_HEAVY_TOUCH_GAP;
+
+            if should_jockey {
+                let jockey_target = opponent.position + to_own_goal * JOCKEY_HOLD_DISTANCE;
+                let jockey_velocity = crate::r#match::SteeringBehavior::Arrive {
+                    target: jockey_target,
+                    slowing_distance: 18.0,
+                }
+                .calculate(ctx.player)
+                .velocity;
+                let jockey_separation = ctx.player().separation_velocity() * 0.15;
+                crate::match_log_info!(
+                    "DELAYJOCKEY hold id={} dist={:.1} danger={:.2} gap={:.1}",
+                    ctx.player.id,
+                    distance_to_opponent,
+                    danger,
+                    ball_carrier_gap
+                );
+                return Some(jockey_velocity + jockey_separation);
+            }
+
             let intercept_target = predicted + to_own_goal * goalside_bias + jockey_offset;
 
             let to_target = intercept_target - ctx.player.position;
