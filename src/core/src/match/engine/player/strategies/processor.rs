@@ -986,6 +986,27 @@ impl<'p> StateProcessor<'p> {
             | Defender(DefenderState::TakeBall)
             | Midfielder(MidfielderState::TakeBall)
             | Forward(ForwardState::TakeBall) => return None,
+            // realism-bug (2026-09-08, "I see no difference" investigation
+            // — docs/positional-football-master-plan.md Stage 3): a
+            // defender/midfielder actively engaging a ball carrier
+            // (jockeying OR the full urgency-chase sub-mode, both live in
+            // `Pressing`) was NOT exempt here, unlike `Tackling`/
+            // `TakeBall` — so whenever a shape rule was also active
+            // (e.g. the default `CompactBackLine`), this full-strength
+            // (weight 1.0, no blend) override could silently replace the
+            // jockeying velocity computed and logged moments earlier with
+            // a "walk back to formation shape" pursuit instead. Measured
+            // via a temporary same-tick/same-player correlation on a
+            // clean single-match trace: 5.0% of should_jockey==true ticks
+            // were overridden this way (83/1647). Real, but modest — not
+            // the dominant explanation for low visible effect on its own,
+            // just one confirmed contributing gap. Chasing hard (the
+            // non-jockeying half of Pressing) is equally legitimate
+            // defending, not idle shape-holding, so the whole state is
+            // exempted, matching Tackling's own wholesale exemption.
+            Defender(DefenderState::Pressing) | Midfielder(MidfielderState::Pressing) => {
+                return None;
+            }
             _ => {}
         }
         if ctx.player().defensive().scan_for_dangerous_runs().is_some() {

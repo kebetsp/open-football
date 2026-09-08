@@ -296,8 +296,9 @@ impl StateProcessingHandler for MidfielderPressingState {
                 .velocity;
                 let jockey_separation = ctx.player().separation_velocity() * 0.15;
                 crate::match_log_info!(
-                    "DELAYJOCKEY hold id={} dist={:.1} danger={:.2} gap={:.1} cover_ready={}",
+                    "DELAYJOCKEY hold id={} tick={} dist={:.1} danger={:.2} gap={:.1} cover_ready={}",
                     ctx.player.id,
+                    ctx.context.current_tick(),
                     distance_to_opponent,
                     danger,
                     ball_carrier_gap,
