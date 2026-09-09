@@ -466,6 +466,31 @@ fn setup_player_on_field(
                         action: ShapeAction::CompactBackLine,
                     });
                 }
+                // docs/positional-attack-phase-design.md, Stage 5: real,
+                // sourced build-out doctrine — centre-backs split wide
+                // toward the box corners specifically when the opponent
+                // is genuinely high-pressing (not routine mid-block
+                // pressure). Reuses `ShapeAction::HoldWidth` (already a
+                // legitimate action for an explicit manager directive —
+                // this is the same action, a different, narrower
+                // trigger) rather than inventing a new action.
+                // realism-bug (2026-08-26, same lesson re-applied): a
+                // flat back-4's two CBs are `DefenderCenterLeft`/
+                // `DefenderCenterRight`, not `DefenderCenter` (that
+                // variant is a back-3's lone sweeper) — the exact class
+                // of formation-mislabeling bug already found once for
+                // T442 strikers.
+                if matches!(
+                    player.tactical_position.current_position,
+                    crate::PlayerPositionType::DefenderCenter
+                        | crate::PlayerPositionType::DefenderCenterLeft
+                        | crate::PlayerPositionType::DefenderCenterRight
+                ) {
+                    player.shape_rules.push(ShapeRule {
+                        trigger: ShapeTrigger::UnderHighPress,
+                        action: ShapeAction::HoldWidth,
+                    });
+                }
                 players.push(player);
             }
         }

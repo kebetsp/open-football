@@ -2108,6 +2108,46 @@ impl PassEvaluator {
                 1.0
             };
 
+            // docs/positional-attack-phase-design.md, Stage 4: circulation
+            // as a bounded decision OVERRIDE, not a scoring bonus (Part 3's
+            // standing rule — a small additive nudge here would be
+            // invisible against forward_value/danger_value, exactly the
+            // failure mode nine-plus prior attempts already documented).
+            // Same established multiplicative-override idiom this
+            // function already uses for link_modifier/combo_modifier/
+            // throw_in_preferred_modifier: while the team holds a
+            // genuine, sustained settled positional-attack phase
+            // (Stage 1) AND the ball has sat on one flank for a while
+            // (Stage 4's own `same_side_ticks`), a genuinely open
+            // teammate on the OPPOSITE flank (`close_opponents_count`
+            // already computed above for this exact teammate) gets a
+            // large preference. `CIRCULATION_SWITCH_MIN_SAME_SIDE_TICKS`
+            // (300 ticks / 3s) and the 3.0x magnitude are reasoned
+            // estimates — no dataset gives "how long before a real team
+            // switches," flagged as such rather than invented silently.
+            const CIRCULATION_SWITCH_MIN_SAME_SIDE_TICKS: u32 = 300;
+            let circulation_switch_modifier = {
+                let team_ops = ctx.team();
+                let tactical = team_ops.tactical();
+                if !Self::circulation_switch_ablated()
+                    && tactical.patient_attack_phase_active()
+                    && tactical.same_side_ticks >= CIRCULATION_SWITCH_MIN_SAME_SIDE_TICKS
+                    && tactical.ball_side != BallSideZone::Center
+                    && close_opponents_count == 0
+                {
+                    let h = ctx.context.field_size.height as f32;
+                    let teammate_side = BallSideZone::for_y(h, teammate.position.y);
+                    let is_opposite = matches!(
+                        (tactical.ball_side, teammate_side),
+                        (BallSideZone::Left, BallSideZone::Right)
+                            | (BallSideZone::Right, BallSideZone::Left)
+                    );
+                    if is_opposite { 3.0 } else { 1.0 }
+                } else {
+                    1.0
+                }
+            };
+
             // Apply graduated recency penalty to discourage ping-pong passing
             // Apply congestion penalty to force ball out of huddles
             let score = score
@@ -2119,7 +2159,8 @@ impl PassEvaluator {
                 * combo_modifier
                 * supply_modifier
                 * intercept_modifier
-                * throw_in_preferred_modifier;
+                * throw_in_preferred_modifier
+                * circulation_switch_modifier;
 
             if score > best_score && is_acceptable {
                 best_score = score;
@@ -2135,6 +2176,17 @@ impl PassEvaluator {
         }
 
         best_option.map(|teammate| (teammate, "PASS_EVALUATOR"))
+    }
+
+    /// docs/positional-attack-phase-design.md, Stage 4: diagnostic-only
+    /// A/B toggle so the circulation-switch override's own before/after
+    /// effect can be measured on one binary without a rebuild-difference
+    /// confound (same idiom as `spacing.rs`'s `MOBILITY_ABLATE`). Inert
+    /// unless `CIRCULATION_SWITCH_ABLATE` is set.
+    fn circulation_switch_ablated() -> bool {
+        use std::sync::OnceLock;
+        static ABLATED: OnceLock<bool> = OnceLock::new();
+        *ABLATED.get_or_init(|| std::env::var("CIRCULATION_SWITCH_ABLATE").is_ok())
     }
 
     // ──────────────────────────────────────────────────────────────────

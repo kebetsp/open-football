@@ -409,6 +409,26 @@ pub struct TeamTacticalState {
     /// `None` when the window is closed — a stale pattern from a
     /// just-expired window must never be read as still active.
     pub positional_attack_pattern: Option<AttackPattern>,
+    /// docs/positional-attack-phase-design.md, Stage 1: how many ticks
+    /// we've held a genuine "patient attack" posture *continuously* —
+    /// we have the ball, our own phase is BuildUp/Progression/Attack
+    /// (not AttackingTransition — not a fast break), and the OPPONENT's
+    /// phase has been settled (MidBlock/LowBlock, not scrambling) for
+    /// this whole run. Accumulates like `possession_ticks` (same
+    /// saturating-add idiom) and resets hard to 0 the instant any
+    /// condition breaks — a deliberately strict definition matching
+    /// Pavel's own framing ("not chasing, not scrambling, not
+    /// mid-transition"). Deliberately named to avoid colliding with
+    /// `positional_attack_ticks_remaining`/`AttackPattern` above, which
+    /// is a different, narrower, contact-triggered mechanism (Chunk 5)
+    /// — see the design doc's Part 2 naming-collision note.
+    pub patient_phase_streak_ticks: u32,
+    /// docs/positional-attack-phase-design.md, Stage 4: how many ticks
+    /// `ball_side` has held the SAME value continuously. Resets to 0
+    /// the instant it flips. Used to gate the circulation-switch
+    /// override — a real team probes on one side for a while before
+    /// switching, it doesn't switch on literally every touch.
+    pub same_side_ticks: u32,
 }
 
 impl TeamTacticalState {
@@ -437,8 +457,23 @@ impl TeamTacticalState {
             central_congestion_discount: 0.0,
             positional_attack_ticks_remaining: 0,
             positional_attack_pattern: None,
+            patient_phase_streak_ticks: 0,
+            same_side_ticks: 0,
         }
     }
+
+    /// docs/positional-attack-phase-design.md, Stage 1: are we
+    /// currently, genuinely, in a settled positional-attack phase?
+    /// `PATIENT_PHASE_ENTRY_TICKS` (1000 ticks / ~10s = two full
+    /// tactical-refresh cycles) is deliberate hysteresis — a single
+    /// refresh where the conditions happen to line up shouldn't flip
+    /// this true; the posture has to actually hold. Log-only this
+    /// stage: nothing yet reads this to change behavior.
+    pub fn patient_attack_phase_active(&self) -> bool {
+        self.patient_phase_streak_ticks >= Self::PATIENT_PHASE_ENTRY_TICKS
+    }
+
+    const PATIENT_PHASE_ENTRY_TICKS: u32 = 1000;
 
     /// Chunk 5: is a positional-attack pattern currently live for this
     /// team? `positional_attack_pattern` is only ever meaningful when
@@ -542,6 +577,17 @@ impl TeamTacticalState {
         home.ball_zone = BallZone::for_side(field_width, ball_x, PlayerSide::Left);
         away.ball_zone = BallZone::for_side(field_width, ball_x, PlayerSide::Right);
         let side_zone = BallSideZone::for_y(field_height, ball_y);
+        // docs/positional-attack-phase-design.md, Stage 4: track how
+        // long the ball has held the SAME side continuously. `ball_side`
+        // is identical for home/away (a raw pitch-side reading, not a
+        // per-team-perspective one), so one comparison covers both.
+        let same_side_ticks = if home.ball_side == side_zone {
+            home.same_side_ticks.saturating_add(inputs.tick_interval)
+        } else {
+            0
+        };
+        home.same_side_ticks = same_side_ticks;
+        away.same_side_ticks = same_side_ticks;
         home.ball_side = side_zone;
         away.ball_side = side_zone;
 
@@ -641,6 +687,29 @@ impl TeamTacticalState {
             away_attack_window,
             away_def_window,
         );
+
+        // docs/positional-attack-phase-design.md, Stage 1: settled-
+        // phase detector. Must run after both `.phase` values above are
+        // final (each side reads the OTHER side's phase). Home holds
+        // the ball against a settled away block, or vice versa.
+        let settled_opponent_phase = |p: GamePhase| matches!(p, GamePhase::MidBlock | GamePhase::LowBlock);
+        let own_patient_phase = |p: GamePhase| {
+            matches!(p, GamePhase::BuildUp | GamePhase::Progression | GamePhase::Attack)
+        };
+        let home_qualifies =
+            home.in_possession && own_patient_phase(home.phase) && settled_opponent_phase(away.phase);
+        let away_qualifies =
+            away.in_possession && own_patient_phase(away.phase) && settled_opponent_phase(home.phase);
+        home.patient_phase_streak_ticks = if home_qualifies {
+            home.patient_phase_streak_ticks.saturating_add(inputs.tick_interval)
+        } else {
+            0
+        };
+        away.patient_phase_streak_ticks = if away_qualifies {
+            away.patient_phase_streak_ticks.saturating_add(inputs.tick_interval)
+        } else {
+            0
+        };
 
         // Defensive line x: interpolate between "deep" (own third
         // boundary) and "high" (opponent's half) based on phase. Gives

@@ -454,11 +454,84 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             away_skills: away_skill_aggregates,
             home_edge: context.environment.crowd_intensity * context.environment.home_advantage,
         };
+        // docs/positional-attack-phase-design.md, Stage 1: capture
+        // before/after so entry/exit into a settled positional-attack
+        // phase can be logged as a discrete episode (start tick, end
+        // tick, duration) rather than a noisy per-refresh sample.
+        #[cfg(feature = "match-logs")]
+        let (was_home_patient, was_away_patient) = (
+            context.tactical_home.patient_attack_phase_active(),
+            context.tactical_away.patient_attack_phase_active(),
+        );
+
         TeamTacticalState::refresh(
             &mut context.tactical_home,
             &mut context.tactical_away,
             &inputs,
         );
+
+        #[cfg(feature = "match-logs")]
+        {
+            let is_home_patient = context.tactical_home.patient_attack_phase_active();
+            let is_away_patient = context.tactical_away.patient_attack_phase_active();
+            if is_home_patient && !was_home_patient {
+                match_log_info!(
+                    "STAGE1PHASE event=enter team=home tick={}",
+                    context.current_tick()
+                );
+            } else if !is_home_patient && was_home_patient {
+                match_log_info!(
+                    "STAGE1PHASE event=exit team=home tick={}",
+                    context.current_tick()
+                );
+            }
+            if is_away_patient && !was_away_patient {
+                match_log_info!(
+                    "STAGE1PHASE event=enter team=away tick={}",
+                    context.current_tick()
+                );
+            } else if !is_away_patient && was_away_patient {
+                match_log_info!(
+                    "STAGE1PHASE event=exit team=away tick={}",
+                    context.current_tick()
+                );
+            }
+        }
+
+        // docs/positional-attack-phase-design.md, Stage 0: baseline
+        // measurement of "settled possession vs a set defense" before
+        // Stage 1's real detector exists. Fires once per tactical
+        // refresh (~5 sim-seconds) — cheap, match-logs builds only. A
+        // post-hoc script finds episodes where one team's
+        // possession_ticks climbs uninterrupted while the opponent's
+        // phase stays MidBlock/LowBlock across consecutive refreshes.
+        #[cfg(feature = "match-logs")]
+        {
+            match_log_info!(
+                "STAGE0PHASE tick={} home_poss_ticks={} home_phase={:?} home_zone={:?} away_poss_ticks={} away_phase={:?} away_zone={:?}",
+                context.current_tick(),
+                context.tactical_home.possession_ticks,
+                context.tactical_home.phase,
+                context.tactical_home.ball_zone,
+                context.tactical_away.possession_ticks,
+                context.tactical_away.phase,
+                context.tactical_away.ball_zone,
+            );
+            // docs/positional-attack-phase-design.md, Stage 4's own
+            // metric: does BallSideZone genuinely flip more often
+            // specifically during a settled positional-attack phase.
+            // `ball_side` is identical for home/away (raw pitch-side),
+            // so one line covers both teams' `patient_attack_phase_active`
+            // reads against the shared side value.
+            match_log_info!(
+                "STAGE4SIDE tick={} side={:?} same_side_ticks={} home_patient={} away_patient={}",
+                context.current_tick(),
+                context.tactical_home.ball_side,
+                context.tactical_home.same_side_ticks,
+                context.tactical_home.patient_attack_phase_active(),
+                context.tactical_away.patient_attack_phase_active(),
+            );
+        }
 
         // Cumulative possession + field-tilt counters feed the rolling
         // metrics consumed by the smart coach evaluator. Updated here

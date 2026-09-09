@@ -1,7 +1,7 @@
 use crate::club::player::events::PositionLoad;
 use crate::club::player::traits::{BehavioralDirective, PlayerTrait};
 use crate::r#match::PlayerMatchEndStats;
-use crate::r#match::{BallZone, TeamTacticalState};
+use crate::r#match::{BallZone, GamePhase, TeamTacticalState};
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::engine::result::PlayerMatchPhysicalSnapshot;
 use crate::r#match::engine::tactics::TacticalPositions;
@@ -55,6 +55,14 @@ pub enum ShapeTrigger {
     /// shared depth/spread while defending deep, not one that only
     /// happens to compact as a side effect of individual duel behaviour.
     DefendingOwnThird,
+    /// docs/positional-attack-phase-design.md, Stage 5: real, sourced
+    /// build-out doctrine ("if they press with two, build with
+    /// three... centre-backs split wide toward the corners of the
+    /// box... the goalkeeper becomes the free man") — active while
+    /// this team has the ball AND the OPPONENT is genuinely in a
+    /// coach-driven high press (`GamePhase::HighPress`), not merely
+    /// pressing incidentally.
+    UnderHighPress,
 }
 
 /// Action half of a shape rule — computed relative to the player's
@@ -106,6 +114,7 @@ impl ShapeRule {
         goals_against: u8,
         minute_now: u32,
         team: TeamTacticalState,
+        opponent_phase: GamePhase,
     ) -> bool {
         match self.trigger {
             ShapeTrigger::InPossession => in_possession,
@@ -123,6 +132,9 @@ impl ShapeRule {
             }
             ShapeTrigger::DefendingOwnThird => {
                 !in_possession && matches!(team.ball_zone, BallZone::DefensiveThird)
+            }
+            ShapeTrigger::UnderHighPress => {
+                in_possession && matches!(opponent_phase, GamePhase::HighPress)
             }
         }
     }
@@ -447,6 +459,21 @@ pub struct MatchPlayer {
     /// inactive); self-decaying like every other transient bias field on
     /// this struct, consumed by `evaluator.rs`'s `blocked_wide_attack_reset_bonus`.
     pub blocked_wide_attack_reset_ticks: u16,
+    /// docs/positional-attack-phase-design.md, Stage 3: the forward
+    /// drop-and-spin primitive. Armed while a Forward genuinely drops
+    /// deep to receive/link up during a `patient_attack_phase_active()`
+    /// window, decays only once the ball has left his feet (mirrors
+    /// `give_and_go_run_ticks`' exact "counts down only after release"
+    /// idiom, same reasoning: the run hasn't started yet while he's
+    /// still deciding what to do with it). Consumed by
+    /// `drop_and_spin_run_velocity` in `processor.rs`.
+    pub drop_and_spin_run_ticks: u16,
+    /// Frozen at arm time (same pattern as `give_and_go_run_target_x/y`
+    /// and `round_keeper_target_x/y`) — "into the box" computed once
+    /// from the state at the moment he received the ball deep, not
+    /// recomputed live as he moves.
+    pub drop_and_spin_target_x: f32,
+    pub drop_and_spin_target_y: f32,
     /// realism-bug (2026-07-27): one-shot-per-possession lock so the
     /// round-keeper probability roll (in the engine loop) fires at most
     /// once per continuous spell of ball ownership, not every tick the
@@ -791,6 +818,9 @@ impl MatchPlayer {
             give_and_go_run_target_x: 0.0,
             give_and_go_run_target_y: 0.0,
             blocked_wide_attack_reset_ticks: 0,
+            drop_and_spin_run_ticks: 0,
+            drop_and_spin_target_x: 0.0,
+            drop_and_spin_target_y: 0.0,
             gk1v1_decision_made: false,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,
@@ -896,6 +926,9 @@ impl MatchPlayer {
             give_and_go_run_target_x: 0.0,
             give_and_go_run_target_y: 0.0,
             blocked_wide_attack_reset_ticks: 0,
+            drop_and_spin_run_ticks: 0,
+            drop_and_spin_target_x: 0.0,
+            drop_and_spin_target_y: 0.0,
             gk1v1_decision_made: false,
             throw_in_pass_pending: 0,
             free_kick_pass_pending: 0,

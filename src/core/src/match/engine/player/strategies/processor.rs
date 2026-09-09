@@ -419,6 +419,15 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
+        // docs/positional-attack-phase-design.md, Stage 3: the drop-
+        // and-spin run. Same placement/priority reasoning as give-and-
+        // go immediately above (attacking off-ball run, tempo-scaled,
+        // still below the defensive/legal overrides that follow).
+        if let Some(velocity) = Self::drop_and_spin_run_velocity(&processing_ctx) {
+            let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
+            result.velocity = Some(velocity * tempo);
+        }
+
         // realism-bug (2026-08-27): defensive wide-run tracking. Applied
         // AFTER the assignment override so an explicit press/mark target
         // still wins outright (also re-checked inside the function
@@ -1153,6 +1162,46 @@ impl<'p> StateProcessor<'p> {
         let target = Vector3::new(
             player.give_and_go_run_target_x,
             player.give_and_go_run_target_y,
+            0.0,
+        );
+        let to_target = target - player.position;
+        let dist = to_target.magnitude();
+        if dist < 3.0 {
+            return Some(Vector3::zeros());
+        }
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some(to_target.normalize() * max_speed)
+    }
+
+    /// docs/positional-attack-phase-design.md, Stage 3: the "spin"
+    /// half of the drop-and-spin primitive — mirrors
+    /// `give_and_go_run_velocity` above exactly (same gates, same
+    /// shape), consuming `drop_and_spin_run_ticks`/`_target_x/y`
+    /// instead. Deliberately does NOT clamp for offside itself — the
+    /// universal `offside_line_hold_velocity` override (engine audit
+    /// Module 3) runs last in this chain and clamps whatever velocity
+    /// any earlier override produces, so a run "into the box" is
+    /// automatically held onside without this function needing its
+    /// own copy of that logic.
+    fn drop_and_spin_run_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None; // an explicit assignment always wins
+        }
+        if player.drop_and_spin_run_ticks == 0 {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None; // still deciding what to do with the deep touch
+        }
+        if !ctx.team().is_control_ball() {
+            return None; // we lost it — no run to make
+        }
+        let target = Vector3::new(
+            player.drop_and_spin_target_x,
+            player.drop_and_spin_target_y,
             0.0,
         );
         let to_target = target - player.position;

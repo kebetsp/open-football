@@ -1244,6 +1244,14 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     // gate) if he ends up never passing at all.
                     p.give_and_go_run_ticks -= 1;
                 }
+                // docs/positional-attack-phase-design.md, Stage 3: the
+                // drop-and-spin run, same "only decays once the ball
+                // has left his feet" reasoning as give_and_go above —
+                // he hasn't started the run yet while still deciding
+                // what to do with the deep touch.
+                if p.drop_and_spin_run_ticks > 0 && raw_owner != Some(p.id) {
+                    p.drop_and_spin_run_ticks -= 1;
+                }
                 // Stage 2 item 3 (docs/positional-football-master-plan.md,
                 // 2026-09-07): decay, unconditional every tick, same
                 // idiom/placement as combo_partner_ticks above (checked
@@ -1288,12 +1296,50 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             .filter(|(team_id, _)| *team_id != p.team_id)
                             .filter(|(_, pos)| (*pos - p.position).magnitude() <= 8.0)
                             .count();
-                        if close_defenders >= 2 {
+                        // docs/positional-attack-phase-design.md, Stage 2:
+                        // Stage 0 measured this trigger firing ~3x below
+                        // the sourced real-world "byline carry recycled
+                        // without delivering" rate — but a genuine
+                        // real-world recycle doesn't need two defenders
+                        // converging, just ONE genuinely blocking the
+                        // direct route forward. A purely geometric
+                        // widening — deliberately does NOT touch the
+                        // tackle/duel model itself (Part 3's guardrail;
+                        // Stage 3.5's "contained dribble outcome" stays
+                        // unbuilt/unscoped) — only changes when the
+                        // already-shipped recycle reward arms.
+                        let goal_x = match p.side {
+                            Some(PlayerSide::Left) => context.field_size.width as f32,
+                            _ => 0.0,
+                        };
+                        let to_goal_sign = (goal_x - p.position.x).signum();
+                        let single_blocker = to_goal_sign != 0.0
+                            && opponent_positions.iter().any(|(team_id, pos)| {
+                                *team_id != p.team_id
+                                    && (*pos - p.position).magnitude() <= 12.0
+                                    && (pos.x - p.position.x) * to_goal_sign > 0.0
+                                    && (pos.y - p.position.y).abs() <= 6.0
+                            });
+                        // A real bug, not just a measurement artifact:
+                        // this used to re-arm (and re-log) on EVERY
+                        // qualifying tick, not once per genuine episode
+                        // — while a defender happened to stay in range
+                        // for several consecutive ticks, the "same"
+                        // decision moment was counted (and re-armed to
+                        // its full 90-tick window) repeatedly. Gating on
+                        // "not already armed" makes each arm a genuine,
+                        // discrete episode — comparable to Stage 0's
+                        // sourced real-world metric, which counts
+                        // discrete carry-endings, not per-tick samples.
+                        if p.blocked_wide_attack_reset_ticks == 0
+                            && (close_defenders >= 2 || single_blocker)
+                        {
                             p.blocked_wide_attack_reset_ticks = 90;
                             match_log_info!(
-                                "BLOCKEDRESETDIAG arm id={} close_defenders={}",
+                                "BLOCKEDRESETDIAG arm id={} close_defenders={} single_blocker={}",
                                 p.id,
-                                close_defenders
+                                close_defenders,
+                                single_blocker
                             );
                         }
                         p.byline_commitment_ticks -= 1;
@@ -1370,6 +1416,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                                     .clamp(0.45, 0.75);
                                 if context.rng.range_u64(0, 10000) < (prob * 10000.0) as u64 {
                                     p.byline_commitment_ticks = 1200;
+                                    match_log_info!(
+                                        "STAGE0ARM kind=contact id={} team={} tick={} poss_ticks={}",
+                                        p.id,
+                                        p.team_id,
+                                        context.current_tick(),
+                                        team_tactical.possession_ticks
+                                    );
                                     // Verification-only field, temporary:
                                     // confirms this arm is firing under
                                     // genuine defender proximity (the
@@ -1679,6 +1732,78 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     }
                 }
                 }
+                // docs/positional-attack-phase-design.md, Stage 3: the
+                // forward drop-and-spin primitive. A Forward who
+                // genuinely drops deep (out of his own attacking half
+                // entirely — Pavel's own framing, "run back deeper to
+                // the box," implies he really went missing from the
+                // front line) to receive/link up during a genuine
+                // settled positional-attack phase (Stage 1's detector)
+                // commits to a run back into the box once he releases
+                // the ball. Armed once per qualifying touch (the
+                // `drop_and_spin_run_ticks == 0` guard, same debounce
+                // idiom as Stage 2's widening above). `prob=0.5` is a
+                // reasoned estimate, not sourced — no dataset gives a
+                // real "does this striker spin a run" rate — flagged
+                // as such rather than invented silently.
+                if raw_owner == Some(p.id) && p.drop_and_spin_run_ticks == 0 {
+                    let group = p.tactical_position.current_position.position_group();
+                    if matches!(group, crate::PlayerFieldPositionGroup::Forward) {
+                        let team_tactical = if p.team_id == context.field_home_team_id {
+                            &context.tactical_home
+                        } else {
+                            &context.tactical_away
+                        };
+                        if team_tactical.patient_attack_phase_active() {
+                            let goal_x = match p.side {
+                                Some(PlayerSide::Left) => context.field_size.width as f32,
+                                _ => 0.0,
+                            };
+                            let depth_from_goal = (goal_x - p.position.x).abs();
+                            let h = context.field_size.height as f32;
+                            // 0.42, not 0.5 (full own half) — real
+                            // "drop deep to link up" more often means
+                            // dropping into the middle third than all
+                            // the way back to one's own half. Widened
+                            // from an initial 0.5 after a 20-match
+                            // measurement found only 3 arms (~0.15/
+                            // match) — too rare to say anything about
+                            // the pattern at all, not a case of chasing
+                            // a target number.
+                            if depth_from_goal > context.field_size.width as f32 * 0.42 {
+                                let prob = 0.5;
+                                if context.rng.range_u64(0, 10000) < (prob * 10000.0) as u64 {
+                                    // ~60u (~7.5m) inside the goal line —
+                                    // a near-six-yard-box run target, a
+                                    // reasoned estimate like every other
+                                    // unsourced radius/depth constant in
+                                    // this codebase's off-ball runs.
+                                    p.drop_and_spin_target_x = match p.side {
+                                        Some(PlayerSide::Left) => goal_x - 60.0,
+                                        _ => goal_x + 60.0,
+                                    };
+                                    // Pull halfway toward the central
+                                    // channel from wherever he actually
+                                    // dropped from — a striker's real
+                                    // in-behind run targets the box, not
+                                    // a literal straight-back-out replay
+                                    // of an incidental wide drop.
+                                    p.drop_and_spin_target_y =
+                                        h * 0.5 + (p.position.y - h * 0.5) * 0.5;
+                                    p.drop_and_spin_run_ticks = 500;
+                                    match_log_info!(
+                                        "STAGE3ARM id={} team={} depth={:.1} target_x={:.1} target_y={:.1}",
+                                        p.id,
+                                        p.team_id,
+                                        depth_from_goal,
+                                        p.drop_and_spin_target_x,
+                                        p.drop_and_spin_target_y
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                 // realism-bug: arming at ownership_duration<=3 (within
                 // 30ms of reception) meant committing before the ball is
                 // genuinely settled — this engine's own shot logic treats
@@ -1739,6 +1864,25 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         group,
                         y,
                         depth
+                    );
+                    // docs/positional-attack-phase-design.md, Stage 0:
+                    // does the byline probe cycle genuinely repeat
+                    // within one continuous team possession, or is it
+                    // structurally one-shot? `poss_ticks` lets a
+                    // post-hoc script group arms by possession streak
+                    // (a streak boundary is any tick where the team's
+                    // own possession_ticks resets to a value smaller
+                    // than the previous sample).
+                    match_log_info!(
+                        "STAGE0ARM kind=ambient id={} team={} tick={} poss_ticks={}",
+                        p.id,
+                        p.team_id,
+                        context.current_tick(),
+                        if p.team_id == context.field_home_team_id {
+                            context.tactical_home.possession_ticks
+                        } else {
+                            context.tactical_away.possession_ticks
+                        }
                     );
                 }
             }
@@ -2063,6 +2207,46 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     // team lookup happens once per player here rather
                     // than inside `ShapeRule` itself.
                     let team_tactical = *context.tactical_for_team(p.team_id);
+                    // docs/positional-attack-phase-design.md, Stage 5:
+                    // `UnderHighPress` needs to know the OPPONENT's
+                    // phase, not just this player's own team's.
+                    let opponent_team_id = if p.team_id == context.field_home_team_id {
+                        context.field_away_team_id
+                    } else {
+                        context.field_home_team_id
+                    };
+                    let opponent_phase = context.tactical_for_team(opponent_team_id).phase;
+                    #[cfg(feature = "match-logs")]
+                    if matches!(opponent_phase, crate::r#match::GamePhase::HighPress)
+                        && in_possession
+                        && matches!(
+                            p.tactical_position.current_position,
+                            crate::PlayerPositionType::DefenderCenter
+                                | crate::PlayerPositionType::DefenderCenterLeft
+                                | crate::PlayerPositionType::DefenderCenterRight
+                        )
+                    {
+                        match_log_info!(
+                            "STAGE5CB cond=highpress id={} team={} y={:.1}",
+                            p.id,
+                            p.team_id,
+                            p.position.y
+                        );
+                    } else if in_possession
+                        && matches!(
+                            p.tactical_position.current_position,
+                            crate::PlayerPositionType::DefenderCenter
+                                | crate::PlayerPositionType::DefenderCenterLeft
+                                | crate::PlayerPositionType::DefenderCenterRight
+                        )
+                    {
+                        match_log_info!(
+                            "STAGE5CB cond=normal id={} team={} y={:.1}",
+                            p.id,
+                            p.team_id,
+                            p.position.y
+                        );
+                    }
                     let ball_owned = current_owner_team.is_some();
                     let mut target = base;
                     let mut rule_active = false;
@@ -2075,6 +2259,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             goals_against,
                             minute_now,
                             team_tactical,
+                            opponent_phase,
                         ) {
                             target = rule.target(base, side, w, h, team_tactical, ball_y);
                             rule_active = true;
