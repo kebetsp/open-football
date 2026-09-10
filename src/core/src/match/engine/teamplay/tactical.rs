@@ -429,6 +429,12 @@ pub struct TeamTacticalState {
     /// override — a real team probes on one side for a while before
     /// switching, it doesn't switch on literally every touch.
     pub same_side_ticks: u32,
+    /// realism-bug (2026-09-10): consecutive ticks the settled-phase
+    /// condition has NOT held, since it last held. Reset to 0 every
+    /// qualifying refresh. Once this reaches `PATIENT_PHASE_GRACE_TICKS`
+    /// (a genuine, sustained interruption, not a single noisy reading),
+    /// `patient_phase_streak_ticks` resets for real. See `refresh()`.
+    pub patient_phase_miss_ticks: u32,
 }
 
 impl TeamTacticalState {
@@ -459,6 +465,7 @@ impl TeamTacticalState {
             positional_attack_pattern: None,
             patient_phase_streak_ticks: 0,
             same_side_ticks: 0,
+            patient_phase_miss_ticks: 0,
         }
     }
 
@@ -700,15 +707,48 @@ impl TeamTacticalState {
             home.in_possession && own_patient_phase(home.phase) && settled_opponent_phase(away.phase);
         let away_qualifies =
             away.in_possession && own_patient_phase(away.phase) && settled_opponent_phase(home.phase);
+        // realism-bug (2026-09-10, Pavel: "I do not see any positional
+        // attacks"): a diagnostic that instruments `own_patient_phase`
+        // vs `settled_opponent_phase` separately (loose_patient_streak_
+        // ticks, since removed) found they were byte-for-byte identical
+        // — `own_patient_phase` was never the bottleneck. The real
+        // cause: this was a hard, zero-tolerance reset — one noisy
+        // ~5s tactical refresh where GamePhase's OWN classification
+        // flickers (a real, pre-existing instability in that
+        // computation, not something to fix here — GamePhase is
+        // load-bearing for many other mechanisms) wiped the whole
+        // streak. Measured: median PEAK streak before reset was only
+        // 3.2s — i.e. most attempts died after a single refresh cycle,
+        // essentially never surviving long enough to reach the 10s
+        // activation bar. Real football's "settled" doesn't mean
+        // "zero hiccups for 10 unbroken seconds" — it tolerates a
+        // brief wobble. Fixed with a bounded grace window: a single
+        // non-qualifying refresh no longer wipes the streak outright;
+        // it only resets once the interruption itself persists.
+        const PATIENT_PHASE_GRACE_TICKS: u32 = 600;
         home.patient_phase_streak_ticks = if home_qualifies {
+            home.patient_phase_miss_ticks = 0;
             home.patient_phase_streak_ticks.saturating_add(inputs.tick_interval)
         } else {
-            0
+            home.patient_phase_miss_ticks =
+                home.patient_phase_miss_ticks.saturating_add(inputs.tick_interval);
+            if home.patient_phase_miss_ticks >= PATIENT_PHASE_GRACE_TICKS {
+                0
+            } else {
+                home.patient_phase_streak_ticks
+            }
         };
         away.patient_phase_streak_ticks = if away_qualifies {
+            away.patient_phase_miss_ticks = 0;
             away.patient_phase_streak_ticks.saturating_add(inputs.tick_interval)
         } else {
-            0
+            away.patient_phase_miss_ticks =
+                away.patient_phase_miss_ticks.saturating_add(inputs.tick_interval);
+            if away.patient_phase_miss_ticks >= PATIENT_PHASE_GRACE_TICKS {
+                0
+            } else {
+                away.patient_phase_streak_ticks
+            }
         };
 
         // Defensive line x: interpolate between "deep" (own third
