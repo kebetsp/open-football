@@ -1263,12 +1263,87 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 // immediately once the ball has left this player's feet —
                 // the bias only matters while he's still deciding what to
                 // do WITH the ball.
-                if p.blocked_wide_attack_reset_ticks > 0 {
+                if p.carrier_contained_reset_ticks > 0 {
                     if raw_owner != Some(p.id) {
-                        p.blocked_wide_attack_reset_ticks = 0;
+                        p.carrier_contained_reset_ticks = 0;
                     } else {
-                        p.blocked_wide_attack_reset_ticks -= 1;
+                        p.carrier_contained_reset_ticks -= 1;
                     }
+                }
+                // docs/positional-attack-phase-design.md, Stage 3.5
+                // generalization (2026-09-11): the byline-specific block
+                // below already recognizes "genuinely blocked, reset"
+                // for a wide-committed carrier; this is the SAME
+                // recognition for any OTHER ball carrier (a central
+                // midfielder, a forward linking up, a winger who never
+                // formally byline-committed) — Stage 3.5's own diagnosis
+                // named this exact gap: "an attacker who runs into a
+                // jockeying defender anywhere except the byline case
+                // just keeps trying to carry forward into the same
+                // defender, tick after tick... there's no deliberate
+                // moment where the attacker recognizes he's stuck and
+                // chooses to reset." Independent of, and never competing
+                // with, the byline-specific arm just below: only
+                // evaluated for players NOT in an active byline
+                // commitment (that block ends in `continue`, so this
+                // code is simply unreached for them), and both write the
+                // same `carrier_contained_reset_ticks` field guarded by
+                // "not already armed" — whichever fires first for a
+                // given player on a given tick wins, harmlessly.
+                // Reuses the exact same `single_blocker` geometry
+                // (within 12u, genuinely ahead toward goal, y-aligned
+                // within 6u) already measured and trusted for the
+                // byline case — Pavel's own words: "just ONE genuinely
+                // blocking the direct route forward" is real
+                // containment, not a fabricated new threshold. The one
+                // real addition is `carrier_containment_dwell_ticks`: a
+                // genuine sustained-dwell requirement (~250ms) before
+                // arming, since — unlike the byline case, which is
+                // already narrowly scoped to a committed run — this
+                // general population has no equivalent prior context
+                // to rule out a single fleeting near-miss.
+                if let Some(owner_id) = raw_owner {
+                    if owner_id == p.id && p.byline_commitment_ticks == 0 {
+                        let goal_x = match p.side {
+                            Some(PlayerSide::Left) => context.field_size.width as f32,
+                            _ => 0.0,
+                        };
+                        let to_goal_sign = (goal_x - p.position.x).signum();
+                        let genuinely_blocked = to_goal_sign != 0.0
+                            && opponent_positions.iter().any(|(team_id, pos)| {
+                                *team_id != p.team_id
+                                    && (*pos - p.position).magnitude() <= 12.0
+                                    && (pos.x - p.position.x) * to_goal_sign > 0.0
+                                    && (pos.y - p.position.y).abs() <= 6.0
+                            });
+                        if genuinely_blocked && p.carrier_contained_reset_ticks == 0 {
+                            p.carrier_containment_dwell_ticks =
+                                p.carrier_containment_dwell_ticks.saturating_add(1);
+                            // ~250ms of sustained, genuine containment —
+                            // a reasoned estimate (category (d), no
+                            // sourced real-world "how long before a
+                            // player recognizes he's stuck" figure
+                            // exists), chosen to be clearly longer than
+                            // a single-tick coincidence while still
+                            // short enough to fire within a realistic
+                            // 1v1 duel's own timescale.
+                            const CONTAINMENT_DWELL_THRESHOLD: u16 = 25;
+                            if p.carrier_containment_dwell_ticks >= CONTAINMENT_DWELL_THRESHOLD {
+                                p.carrier_contained_reset_ticks = 90;
+                                p.carrier_containment_dwell_ticks = 0;
+                                match_log_info!(
+                                    "CONTAINEDDIAG arm id={} general",
+                                    p.id
+                                );
+                            }
+                        } else {
+                            p.carrier_containment_dwell_ticks = 0;
+                        }
+                    } else if p.byline_commitment_ticks == 0 {
+                        p.carrier_containment_dwell_ticks = 0;
+                    }
+                } else {
+                    p.carrier_containment_dwell_ticks = 0;
                 }
                 if p.byline_commitment_ticks > 0 {
                     if raw_owner != Some(p.id) {
@@ -1287,7 +1362,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         // identical live condition independently and will
                         // reach the same Passing transition this tick or
                         // next), so the very next pass decision already
-                        // sees `blocked_wide_attack_reset_ticks` set. A
+                        // sees `carrier_contained_reset_ticks` set. A
                         // 1-tick lead/lag either way is harmless since the
                         // field decays over ~0.9s (90 ticks), not a single
                         // tick.
@@ -1331,10 +1406,10 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         // discrete episode — comparable to Stage 0's
                         // sourced real-world metric, which counts
                         // discrete carry-endings, not per-tick samples.
-                        if p.blocked_wide_attack_reset_ticks == 0
+                        if p.carrier_contained_reset_ticks == 0
                             && (close_defenders >= 2 || single_blocker)
                         {
-                            p.blocked_wide_attack_reset_ticks = 90;
+                            p.carrier_contained_reset_ticks = 90;
                             match_log_info!(
                                 "BLOCKEDRESETDIAG arm id={} close_defenders={} single_blocker={}",
                                 p.id,

@@ -1001,7 +1001,7 @@ impl PassEvaluator {
         // docs/positional-football-master-plan.md Stage 2 item 3
         // (2026-09-07): a byline-committed carrier who's just been
         // genuinely boxed in by a 2-man press
-        // (`blocked_wide_attack_reset_ticks`, armed in run.rs's per-tick
+        // (`carrier_contained_reset_ticks`, armed in run.rs's per-tick
         // loop the instant that abort happens, mirroring the exact
         // `close_defenders >= 2` condition the Dribbling states
         // themselves abort a run on) had no positive reward anywhere for
@@ -1023,7 +1023,7 @@ impl PassEvaluator {
         // gated to a central position near goal and structurally can't
         // fire for a wide/byline carrier — confirmed by reading it, not
         // assumed).
-        let blocked_wide_attack_reset_bonus = if ctx.player.blocked_wide_attack_reset_ticks > 0
+        let carrier_contained_reset_bonus = if ctx.player.carrier_contained_reset_ticks > 0
             && pass_distance >= 15.0
             && forward_progress <= 0.15
         {
@@ -1234,7 +1234,7 @@ impl PassEvaluator {
             forward_width_bonus_unweighted +  // /goal 2026-07-26: flat, same family as cutback_bonus
             build_up_recycle_bonus +
             stalled_recycle_bonus +
-            blocked_wide_attack_reset_bonus +
+            carrier_contained_reset_bonus +
             directness_length_bias +
             counter_first_pass_bonus +
             same_side_density_penalty +

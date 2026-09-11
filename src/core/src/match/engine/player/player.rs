@@ -447,18 +447,45 @@ pub struct MatchPlayer {
     /// the ball off, not one that keeps drifting as he moves.
     pub give_and_go_run_target_x: f32,
     pub give_and_go_run_target_y: f32,
-    /// docs/positional-football-master-plan.md Stage 2 item 3 (2026-09-07):
-    /// armed in `run.rs`'s per-tick loop the instant a byline-committed
-    /// carrier meets the exact genuine-2-man-press condition the forward/
-    /// midfielder Dribbling states themselves abort a run on
-    /// (`close_defenders >= 2` within 8u) — a real "this wide attack just
-    /// failed, look for a considered reset" moment that previously had no
-    /// positive reward anywhere: `build_up_recycle_bonus` requires a CB/DM/
-    /// GK receiver, `stalled_recycle_bonus` requires ~20s of continuous
-    /// possession a quick byline dash never reaches. Ticks remaining (0 =
-    /// inactive); self-decaying like every other transient bias field on
-    /// this struct, consumed by `evaluator.rs`'s `blocked_wide_attack_reset_bonus`.
-    pub blocked_wide_attack_reset_ticks: u16,
+    /// docs/positional-football-master-plan.md Stage 2 item 3 (2026-09-07),
+    /// GENERALIZED docs/positional-attack-phase-design.md Stage 3.5
+    /// (2026-09-11): originally armed only for a byline-committed wide
+    /// carrier meeting a genuine 2-man press (`close_defenders >= 2`
+    /// within 8u) or one genuine blocker on the direct route
+    /// (`single_blocker`) — real, verified, but narrow: Stage 3.5's own
+    /// diagnosis named the missing piece directly — "the repeated
+    /// probe → contained → retreat → probe-again shape at the center of
+    /// Pavel's whole vision needs a genuine trigger for 'contained' that
+    /// isn't RNG... generalizing beyond the one already-built byline
+    /// case may have no real foundation without this." Now ALSO armed
+    /// for ANY ball carrier, any role, any zone, who has been genuinely
+    /// blocked ahead (see `carrier_containment_dwell_ticks` below) for
+    /// a real, sustained moment — not just an instantaneous geometric
+    /// coincidence. The original byline-specific instant-fire arm site
+    /// is untouched (its own timing was already measured and verified;
+    /// this generalization is purely additive, gated on the carrier NOT
+    /// already being armed by it). A real "this attack just failed,
+    /// look for a considered reset" moment that previously had no
+    /// positive reward anywhere outside the byline case:
+    /// `build_up_recycle_bonus` requires a CB/DM/GK receiver,
+    /// `stalled_recycle_bonus` requires ~20s of continuous possession a
+    /// quick contained dribble never reaches. Ticks remaining (0 =
+    /// inactive); self-decaying like every other transient bias field
+    /// on this struct, consumed by `evaluator.rs`'s
+    /// `carrier_contained_reset_bonus`.
+    pub carrier_contained_reset_ticks: u16,
+    /// docs/positional-attack-phase-design.md, Stage 3.5 generalization
+    /// (2026-09-11): consecutive ticks the current ball carrier has been
+    /// genuinely blocked ahead by a close opponent (same geometry as the
+    /// existing `single_blocker` check, generalized to any carrier, not
+    /// just a byline-committed one). Resets to 0 the instant the
+    /// carrier isn't blocked, loses the ball, or `carrier_contained_
+    /// reset_ticks` is already armed (no need to keep counting once the
+    /// reset bonus has fired). A real dwell requirement — not an
+    /// instantaneous coincidence — so a single fleeting near-miss
+    /// doesn't fire the reset; the carrier has to genuinely fail to
+    /// progress for a real moment before "recognizing" containment.
+    pub carrier_containment_dwell_ticks: u16,
     /// docs/positional-attack-phase-design.md, Stage 3: the forward
     /// drop-and-spin primitive. Armed while a Forward genuinely drops
     /// deep to receive/link up during a `patient_attack_phase_active()`
@@ -817,7 +844,8 @@ impl MatchPlayer {
             give_and_go_run_ticks: 0,
             give_and_go_run_target_x: 0.0,
             give_and_go_run_target_y: 0.0,
-            blocked_wide_attack_reset_ticks: 0,
+            carrier_contained_reset_ticks: 0,
+            carrier_containment_dwell_ticks: 0,
             drop_and_spin_run_ticks: 0,
             drop_and_spin_target_x: 0.0,
             drop_and_spin_target_y: 0.0,
@@ -925,7 +953,8 @@ impl MatchPlayer {
             give_and_go_run_ticks: 0,
             give_and_go_run_target_x: 0.0,
             give_and_go_run_target_y: 0.0,
-            blocked_wide_attack_reset_ticks: 0,
+            carrier_contained_reset_ticks: 0,
+            carrier_containment_dwell_ticks: 0,
             drop_and_spin_run_ticks: 0,
             drop_and_spin_target_x: 0.0,
             drop_and_spin_target_y: 0.0,
