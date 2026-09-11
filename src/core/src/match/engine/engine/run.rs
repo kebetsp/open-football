@@ -1319,14 +1319,24 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         if genuinely_blocked && p.carrier_contained_reset_ticks == 0 {
                             p.carrier_containment_dwell_ticks =
                                 p.carrier_containment_dwell_ticks.saturating_add(1);
-                            // ~250ms of sustained, genuine containment —
-                            // a reasoned estimate (category (d), no
-                            // sourced real-world "how long before a
-                            // player recognizes he's stuck" figure
-                            // exists), chosen to be clearly longer than
-                            // a single-tick coincidence while still
-                            // short enough to fire within a realistic
-                            // 1v1 duel's own timescale.
+                            // TESTED and REJECTED 2026-09-11: reducing
+                            // this to 1 (instant-fire, matching the
+                            // byline-committed case) was hypothesized to
+                            // help by beating the defender's own tackle
+                            // roll to the punch — measured, directly, and
+                            // it made both numbers worse (total byline-
+                            // reaching carries 8.04->5.32/match, recycle
+                            // rate 5.0%->1.5%). Real cause: a defender
+                            // merely being within 12u ANYWHERE during an
+                            // otherwise-live run (not only near the
+                            // byline) was enough to instantly abort the
+                            // run into Passing, cutting off carries
+                            // before they ever developed far enough to
+                            // reach the byline at all. Reverted. ~250ms
+                            // of sustained, genuine containment remains a
+                            // reasoned estimate (category (d)) but is
+                            // measured, not merely assumed, to be better
+                            // than the alternative.
                             const CONTAINMENT_DWELL_THRESHOLD: u16 = 25;
                             if p.carrier_containment_dwell_ticks >= CONTAINMENT_DWELL_THRESHOLD {
                                 p.carrier_contained_reset_ticks = 90;

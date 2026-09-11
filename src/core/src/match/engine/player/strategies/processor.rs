@@ -572,6 +572,30 @@ impl<'p> StateProcessor<'p> {
             return complete_result(state_result, result);
         }
 
+        // docs/positional-play-master-design.md, Stage 3.5 follow-up
+        // (2026-09-11): found by directly re-measuring the actual
+        // outcome after generalizing `carrier_contained_reset_ticks` —
+        // 96.4% of wide carries that genuinely reach the byline area end
+        // in the carrier being DISPOSSESSED, not a clean pass of any
+        // kind. Root cause: the earlier generalization only biased WHICH
+        // pass the evaluator picks once a pass is actually attempted —
+        // it never forced the attempt itself. The byline-committed case
+        // doesn't have this problem because its OWN dribbling-state
+        // logic already aborts to Passing the same tick the contained
+        // condition is detected (see `run.rs`'s "Armed here, one tick
+        // ahead of the state machine's own abort" comment); the newly-
+        // generalized population had no equivalent — the carrier kept
+        // dribbling/trying to carry into the very defender who was
+        // blocking him, giving that defender more ticks to win a tackle
+        // before any pass decision ever ran. Same pattern as `free_kick_
+        // pass_override` directly above: force the role's Passing state
+        // outright while contained and still on the ball, so the
+        // already-built reward bias actually gets a chance to apply
+        // before the ball is lost, not after.
+        if let Some(state_result) = Self::carrier_contained_pass_override(&processing_ctx) {
+            return complete_result(state_result, result);
+        }
+
         if let Some(state_result) = handler.process(&processing_ctx) {
             return complete_result(state_result, result);
         }
@@ -700,6 +724,46 @@ impl<'p> StateProcessor<'p> {
             // (`GoalkeeperPassingState`, reachable from Diving/
             // PreparingForSave) — reused rather than reinvented, and
             // already skill/pressure/space-graduated.
+            Goalkeeper(_) => Some(StateChangeResult::with_goalkeeper_state(
+                GoalkeeperState::Passing,
+            )),
+            PlayerState::Injured => None,
+        }
+    }
+
+    /// docs/positional-play-master-design.md, Stage 3.5 follow-up
+    /// (2026-09-11) — see the call site's own doc comment for the full
+    /// diagnosis. Forces the role's Passing state while `carrier_
+    /// contained_reset_ticks` is armed and the player still has the
+    /// ball, exactly mirroring `free_kick_pass_override` immediately
+    /// above (same idiom, same reasoning: a decision that only biases
+    /// pass SELECTION is worthless if the pass ATTEMPT itself never
+    /// happens in time). Self-limiting by construction — `run.rs`'s own
+    /// decay clears the ticks field the instant the ball leaves this
+    /// player's feet, whether by a completed pass or a lost duel, so
+    /// this override can never hold a player in Passing indefinitely.
+    fn carrier_contained_pass_override(ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        if ctx.player.carrier_contained_reset_ticks == 0 || !ctx.player.has_ball(ctx) {
+            return None;
+        }
+        match ctx.player.state {
+            Forward(ForwardState::Passing)
+            | Midfielder(MidfielderState::Passing)
+            | Defender(DefenderState::Passing)
+            | Goalkeeper(GoalkeeperState::Passing) => None,
+            Forward(_) => Some(StateChangeResult::with_forward_state(ForwardState::Passing)),
+            Midfielder(_) => Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Passing,
+            )),
+            Defender(_) => Some(StateChangeResult::with_defender_state(
+                DefenderState::Passing,
+            )),
+            // A goalkeeper being "contained" while dribbling is an
+            // exotic edge case (GKs rarely carry forward into traffic),
+            // but the field carries no role restriction and the same
+            // "release now" logic is correct for him too if it ever
+            // arms — reuses the existing GoalkeeperState::Passing route,
+            // same as free_kick_pass_override above.
             Goalkeeper(_) => Some(StateChangeResult::with_goalkeeper_state(
                 GoalkeeperState::Passing,
             )),
