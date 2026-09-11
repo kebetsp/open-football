@@ -11,6 +11,7 @@ use crate::r#match::{
     BallSideZone, GamePhase, MatchPlayer, MatchPlayerLite, PassOriginRestart, PitchLane,
     PlayerSide, StateProcessingContext,
 };
+use nalgebra::Vector3;
 
 /// Comprehensive pass evaluation result
 #[derive(Debug, Clone)]
@@ -586,6 +587,46 @@ impl PassEvaluator {
                 forward_progress * 2.5 * phase_forward_mult * risk_forward_bias
             }
         };
+
+        // docs/positional-play-master-design.md, Follow-up #7 (2026-09-12,
+        // "touch whatever is needed... true positional play, not a hacky
+        // override"): everything above rewards forward_progress as a PURE
+        // geometric quantity — it has never had any concept of whether
+        // this specific pass actually achieves anything tactically. Real
+        // pass-quality analytics (StatsBomb/Opta's own "progressive pass"
+        // concept) distinguish a genuine line-breaking pass — one that
+        // gets the ball past opposing players — from a pass that merely
+        // advances a few units into a still-crowded, still-blocked lane.
+        // This engine rewarded both identically per unit of progress,
+        // which is the real decision-level bug behind the long-documented
+        // central-bias/forward-share gap (ball-distribution-fix-plan.md):
+        // not that forward is weighted too heavily on average, but that
+        // it's weighted the SAME regardless of whether THIS pass is a
+        // real gain. Fixing this changes WHY a forward option scores
+        // high, not just how much — Part 6's "find the actual decision"
+        // principle, not another additive counter-bonus (already tried
+        // nine-plus times) or a further blanket weight cut (already
+        // plateaued at 0.32→0.28).
+        if forward_progress > 0.0 {
+            let opponents_beaten =
+                Self::count_opponents_beaten(ctx, passer_position, receiver_position, side, field_width);
+            // A corridor-based first cut (measured, then found biased
+            // toward crowding — see count_opponents_beaten's own doc
+            // comment) had already been tried at 0.55/1.0/1.15, then
+            // strengthened to 0.35/1.0/1.15 — the strengthening is what
+            // exposed the bias (moved the wrong way once the discount
+            // had enough weight to matter). Restarting the magnitude at
+            // the original, more conservative 0.55 now that the metric
+            // itself is fixed, so any further retuning starts from a
+            // clean baseline rather than carrying over a magnitude
+            // chosen to compensate for the old, biased mechanism.
+            let line_break_factor = match opponents_beaten {
+                0 => 0.55,
+                1 => 1.0,
+                _ => 1.15,
+            };
+            forward_value *= line_break_factor;
+        }
 
         // Distance bonus: prefer passes of 20-50m over very short (< 15m) or very long
         let pass_distance = (receiver_position - passer_position).norm();
@@ -1218,7 +1259,26 @@ impl PassEvaluator {
         // steps — re-verified via scripts/ball-distribution-check.mjs
         // before being kept; see the fix plan's §1 table for the
         // measured before/after.
-        const FORWARD_VALUE_WEIGHT: f32 = 0.28;
+        //
+        // docs/positional-play-master-design.md, Follow-up #7 (2026-09-
+        // 12): earlier weight cuts plateaued because forward_value was
+        // UNDIFFERENTIATED — every forward pass scored the same per
+        // unit of progress, so shrinking the weight just scaled every
+        // forward candidate down together without changing which one
+        // won. Now that forward_value carries genuine per-candidate
+        // signal (the opponents-beaten line-break factor above — an
+        // earned progressive pass keeps full value, an empty one is
+        // discounted), a further weight cut has a materially different
+        // effect: it de-emphasizes forward as a GENERIC direction
+        // relative to the other terms, while the line-break factor
+        // still protects a genuinely earned forward option from being
+        // crushed alongside it. Cut a further ~14% (0.28→0.24), then
+        // measured a real, meaningful shift (overall forward 55.3%->
+        // 53.9%, backward 30.1%->31.4%, still a clear forward plurality
+        // — not an overcorrection into "never forward"). One more
+        // step at the same ~15% cadence (0.24->0.205) to see whether
+        // the trend continues or has started to plateau.
+        const FORWARD_VALUE_WEIGHT: f32 = 0.205;
         let mut tactical_value = forward_value * FORWARD_VALUE_WEIGHT +
             distance_value * 0.10 +
             position_value * 0.08 +
@@ -1362,6 +1422,53 @@ impl PassEvaluator {
                 (1.0 - factors.receiver_ability) * 0.20;
 
         risk.clamp(0.0, 1.0)
+    }
+
+    /// How many opponents this specific pass genuinely bypasses — the
+    /// real "progressive pass"/"packing" distinction real football
+    /// analytics use (the concept RB Leipzig-style packing metrics and
+    /// StatsBomb's progressive-pass definitions both build on): an
+    /// opponent counts as bypassed when the ball's forward progress
+    /// carries it from behind them to in front of them, by DEPTH alone
+    /// — deliberately NOT a lateral corridor around the straight pass
+    /// line.
+    ///
+    /// REDESIGNED 2026-09-12 after the first (corridor-based) version
+    /// measured backwards: tightening its corridor to strengthen the
+    /// effect made CB forward-share and FW center-destination move the
+    /// WRONG way. Root cause, worked out from the result: a corridor
+    /// count is a crowding proxy, not a progress proxy — central areas
+    /// of the pitch always have more bodies nearby, so a central pass
+    /// through a crowd found opponents "in the corridor" easily (full
+    /// value) while an equally-progressive wide pass into genuinely
+    /// empty flank space usually found nobody nearby at all (discounted)
+    /// — rewarding density, not the line-break itself, exactly
+    /// backwards from the intent and compounding the very central bias
+    /// this fix exists to fix. Depth-only bypass has no such bias: a
+    /// switch of play into empty space still correctly counts every
+    /// opponent it leaves goal-side of the ball, regardless of how far
+    /// away they stand laterally — matching how packing metrics
+    /// actually work in real analytics.
+    fn count_opponents_beaten(
+        ctx: &StateProcessingContext,
+        passer_position: Vector3<f32>,
+        receiver_position: Vector3<f32>,
+        side: PlayerSide,
+        field_width: f32,
+    ) -> usize {
+        let passer_progress = side.attacking_progress_x(passer_position.x, field_width);
+        let receiver_progress = side.attacking_progress_x(receiver_position.x, field_width);
+        if receiver_progress <= passer_progress {
+            return 0;
+        }
+        ctx.players()
+            .opponents()
+            .all()
+            .filter(|opp| {
+                let opp_progress = side.attacking_progress_x(opp.position.x, field_width);
+                opp_progress > passer_progress && opp_progress < receiver_progress
+            })
+            .count()
     }
 
     /// Calculate interception risk from opponents along the pass path
