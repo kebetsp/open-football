@@ -410,38 +410,58 @@ pub struct TeamTacticalState {
     /// `None` when the window is closed — a stale pattern from a
     /// just-expired window must never be read as still active.
     pub positional_attack_pattern: Option<AttackPattern>,
-    /// docs/positional-attack-phase-design.md, Stage 1: how many ticks
-    /// we've held a genuine "patient attack" posture *continuously* —
-    /// we have the ball, our own phase is BuildUp/Progression/Attack
-    /// (not AttackingTransition — not a fast break), and the OPPONENT's
-    /// phase has been settled (MidBlock/LowBlock, not scrambling) for
-    /// this whole run. Accumulates like `possession_ticks` (same
-    /// saturating-add idiom) and resets hard to 0 the instant any
-    /// condition breaks — a deliberately strict definition matching
-    /// Pavel's own framing ("not chasing, not scrambling, not
-    /// mid-transition"). Deliberately named to avoid colliding with
-    /// `positional_attack_ticks_remaining`/`AttackPattern` above, which
-    /// is a different, narrower, contact-triggered mechanism (Chunk 5)
-    /// — see the design doc's Part 2 naming-collision note.
-    pub patient_phase_streak_ticks: u32,
+    /// docs/positional-play-master-design.md Part 11 follow-up
+    /// (2026-09-11): REPLACES the original streak+grace-window design
+    /// (`patient_phase_streak_ticks`/`patient_phase_miss_ticks`,
+    /// removed — no other file read them, confirmed by grep before
+    /// deleting). That design's own doc comment claimed "1000 ticks /
+    /// ~10s = two full tactical-refresh cycles" — a real, load-bearing
+    /// miscalibration: `refresh()` is actually called every
+    /// `BASE_TACTICAL_INTERVAL_TICKS`=25 (or 10 during a transition
+    /// window) ticks, i.e. every 100-250ms, not every ~5s. So the old
+    /// "sustained 10s streak, 6s grace" requirement was really asking
+    /// for a per-100-250ms binary condition (a team's instantaneous
+    /// possession, and the ball's instantaneous heading, being more
+    /// sideways than forward RIGHT NOW) to hold almost continuously
+    /// across 40-100 consecutive samples — noise, not signal. Measured
+    /// result: 0.00% true across ~75,000 sampled ticks even after an
+    /// earlier same-session fix. A rolling EMA over each condition,
+    /// with a time constant anchored to this project's own already-
+    /// sourced real-world settled-possession-duration figure (median
+    /// 21.8s, StatsBomb, `docs/positional-attack-phase-design.md` Stage
+    /// 0), is the correct fix: it asks "has this been true on balance
+    /// over a realistic window," not "has this been true at every
+    /// single 100-250ms sample with almost no exception" — the latter
+    /// is not how real football commentary ("Team A dominated
+    /// possession for the last 20 seconds") works either; a genuine
+    /// spell tolerates individual duel losses and brief kick-direction
+    /// noise without ceasing to be a real spell.
+    pub possession_share_ema: f32,
+    /// EMA of `ball_moving_laterally` (defined in `refresh()`) — how
+    /// much of the recent window has the ball's own instantaneous
+    /// movement been more sideways than forward.
+    pub lateral_share_ema: f32,
+    /// EMA of `full_line_goal_side(...)` — how much of the recent
+    /// window has the WHOLE defensive/midfield line (Pavel's own words:
+    /// "not a player, or two players — full line") been genuinely
+    /// goal-side of the ball. The spatial "full line" requirement is
+    /// untouched and unrelaxed; only the temporal strictness (must this
+    /// be true at literally every single sample) is relaxed, which
+    /// Pavel never specified either way.
+    pub line_goalside_share_ema: f32,
     /// docs/positional-attack-phase-design.md, Stage 4: how many ticks
     /// `ball_side` has held the SAME value continuously. Resets to 0
     /// the instant it flips. Used to gate the circulation-switch
     /// override — a real team probes on one side for a while before
     /// switching, it doesn't switch on literally every touch.
     pub same_side_ticks: u32,
-    /// realism-bug (2026-09-10): consecutive ticks the settled-phase
-    /// condition has NOT held, since it last held. Reset to 0 every
-    /// qualifying refresh. Once this reaches `PATIENT_PHASE_GRACE_TICKS`
-    /// (a genuine, sustained interruption, not a single noisy reading),
-    /// `patient_phase_streak_ticks` resets for real. See `refresh()`.
-    pub patient_phase_miss_ticks: u32,
     /// docs/positional-attack-phase-design.md, Stage 1 redefinition
-    /// (2026-09-10): ball x/y at the LAST tactical refresh, so this
-    /// refresh's net displacement (not an instantaneous single-tick
-    /// velocity sample) can be classified as lateral- vs forward-
-    /// dominant. Shared/identical for home+away (same physical ball),
-    /// same idiom as `ball_side`.
+    /// (2026-09-10): ball x/y at the LAST tactical refresh — feeds
+    /// `ball_moving_laterally`'s per-refresh displacement sample (now
+    /// correctly understood as a near-instantaneous ~100-250ms sample,
+    /// smoothed by `lateral_share_ema` above, not a 5s window itself).
+    /// Shared/identical for home+away (same physical ball), same idiom
+    /// as `ball_side`.
     pub last_ball_x: f32,
     pub last_ball_y: f32,
 }
@@ -472,26 +492,53 @@ impl TeamTacticalState {
             central_congestion_discount: 0.0,
             positional_attack_ticks_remaining: 0,
             positional_attack_pattern: None,
-            patient_phase_streak_ticks: 0,
+            possession_share_ema: 0.0,
+            lateral_share_ema: 0.0,
+            line_goalside_share_ema: 0.0,
             same_side_ticks: 0,
-            patient_phase_miss_ticks: 0,
             last_ball_x: 0.0,
             last_ball_y: 0.0,
         }
     }
 
-    /// docs/positional-attack-phase-design.md, Stage 1: are we
-    /// currently, genuinely, in a settled positional-attack phase?
-    /// `PATIENT_PHASE_ENTRY_TICKS` (1000 ticks / ~10s = two full
-    /// tactical-refresh cycles) is deliberate hysteresis — a single
-    /// refresh where the conditions happen to line up shouldn't flip
-    /// this true; the posture has to actually hold. Log-only this
-    /// stage: nothing yet reads this to change behavior.
+    /// docs/positional-play-master-design.md Part 11 follow-up: are we
+    /// currently, genuinely, in a settled positional-attack phase — on
+    /// balance, over a realistic recent window (see the EMA fields'
+    /// own doc comments for why this replaced a broken continuous-
+    /// streak design). Thresholds are reasoned, not blindly fit to a
+    /// single clip: `POSSESSION_SHARE_THRESHOLD` (0.65) tolerates real
+    /// duel-loss/recovery cycles within an overall-dominant spell (this
+    /// project's own measured median gap between a team's consecutive
+    /// turnovers is ~3.9s, well inside the EMA's ~8s time constant, so
+    /// a couple of such cycles naturally average out without needing a
+    /// separate fix to turnover detection itself);
+    /// `LATERAL_SHARE_THRESHOLD` (0.35) requires a meaningfully-elevated
+    /// (not majority — real play is forward-biased overall even during
+    /// patient buildup) share of instants where the ball's own movement
+    /// is more sideways than forward; `LINE_GOALSIDE_SHARE_THRESHOLD`
+    /// (0.75) keeps Pavel's explicit "full line, not one or two
+    /// players" requirement spatially strict while tolerating a brief
+    /// individual press excursion temporally. No sourced real-world
+    /// figures exist for the exact lateral/line-goalside ratios
+    /// (category (d), flagged estimates) — verify with fresh raw data,
+    /// not assumed correct on reasoning alone.
     pub fn patient_attack_phase_active(&self) -> bool {
-        self.patient_phase_streak_ticks >= Self::PATIENT_PHASE_ENTRY_TICKS
+        self.possession_share_ema >= Self::POSSESSION_SHARE_THRESHOLD
+            && self.lateral_share_ema >= Self::LATERAL_SHARE_THRESHOLD
+            && self.line_goalside_share_ema >= Self::LINE_GOALSIDE_SHARE_THRESHOLD
     }
 
-    const PATIENT_PHASE_ENTRY_TICKS: u32 = 1000;
+    /// Time constant for the three settled-phase EMAs, in milliseconds.
+    /// Anchored to this project's own already-sourced real-world
+    /// settled-possession-episode duration (median 21.8s, StatsBomb,
+    /// `docs/positional-attack-phase-design.md` Stage 0) — roughly
+    /// half that, so a genuine ~20s spell is clearly, confidently
+    /// flagged well before it would naturally end, not just at its
+    /// tail.
+    const PATIENT_EMA_TAU_MS: f32 = 10_000.0;
+    const POSSESSION_SHARE_THRESHOLD: f32 = 0.65;
+    const LATERAL_SHARE_THRESHOLD: f32 = 0.35;
+    const LINE_GOALSIDE_SHARE_THRESHOLD: f32 = 0.75;
 
     /// Chunk 5: is a positional-attack pattern currently live for this
     /// team? `positional_attack_pattern` is only ever meaningful when
@@ -846,21 +893,26 @@ impl TeamTacticalState {
         // must be strictly goal-side, not a majority.
         let ball_x = inputs.field.ball.position.x;
         let ball_y = inputs.field.ball.position.y;
-        // Net ball displacement since the LAST refresh (~5s ago, not an
-        // instantaneous single-tick velocity sample, which would be
-        // dominated by whatever the most recent single pass/kick did).
-        // Lateral distance covered exceeding net forward/backward
-        // progress over that window is the direct, literal reading of
-        // "moves horizontally rather than back to front" — side-
-        // agnostic by construction, no attack-direction correction
-        // needed (it's a magnitude comparison, not a signed one).
+        // Net ball displacement since the LAST refresh. CORRECTED
+        // 2026-09-11 (docs/positional-play-master-design.md Part 11
+        // follow-up): this was long documented as "~5s ago" — actually
+        // false. `refresh()` (this function) is called from
+        // `refresh_tactical_states` every `BASE_TACTICAL_INTERVAL_TICKS`
+        // (25 ticks) or `TRANSITION_TACTICAL_INTERVAL_TICKS` (10 ticks)
+        // — i.e. every 100-250ms at this engine's real 10ms/tick rate,
+        // not every 5 seconds. So this is a near-instantaneous sample
+        // of the ball's current heading, not a meaningful trend over an
+        // extended window — real signal, but noisy at this timescale,
+        // which is exactly why it needs the EMA smoothing below rather
+        // than a continuous-streak requirement (see `possession_share_
+        // ema`'s own doc comment for the full story).
         let dx = (ball_x - home.last_ball_x).abs();
         let dy = (ball_y - home.last_ball_y).abs();
         // docs/positional-play-master-design.md Stage B: the literal
         // "dy > dx" reading of "moves horizontally rather than back to
         // front" turned out to be far too strict in practice — measured
         // 0.00% true across ~75,000 sampled ticks (25 matches) even with
-        // the already-applied grace window, while a completely
+        // the (since-replaced) grace window, while a completely
         // independent, ground-truth measurement (real pass-dispatch
         // chains, not this internal signal) found 74.4% of sustained
         // attacking-third possession sequences DO cross between pitch
@@ -872,59 +924,39 @@ impl TeamTacticalState {
         // substantial component (not the outright majority) matches
         // that framing without inventing a new signal.
         let ball_moving_laterally = dy > dx * 0.6;
-        let home_qualifies = home.in_possession
-            && ball_moving_laterally
-            && Self::full_line_goal_side(inputs.field, inputs.field.away_team_id, ball_x, home.ball_zone);
-        let away_qualifies = away.in_possession
-            && ball_moving_laterally
-            && Self::full_line_goal_side(inputs.field, inputs.field.home_team_id, ball_x, away.ball_zone);
+        let home_line_goalside =
+            Self::full_line_goal_side(inputs.field, inputs.field.away_team_id, ball_x, home.ball_zone);
+        let away_line_goalside =
+            Self::full_line_goal_side(inputs.field, inputs.field.home_team_id, ball_x, away.ball_zone);
         home.last_ball_x = ball_x;
         home.last_ball_y = ball_y;
         away.last_ball_x = ball_x;
         away.last_ball_y = ball_y;
-        // realism-bug (2026-09-10, Pavel: "I do not see any positional
-        // attacks"): a diagnostic that instruments `own_patient_phase`
-        // vs `settled_opponent_phase` separately (loose_patient_streak_
-        // ticks, since removed) found they were byte-for-byte identical
-        // — `own_patient_phase` was never the bottleneck. The real
-        // cause: this was a hard, zero-tolerance reset — one noisy
-        // ~5s tactical refresh where GamePhase's OWN classification
-        // flickers (a real, pre-existing instability in that
-        // computation, not something to fix here — GamePhase is
-        // load-bearing for many other mechanisms) wiped the whole
-        // streak. Measured: median PEAK streak before reset was only
-        // 3.2s — i.e. most attempts died after a single refresh cycle,
-        // essentially never surviving long enough to reach the 10s
-        // activation bar. Real football's "settled" doesn't mean
-        // "zero hiccups for 10 unbroken seconds" — it tolerates a
-        // brief wobble. Fixed with a bounded grace window: a single
-        // non-qualifying refresh no longer wipes the streak outright;
-        // it only resets once the interruption itself persists.
-        const PATIENT_PHASE_GRACE_TICKS: u32 = 600;
-        home.patient_phase_streak_ticks = if home_qualifies {
-            home.patient_phase_miss_ticks = 0;
-            home.patient_phase_streak_ticks.saturating_add(inputs.tick_interval)
-        } else {
-            home.patient_phase_miss_ticks =
-                home.patient_phase_miss_ticks.saturating_add(inputs.tick_interval);
-            if home.patient_phase_miss_ticks >= PATIENT_PHASE_GRACE_TICKS {
-                0
-            } else {
-                home.patient_phase_streak_ticks
-            }
+        // docs/positional-play-master-design.md Part 11 follow-up:
+        // replaces the old "continuous streak + grace window" mechanism
+        // (deleted — see `possession_share_ema`'s own doc comment for
+        // why) with a genuine exponential moving average per condition,
+        // per team. `dt_ms` uses this engine's real, established
+        // 10ms/tick rate (not the ~5s this refresh cadence was
+        // previously, incorrectly, assumed to run at). `alpha` is the
+        // standard EMA-from-a-time-constant conversion so the smoothing
+        // is correct regardless of how many ticks actually elapsed
+        // between refreshes (25 in steady state, 10 during a
+        // transition window) — a real Rust `.exp()`, not a
+        // per-refresh-count approximation, precisely because that
+        // count already fooled one previous design (the "two refresh
+        // cycles" comment this section replaces).
+        let dt_ms = inputs.tick_interval as f32 * 10.0;
+        let alpha = 1.0 - (-dt_ms / Self::PATIENT_EMA_TAU_MS).exp();
+        let ema_step = |prev: f32, sample: bool| -> f32 {
+            prev + (if sample { 1.0 } else { 0.0 } - prev) * alpha
         };
-        away.patient_phase_streak_ticks = if away_qualifies {
-            away.patient_phase_miss_ticks = 0;
-            away.patient_phase_streak_ticks.saturating_add(inputs.tick_interval)
-        } else {
-            away.patient_phase_miss_ticks =
-                away.patient_phase_miss_ticks.saturating_add(inputs.tick_interval);
-            if away.patient_phase_miss_ticks >= PATIENT_PHASE_GRACE_TICKS {
-                0
-            } else {
-                away.patient_phase_streak_ticks
-            }
-        };
+        home.possession_share_ema = ema_step(home.possession_share_ema, home.in_possession);
+        home.lateral_share_ema = ema_step(home.lateral_share_ema, ball_moving_laterally);
+        home.line_goalside_share_ema = ema_step(home.line_goalside_share_ema, home_line_goalside);
+        away.possession_share_ema = ema_step(away.possession_share_ema, away.in_possession);
+        away.lateral_share_ema = ema_step(away.lateral_share_ema, ball_moving_laterally);
+        away.line_goalside_share_ema = ema_step(away.line_goalside_share_ema, away_line_goalside);
 
         // Defensive line x: interpolate between "deep" (own third
         // boundary) and "high" (opponent's half) based on phase. Gives
