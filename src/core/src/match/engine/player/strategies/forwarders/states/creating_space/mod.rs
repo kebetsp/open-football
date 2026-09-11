@@ -128,12 +128,23 @@ impl ForwardCreatingSpaceState {
             .copied()
             .collect();
 
-        // If no nearby opponents, move toward goal
-        if opponents.is_empty() {
-            let forward_direction = (goal_pos - player_pos).normalize();
-            return self
-                .apply_forward_tactical_adjustment(ctx, player_pos + forward_direction * 30.0);
-        }
+        // realism-bug (2026-09-12, same investigation as the channel-
+        // positioning fix above): this used to short-circuit straight to
+        // "move toward goal" whenever no opponent was within 250u —
+        // skipping candidate generation entirely, including the width/
+        // wide-channel strategies below, which don't depend on nearby
+        // opponents at all (Strategy 3's grid scan and Strategy 4's wide
+        // channel positions are both computed independent of `opponents`,
+        // and the scorer itself uses `all_opponent_positions`, the
+        // unfiltered full list, for congestion/behind-line/offside — none
+        // of that breaks with an empty local `opponents`). A forward with
+        // no opponent nearby (common during build-up/transition, exactly
+        // where width matters most) was being forced into a pure beeline
+        // toward goal with zero chance to offer width — the single
+        // biggest remaining case this function ever ran without any
+        // width consideration. Removed; the general candidate scan below
+        // already handles an empty `opponents` correctly (Strategy 1/2
+        // just contribute nothing, everything else runs as normal).
 
         // Pre-compute values used in scoring
         let ball_holder = self.get_ball_holder(ctx);
@@ -339,13 +350,35 @@ impl ForwardCreatingSpaceState {
             score -= 50.0;
         }
 
-        // Channel positioning
+        // Channel positioning — a striker holds a central channel
+        // specifically because it's a goal threat, not as a default
+        // preference wherever he happens to be on the pitch. This term
+        // used to apply its full +20 UNCONDITIONALLY, anywhere on the
+        // field, in a band ±163.5u around the pitch centre — 60% of the
+        // pitch width — the only term in this whole function with no
+        // distance-to-goal gate at all (every other meaningful term
+        // here — angle_score, box_area_bonus, the extra +15 this same
+        // block used to add — is explicitly gated by `distance_to_goal`).
+        // Measured directly (raw position samples, not passes): forwards
+        // spent 2.4% of their own match time in the flank third, vs
+        // 24.9-28.1% for midfielders/defenders — an off-ball positioning
+        // bug, not a passing-decision one, and this unconditional,
+        // pitch-wide bonus is the dominant, previously-unexamined cause.
+        // Fixed to a genuine central-channel width (drop the 1.5x
+        // widening — channel_width alone, ~20% of the pitch, is already
+        // a real central operating zone) AND gated by the same
+        // attacking-relevance distance the rest of the function already
+        // uses, so a striker holds his channel IN the areas where doing
+        // so is a real goal threat, and is free to roam/stretch wide
+        // everywhere else — exactly the real football pattern (forwards
+        // provide an out-ball and stretch play in build-up/transition,
+        // then tuck central once genuinely dangerous).
         let field_height = ctx.context.field_size.height as f32;
         let channel_width = field_height / 5.0;
         let center = field_height / 2.0;
-        if (position.y - center).abs() < channel_width * 1.5 {
+        if distance_to_goal < 300.0 && (position.y - center).abs() < channel_width {
             score += 20.0;
-            if distance_to_goal < 300.0 {
+            if distance_to_goal < 180.0 {
                 score += 15.0;
             }
         }

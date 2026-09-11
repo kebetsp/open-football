@@ -1391,8 +1391,16 @@ impl StateProcessingHandler for ForwardRunningState {
             let qball_x = (ball_pos.x / 10.0).round() * 10.0;
             let qball_y = (ball_pos.y / 10.0).round() * 10.0;
 
-            // Smooth ball proximity (no binary switches)
-            let proximity = (1.0 - ball_distance / 400.0).clamp(0.05, 0.45);
+            // Smooth ball proximity (no binary switches).
+            // realism-bug (2026-09-12): the 0.45 ceiling meant the ball's
+            // own live Y-position — the ONE term in this blend that can
+            // genuinely reach a real flank value when the ball is
+            // actually there — never contributed more than ~22% of the
+            // final Y target (0.45 * (1-slot_weight)). Raised so a
+            // forward who IS close to a wide-positioned ball can
+            // actually follow it out there, rather than being pulled
+            // back toward a structurally central anchor regardless.
+            let proximity = (1.0 - ball_distance / 400.0).clamp(0.05, 0.65);
 
             // === UNIQUE FORWARD SLOT: spread forwards vertically ===
             let my_id = ctx.player.id;
@@ -1409,9 +1417,24 @@ impl StateProcessingHandler for ForwardRunningState {
             let slot_index = slot_index as usize;
             let total_fwds = total_fwds as usize;
 
-            // Spread forwards across 25%-75% of field height
-            let slot_y = field_height * 0.25
-                + (field_height * 0.5) * (slot_index as f32 + 0.5) / total_fwds as f32;
+            // realism-bug (2026-09-12): "spread forwards across 25%-75%
+            // of field height" is a MUCH tighter cap than it looks —
+            // for the common 2-forward case this quantile formula places
+            // both slots at the quarter-points of that sub-band (37.5%/
+            // 62.5% of the full pitch height), a genuinely narrow
+            // central corridor. Measured directly (raw position samples,
+            // not passes): forwards spent 2.4% of their own match time
+            // in the flank third vs 24.9-28.1% for midfielders/
+            // defenders — this state alone is 27.4% of a forward's
+            // total game-time, the single largest state, making it the
+            // dominant contributor. Widened to the full pitch (0%-100%,
+            // matching the natural unconstrained quantile split) — for
+            // 2 forwards this alone moves the anchor from 37.5%/62.5%
+            // toward 25%/75%, and for a genuine front three or wide
+            // forward it can now reach real flank values, which the old
+            // sub-band made mathematically impossible regardless of
+            // tuning slot_weight/proximity.
+            let slot_y = (field_height) * (slot_index as f32 + 0.5) / total_fwds as f32;
 
             // Forwards stay HIGH — target pushes well ahead of ball toward opponent goal
             let depth_stagger = attacking_direction * (slot_index as f32 * 20.0);
@@ -1432,11 +1455,32 @@ impl StateProcessingHandler for ForwardRunningState {
             // Y: blend between assigned slot and start position
             let center_y = field_height / 2.0;
             let is_wide = (start_pos.y - center_y).abs() > field_height * 0.2;
-            let slot_weight = if is_wide { 0.4 } else { 0.5 };
+            // realism-bug (2026-09-12): reduced from 0.5/0.4 alongside
+            // the slot_y widening above — even with the wider band, the
+            // slot anchor is still a fundamentally central-tending
+            // quantile position (see its own comment). Giving it less
+            // than half the blend weight lets `qball_y`/`start_pos.y`
+            // (the two terms that CAN genuinely reach a real flank
+            // value) actually move the target there when the situation
+            // calls for it, instead of being pulled back by an anchor
+            // that structurally can't follow.
+            let slot_weight = if is_wide { 0.28 } else { 0.33 };
             let ball_weight = proximity * (1.0 - slot_weight);
             let start_weight = (1.0 - slot_weight - ball_weight).max(0.0);
             let target_y =
                 slot_y * slot_weight + qball_y * ball_weight + start_pos.y * start_weight;
+
+            // realism-bug (2026-09-12), continued: a `side_density_*`-
+            // based width-stretch nudge was tried here (pull toward
+            // whichever side has fewer of the team's own players) and
+            // MEASURED to make flank occupancy WORSE (3.0%->1.7%), not
+            // better — likely both forwards (who share the same
+            // TeamTacticalState reading) chasing the identical "emptier"
+            // side simultaneously and thrashing rather than settling.
+            // Reverted per this project's own standing discipline: a
+            // measured regression doesn't ship regardless of how
+            // reasoned the theory was. Flagged as a real dead end for
+            // whoever picks this up next, not silently dropped.
 
             let target = Vector3::new(
                 target_x.clamp(30.0, field_width - 30.0),
