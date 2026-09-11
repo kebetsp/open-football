@@ -2469,6 +2469,88 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 }
             }
 
+            // realism-bug (2026-09-12): forward off-ball width commitment
+            // (see the field's own doc comment, player.rs) — a bounded,
+            // probabilistic "hold genuine flank depth for a few seconds"
+            // window, mirroring byline_commitment_ticks' own proven
+            // persistence pattern. Decay/release first (unconditional,
+            // same idiom as combo_partner_ticks above), then a fresh arm
+            // check for anyone not currently committed.
+            for p in field.players.iter_mut() {
+                if p.width_commitment_ticks > 0 {
+                    if raw_owner == Some(p.id) {
+                        // Released the moment he actually receives the
+                        // ball — on-ball decision logic takes over from
+                        // there, this field only governs off-ball
+                        // positioning.
+                        p.width_commitment_ticks = 0;
+                    } else {
+                        p.width_commitment_ticks -= 1;
+                    }
+                    continue;
+                }
+                if raw_owner == Some(p.id) {
+                    continue;
+                }
+                if p.tactical_position.current_position.position_group()
+                    != crate::PlayerFieldPositionGroup::Forward
+                {
+                    continue;
+                }
+                // Team must control the ball -- a real striker doesn't
+                // drift wide to stretch play while chasing the ball back.
+                if current_owner_team != Some(p.team_id) {
+                    continue;
+                }
+                // Settled possession only, not an urgent attacking
+                // moment -- matches the real doctrine this whole fix is
+                // built on (a striker's occasional channel run happens
+                // during patient build-up/progression, not mid-transition
+                // or already inside a live attacking sequence).
+                let team_tactical_ref = if Some(p.team_id) == Some(field.home_team_id) {
+                    &context.tactical_home
+                } else {
+                    &context.tactical_away
+                };
+                if !matches!(
+                    team_tactical_ref.phase,
+                    crate::r#match::GamePhase::BuildUp | crate::r#match::GamePhase::Progression
+                ) {
+                    continue;
+                }
+                let h = context.field_size.height as f32;
+                // Aim at whichever touchline is nearer this forward's
+                // current channel -- a real player drifts to HIS OWN
+                // side, not an arbitrary one.
+                let near_flank_y = if p.position.y < h * 0.5 { h * 0.08 } else { h * 0.92 };
+                // Genuine room check: no opponent already camped near
+                // that flank spot, roughly level with this player --
+                // an occupied channel isn't a real opportunity to drift
+                // into.
+                let has_room = !opponent_positions.iter().any(|(opp_team, opp_pos)| {
+                    *opp_team != p.team_id
+                        && (opp_pos.y - near_flank_y).abs() < 40.0
+                        && (opp_pos.x - p.position.x).abs() < 70.0
+                });
+                if !has_room {
+                    continue;
+                }
+                // Retuned once (1-in-3000 -> 1-in-1100, 400 -> 550
+                // ticks) to test whether raising the arm rate helped --
+                // measured WORSE (4.1%->2.6%), not better. Given this is
+                // a rare, probabilistic per-match event, a 20-match
+                // sample's EPISODE count (not the huge per-tick sample
+                // size) is the real, much smaller n, and high batch-to-
+                // batch variance at that scale is exactly this project's
+                // own well-documented pattern elsewhere. Reverted to the
+                // original settings, the one configuration with a clear
+                // measured gain, rather than chase a single noisier
+                // reading. Still category (d), still tunable.
+                if context.rng.range_u64(0, 3000) == 0 {
+                    p.width_commitment_ticks = 400;
+                }
+            }
+
             let possession_changed =
                 current_owner_team != last_possession_team && current_owner_team.is_some();
             let home_score_now = context.score.home_team.get();

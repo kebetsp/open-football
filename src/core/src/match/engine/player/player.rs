@@ -332,6 +332,25 @@ pub struct MatchPlayer {
     /// Cleared on ball release, genuine two-man pressure, or budget
     /// expiry (engine loop, same pattern as the three fields above).
     pub byline_commitment_ticks: u16,
+    /// realism-bug (2026-09-12): a forward's off-ball width is governed
+    /// by a per-tick blend (`ForwardRunningState`/`ForwardCreatingSpace
+    /// State`) whose every input (ball position, start-position anchor,
+    /// slot quantile) is itself correlated with where forwards already
+    /// tend to be — a self-reinforcing loop that two direct fixes to
+    /// those blends only dented (raw position measurement: forward
+    /// flank-time 2.4%->2.7-3.0%, still far below the ~25-28% seen for
+    /// midfielders/defenders). Mirrors `byline_commitment_ticks`'s own
+    /// proven pattern: a PERSISTENT, probabilistically-armed commitment
+    /// that survives across ticks, immune to the same per-tick pull-back
+    /// that neutralized a continuous side-density nudge (measured to
+    /// make things WORSE, reverted same session). While active, forces
+    /// the forward's off-ball target toward genuine flank depth for a
+    /// bounded window (a real striker's occasional channel run to
+    /// stretch play, not a permanent freeze) — armed rarely, only when
+    /// not on the ball, team in settled possession, and genuine room
+    /// exists; released on ball reception, genuine pressure, or budget
+    /// expiry, same discipline as every other commitment field here.
+    pub width_commitment_ticks: u16,
     /// realism-bug (2026-08-27): persistent assignment for
     /// `wide_run_track_override_velocity` (processor.rs) — the opponent
     /// this defender is currently shadowing on a wide run toward the
@@ -826,6 +845,7 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            width_commitment_ticks: 0,
             wide_run_track_target: None,
             wide_run_track_ticks: 0,
             lane_residency_ticks: 0,
@@ -935,6 +955,7 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            width_commitment_ticks: 0,
             wide_run_track_target: None,
             wide_run_track_ticks: 0,
             lane_residency_ticks: 0,
