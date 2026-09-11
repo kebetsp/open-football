@@ -171,8 +171,28 @@ pub fn tackle_win_probability(
     tackle_profile: f32,
 ) -> f32 {
     let minute = sc::minute_from_ms(ctx.context.total_match_time);
+    // docs/positional-play-master-design.md, Follow-up #6 (2026-09-11,
+    // target: >=8 open-play byline-reaching carries/match): an internal
+    // funnel diagnostic found ~98% of byline_commitment_ticks episodes
+    // end (ball changes possession) well before the carrier's depth
+    // crosses the near-byline threshold, while only ~31% of episodes
+    // ever trigger the specific close_defenders/single_blocker
+    // containment check -- meaning the dominant attrition is ordinary
+    // tackle duels along the way, not the containment/forced-pass
+    // mechanism (already fixed above, in `carrier_contained_pass_
+    // override`). A real winger fully committed to a byline run is
+    // playing with heightened focus and tight ball control specifically
+    // for that duel -- not a blanket dribbling buff, only active while
+    // `byline_commitment_ticks` is armed, so every other tackle duel in
+    // the match is untouched.
+    const COMMITTED_RUN_ATTACKER_BONUS: f32 = 0.20;
     let attacker_score = if let Some(att) = ctx.context.players.by_id(opponent.id) {
-        sc::dribble_attack(att, minute)
+        let base = sc::dribble_attack(att, minute);
+        if att.byline_commitment_ticks > 0 {
+            (base + COMMITTED_RUN_ATTACKER_BONUS).min(1.0)
+        } else {
+            base
+        }
     } else {
         let dribbling;
         let agility;

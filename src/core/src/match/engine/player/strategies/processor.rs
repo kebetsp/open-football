@@ -746,6 +746,38 @@ impl<'p> StateProcessor<'p> {
         if ctx.player.carrier_contained_reset_ticks == 0 || !ctx.player.has_ball(ctx) {
             return None;
         }
+        // docs/positional-play-master-design.md, Follow-up #6
+        // (2026-09-11, target: >=8 open-play byline-reaching carries/
+        // match): a match-logs diagnostic found internal
+        // byline_commitment_ticks arms firing ~23/match while the
+        // matching CROSSDIAG LOSTBALL count sat at almost exactly the
+        // same rate -- nearly every committed run was ending via a
+        // FORCED PASS (this override, unconditional at the time) long
+        // before the carrier got anywhere near the byline. This
+        // override existed to make sure a genuinely-contained carrier
+        // near goal actually releases the ball rather than dying on the
+        // vine (Follow-up #4) -- but forcing it unconditionally,
+        // wherever `carrier_contained_reset_ticks` happens to arm
+        // (including a byline-committed run's own much looser,
+        // instant-fire `single_blocker` abort check, still active deep
+        // in a developing run), was cutting runs short well before they
+        // could ever register as an external byline-reaching carry.
+        // Scoped to only force the immediate release once the carrier
+        // is ALREADY near the byline (reusing the same NEAR_BYLINE_DEPTH
+        // threshold Follow-up #5's distance-aware dwell fix already
+        // established as the genuine "act now" zone) -- far from goal,
+        // `carrier_contained_reset_bonus` (evaluator.rs) still biases
+        // the natural pass decision toward releasing, it just no longer
+        // forcibly interrupts a run that's still developing.
+        let goal_x = match ctx.player.side {
+            Some(crate::r#match::PlayerSide::Left) => ctx.context.field_size.width as f32,
+            _ => 0.0,
+        };
+        let depth_from_goal = (goal_x - ctx.player.position.x).abs();
+        const NEAR_BYLINE_DEPTH: f32 = 150.0;
+        if depth_from_goal > NEAR_BYLINE_DEPTH {
+            return None;
+        }
         match ctx.player.state {
             Forward(ForwardState::Passing)
             | Midfielder(MidfielderState::Passing)

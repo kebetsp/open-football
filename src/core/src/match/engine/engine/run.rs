@@ -1379,7 +1379,18 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 }
                 if p.byline_commitment_ticks > 0 {
                     if raw_owner != Some(p.id) {
-                        match_log_info!("CROSSDIAG LOSTBALL id={} ticks_left={}", p.id, p.byline_commitment_ticks);
+                        // TEMP DIAG (2026-09-11, Follow-up #6 funnel trace):
+                        // depth added to correlate against the ARM-time
+                        // depth already logged above, to see whether loss
+                        // is concentrated in deep-start runs or happens
+                        // close to goal too. Remove once the funnel
+                        // question is answered.
+                        let goal_x_diag = match p.side {
+                            Some(PlayerSide::Left) => context.field_size.width as f32,
+                            _ => 0.0,
+                        };
+                        let depth_diag = (goal_x_diag - p.position.x).abs();
+                        match_log_info!("CROSSDIAG LOSTBALL id={} ticks_left={} depth={:.1}", p.id, p.byline_commitment_ticks, depth_diag);
                         p.byline_commitment_ticks = 0;
                     } else {
                         // Stage 2 item 3: mirror the exact genuine-2-man-
@@ -1922,16 +1933,38 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 // carrier has actually secured it. Widened to 20-150
                 // ticks (200ms-1.5s) — settled, but still an early
                 // decision point in the possession.
+                //
+                // docs/positional-play-master-design.md, Follow-up #6
+                // (2026-09-11, target: >=8 open-play byline-reaching
+                // carries/match): the 150-tick (1.5s) ceiling meant a
+                // real winger could only ever decide to commit to a
+                // byline run in the first 1.5 seconds after FIRST
+                // receiving the ball — a real player carrying/dribbling
+                // for several seconds, finding themselves wide and open
+                // LATER in that same unbroken possession, had no path to
+                // commit at all. Real wingers commit to a run whenever
+                // they find the right moment, not only in the opening
+                // instant. Widened to 20-600 ticks (~6s) — still requires
+                // the SAME player to have held the ball continuously
+                // (a genuine, ongoing carry, not a stale flag), just no
+                // longer artificially cuts that window down to 1.5s.
                 if raw_owner != Some(p.id)
-                    || !(20..150).contains(&field.ball.ownership_duration)
+                    || !(20..600).contains(&field.ball.ownership_duration)
                 {
                     continue;
                 }
                 let group = p.tactical_position.current_position.position_group();
+                // docs/positional-play-master-design.md, Follow-up #6
+                // (target: >=8/match): a real overlapping fullback/
+                // wingback also makes this exact run in real football —
+                // excluding Defender entirely meant this whole mechanism
+                // was structurally invisible to roughly a third of the
+                // outfield roster.
                 if !matches!(
                     group,
                     crate::PlayerFieldPositionGroup::Forward
                         | crate::PlayerFieldPositionGroup::Midfielder
+                        | crate::PlayerFieldPositionGroup::Defender
                 ) {
                     continue;
                 }
@@ -1946,12 +1979,70 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     _ => 0.0,
                 };
                 let depth = (goal_x - p.position.x).abs();
-                if !(130.0..380.0).contains(&depth) {
+                // docs/positional-play-master-design.md, Follow-up #6
+                // continued (2026-09-11): 100-450 was tried and directly
+                // measured with a paired arm->outcome funnel trace (20
+                // matches, depth logged at both arm and loss moments,
+                // matched per-player in event order). Result: arms
+                // starting at depth 100-250 reach the byline 31.5% of the
+                // time (mean progress 41.8u before losing the ball) —
+                // genuinely productive. Arms starting at 250-350 reach it
+                // 0.0% of the time (mean progress only 22.0u — nowhere
+                // near enough to matter), and 350-450 reach it 0.9% of
+                // the time (mean progress 12.6u — essentially dying on
+                // the spot). Over half of all arms (227/424 paired
+                // episodes) were landing in these two unproductive
+                // buckets, contributing volume to LOSTBALL but ~0 to the
+                // actual target metric — a real, measured net negative
+                // from the earlier widening, not a neutral no-op.
+                // Narrowed to 100-280 (a small margin past the observed
+                // 250 cliff, not exactly at it) to stop arming runs that
+                // structurally cannot complete at realistic dribble
+                // speed against this engine's own defensive-recovery
+                // rate, while keeping the low-end widening (130->100),
+                // which was never implicated by this measurement.
+                if !(100.0..280.0).contains(&depth) {
                     continue;
                 }
-                let has_room = !opponent_positions.iter().any(|(team_id, pos)| {
-                    *team_id != p.team_id && (*pos - p.position).magnitude() < 9.0
-                });
+                // docs/positional-play-master-design.md, Follow-up #6
+                // continued (2026-09-11): an isotropic "nobody within Xu"
+                // check was ALWAYS the wrong shape for "has room to run"
+                // — measured directly (temporary PREROOM diagnostic,
+                // logged every tick a player was already wide + right
+                // depth + settled: 133.7 such ticks/match, but only
+                // 10.5% had an isotropic 5u radius clear). The underlying
+                // situation (wide, right depth, settled possession) is
+                // NOT rare; an isotropic radius check was discarding
+                // ~90% of it, including every case where the nearby
+                // opponent is BEHIND the carrier (already beaten — no
+                // threat to a forward run at all) or directly alongside
+                // (normal 1v1 defending a real winger runs at anyway).
+                // Follow-up: a first cut reused the containment check's
+                // own 12u ahead-radius verbatim — measured (30-match
+                // funnel) to be a NET WASH vs. the old isotropic 5u
+                // (arms 13.07->12.23/match, reached-byline 3.40->3.30):
+                // most nearby opponents in this situation ARE ahead
+                // (defenders sit goal-side by design), so exempting
+                // behind/lateral cases was offset by widening the
+                // ahead-radius from 5u to 12u for the dominant case.
+                // Kept the directional exemption (behind/lateral no
+                // longer disqualify at all — a real, defensible change
+                // on its own) but shrunk the ahead-radius to 6u, smaller
+                // than the isotropic 5u it replaces in effective area
+                // once direction is accounted for, so this is now a
+                // strict loosening in every direction rather than a
+                // wash. has_room is still "not already genuinely
+                // blocked," just tuned rather than borrowing the
+                // containment check's own already-tuned distance
+                // unverified.
+                let to_goal_sign = (goal_x - p.position.x).signum();
+                let has_room = to_goal_sign == 0.0
+                    || !opponent_positions.iter().any(|(team_id, pos)| {
+                        *team_id != p.team_id
+                            && (*pos - p.position).magnitude() <= 6.0
+                            && (pos.x - p.position.x) * to_goal_sign > 0.0
+                            && (pos.y - p.position.y).abs() <= 6.0
+                    });
                 if !has_room {
                     continue;
                 }
