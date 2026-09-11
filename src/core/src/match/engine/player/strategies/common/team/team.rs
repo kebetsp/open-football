@@ -54,23 +54,42 @@ impl<'b> TeamOperationsImpl<'b> {
 
     /// Is the attack ready to progress? True when at least one of our
     /// forwards / attacking midfielders is positioned in the final
-    /// third (≤80 u from goal). Marking is NOT a disqualifier — real
-    /// defences always mark forwards in the box, so requiring a
-    /// completely-unmarked forward made `is_attack_ready` essentially
-    /// always false against organised defences and forced the team
-    /// into permanent possession-recycle mode.
+    /// third (≤80 u from goal) AND the current ball carrier has a
+    /// genuine, currently-deliverable passing lane to at least one of
+    /// them. Marking is still NOT a disqualifier — real defences always
+    /// mark forwards in the box, so requiring the RECEIVER to be
+    /// unmarked made `is_attack_ready` essentially always false against
+    /// organised defences and forced the team into permanent
+    /// possession-recycle mode (see the git-blame history on this
+    /// function for that reverted attempt).
     ///
-    /// The signal is intentionally generous: the *forward's job* is
-    /// to receive the ball under marking and create the chance; the
-    /// recycle gate's job is to avoid blind hopeful balls when no one
-    /// is anywhere near goal at all. Distance alone covers that.
+    /// docs/positional-attack-realistic-decision-model.md, Part 3 step
+    /// 1/2 (2026-09-11): this is a genuinely different, narrower check
+    /// than the one that failed before — `has_clear_pass` is a straight-
+    /// line ray-cast between the CARRIER and the receiver (is a
+    /// defender's BODY physically standing in the passing lane right
+    /// now), not a test of whether the receiver himself is surrounded
+    /// once he gets it. A marked forward is routinely still reachable by
+    /// this test; only a forward genuinely CUT OFF by the defensive
+    /// shape (the actual "well-organized defense denies space" scenario
+    /// `should_play_possession`'s callers exist to detect) fails it. This
+    /// is what turns the doc's "look for the genuinely incisive pass
+    /// first; if it's not there, keep circulating" priority ordering into
+    /// a real, existing-machinery-only trigger — previously
+    /// `is_attack_ready` only asked "is a forward standing near goal,"
+    /// never "can I actually get the ball to him right now," so a team
+    /// facing a compact block with its forward simply blanketed out of
+    /// the passing lane never routed to the patient-possession /
+    /// circulation path at all, regardless of how genuinely closed off
+    /// progression was.
     pub fn is_attack_ready(&self) -> bool {
         let ctx = self.ctx;
         let goal_pos = ctx.player().opponent_goal_position();
         ctx.players()
             .teammates()
             .nearby_at(goal_pos, 80.0)
-            .any(|t| t.tactical_positions.is_forward() || t.tactical_positions.is_midfielder())
+            .filter(|t| t.tactical_positions.is_forward() || t.tactical_positions.is_midfielder())
+            .any(|t| ctx.player().has_clear_pass(t.id))
     }
 
     /// Should the team play in "possession mode" right now — i.e. slow
