@@ -1319,26 +1319,48 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         if genuinely_blocked && p.carrier_contained_reset_ticks == 0 {
                             p.carrier_containment_dwell_ticks =
                                 p.carrier_containment_dwell_ticks.saturating_add(1);
-                            // TESTED and REJECTED 2026-09-11: reducing
-                            // this to 1 (instant-fire, matching the
-                            // byline-committed case) was hypothesized to
-                            // help by beating the defender's own tackle
-                            // roll to the punch — measured, directly, and
-                            // it made both numbers worse (total byline-
-                            // reaching carries 8.04->5.32/match, recycle
-                            // rate 5.0%->1.5%). Real cause: a defender
-                            // merely being within 12u ANYWHERE during an
-                            // otherwise-live run (not only near the
-                            // byline) was enough to instantly abort the
-                            // run into Passing, cutting off carries
-                            // before they ever developed far enough to
-                            // reach the byline at all. Reverted. ~250ms
-                            // of sustained, genuine containment remains a
-                            // reasoned estimate (category (d)) but is
-                            // measured, not merely assumed, to be better
-                            // than the alternative.
-                            const CONTAINMENT_DWELL_THRESHOLD: u16 = 25;
-                            if p.carrier_containment_dwell_ticks >= CONTAINMENT_DWELL_THRESHOLD {
+                            // TESTED and REJECTED 2026-09-11 (kept for the
+                            // record): a GLOBAL instant-fire (threshold=1
+                            // everywhere) was hypothesized to help by
+                            // beating the defender's own tackle roll to
+                            // the punch — measured, and it made both
+                            // numbers worse (byline-reaching carries
+                            // 8.04->5.32/match, recycle rate 5.0%->1.5%),
+                            // because a defender merely being within 12u
+                            // ANYWHERE during an otherwise-live run
+                            // (not only near the byline) instantly
+                            // aborted developing runs before they ever
+                            // got there.
+                            //
+                            // FOLLOW-UP FIX, same day, per the corrected
+                            // measurement (Follow-up #4): the global
+                            // rejection doesn't mean 25 ticks is right
+                            // EVERYWHERE — it means the two zones need
+                            // different answers. Far from goal, a
+                            // developing run needs the ~250ms tolerance
+                            // to not be killed by a passing defender.
+                            // Right at the byline, the carrier has
+                            // nowhere further useful to go — waiting
+                            // there only hands the very same close
+                            // defender (within this engine's own
+                            // TACKLE_ENGAGEMENT_DISTANCE=10.0, essentially
+                            // the same radius as "genuinely_blocked"'s
+                            // own 12u) repeated tackle rolls before
+                            // containment is ever recognized. The
+                            // measured 52.9% open-play byline-carry
+                            // dispossession rate (vs. 31.4% recycled) is
+                            // consistent with exactly this. React near-
+                            // instantly once already in the danger zone;
+                            // keep the slower, already-justified dwell
+                            // everywhere else.
+                            let depth_from_goal = (goal_x - p.position.x).abs();
+                            const NEAR_BYLINE_DEPTH: f32 = 150.0;
+                            let dwell_threshold: u16 = if depth_from_goal <= NEAR_BYLINE_DEPTH {
+                                3
+                            } else {
+                                25
+                            };
+                            if p.carrier_containment_dwell_ticks >= dwell_threshold {
                                 p.carrier_contained_reset_ticks = 90;
                                 p.carrier_containment_dwell_ticks = 0;
                                 match_log_info!(
