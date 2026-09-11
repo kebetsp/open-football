@@ -197,7 +197,14 @@ impl StateProcessingHandler for DefenderCoveringState {
             }
         }
 
-        if ball_ops.is_towards_player() && ball_ops.distance() < INTERCEPTION_DISTANCE {
+        // docs/positional-play-master-design.md Stage A: by this point
+        // `opponents().with_ball().next()` was already None (the role
+        // block above returns for every case where an opponent holds
+        // the ball) — so if the ball IS owned here, it's owned by a
+        // TEAMMATE. Reacting to our own team's circulation as a threat
+        // is exactly the "scrambling" Pavel described; only a
+        // genuinely loose ball is a real, role-independent trigger.
+        if !ball_ops.is_owned() && ball_ops.is_towards_player() && ball_ops.distance() < INTERCEPTION_DISTANCE {
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Intercepting,
             ));

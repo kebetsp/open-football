@@ -14,6 +14,7 @@
 //! functions in this module. Keeping the math attached to the type
 //! makes the calculator boundary obvious from a `cargo doc` view.
 
+use crate::PlayerFieldPositionGroup;
 use crate::Tactics;
 use crate::r#match::{MatchField, PlayerSide};
 
@@ -435,6 +436,14 @@ pub struct TeamTacticalState {
     /// (a genuine, sustained interruption, not a single noisy reading),
     /// `patient_phase_streak_ticks` resets for real. See `refresh()`.
     pub patient_phase_miss_ticks: u32,
+    /// docs/positional-attack-phase-design.md, Stage 1 redefinition
+    /// (2026-09-10): ball x/y at the LAST tactical refresh, so this
+    /// refresh's net displacement (not an instantaneous single-tick
+    /// velocity sample) can be classified as lateral- vs forward-
+    /// dominant. Shared/identical for home+away (same physical ball),
+    /// same idiom as `ball_side`.
+    pub last_ball_x: f32,
+    pub last_ball_y: f32,
 }
 
 impl TeamTacticalState {
@@ -466,6 +475,8 @@ impl TeamTacticalState {
             patient_phase_streak_ticks: 0,
             same_side_ticks: 0,
             patient_phase_miss_ticks: 0,
+            last_ball_x: 0.0,
+            last_ball_y: 0.0,
         }
     }
 
@@ -523,6 +534,107 @@ impl TeamTacticalState {
     /// Recompute both teams' tactical state in-place. Called periodically
     /// from the match tick loop (every ~10 ticks is enough — phase shifts
     /// settle over multiple seconds, not every frame).
+    /// docs/positional-attack-phase-design.md, Stage 1 redefinition:
+    /// is every outfield player in AT LEAST ONE of `defending_team_id`'s
+    /// two structural bands (defence, midfield) strictly goal-side of
+    /// `ball_x`? "Full line" read literally — one player still high
+    /// disqualifies that band, but the OTHER band can still qualify.
+    /// `attacking_ball_zone` = the zone in `ball_x` from the ATTACKING
+    /// team's own perspective (their `ball_zone`). Corrected 2026-09-10
+    /// per Pavel's direct correction: "goalside alone is not enough...
+    /// only if the attackers are doing their horizontal passes next to
+    /// the box... then we should count it as defender line
+    /// participation." A defender is trivially goal-side of a ball
+    /// nowhere near them — that's normal spacing, not a defensive
+    /// structure being tested. Zone-gated: near the box (their
+    /// AttackingThird) tests the DEFENDER line specifically;
+    /// mid-pitch (MiddleThird) tests the MIDFIELD line; deep in their
+    /// own third (DefensiveThird) is the OTHER scenario (build-out
+    /// under press) and doesn't apply here.
+    fn full_line_goal_side(
+        field: &MatchField,
+        defending_team_id: u32,
+        ball_x: f32,
+        attacking_ball_zone: BallZone,
+    ) -> bool {
+        let target_group = match attacking_ball_zone {
+            BallZone::AttackingThird => PlayerFieldPositionGroup::Defender,
+            BallZone::MiddleThird => PlayerFieldPositionGroup::Midfielder,
+            BallZone::DefensiveThird => return false,
+        };
+        let check_group = |group: PlayerFieldPositionGroup| -> bool {
+            let mut saw_any = false;
+            for p in field.players.iter().filter(|p| {
+                p.team_id == defending_team_id
+                    && !p.tactical_position.current_position.is_goalkeeper()
+                    && p.tactical_position.current_position.position_group() == group
+            }) {
+                saw_any = true;
+                let goal_side = match p.side {
+                    Some(PlayerSide::Left) => p.position.x < ball_x,
+                    Some(PlayerSide::Right) => p.position.x > ball_x,
+                    None => true,
+                };
+                if !goal_side {
+                    return false;
+                }
+            }
+            saw_any
+        };
+        check_group(target_group)
+    }
+
+    /// TEMPORARY diagnostic (2026-09-10, Pavel: "the defensive line
+    /// doesn't drop deep enough between the ball and the goal") — for
+    /// a defending team, how many of each line's players are ACTUALLY
+    /// goal-side of the ball right now, out of how many, plus the mean
+    /// signed gap (positive = goal-side by that many units, negative =
+    /// this many units the WRONG side/too advanced). Answers the real
+    /// question directly instead of guessing at detector tolerances.
+    #[cfg(feature = "match-logs")]
+    pub fn line_gap_diagnostic(
+        field: &MatchField,
+        defending_team_id: u32,
+        ball_x: f32,
+        attacking_zone: BallZone,
+    ) {
+        let stats = |group: PlayerFieldPositionGroup| -> (u32, u32, f32) {
+            let mut n = 0u32;
+            let mut good = 0u32;
+            let mut sum_gap = 0.0f32;
+            for p in field.players.iter().filter(|p| {
+                p.team_id == defending_team_id
+                    && !p.tactical_position.current_position.is_goalkeeper()
+                    && p.tactical_position.current_position.position_group() == group
+            }) {
+                n += 1;
+                let gap = match p.side {
+                    Some(PlayerSide::Left) => ball_x - p.position.x,
+                    Some(PlayerSide::Right) => p.position.x - ball_x,
+                    None => 0.0,
+                };
+                if gap > 0.0 {
+                    good += 1;
+                }
+                sum_gap += gap;
+            }
+            (good, n, if n > 0 { sum_gap / n as f32 } else { 0.0 })
+        };
+        let (dg, dn, dgap) = stats(PlayerFieldPositionGroup::Defender);
+        let (mg, mn, mgap) = stats(PlayerFieldPositionGroup::Midfielder);
+        crate::match_log_info!(
+            "LINEGAPDIAG team={} zone={:?} def_goalside={}/{} def_meangap={:.1} mid_goalside={}/{} mid_meangap={:.1}",
+            defending_team_id,
+            attacking_zone,
+            dg,
+            dn,
+            dgap,
+            mg,
+            mn,
+            mgap
+        );
+    }
+
     pub fn refresh(home: &mut Self, away: &mut Self, inputs: &TacticalRefreshInputs<'_>) {
         let field = inputs.field;
         let field_width = field.size.width as f32;
@@ -695,18 +807,81 @@ impl TeamTacticalState {
             away_def_window,
         );
 
-        // docs/positional-attack-phase-design.md, Stage 1: settled-
-        // phase detector. Must run after both `.phase` values above are
-        // final (each side reads the OTHER side's phase). Home holds
-        // the ball against a settled away block, or vice versa.
-        let settled_opponent_phase = |p: GamePhase| matches!(p, GamePhase::MidBlock | GamePhase::LowBlock);
-        let own_patient_phase = |p: GamePhase| {
-            matches!(p, GamePhase::BuildUp | GamePhase::Progression | GamePhase::Attack)
-        };
-        let home_qualifies =
-            home.in_possession && own_patient_phase(home.phase) && settled_opponent_phase(away.phase);
-        let away_qualifies =
-            away.in_possession && own_patient_phase(away.phase) && settled_opponent_phase(home.phase);
+        // TEMPORARY diagnostic (docs/positional-play-master-design.md
+        // Stage A): which GamePhase each team actually spends its time
+        // in — needed to check whether DefenderRunningState's
+        // phase_dispatch (LowBlock/MidBlock -> HoldingLine default) is
+        // even reachable often, or whether most defending time is spent
+        // in other phases that fall through to less shape-disciplined
+        // logic. Removed once the investigation concludes.
+        crate::match_log_info!("PHASEDIAG team=HOME phase={:?}", home.phase);
+        crate::match_log_info!("PHASEDIAG team=AWAY phase={:?}", away.phase);
+
+        // docs/positional-attack-phase-design.md, Stage 1 — REDEFINED
+        // 2026-09-10 per Pavel's own precise definition, replacing the
+        // GamePhase-based proxy entirely: "positional attack is when
+        // the ball moves horizontally (from side to side rather than
+        // from back to front) with the defending team having at least
+        // one line closer to their own goal than the ball. Not a
+        // player, or two players. Full line." Two genuinely new,
+        // directly geometric checks — nothing reused from GamePhase.
+        //
+        // Idea-to-code conflict check (CLAUDE.md standing rule), done
+        // before writing this: `defensive_line_x` is a soft TARGET the
+        // team's shape steers toward, not real player positions — it
+        // can't answer "is every player in a line actually goal-side of
+        // the ball right now." `find_defensive_line()` finds the single
+        // deepest outfield opponent, not a whole line. Neither
+        // conflicts with or already implements this; both were checked
+        // and ruled out as reusable. `patient_attack_phase_active()`
+        // has exactly two consumers (Stage 3's drop-and-spin arm, Stage
+        // 4's circulation-switch override) — confirmed via grep — so
+        // redefining what feeds it has a small, known blast radius.
+        // Ambiguity resolved, flagged rather than silently picked:
+        // "a line" checks BOTH the Defender group and the Midfielder
+        // group (either one, entirely goal-side, counts) — not just
+        // the back four — because Pavel's own framing says this isn't
+        // box-specific ("can perfectly happen in the middle"). "Full
+        // line" is read literally: every outfield player in that group
+        // must be strictly goal-side, not a majority.
+        let ball_x = inputs.field.ball.position.x;
+        let ball_y = inputs.field.ball.position.y;
+        // Net ball displacement since the LAST refresh (~5s ago, not an
+        // instantaneous single-tick velocity sample, which would be
+        // dominated by whatever the most recent single pass/kick did).
+        // Lateral distance covered exceeding net forward/backward
+        // progress over that window is the direct, literal reading of
+        // "moves horizontally rather than back to front" — side-
+        // agnostic by construction, no attack-direction correction
+        // needed (it's a magnitude comparison, not a signed one).
+        let dx = (ball_x - home.last_ball_x).abs();
+        let dy = (ball_y - home.last_ball_y).abs();
+        // docs/positional-play-master-design.md Stage B: the literal
+        // "dy > dx" reading of "moves horizontally rather than back to
+        // front" turned out to be far too strict in practice — measured
+        // 0.00% true across ~75,000 sampled ticks (25 matches) even with
+        // the already-applied grace window, while a completely
+        // independent, ground-truth measurement (real pass-dispatch
+        // chains, not this internal signal) found 74.4% of sustained
+        // attacking-third possession sequences DO cross between pitch
+        // thirds at least once. Real positional play still makes real
+        // net forward progress even while probing side to side — Pavel's
+        // own description is "trying to drag the formation and find the
+        // space," not "the ball travels further sideways than forward
+        // in aggregate." Requiring lateral movement to be a genuine,
+        // substantial component (not the outright majority) matches
+        // that framing without inventing a new signal.
+        let ball_moving_laterally = dy > dx * 0.6;
+        let home_qualifies = home.in_possession
+            && ball_moving_laterally
+            && Self::full_line_goal_side(inputs.field, inputs.field.away_team_id, ball_x, home.ball_zone);
+        let away_qualifies = away.in_possession
+            && ball_moving_laterally
+            && Self::full_line_goal_side(inputs.field, inputs.field.home_team_id, ball_x, away.ball_zone);
+        home.last_ball_x = ball_x;
+        home.last_ball_y = ball_y;
+        away.last_ball_x = ball_x;
+        away.last_ball_y = ball_y;
         // realism-bug (2026-09-10, Pavel: "I do not see any positional
         // attacks"): a diagnostic that instruments `own_patient_phase`
         // vs `settled_opponent_phase` separately (loose_patient_streak_

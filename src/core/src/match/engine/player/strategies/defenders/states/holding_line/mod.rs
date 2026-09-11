@@ -5,23 +5,22 @@ use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondi
 use crate::r#match::player::strategies::common::players::ops::defender_skill::DefenderSkillProfile;
 use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::{
-    ConditionContext, MatchPlayerLite, StateChangeResult, StateProcessingContext,
-    StateProcessingHandler,
+    ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
 };
 
 const MAX_DEFENSIVE_LINE_DEVIATION: f32 = 35.0; // Tighter line — less room for attackers
 const BALL_PROXIMITY_THRESHOLD: f32 = 150.0; // React to ball from further out
 const MARKING_DISTANCE_THRESHOLD: f32 = 50.0; // Pick up attackers from further away
 const PRESSING_DISTANCE_THRESHOLD: f32 = 60.0; // Step out to press ball carrier earlier
-const DANGEROUS_RUN_SCAN_DISTANCE: f32 = 100.0; // Scan wider for dangerous runs
-const DANGEROUS_RUN_SPEED: f32 = 2.0; // Detect slower dangerous runs too
-const DANGEROUS_RUN_ANGLE: f32 = 0.5; // Wider angle detection for goal-bound runs
 
 #[derive(Default, Clone)]
 pub struct DefenderHoldingLineState {}
 
 impl StateProcessingHandler for DefenderHoldingLineState {
     fn process(&self, ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        // TEMPORARY diagnostic (docs/positional-play-master-design.md
+        // Stage A). Removed once the investigation concludes.
+        crate::match_log_info!("HLDIAG_ENTRY");
         // Attacking corner: centre-backs push up to attack the delivery
         // (self-terminates the instant the corner is over).
         if !ctx.player.has_ball(ctx)
@@ -64,18 +63,48 @@ impl StateProcessingHandler for DefenderHoldingLineState {
             ));
         }
 
-        // 1. Calculate the defensive line position (x-axis: goal-to-goal)
-        let defensive_line_position = self.calculate_defensive_line_position(ctx);
-
-        // 2. Calculate the distance from the defender to the defensive line
-        let distance_from_line = (ctx.player.position.x - defensive_line_position).abs();
+        // 1. My own actual zonal target — the EXACT point velocity()
+        // steers toward (own tactical slot, ball-proportional offset,
+        // compactness shift). docs/positional-play-master-design.md
+        // Stage A found this gate used to compare against a SEPARATE,
+        // more volatile reference (a blend of the live back-line
+        // average with the team's phase-driven `defensive_line_x`) —
+        // a real, structural mismatch: raw diagnostic traces showed
+        // defenders sitting within a fraction of a unit of their own
+        // start position still measuring 250+ units of "deviation",
+        // because `defensive_line_x` itself can jump by hundreds of
+        // units the instant GamePhase flips (this engine spends the
+        // majority of match time oscillating between
+        // DefensiveTransition/AttackingTransition — measured this same
+        // investigation), long before the physical line has had any
+        // chance to actually walk anywhere. A defender who hadn't moved
+        // at all was being flagged as badly out of position and kicked
+        // into Running (an explicitly chase-labelled state) purely
+        // because the abstract target moved, not because they had.
+        // Measuring against the same target `velocity()` already
+        // computes removes the mismatch by construction — the gate and
+        // the actual movement now agree on what "in position" means.
+        let ball_position = ctx.tick_context.positions.ball.position;
+        let zonal_target = self.calculate_zonal_position(ctx, ball_position);
+        let distance_from_line = (ctx.player.position.x - zonal_target.x).abs();
 
         // 3. If the defender is too far from the defensive line, switch to Running state
         if distance_from_line > MAX_DEFENSIVE_LINE_DEVIATION {
+            // TEMPORARY diagnostic (docs/positional-play-master-design.md
+            // Stage A): how often does the deviation check itself fire,
+            // and by how much. Removed once the investigation concludes.
+            crate::match_log_info!(
+                "HLDIAG_DEVIATION dist_from_line={:.1} zonal_target_x={:.1} my_x={:.1} start_x={:.1}",
+                distance_from_line,
+                zonal_target.x,
+                ctx.player.position.x,
+                ctx.player.start_position.x
+            );
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Running,
             ));
         }
+        crate::match_log_info!("HLDIAG_PASS_DEVIATION");
 
         // Loose ball nearby — go claim it directly
         if !ctx.ball().is_owned() && ctx.ball().distance() < 40.0 && ctx.ball().speed() < 3.0 {
@@ -149,7 +178,21 @@ impl StateProcessingHandler for DefenderHoldingLineState {
         // Break line to track dangerous runners if we're the best
         // positioned defender for them (no ball carrier scenario, or
         // our role was Hold).
-        if let Some(dangerous_runner) = self.scan_for_dangerous_runs(ctx) {
+        //
+        // docs/positional-play-master-design.md Stage A: this used to
+        // call this file's own PRIVATE, orphaned duplicate of
+        // `scan_for_dangerous_runs` (below), which still carried the
+        // stale `DANGEROUS_RUN_SPEED = 2.0` — a threshold the shared
+        // copy in `defensive.rs` was already found and fixed (2026-08-27)
+        // to be unreachable at this engine's real velocity scale (a
+        // fully-fit elite player tops out ~0.36-0.6 u/tick). That fix
+        // never propagated to this shadow copy, so this branch has been
+        // silently dead for any real running pace since it was written —
+        // a Hold-role defender could never actually break to track a
+        // genuine dangerous run here. Switched to the shared, already-
+        // corrected implementation (also gains its `is_opponent_being_
+        // engaged` de-duplication, which this file's own copy lacked).
+        if let Some(dangerous_runner) = ctx.player().defensive().scan_for_dangerous_runs() {
             let distance_to_runner = dangerous_runner.distance(ctx);
             if distance_to_runner < 25.0 {
                 return Some(StateChangeResult::with_defender_state(
@@ -200,19 +243,37 @@ impl StateProcessingHandler for DefenderHoldingLineState {
             }
         }
 
-        if ctx.ball().distance() < 250.0 && ctx.ball().is_towards_player_with_angle(0.8) {
-            return Some(StateChangeResult::with_defender_state(
-                DefenderState::Intercepting,
-            ));
-        }
+        // docs/positional-play-master-design.md Part 7/Stage A: both of
+        // these fired on raw ball distance/heading regardless of
+        // possession — a Cover/Hold-role defender got yanked into
+        // Marking/Intercepting the instant the ball was merely near
+        // THEM, even while a teammate held the ball (no threat at all)
+        // or while the role block above had already judged this
+        // defender shouldn't engage a live opponent carrier. Real
+        // defenders don't scramble at their own team's circulation, and
+        // a role verdict that already said "hold" shouldn't be
+        // re-litigated by a blind proximity check two lines later.
+        // Gated to a genuinely LOOSE ball (no owner at all) — the one
+        // case where "the ball entered my zone" is a real, role-
+        // independent trigger (a rebound, a loose ball nobody has
+        // claimed yet), matching Pavel's own "the ball entering their
+        // zone" as a legitimate break-shape trigger, distinct from
+        // "the ball merely exists somewhere on the pitch".
+        if !ctx.ball().is_owned() {
+            if ctx.ball().distance() < 250.0 && ctx.ball().is_towards_player_with_angle(0.8) {
+                return Some(StateChangeResult::with_defender_state(
+                    DefenderState::Intercepting,
+                ));
+            }
 
-        if ctx.ball().distance() < BALL_PROXIMITY_THRESHOLD {
-            let opponent_nearby = self.is_opponent_nearby(ctx);
-            return Some(StateChangeResult::with_defender_state(if opponent_nearby {
-                DefenderState::Marking
-            } else {
-                DefenderState::Intercepting
-            }));
+            if ctx.ball().distance() < BALL_PROXIMITY_THRESHOLD {
+                let opponent_nearby = self.is_opponent_nearby(ctx);
+                return Some(StateChangeResult::with_defender_state(if opponent_nearby {
+                    DefenderState::Marking
+                } else {
+                    DefenderState::Intercepting
+                }));
+            }
         }
 
         // Offside-trap detection used to transition into a dedicated
@@ -220,6 +281,7 @@ impl StateProcessingHandler for DefenderHoldingLineState {
         // bounced back to HoldingLine. Staying in HoldingLine with the
         // same zonal-line logic is the simpler model; if we want trap
         // pressing later, reintroduce as a team-level flag (Phase 2).
+        crate::match_log_info!("HLDIAG_HOLD");
         None
     }
 
@@ -350,75 +412,8 @@ impl DefenderHoldingLineState {
         Vector3::new(target_x, target_y, 0.0)
     }
 
-    /// Calculates the defensive line position based on team tactics and defender positions.
-    /// Uses tactical defensive line height to bias the position forward or deep.
-    fn calculate_defensive_line_position(&self, ctx: &StateProcessingContext) -> f32 {
-        let (sum_x, count) = ctx
-            .players()
-            .teammates()
-            .defenders()
-            .map(|p| p.position.x)
-            .fold((0.0f32, 0u32), |(s, c), x| (s + x, c + 1));
-
-        let avg_x = if count > 0 {
-            sum_x / count as f32
-        } else {
-            ctx.player.position.x
-        };
-
-        // Use the team-shared defensive_line_x — already phase-aware
-        // (high in Attack/HighPress, deep in LowBlock). Blend toward it
-        // rather than overwrite, so the live back-line average still
-        // matters (avoids teleporting one CB out of an organised line).
-        let target_line_x = ctx
-            .context
-            .tactical_for_team(ctx.player.team_id)
-            .defensive_line_x;
-        avg_x * 0.6 + target_line_x * 0.4
-    }
-
     /// Checks if an opponent player is nearby within the MARKING_DISTANCE_THRESHOLD.
     fn is_opponent_nearby(&self, ctx: &StateProcessingContext) -> bool {
         ctx.players().opponents().exists(MARKING_DISTANCE_THRESHOLD)
-    }
-
-    /// Scan for opponents making dangerous runs toward goal
-    fn scan_for_dangerous_runs(&self, ctx: &StateProcessingContext) -> Option<MatchPlayerLite> {
-        let own_goal_position = ctx.ball().direction_to_own_goal();
-
-        ctx.players()
-            .opponents()
-            .nearby(DANGEROUS_RUN_SCAN_DISTANCE)
-            .filter(|opp| {
-                let velocity = opp.velocity(ctx);
-                let speed = velocity.norm();
-
-                if speed < DANGEROUS_RUN_SPEED {
-                    return false;
-                }
-
-                let to_goal = (own_goal_position - opp.position).normalize();
-                let velocity_dir = velocity.normalize();
-                let alignment = velocity_dir.dot(&to_goal);
-
-                if alignment < DANGEROUS_RUN_ANGLE {
-                    return false;
-                }
-
-                let defender_x = ctx.player.position.x;
-                let is_ahead_or_close =
-                    if own_goal_position.x < ctx.context.field_size.width as f32 / 2.0 {
-                        opp.position.x < defender_x + 30.0
-                    } else {
-                        opp.position.x > defender_x - 30.0
-                    };
-
-                alignment >= DANGEROUS_RUN_ANGLE && is_ahead_or_close
-            })
-            .min_by(|a, b| {
-                let dist_a = a.distance(ctx);
-                let dist_b = b.distance(ctx);
-                dist_a.total_cmp(&dist_b)
-            })
     }
 }

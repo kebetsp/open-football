@@ -1,5 +1,6 @@
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondition};
+use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::{
     ConditionContext, MATCH_TIME_MS, StateChangeResult, StateProcessingContext,
     StateProcessingHandler, SteeringBehavior,
@@ -47,28 +48,48 @@ impl StateProcessingHandler for DefenderReturningState {
         } else {
             if ctx.ball().distance() < 100.0 {
                 if let Some(opponent) = ctx.players().opponents().with_ball().next() {
-                    // 2026-08-30 (engine-audit Module 6): was an
-                    // unconditional Tackling transition off a 100u
-                    // ball-distance proxy — the worst mismatch found in
-                    // this whole sweep (90u looser than Tackling's real
-                    // 10u gate), never checked cooldown, and didn't even
-                    // check the actual carrier's distance. Now routes
-                    // through the shared gate; falls back to Pressing
-                    // (closing the gap) when not genuinely in range yet,
-                    // same convention as every other fixed state.
-                    if ctx
-                        .player()
-                        .defensive()
-                        .can_engage_tackle(opponent.distance(ctx))
-                    {
+                    // docs/positional-play-master-design.md Stage A: this
+                    // used to break EVERY returning defender within 100u
+                    // off their walk back to shape, regardless of whether
+                    // they were actually the best-placed responder — real
+                    // football has one defender close down a carrier
+                    // while the rest keep recovering into their own
+                    // positions. Gated on the same unified Primary role
+                    // every other defensive state already uses, so only
+                    // the genuinely closest defender abandons the return
+                    // journey; everyone else keeps walking back.
+                    let is_primary = matches!(
+                        ctx.player().defensive().defensive_role_for_ball_carrier_unified(),
+                        DefensiveRole::Primary
+                    );
+                    if is_primary {
+                        // 2026-08-30 (engine-audit Module 6): was an
+                        // unconditional Tackling transition off a 100u
+                        // ball-distance proxy — the worst mismatch found in
+                        // this whole sweep (90u looser than Tackling's real
+                        // 10u gate), never checked cooldown, and didn't even
+                        // check the actual carrier's distance. Now routes
+                        // through the shared gate; falls back to Pressing
+                        // (closing the gap) when not genuinely in range yet,
+                        // same convention as every other fixed state.
+                        if ctx
+                            .player()
+                            .defensive()
+                            .can_engage_tackle(opponent.distance(ctx))
+                        {
+                            return Some(StateChangeResult::with_defender_state(
+                                DefenderState::Tackling,
+                            ));
+                        }
                         return Some(StateChangeResult::with_defender_state(
-                            DefenderState::Tackling,
+                            DefenderState::Pressing,
                         ));
                     }
-                    return Some(StateChangeResult::with_defender_state(
-                        DefenderState::Pressing,
-                    ));
-                } else {
+                } else if ctx.team().is_best_player_to_chase_ball() {
+                    // Loose ball, not an opponent's controlled carry —
+                    // only the genuinely best-placed teammate breaks off
+                    // to collect it, same discipline as every other
+                    // "loose ball nearby" check elsewhere in this file.
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::TakeBall,
                     ));

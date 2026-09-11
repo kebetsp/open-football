@@ -517,6 +517,19 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 context.tactical_away.phase,
                 context.tactical_away.ball_zone,
             );
+            let ball_x_diag = field.ball.position.x;
+            TeamTacticalState::line_gap_diagnostic(
+                field,
+                field.home_team_id,
+                ball_x_diag,
+                context.tactical_away.ball_zone,
+            );
+            TeamTacticalState::line_gap_diagnostic(
+                field,
+                field.away_team_id,
+                ball_x_diag,
+                context.tactical_home.ball_zone,
+            );
             // docs/positional-attack-phase-design.md, Stage 4's own
             // metric: does BallSideZone genuinely flip more often
             // specifically during a settled positional-attack phase.
