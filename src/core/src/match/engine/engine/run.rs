@@ -2483,9 +2483,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         // ball — on-ball decision logic takes over from
                         // there, this field only governs off-ball
                         // positioning.
+                        match_log_info!("WIDTHCOMMITDIAG release=received id={}", p.id);
                         p.width_commitment_ticks = 0;
                     } else {
                         p.width_commitment_ticks -= 1;
+                        if p.width_commitment_ticks == 0 {
+                            match_log_info!("WIDTHCOMMITDIAG release=timeout id={}", p.id);
+                        }
                     }
                     continue;
                 }
@@ -2518,6 +2522,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 ) {
                     continue;
                 }
+                match_log_info!("WIDTHCOMMITDIAG opportunity id={}", p.id);
                 let h = context.field_size.height as f32;
                 // Aim at whichever touchline is nearer this forward's
                 // current channel -- a real player drifts to HIS OWN
@@ -2535,19 +2540,34 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 if !has_room {
                     continue;
                 }
-                // Retuned once (1-in-3000 -> 1-in-1100, 400 -> 550
-                // ticks) to test whether raising the arm rate helped --
-                // measured WORSE (4.1%->2.6%), not better. Given this is
-                // a rare, probabilistic per-match event, a 20-match
-                // sample's EPISODE count (not the huge per-tick sample
-                // size) is the real, much smaller n, and high batch-to-
-                // batch variance at that scale is exactly this project's
-                // own well-documented pattern elsewhere. Reverted to the
-                // original settings, the one configuration with a clear
-                // measured gain, rather than chase a single noisier
-                // reading. Still category (d), still tunable.
+                match_log_info!("WIDTHCOMMITDIAG has_room id={}", p.id);
+                // Diagnostic trace (2026-09-12) found the REAL bottleneck
+                // was never arm frequency: opportunity fires ~33k/match,
+                // has_room passes 91% of those, arm fires ~8.7/match --
+                // all reasonably healthy. The bug: at realistic off-ball
+                // speed (~0.5u/tick), travelling from a central start to
+                // near_flank_y (up to ~228u away) takes ~450+ ticks --
+                // LONGER than the old 400-tick window itself. Most
+                // commitments were timing out mid-journey, never actually
+                // holding genuine flank position (only 24% even ended in
+                // receiving the ball; the rest spent the whole window in
+                // transit). This is why raising ARM RATE earlier made
+                // things worse, not better -- more half-finished journeys
+                // competing for the same too-short window doesn't help
+                // when the window itself is the constraint. Widened to
+                // 900 ticks (9s): ~450 ticks realistic worst-case travel
+                // + ~450 ticks of genuine hold time once there, so a
+                // completed commitment now contributes real flank-zone
+                // residence, not just transit.
                 if context.rng.range_u64(0, 3000) == 0 {
-                    p.width_commitment_ticks = 400;
+                    p.width_commitment_ticks = 900;
+                    match_log_info!(
+                        "WIDTHCOMMITDIAG arm id={} y={:.1} x={:.1} ms={}",
+                        p.id,
+                        p.position.y,
+                        p.position.x,
+                        context.total_match_time
+                    );
                 }
             }
 

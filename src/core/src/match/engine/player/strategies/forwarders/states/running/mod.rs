@@ -1313,44 +1313,26 @@ impl StateProcessingHandler for ForwardRunningState {
             let field_height = ctx.context.field_size.height as f32;
             let ball_distance = ctx.ball().distance();
 
-            // realism-bug (2026-09-12): width_commitment_ticks (see the
-            // field's own doc comment, player.rs) — while active, this
-            // takes priority over the anti-following/support logic below,
-            // exactly like round_keeper_commitment_ticks does for the
-            // on-ball branch above, so the commitment genuinely holds
-            // for its window instead of being overridden the instant a
-            // teammate nearby triggers a different rule. Target: genuine
-            // flank depth (the same near_flank_y the arm site computed
-            // from), with forward progress in X still following the
-            // ball/attacking direction as normal.
-            if ctx.player.width_commitment_ticks > 0 {
-                let near_flank_y = if ctx.player.position.y < field_height * 0.5 {
-                    field_height * 0.08
-                } else {
-                    field_height * 0.92
-                };
-                let attacking_direction = match ctx.player.side {
-                    Some(PlayerSide::Left) => 1.0,
-                    Some(PlayerSide::Right) => -1.0,
-                    None => 0.0,
-                };
-                let target_x = (ball_pos.x + attacking_direction * 40.0)
-                    .clamp(30.0, field_width - 30.0);
-                let target = Vector3::new(target_x, near_flank_y, 0.0);
-                let dist_to_target = (target - ctx.player.position).magnitude();
-                if dist_to_target < 8.0 {
-                    return Some(Vector3::zeros());
-                }
-                return Some(
-                    SteeringBehavior::Arrive {
-                        target,
-                        slowing_distance: 15.0,
-                    }
-                    .calculate(ctx.player)
-                    .velocity
-                        * fatigue_factor,
-                );
-            }
+            // realism-bug (2026-09-12, Follow-up #8): the
+            // `width_commitment_ticks` consumption block that used to
+            // live here was removed — it was the actual root cause of
+            // the state-fragmentation bug this follow-up fixed. It only
+            // ever fired while the player happened to be in THIS state
+            // (`ForwardRunningState`), so a committed player who
+            // transitioned into Pressing/Returning/CreatingSpace/
+            // Intercepting/RunningInBehind/TakeBall — which a raw
+            // position+state trace showed is where most of a commitment
+            // window is actually spent — silently ignored the
+            // commitment entirely. Replaced with a single
+            // state-independent processor override,
+            // `width_commitment_override_velocity`
+            // (`player/strategies/processor.rs`), applied after every
+            // state's own `velocity()` regardless of which state that
+            // is — see that function's doc comment for the full
+            // reasoning. Leaving both in place would have been harmless
+            // but pointless (the override always wins when the field is
+            // set), so the old, narrower path is removed rather than
+            // left as dead-but-technically-correct duplication.
 
             // SUPPORT PRESSURED TEAMMATE: carrier has the ball but is
             // under pressure — offer a close safe outlet. Previously

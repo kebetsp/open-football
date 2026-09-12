@@ -428,6 +428,19 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
+        // realism-bug (2026-09-12, Follow-up #8): forward width
+        // commitment, state-independent. Same placement/priority
+        // reasoning as give-and-go/drop-and-spin immediately above
+        // (attacking off-ball positioning, tempo-scaled, still below the
+        // defensive/legal overrides that follow) — this is what fixes
+        // the state-fragmentation bug: previously this only fired from
+        // inside `ForwardRunningState::velocity()`, so a committed
+        // player in any other forward state ignored it entirely.
+        if let Some(velocity) = Self::width_commitment_override_velocity(&processing_ctx) {
+            let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();
+            result.velocity = Some(velocity * tempo);
+        }
+
         // realism-bug (2026-08-27): defensive wide-run tracking. Applied
         // AFTER the assignment override so an explicit press/mark target
         // still wins outright (also re-checked inside the function
@@ -1218,6 +1231,66 @@ impl<'p> StateProcessor<'p> {
             .skills
             .max_speed_with_condition(player.player_attributes.condition);
         Some(to_target.normalize() * max_speed)
+    }
+
+    /// realism-bug (2026-09-12, `docs/positional-play-master-design.md`
+    /// Follow-up #8): `width_commitment_ticks`'s real bug wasn't the arm
+    /// gate (opportunity/room-check rate was already healthy) — it was
+    /// that the consumption logic lived ONLY inside
+    /// `ForwardRunningState::velocity()`. A raw position+state trace of
+    /// real arm episodes showed the committed player spends most of a
+    /// commitment window in OTHER forward states entirely (Pressing,
+    /// Returning, CreatingSpace, Intercepting, RunningInBehind,
+    /// TakeBall) — none of which ever consulted the field, so the
+    /// commitment was silently ignored whenever `process()` picked any
+    /// state but `Running`. Fixed the same way every other
+    /// state-spanning commitment in this file is fixed: a single
+    /// processor-level override that runs regardless of which state the
+    /// player's own `process()` selected, mirroring
+    /// `wide_run_track_override_velocity`/`give_and_go_run_velocity`
+    /// immediately above. This is a state-independence fix, not a new
+    /// behavior — the target geometry is unchanged from the original
+    /// `ForwardRunningState`-only version.
+    fn width_commitment_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if player.width_commitment_ticks == 0 {
+            return None;
+        }
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None; // an explicit assignment always wins
+        }
+        if matches!(ctx.player.state, Forward(ForwardState::Tackling)) {
+            return None; // don't abort a genuine tackle attempt mid-duel
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            // Should already be released to 0 by `run.rs`'s per-tick
+            // loop the instant he receives the ball; this is a defensive
+            // fallback so on-ball decision logic is never overridden.
+            return None;
+        }
+        let field_width = ctx.context.field_size.width as f32;
+        let field_height = ctx.context.field_size.height as f32;
+        let ball_pos = ctx.tick_context.positions.ball.position;
+        let near_flank_y = if player.position.y < field_height * 0.5 {
+            field_height * 0.08
+        } else {
+            field_height * 0.92
+        };
+        let attacking_direction = match player.side {
+            Some(crate::r#match::PlayerSide::Left) => 1.0,
+            Some(crate::r#match::PlayerSide::Right) => -1.0,
+            None => 0.0,
+        };
+        let target_x = (ball_pos.x + attacking_direction * 40.0).clamp(30.0, field_width - 30.0);
+        let target = Vector3::new(target_x, near_flank_y, 0.0);
+        let dist_to_target = (target - player.position).magnitude();
+        if dist_to_target < 8.0 {
+            return Some(Vector3::zeros());
+        }
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some((target - player.position).normalize() * max_speed)
     }
 
     /// Chunk 5b (docs/zone-staged-possession-progression.md): the "go"
