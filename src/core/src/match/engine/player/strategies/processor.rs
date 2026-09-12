@@ -395,6 +395,22 @@ impl<'p> StateProcessor<'p> {
             );
         }
 
+        // Kicker-mode baseline (2026-09-12, Pavel's request — see
+        // `kicker_line_hold_velocity`'s own doc comment for the full
+        // design). A full-strength override, same convention as
+        // `shape_rule_override_velocity` immediately above (which this
+        // slot deliberately mirrors) — when active it replaces whatever
+        // the state machine and every earlier override proposed for an
+        // off-ball outfield player, full stop. Every "advanced"
+        // positioning override below this point (assignment/give-and-go/
+        // drop-and-spin/width-commitment/wide-run-tracking/shot-lane-
+        // cover/shot-block-reaction/rebound-crash) is separately gated
+        // off at its own definition when kicker mode is active, so none
+        // of them can silently re-override this one later in the chain.
+        if let Some(velocity) = Self::kicker_line_hold_velocity(&processing_ctx) {
+            result.velocity = Some(velocity);
+        }
+
         // Cross-player assignment overrides (press / mark). Applied AFTER
         // the state handler so the manager's man-assignment wins over
         // normal state movement, regardless of which state the player is
@@ -585,6 +601,19 @@ impl<'p> StateProcessor<'p> {
             return complete_result(state_result, result);
         }
 
+        // Kicker-mode baseline (2026-09-12) — see `kicker_mode_pass_override`'s
+        // own doc comment. Runs after the four restart-specific forced-
+        // passing overrides above (kickoff/throw-in/free-kick still win
+        // for their own specific scenarios) and before
+        // `carrier_contained_pass_override` immediately below, which
+        // becomes unreachable while this is active (this override is a
+        // strict superset of its trigger condition) — left in place
+        // rather than separately gated, since ordering alone makes it
+        // inert.
+        if let Some(state_result) = Self::kicker_mode_pass_override(&processing_ctx) {
+            return complete_result(state_result, result);
+        }
+
         // docs/positional-play-master-design.md, Stage 3.5 follow-up
         // (2026-09-11): found by directly re-measuring the actual
         // outcome after generalizing `carrier_contained_reset_ticks` —
@@ -737,6 +766,67 @@ impl<'p> StateProcessor<'p> {
             // (`GoalkeeperPassingState`, reachable from Diving/
             // PreparingForSave) — reused rather than reinvented, and
             // already skill/pressure/space-graduated.
+            Goalkeeper(_) => Some(StateChangeResult::with_goalkeeper_state(
+                GoalkeeperState::Passing,
+            )),
+            PlayerState::Injured => None,
+        }
+    }
+
+    /// Kicker-mode on-ball decision baseline (2026-09-12, Pavel's
+    /// request — docs/kicker-mode-baseline.md). Forces ANY outfield
+    /// player straight into their role's `Passing` state the instant
+    /// they have the ball, bypassing Running/Standing/Walking/
+    /// Dribbling/CreatingSpace's own carry-vs-pass-vs-shoot value
+    /// comparisons entirely — those are exactly the "advanced" decision
+    /// logic this mode exists to strip out. `PassEvaluator::
+    /// find_best_pass_option`'s own kicker-mode branch (evaluator.rs)
+    /// then does the actual line/lane target selection once inside
+    /// Passing.
+    ///
+    /// Deliberately does NOT touch shooting: each role's `Passing`
+    /// state already has its own shot-decision check near the top of
+    /// its `process()` (e.g. `MidfielderPassingState`'s
+    /// `evaluate_forward_shot_decision` call) — routing every ball-
+    /// holder through Passing still lets a genuine chance near goal
+    /// resolve as a shot exactly where it already would have, it just
+    /// removes the EARLIER shot/carry/pass comparisons that used to run
+    /// from Running/Dribbling before a player ever reached Passing.
+    /// Real football's "hold the ball, buy time, wait for the gap" is
+    /// what this produces for the 95%+ of the pitch that isn't a
+    /// genuine chance.
+    ///
+    /// Placed after the three restart-specific forced-passing overrides
+    /// above (kickoff/throw-in/free-kick) so those still own their own
+    /// specific restart scenarios untouched, and before
+    /// `carrier_contained_pass_override` below (an "advanced" feature
+    /// this override makes structurally unreachable by ordering alone —
+    /// see that function's own call site for why it's fine left as-is
+    /// rather than separately gated).
+    fn kicker_mode_pass_override(ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        if !crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None;
+        }
+        if !ctx.player.has_ball(ctx) {
+            return None;
+        }
+        match ctx.player.state {
+            Forward(ForwardState::Passing)
+            | Midfielder(MidfielderState::Passing)
+            | Defender(DefenderState::Passing)
+            | Goalkeeper(GoalkeeperState::Passing) => None,
+            Forward(_) => Some(StateChangeResult::with_forward_state(ForwardState::Passing)),
+            Midfielder(_) => Some(StateChangeResult::with_midfielder_state(
+                MidfielderState::Passing,
+            )),
+            Defender(_) => Some(StateChangeResult::with_defender_state(
+                DefenderState::Passing,
+            )),
+            // A goalkeeper holding the ball in open play (a catch, a
+            // back-pass) gets the same treatment — his existing
+            // Passing state's own short/medium/long distribution logic
+            // is untouched, this just routes him there directly instead
+            // of via his normal Holding/ComingOut decision tree.
             Goalkeeper(_) => Some(StateChangeResult::with_goalkeeper_state(
                 GoalkeeperState::Passing,
             )),
@@ -1142,6 +1232,139 @@ impl<'p> StateProcessor<'p> {
         Some(to_target.normalize() * max_speed)
     }
 
+    /// Kicker-mode positioning baseline (2026-09-12, Pavel's request —
+    /// docs/kicker-mode-baseline.md). Opt-in via `KICKER_MODE`
+    /// (`kicker_mode::is_active()`). The goal, in his own words: "players
+    /// move in their lines passing horizontally until they find a gap to
+    /// make a pass to the next line... there should be a distance
+    /// between forwards and defenders (delay principle)". This is that
+    /// line-holding half; `kicker_mode_pass_override`/
+    /// `PassEvaluator::kicker_find_pass_option` (evaluator.rs) is the
+    /// matching on-ball decision half.
+    ///
+    /// Three lines (back/mid/front — `PlayerFieldPositionGroup::
+    /// {Defender,Midfielder,Forward}`, goalkeepers excluded) hold a real
+    /// depth separation (`LINE_GAP`) from each other. The reference
+    /// depth the lines are built from differs by possession:
+    ///   - IN possession: the ball's own depth (a proxy for the
+    ///     carrier's depth), offset by how many line-steps this
+    ///     player's own line sits from the carrier's line — teammates in
+    ///     the carrier's own line hold roughly alongside him (a
+    ///     horizontal outlet), one line ahead pushes forward to open a
+    ///     gap to receive into, one line behind drops to recycle.
+    ///   - OUT of possession: `DELAY_GAP` behind the ball (toward this
+    ///     team's own goal), floored at `MIN_DEPTH_FROM_GOAL` so the
+    ///     back line never collapses onto its own goal line — this is
+    ///     the explicit, ENFORCED version of "distance between forwards
+    ///     and defenders" Pavel asked for, not left to emerge on its
+    ///     own. Midfield/front lines (this team's own forwards, now
+    ///     defending) sit progressively less deep, `LINE_GAP` steps
+    ///     ahead of the back line — the classic compact defensive block.
+    ///
+    /// Deliberately NOT built: active lane-stepping (a defender
+    /// deliberately positioning INSIDE a specific passing lane, not just
+    /// holding a line depth). Pavel's own framing downplayed strict
+    /// lateral positioning as "not the important part" — lateral
+    /// position is left at each player's own formation slot
+    /// (`start_position.y`), and "defenders closing passing lanes"
+    /// emerges only passively, from `has_clear_pass`'s existing ray-cast
+    /// obstruction check against wherever the lines happen to stand. If
+    /// that passive effect turns out to be too weak to ever produce a
+    /// genuine "no lane, recycle" decision, active lane-stepping is the
+    /// natural next feature to add back in, not something this first
+    /// cut should reach for.
+    ///
+    /// Excluded from this positioning (matching the "can't fully
+    /// disable" list from Pavel's own request): the ball carrier (his
+    /// own movement is driven by `kicker_mode_pass_override` forcing him
+    /// into the role's Passing state), a live loose-ball chase
+    /// (TakeBall), a live 1v1 duel (Tackling), and any player currently
+    /// staged for a restart (`restart_retreat_target` — corner/free-
+    /// kick/throw-in/goal-kick teleport-and-hold machinery keeps working
+    /// untouched).
+    fn kicker_line_hold_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        use crate::r#match::player::strategies::common::kicker_mode::{self, line_index};
+
+        if !kicker_mode::is_active() {
+            return None;
+        }
+        let player = ctx.player;
+        if player.tactical_position.current_position.is_goalkeeper() {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None; // the carrier's own movement is handled elsewhere
+        }
+        match ctx.player.state {
+            Defender(DefenderState::TakeBall)
+            | Midfielder(MidfielderState::TakeBall)
+            | Forward(ForwardState::TakeBall)
+            | Defender(DefenderState::Tackling)
+            | Midfielder(MidfielderState::Tackling)
+            | Forward(ForwardState::Tackling) => return None,
+            _ => {}
+        }
+        if player.restart_retreat_target.is_some() {
+            return None; // corner/free-kick/throw-in/goal-kick staging wins
+        }
+
+        let group = player.tactical_position.current_position.position_group();
+        let field_w = ctx.context.field_size.width as f32;
+        let field_h = ctx.context.field_size.height as f32;
+        let side = player.side?;
+        let (own_goal_x, dir) = match side {
+            crate::r#match::PlayerSide::Left => (0.0_f32, 1.0_f32),
+            crate::r#match::PlayerSide::Right => (field_w, -1.0_f32),
+        };
+
+        const LINE_GAP: f32 = 110.0; // ~14m between adjacent lines
+        const MIN_DEPTH_FROM_GOAL: f32 = 60.0;
+
+        // "Progress" = distance from THIS player's own goal toward the
+        // opponent's, regardless of side — all the geometry below works
+        // in this one scalar space and converts back to absolute X only
+        // once, at the very end. Avoids the sign-juggling that a
+        // per-side `dir` multiplier invites when both a team-relative
+        // AND a cross-team comparison are needed in the same function.
+        let progress = |x: f32| (x - own_goal_x) * dir;
+        let from_progress = |d: f32| own_goal_x + dir * d;
+
+        // realism-bug (2026-09-12, first cut of this function): the
+        // original design re-anchored every tick to the BALL's current
+        // depth (in possession) with each line's offset computed
+        // relative to whichever player happened to be the CARRIER's own
+        // line that specific tick. Verified with raw position data
+        // (kicker_verify.mjs, 15 matches): the intended ~110-220u line
+        // separation washed out to ~15-23u on average — because the
+        // carrier's own line identity changes shot to shot (sometimes a
+        // defender carries, sometimes a forward), a role's offset
+        // FLIPS SIGN depending on who's on the ball right now, and that
+        // flipping cancels out under a time-average. Replaced with
+        // `TeamTacticalState.defensive_line_x` — already a STABLE,
+        // phase-aware, once-per-tick team-level depth (pushes higher in
+        // Attack/HighPress, drops in LowBlock; see its own doc comments
+        // in teamplay/tactical.rs) that doesn't reset identity based on
+        // who's touching the ball. Every line is now a FIXED real offset
+        // from this one stable reference, so the intended separation
+        // can't average itself away the same way.
+        let back_line_progress = progress(ctx.team().tactical().defensive_line_x)
+            .max(MIN_DEPTH_FROM_GOAL);
+        let my_line_progress = back_line_progress + LINE_GAP * line_index(group) as f32;
+        let target_x = from_progress(my_line_progress).clamp(20.0, field_w - 20.0);
+        let target_y = player.start_position.y.clamp(15.0, field_h - 15.0);
+        let target = Vector3::new(target_x, target_y, 0.0);
+
+        let to_target = target - player.position;
+        let dist = to_target.magnitude();
+        if dist < 3.0 {
+            return Some(Vector3::zeros());
+        }
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some(to_target.normalize() * max_speed * 0.65)
+    }
+
     /// Milestone 13 (possession-decision-intelligence PRD) —
     /// event-triggered reaction to a loose ball after a block, parry, or
     /// deflection. Architecturally different from every other milestone
@@ -1187,6 +1410,9 @@ impl<'p> StateProcessor<'p> {
     /// the fullback-tracks-the-winger duty real football has and this
     /// engine never modeled.
     fn wide_run_track_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None; // kicker-mode baseline: gated off, see kicker_line_hold_velocity
+        }
         let player = ctx.player;
         if player.press_target.is_some() || player.mark_target.is_some() {
             return None; // an explicit assignment always wins
@@ -1252,6 +1478,9 @@ impl<'p> StateProcessor<'p> {
     /// behavior — the target geometry is unchanged from the original
     /// `ForwardRunningState`-only version.
     fn width_commitment_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None; // kicker-mode baseline: gated off, see kicker_line_hold_velocity
+        }
         let player = ctx.player;
         if player.width_commitment_ticks == 0 {
             return None;
@@ -1315,6 +1544,9 @@ impl<'p> StateProcessor<'p> {
     /// pass-value machinery rewards feeding an open teammate on its
     /// own.
     fn give_and_go_run_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None; // kicker-mode baseline: gated off, see kicker_line_hold_velocity
+        }
         let player = ctx.player;
         if player.press_target.is_some() || player.mark_target.is_some() {
             return None; // an explicit assignment always wins
@@ -1355,6 +1587,9 @@ impl<'p> StateProcessor<'p> {
     /// automatically held onside without this function needing its
     /// own copy of that logic.
     fn drop_and_spin_run_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None; // kicker-mode baseline: gated off, see kicker_line_hold_velocity
+        }
         let player = ctx.player;
         if player.press_target.is_some() || player.mark_target.is_some() {
             return None; // an explicit assignment always wins
@@ -1418,6 +1653,9 @@ impl<'p> StateProcessor<'p> {
     /// signal than this function's predictive "toward goal centre"
     /// proxy for where the shot will actually go.
     fn shot_lane_cover_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None; // kicker-mode baseline: gated off (no shots dispatched anyway)
+        }
         let player = ctx.player;
         if player.press_target.is_some() || player.mark_target.is_some() {
             return None; // an explicit assignment always wins
@@ -1561,6 +1799,9 @@ impl<'p> StateProcessor<'p> {
     /// (§13.3's own established rule: no generic outfield block chance
     /// beyond the wall for an already-in-flight dead-ball strike).
     fn shot_block_reaction_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None; // kicker-mode baseline: gated off (no shots dispatched anyway)
+        }
         let player = ctx.player;
         if player.press_target.is_some() || player.mark_target.is_some() {
             return None; // an explicit assignment always wins
@@ -1615,6 +1856,9 @@ impl<'p> StateProcessor<'p> {
     }
 
     fn rebound_crash_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None; // kicker-mode baseline: gated off (no shots dispatched anyway)
+        }
         let player = ctx.player;
         if player.press_target.is_some() || player.mark_target.is_some() {
             return None; // an explicit assignment always wins

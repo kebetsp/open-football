@@ -1578,6 +1578,119 @@ impl PassEvaluator {
         }
     }
 
+    /// Kicker-mode deterministic pass-target search (2026-09-12, Pavel's
+    /// request — docs/kicker-mode-baseline.md, the on-ball half;
+    /// `kicker_line_hold_velocity`/`kicker_mode_pass_override`,
+    /// processor.rs, are the positioning/state-forcing halves). Replaces
+    /// the full value-scored evaluator below with the deliberately
+    /// simple decision Pavel described: same line (horizontal) first,
+    /// then one line forward through a genuinely open lane, then one
+    /// line back to recycle, then — for a defender specifically — the
+    /// goalkeeper as a last resort. Each tier picks the NEAREST
+    /// clear-lane candidate (a simple, safe "quick combination" bias,
+    /// not a value comparison) rather than scoring every candidate the
+    /// way the full evaluator does.
+    ///
+    /// "Defenders closing passing lanes" is deliberately NOT built as
+    /// active lane-stepping here — `has_clear_pass`'s existing ray-cast
+    /// obstruction check already does the "is this lane actually open"
+    /// job against wherever `kicker_line_hold_velocity` has the
+    /// defending lines standing; this function only asks that question,
+    /// it doesn't try to engineer the obstruction itself.
+    ///
+    /// Returns `None` when literally no candidate qualifies at any tier
+    /// within `max_distance` — the caller (`find_best_pass_option`,
+    /// immediately below) falls back to the full evaluator in that case,
+    /// so kicker mode can never permanently strand a possession.
+    fn kicker_find_pass_option(
+        ctx: &StateProcessingContext,
+        max_distance: f32,
+    ) -> Option<(MatchPlayerLite, &'static str)> {
+        use crate::PlayerFieldPositionGroup;
+        use crate::r#match::player::strategies::common::kicker_mode::line_index;
+
+        let my_group = ctx.player.tactical_position.current_position.position_group();
+        if my_group == PlayerFieldPositionGroup::Goalkeeper {
+            return None; // GK passing untouched — let the normal evaluator run
+        }
+        let my_index = line_index(my_group);
+
+        let pick_clear = |candidates: Vec<MatchPlayerLite>| -> Option<MatchPlayerLite> {
+            candidates
+                .into_iter()
+                .filter(|c| {
+                    let d = ctx.player().distance_to_player(c.id);
+                    d > 0.0 && d <= max_distance && ctx.player().has_clear_pass(c.id)
+                })
+                .min_by(|a, b| {
+                    let da = ctx.player().distance_to_player(a.id);
+                    let db = ctx.player().distance_to_player(b.id);
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                })
+        };
+
+        let by_group = |g: PlayerFieldPositionGroup| -> Vec<MatchPlayerLite> {
+            match g {
+                PlayerFieldPositionGroup::Defender => {
+                    ctx.players().teammates().defenders().collect()
+                }
+                PlayerFieldPositionGroup::Midfielder => {
+                    ctx.players().teammates().midfielders().collect()
+                }
+                PlayerFieldPositionGroup::Forward => {
+                    ctx.players().teammates().forwards().collect()
+                }
+                PlayerFieldPositionGroup::Goalkeeper => ctx
+                    .players()
+                    .teammates()
+                    .all()
+                    .filter(|p| {
+                        p.tactical_positions.position_group()
+                            == PlayerFieldPositionGroup::Goalkeeper
+                    })
+                    .collect(),
+            }
+        };
+
+        // 1. Same line (horizontal).
+        if let Some(mate) = pick_clear(by_group(my_group)) {
+            return Some((mate, "KICKER_SAME_LINE"));
+        }
+
+        // 2. One line forward, through an open gap.
+        if my_index < 2 {
+            let forward_group = if my_index == 0 {
+                PlayerFieldPositionGroup::Midfielder
+            } else {
+                PlayerFieldPositionGroup::Forward
+            };
+            if let Some(mate) = pick_clear(by_group(forward_group)) {
+                return Some((mate, "KICKER_FORWARD_GAP"));
+            }
+        }
+
+        // 3. One line back, to recycle.
+        if my_index > 0 {
+            let back_group = if my_index == 1 {
+                PlayerFieldPositionGroup::Defender
+            } else {
+                PlayerFieldPositionGroup::Midfielder
+            };
+            if let Some(mate) = pick_clear(by_group(back_group)) {
+                return Some((mate, "KICKER_RECYCLE"));
+            }
+        }
+
+        // 4. Defenders' last resort: back to the goalkeeper.
+        if my_group == PlayerFieldPositionGroup::Defender {
+            if let Some(mate) = pick_clear(by_group(PlayerFieldPositionGroup::Goalkeeper)) {
+                return Some((mate, "KICKER_RECYCLE_GK"));
+            }
+        }
+
+        None
+    }
+
     /// Find the best pass option from available teammates with skill-based personality
     /// Returns (teammate, reason) tuple
     pub fn find_best_pass_option(
@@ -1631,6 +1744,18 @@ impl PassEvaluator {
         } else {
             max_distance
         };
+
+        // Kicker-mode baseline (2026-09-12) — see `kicker_find_pass_option`'s
+        // own doc comment for the full design. A `None` here means no
+        // same-line/next-line/recycle candidate qualified at all (rare);
+        // rather than truly returning None (which would strand the
+        // possession), fall through to the normal evaluator below as a
+        // safety net.
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            if let Some(result) = Self::kicker_find_pass_option(ctx, max_distance) {
+                return Some(result);
+            }
+        }
 
         let mut best_option: Option<MatchPlayerLite> = None;
         let mut best_score = 0.0;

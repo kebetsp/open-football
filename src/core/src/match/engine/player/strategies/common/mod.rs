@@ -1,4 +1,5 @@
 pub mod ball;
+pub mod kicker_mode;
 pub mod passing;
 pub mod players;
 pub mod set_pieces;
