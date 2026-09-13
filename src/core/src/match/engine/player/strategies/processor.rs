@@ -1382,46 +1382,59 @@ impl<'p> StateProcessor<'p> {
         let field_w = ctx.context.field_size.width as f32;
         let field_h = ctx.context.field_size.height as f32;
         let side = player.side?;
-        let (own_goal_x, dir) = match side {
+        let (_own_goal_x, dir) = match side {
             crate::r#match::PlayerSide::Left => (0.0_f32, 1.0_f32),
             crate::r#match::PlayerSide::Right => (field_w, -1.0_f32),
         };
 
-        const LINE_GAP: f32 = 110.0; // ~14m between adjacent lines
-        const MIN_DEPTH_FROM_GOAL: f32 = 60.0;
         const MIN_MARK_GAP: f32 = 24.0; // 3m — the sourced floor, not a ceiling
 
-        // "Progress" = distance from THIS player's own goal toward the
-        // opponent's, regardless of side — all the geometry below works
-        // in this one scalar space and converts back to absolute X only
-        // once, at the very end. Avoids the sign-juggling that a
-        // per-side `dir` multiplier invites when both a team-relative
-        // AND a cross-team comparison are needed in the same function.
-        let progress = |x: f32| (x - own_goal_x) * dir;
-        let from_progress = |d: f32| own_goal_x + dir * d;
+        // realism-bug (2026-09-12, first cut of this function, now
+        // superseded): re-anchoring each team's lines to that team's OWN
+        // `TeamTacticalState.defensive_line_x` fixed the earlier "washes
+        // out under a time-average" bug (kept in git history), but each
+        // team computed its 3 lines completely independently — nothing
+        // ever checked that the two teams' six lines actually interleave
+        // in the right ORDER along the pitch. Pavel's follow-up
+        // (2026-09-13) named the exact required sequence end to end:
+        // [side-A defence, side-B forwards, side-A midfield, side-B
+        // midfield, side-A forwards, side-B defence] — i.e. each side's
+        // forward line sits just short of the OPPONENT's goal, each
+        // side's defence sits just in front of its OWN goal, and the
+        // two midfields meet in between. That's not something two
+        // independently-computed team depths can guarantee by
+        // construction; it needs one SHARED reference both sides are
+        // offset from, in a fixed relative order that can never cross.
+        //
+        // `center` — the ball's own X — is that shared reference: all
+        // six bands shift together as the ball moves up and down the
+        // pitch, but their relative order is baked into the formula
+        // itself, not something ball position or phase can ever
+        // scramble. Clamped well inside the pitch so even the outermost
+        // bands (defence/defence, the widest offset) never go off it.
+        const BAND_GAP: f32 = 55.0; // half of the old LINE_GAP — see below
+        const MAX_HALF_SPAN: f32 = 2.5 * BAND_GAP;
+        let center = ctx
+            .tick_context
+            .positions
+            .ball
+            .position
+            .x
+            .clamp(MAX_HALF_SPAN + 20.0, field_w - MAX_HALF_SPAN - 20.0);
 
-        // realism-bug (2026-09-12, first cut of this function): the
-        // original design re-anchored every tick to the BALL's current
-        // depth (in possession) with each line's offset computed
-        // relative to whichever player happened to be the CARRIER's own
-        // line that specific tick. Verified with raw position data
-        // (kicker_verify.mjs, 15 matches): the intended ~110-220u line
-        // separation washed out to ~15-23u on average — because the
-        // carrier's own line identity changes shot to shot (sometimes a
-        // defender carries, sometimes a forward), a role's offset
-        // FLIPS SIGN depending on who's on the ball right now, and that
-        // flipping cancels out under a time-average. Replaced with
-        // `TeamTacticalState.defensive_line_x` — already a STABLE,
-        // phase-aware, once-per-tick team-level depth (pushes higher in
-        // Attack/HighPress, drops in LowBlock; see its own doc comments
-        // in teamplay/tactical.rs) that doesn't reset identity based on
-        // who's touching the ball. Every line is now a FIXED real offset
-        // from this one stable reference, so the intended separation
-        // can't average itself away the same way.
-        let back_line_progress = progress(ctx.team().tactical().defensive_line_x)
-            .max(MIN_DEPTH_FROM_GOAL);
-        let my_line_progress = back_line_progress + LINE_GAP * line_index(group) as f32;
-        let target_x = from_progress(my_line_progress).clamp(20.0, field_w - 20.0);
+        // Slot index along the pitch, LOW to HIGH x, per Pavel's exact
+        // sequence: 1=Left-Defender, 2=Right-Forward, 3=Left-Midfielder,
+        // 4=Right-Midfielder, 5=Left-Forward, 6=Right-Defender. Solving
+        // for a single closed-form offset in units of BAND_GAP (verified
+        // against all 6 cases): `dir * (2*line_index(group) - 2.5)`,
+        // where `dir` is already +1 for Left / -1 for Right. This keeps
+        // each side's OWN three lines exactly 2 slots (2*BAND_GAP = 110
+        // units, matching the original per-team LINE_GAP) apart, while
+        // guaranteeing the two sides' lines can never cross — they're
+        // permanently locked to alternating slots around one shared
+        // centre, not derived independently.
+        let slot_offset = dir * (2.0 * line_index(group) as f32 - 2.5);
+        let target_x = (center + slot_offset * BAND_GAP).clamp(20.0, field_w - 20.0);
         let target_y = player.start_position.y.clamp(15.0, field_h - 15.0);
         let mut target = Vector3::new(target_x, target_y, 0.0);
 
