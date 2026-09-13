@@ -810,27 +810,66 @@ impl<'p> StateProcessor<'p> {
         if !ctx.player.has_ball(ctx) {
             return None;
         }
+        // realism-bug (2026-09-13, "small bursts like an inkjet
+        // printer" investigation): originally a DENYLIST — force
+        // Passing from ANY non-Passing state, with specific "already
+        // resolved" states (Dribbling, Shooting, DistanceShooting,
+        // Clearing) exempted one at a time as raw ball-position tracing
+        // caught each one causing a Passing<->X ping-pong (each role's
+        // own Passing state has a bail-out for "no pass found" —
+        // Dribbling, a Shooting attempt, DefenderPassingState's own
+        // pressure-driven Clearing — and this override was immediately
+        // reverting every one of them on the very next tick, resetting
+        // the scan timer and re-running the identical failed search;
+        // one measured freeze ran 20+ SECONDS of simulated time,
+        // nowhere near a restart or a real first-touch pause). Chasing
+        // each newly-discovered bail-out state individually didn't
+        // converge — there is no guarantee every "already resolved"
+        // state has now been found.
+        //
+        // Rebuilt as an ALLOWLIST instead: force Passing ONLY from the
+        // small set of states that represent "just has the ball, hasn't
+        // decided anything yet" — the states that would otherwise run
+        // the old carry-vs-pass-vs-shoot value comparison this whole
+        // mode exists to bypass. Everything else (any bail-out the base
+        // game already has, discovered or not) is left alone by
+        // construction, not enumerated.
+        let already_deciding = matches!(
+            ctx.player.state,
+            Forward(ForwardState::Standing)
+                | Forward(ForwardState::Walking)
+                | Forward(ForwardState::Running)
+                | Midfielder(MidfielderState::Standing)
+                | Midfielder(MidfielderState::Walking)
+                | Midfielder(MidfielderState::Running)
+                | Defender(DefenderState::Standing)
+                | Defender(DefenderState::Walking)
+                | Defender(DefenderState::Running)
+        );
+        if already_deciding {
+            return match ctx.player.state {
+                Forward(_) => Some(StateChangeResult::with_forward_state(ForwardState::Passing)),
+                Midfielder(_) => Some(StateChangeResult::with_midfielder_state(
+                    MidfielderState::Passing,
+                )),
+                Defender(_) => Some(StateChangeResult::with_defender_state(
+                    DefenderState::Passing,
+                )),
+                _ => None,
+            };
+        }
+        // A goalkeeper holding the ball in open play (a catch, a
+        // back-pass) gets the same treatment as before — his decision
+        // tree is much simpler (no carry/pass/shoot value comparison to
+        // bypass) and wasn't implicated in any of the loops found above,
+        // so this one keeps the original "force unless already Passing"
+        // shape rather than switching to the allowlist.
         match ctx.player.state {
-            Forward(ForwardState::Passing)
-            | Midfielder(MidfielderState::Passing)
-            | Defender(DefenderState::Passing)
-            | Goalkeeper(GoalkeeperState::Passing) => None,
-            Forward(_) => Some(StateChangeResult::with_forward_state(ForwardState::Passing)),
-            Midfielder(_) => Some(StateChangeResult::with_midfielder_state(
-                MidfielderState::Passing,
-            )),
-            Defender(_) => Some(StateChangeResult::with_defender_state(
-                DefenderState::Passing,
-            )),
-            // A goalkeeper holding the ball in open play (a catch, a
-            // back-pass) gets the same treatment — his existing
-            // Passing state's own short/medium/long distribution logic
-            // is untouched, this just routes him there directly instead
-            // of via his normal Holding/ComingOut decision tree.
+            Goalkeeper(GoalkeeperState::Passing) => None,
             Goalkeeper(_) => Some(StateChangeResult::with_goalkeeper_state(
                 GoalkeeperState::Passing,
             )),
-            PlayerState::Injured => None,
+            _ => None,
         }
     }
 

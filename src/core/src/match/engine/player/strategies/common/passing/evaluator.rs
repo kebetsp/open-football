@@ -1615,12 +1615,36 @@ impl PassEvaluator {
         }
         let my_index = line_index(my_group);
 
+        // realism-bug (2026-09-13, "small bursts like an inkjet
+        // printer" investigation, part 2): `DefenderPassingState`'s own
+        // pre-existing "ANTI-LOOP" guard (defenders/states/passing/
+        // mod.rs, predates kicker mode entirely) silently REJECTS any
+        // dispatched target under 30 units away — exactly the "pick the
+        // nearest clear-lane candidate" choice this function was making
+        // for same-line combinations, especially early in a passage of
+        // play before a line has spread out. The rejection doesn't
+        // error or fall back cleanly; it just means nothing gets
+        // dispatched that tick, `DefenderPassingState` runs its own
+        // time-based fallback (Running/Clearing), and
+        // `kicker_mode_pass_override` immediately forces the player
+        // straight back into Passing on the very next tick — a real,
+        // measured loop (raw ball-position tracing: one player cycling
+        // Passing<->Running every ~1-2s for a continuous 20-second
+        // stretch, ball essentially frozen the whole time). A textbook
+        // instance of the project's own "Idea-to-code conflict check"
+        // gap: this guard already existed and was never checked before
+        // `kicker_find_pass_option`'s nearest-candidate tie-break was
+        // built. `MIN_PASS_DISTANCE` reuses the guard's own 30-unit
+        // threshold directly rather than inventing a second number.
+        const MIN_PASS_DISTANCE: f32 = 30.0;
         let pick_clear = |candidates: Vec<MatchPlayerLite>| -> Option<MatchPlayerLite> {
             candidates
                 .into_iter()
                 .filter(|c| {
                     let d = ctx.player().distance_to_player(c.id);
-                    d > 0.0 && d <= max_distance && ctx.player().has_clear_pass(c.id)
+                    d >= MIN_PASS_DISTANCE
+                        && d <= max_distance
+                        && ctx.player().has_clear_pass(c.id)
                 })
                 .min_by(|a, b| {
                     let da = ctx.player().distance_to_player(a.id);
@@ -1681,13 +1705,15 @@ impl PassEvaluator {
             }
         }
 
-        // 4. Defenders' last resort: back to the goalkeeper.
-        if my_group == PlayerFieldPositionGroup::Defender {
-            if let Some(mate) = pick_clear(by_group(PlayerFieldPositionGroup::Goalkeeper)) {
-                return Some((mate, "KICKER_RECYCLE_GK"));
-            }
-        }
-
+        // Deliberately no 4th tier recycling to the goalkeeper: a pass
+        // toward your own GK is close to directly backward, which trips
+        // the SAME anti-loop `forward_component > -0.3` guard mentioned
+        // above regardless of distance — trying to hand-pick a GK
+        // target here would just relocate the identical bug rather than
+        // fix it. Falls through to the full evaluator instead (below),
+        // which already knows how to pick a target that clears this
+        // guard — it's what defenders use for this exact case outside
+        // kicker mode.
         None
     }
 

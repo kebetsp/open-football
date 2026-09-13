@@ -106,7 +106,31 @@ impl StateProcessingHandler for ForwardPassingState {
             // Apply reduced separation to avoid interference with deliberate movement
             let separation = ctx.player().separation_velocity() * 0.3;
 
-            return Some(steering_velocity + separation);
+            // realism-bug (2026-09-13, "ball carrier moves directly
+            // vertically, in bursts" investigation -- see
+            // MidfielderPassingState::velocity()'s own doc comment for
+            // the full ground-truth trace): `separation_velocity()`'s
+            // internal cap (40.0) is a raw force magnitude, not a real
+            // per-tick speed, and nothing downstream of this function
+            // clamps the combined result to the player's actual
+            // max_speed -- even damped 0.3x it can still exceed
+            // max_speed when a teammate is close, on top of an
+            // already-real-speed-scaled `steering_velocity`. A
+            // teammate a few units away is common, everyday geometry,
+            // not an edge case, so this was a real (smaller-magnitude
+            // than the sibling bug, per the ground-truth trace) source
+            // of the same stop/go burst pattern.
+            let combined = steering_velocity + separation;
+            let max_speed = ctx
+                .player
+                .skills
+                .max_speed_with_condition(ctx.player.player_attributes.condition);
+            let magnitude = combined.magnitude();
+            return Some(if magnitude > max_speed {
+                combined * (max_speed / magnitude)
+            } else {
+                combined
+            });
         }
 
         None

@@ -204,7 +204,35 @@ impl StateProcessingHandler for DefenderMarkingState {
             // Recovery-run mult bakes pace/stamina/condition into a
             // 0.58..1.05 multiplier so tired markers can't keep up
             // with fast attackers.
-            let speed = ctx.player.skills.physical.pace * urgency * def_profile.recovery_run_mult;
+            //
+            // realism-bug (2026-09-13, "ball carrier moves directly
+            // vertically, in bursts" investigation): `skills.physical.
+            // pace` is a raw 1-20 SKILL RATING, not a per-tick speed --
+            // used directly here it could reach `20 * 2.0(urgency) *
+            // 1.05(recovery) * 1.3(threat_boost) ~= 54.6` units/tick,
+            // ~90x a real player's actual top speed
+            // (max_speed_with_condition is ~0.36-0.6 units/tick, which
+            // already bakes pace/acceleration into a real scale --
+            // same pattern already established and used everywhere
+            // else in this codebase). Surfaced by the same ground-truth
+            // trace (duel_debug's own recorded `has_ball`/velocity):
+            // when a marker wins the ball mid-duel, his state doesn't
+            // transition off Marking until the NEXT tick's `process()`
+            // runs, so this exact velocity computation fires for one
+            // real tick while he already, genuinely has the ball --
+            // and was, after fixing the larger sibling bug in the
+            // Passing states, the single largest remaining source of
+            // carrier bursting in the same measurement (87.5% of
+            // vertical-classified carrier jerk samples). `urgency`/
+            // `recovery_run_mult`/`threat_boost` are still legitimate
+            // multipliers on top of a REAL base speed -- only the base
+            // itself was wrong.
+            let speed = ctx
+                .player
+                .skills
+                .max_speed_with_condition(ctx.player.player_attributes.condition)
+                * urgency
+                * def_profile.recovery_run_mult;
 
             let threat_boost = if opponent_to_mark.has_ball(ctx) && distance < 20.0 {
                 1.3

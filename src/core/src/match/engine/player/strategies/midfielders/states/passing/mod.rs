@@ -172,6 +172,35 @@ impl StateProcessingHandler for MidfielderPassingState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        // realism-bug (2026-09-13, "ball carrier moves directly
+        // vertically, in bursts" investigation): `separation_velocity()`
+        // is a shared, broadly-used helper whose internal cap (40.0) is
+        // a raw force magnitude, not a real per-tick speed -- and
+        // `move_to()` applies `position += velocity` with no downstream
+        // clamp anywhere in the pipeline. Both branches below add it on
+        // top of an already-real-speed-scaled steering term with
+        // nothing capping the SUM, so a nearby teammate (a common,
+        // everyday occurrence, not an edge case) could send the final
+        // velocity far past any player's actual top speed for exactly
+        // as long as the trigger condition held, then drop back to
+        // near-zero the instant it didn't -- a genuine stop/go burst,
+        // not smooth accel/decel. `clamp_to_max_speed` is the shared
+        // safety net for both branches; ground-truth verified (engine's
+        // own recorded velocity magnitude, not reconstructed from
+        // position deltas) via a temporary diagnostic before this fix.
+        let max_speed = ctx
+            .player
+            .skills
+            .max_speed_with_condition(ctx.player.player_attributes.condition);
+        let clamp_to_max_speed = |v: Vector3<f32>| -> Vector3<f32> {
+            let magnitude = v.magnitude();
+            if magnitude > max_speed {
+                v * (max_speed / magnitude)
+            } else {
+                v
+            }
+        };
+
         // If under heavy pressure, shield the ball and create space
         if self.is_under_heavy_pressure(ctx) {
             // Move away from nearest opponent to create passing space
@@ -183,22 +212,46 @@ impl StateProcessingHandler for MidfielderPassingState {
                     (ctx.player().opponent_goal_position() - ctx.player.position).normalize();
                 let perpendicular = Vector3::new(-to_goal.y, to_goal.x, 0.0);
                 let escape_direction = (away_from_opponent * 0.7 + perpendicular * 0.3).normalize();
-                return Some(escape_direction * 2.5 + ctx.player().separation_velocity());
+                // realism-bug (same investigation): this used to be a
+                // raw `escape_direction * 2.5` -- an unscaled velocity
+                // MAGNITUDE, not a fraction of the player's real
+                // max_speed like every other velocity computation in
+                // this codebase (`unit_vector * max_speed`). 2.5
+                // units/tick is ~250 units/second (~31 m/s at this
+                // engine's 8-units/metre scale), 4-7x any real player's
+                // actual top speed (max_speed_with_condition is
+                // ~0.36-0.6 units/tick) -- a genuine teleport, not a
+                // sprint. `perpendicular` is a 90-degree rotation of
+                // the goal-direction vector (dominantly the pitch's X
+                // axis), so it's dominantly Y (screen-vertical) by
+                // construction and blended in at 30% weight -- this is
+                // the confirmed, dominant source of the reported
+                // vertical-specific bursting (ground-truth measured:
+                // carrier tick-to-tick speed change ~3.6x higher for
+                // vertical-dominant movement than horizontal,
+                // concentrated almost entirely in "Midfielder: Passing"
+                // samples). Scaled to the real max_speed, damped
+                // separation contribution (0.3x, matching
+                // ForwardPassingState's own established precedent for
+                // combining separation with an already-scaled steering
+                // term), then clamped as a final safety net.
+                let combined = escape_direction * max_speed
+                    + ctx.player().separation_velocity() * 0.3;
+                return Some(clamp_to_max_speed(combined));
             }
         }
 
         // Adjust position to find better passing angles if needed
         if self.should_adjust_position(ctx) {
             if let Some(nearest_teammate) = ctx.players().teammates().nearby_to_opponent_goal() {
-                return Some(
-                    SteeringBehavior::Arrive {
-                        target: self.calculate_better_passing_position(ctx, &nearest_teammate),
-                        slowing_distance: 30.0,
-                    }
-                    .calculate(ctx.player)
-                    .velocity
-                        + ctx.player().separation_velocity(),
-                );
+                let steering_velocity = SteeringBehavior::Arrive {
+                    target: self.calculate_better_passing_position(ctx, &nearest_teammate),
+                    slowing_distance: 30.0,
+                }
+                .calculate(ctx.player)
+                .velocity;
+                let combined = steering_velocity + ctx.player().separation_velocity() * 0.3;
+                return Some(clamp_to_max_speed(combined));
             }
         }
 
