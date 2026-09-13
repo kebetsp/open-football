@@ -1421,7 +1421,7 @@ impl<'p> StateProcessor<'p> {
         let field_w = ctx.context.field_size.width as f32;
         let field_h = ctx.context.field_size.height as f32;
         let side = player.side?;
-        let (_own_goal_x, dir) = match side {
+        let (own_goal_x, dir) = match side {
             crate::r#match::PlayerSide::Left => (0.0_f32, 1.0_f32),
             crate::r#match::PlayerSide::Right => (field_w, -1.0_f32),
         };
@@ -1473,8 +1473,71 @@ impl<'p> StateProcessor<'p> {
         // permanently locked to alternating slots around one shared
         // centre, not derived independently.
         let slot_offset = dir * (2.0 * line_index(group) as f32 - 2.5);
-        let target_x = (center + slot_offset * BAND_GAP).clamp(20.0, field_w - 20.0);
-        let target_y = player.start_position.y.clamp(15.0, field_h - 15.0);
+        let mut target_x = (center + slot_offset * BAND_GAP).clamp(20.0, field_w - 20.0);
+
+        // Pavel (2026-09-13): "defenders not to go too close to their own
+        // goal... stop somewhere at the edge of the 6-y box, and may go
+        // deeper if only they actively trace an attacker with the ball
+        // or there is a byline run". The pure band formula above has no
+        // depth floor at all — `center` bottoms out at MAX_HALF_SPAN+20
+        // when the ball sits deep in the defending third, which puts a
+        // defender's own line at the 20.0 pitch-edge clamp, deeper than
+        // even the six-yard box. "Actively tracking an attacker with the
+        // ball" is already the designated-presser case (exempted from
+        // this whole function above, deferring to Pressing/Tackling,
+        // which can take him all the way to the byline if the carrier
+        // does). "A byline run" is new: reuses the already-fixed (2026-
+        // 09-12) `scan_for_dangerous_runs` — a genuine fast, wide,
+        // goal-ward opponent run — rather than inventing a second
+        // detector; the single closest defender to that specific runner
+        // (same pattern as the presser check above) is exempt from the
+        // floor, everyone else holds it.
+        const DEFENSIVE_DEPTH_FLOOR: f32 = 44.0; // six-yard box edge: 5.5m Law 1 x 8u/m
+        if group == PlayerFieldPositionGroup::Defender {
+            let tracking_byline_run = ctx
+                .player()
+                .defensive()
+                .scan_for_dangerous_runs()
+                .map(|runner| {
+                    let my_dist = (player.position - runner.position).magnitude();
+                    !ctx.players().teammates().defenders().any(|tm| {
+                        (tm.position - runner.position).magnitude() < my_dist
+                    })
+                })
+                .unwrap_or(false);
+            if !tracking_byline_run {
+                let depth_from_own_goal = (target_x - own_goal_x).abs();
+                if depth_from_own_goal < DEFENSIVE_DEPTH_FLOOR {
+                    target_x = own_goal_x + dir * DEFENSIVE_DEPTH_FLOOR;
+                }
+            }
+        }
+
+        // Pavel (2026-09-13): kicker mode's whole point is to "bring
+        // features back one at a time" -- lateral (Y) shape was left at
+        // each player's static formation slot in the first cut, and it
+        // shows: no line ever moves side to side to open or close a
+        // passing lane. A single, symmetric mechanism for BOTH teams --
+        // the whole line translates toward whichever side of the pitch
+        // width the ball is currently on, same weight/cap for everyone
+        // -- is enough to produce the requested dynamic on its own: the
+        // attacking team's shape (wherever the ball-carrier's own line
+        // sits) leads the shift, the defending team's shape follows the
+        // SAME ball position a moment later, closing the lane the
+        // attacker just opened. A pure translation (identical shift
+        // added to every player's own static Y), not a per-player pull
+        // toward the ball, so relative spacing within a line is
+        // preserved -- it moves as a block, it doesn't compress onto the
+        // ball. `MAX_LATERAL_SHIFT` (80u/~10m) and `LATERAL_SHIFT_WEIGHT`
+        // are reasoned starting points, not sourced -- tune from
+        // watching it, not blindly.
+        const LATERAL_SHIFT_WEIGHT: f32 = 0.3;
+        const MAX_LATERAL_SHIFT: f32 = 80.0;
+        let ball_y = ctx.tick_context.positions.ball.position.y;
+        let pitch_center_y = field_h / 2.0;
+        let lateral_shift =
+            ((ball_y - pitch_center_y) * LATERAL_SHIFT_WEIGHT).clamp(-MAX_LATERAL_SHIFT, MAX_LATERAL_SHIFT);
+        let target_y = (player.start_position.y + lateral_shift).clamp(15.0, field_h - 15.0);
         let mut target = Vector3::new(target_x, target_y, 0.0);
 
         // realism-bug (2026-09-12, marking-distance follow-up): the
