@@ -1638,47 +1638,16 @@ impl PassEvaluator {
         // threshold directly rather than inventing a second number.
         const MIN_PASS_DISTANCE: f32 = 30.0;
         // realism-bug (2026-09-13, "passing lanes always look open"
-        // investigation, second attempt): a first attempt reused
-        // `on_ball_value::lane_completion_prob` (a genuine race-in-time
-        // model) but measured WORSE, not better -- it uses the engine's
-        // own `BALL_SPEED` (its absolute max pass velocity) for every
-        // pass regardless of how short/gentle it actually is, so the
-        // ball almost always "won the race" against any realistically-
-        // positioned defender, making the check even MORE permissive
-        // than the 0.5-unit ray-cast it replaced (reverted, see the
-        // decisions log). This is the simpler, static-radius approach
-        // instead: any opponent within `LANE_CLEAR_RADIUS` (16 units /
-        // ~2m -- StatsBomb's own sourced "meaningful pressure" tagging
-        // threshold, not a guess) of the straight passer-receiver
-        // segment, genuinely between the two endpoints, counts as
-        // blocking the lane. Scoped to kicker mode only -- `has_clear_
-        // pass` itself and its other engine-wide call sites are
-        // untouched.
-        const LANE_CLEAR_RADIUS: f32 = 16.0;
-        let kicker_lane_clear = |target_pos: Vector3<f32>| -> bool {
-            let from = ctx.player.position;
-            let seg = target_pos - from;
-            let seg_len_sq = seg.x * seg.x + seg.y * seg.y;
-            if seg_len_sq < 1.0 {
-                return true;
-            }
-            for opp in ctx
-                .players()
-                .opponents()
-                .nearby_at(from, seg_len_sq.sqrt() + LANE_CLEAR_RADIUS)
-            {
-                let to_opp = opp.position - from;
-                let t = ((to_opp.x * seg.x + to_opp.y * seg.y) / seg_len_sq).clamp(0.0, 1.0);
-                if !(0.05..=0.95).contains(&t) {
-                    continue; // exclude the immediate passer/receiver endpoints
-                }
-                let closest = from + seg * t;
-                if (opp.position - closest).magnitude() < LANE_CLEAR_RADIUS {
-                    return false;
-                }
-            }
-            true
-        };
+        // investigation): originally a kicker-mode-only local corridor
+        // check (a first attempt reusing `on_ball_value::
+        // lane_completion_prob` measured WORSE, not better -- see the
+        // decisions log; a second, static-radius attempt worked and was
+        // verified here before being generalized). `has_clear_pass`
+        // itself (player.rs) now carries this exact fix directly --
+        // its old ray-cast never actually checked player colliders at
+        // all (`include_players=false`), engine-wide, not just in
+        // kicker mode. Simplified back to calling it directly so there
+        // is only one copy of this logic, not two that can drift apart.
         let pick_clear = |candidates: Vec<MatchPlayerLite>| -> Option<MatchPlayerLite> {
             candidates
                 .into_iter()
@@ -1686,7 +1655,7 @@ impl PassEvaluator {
                     let d = ctx.player().distance_to_player(c.id);
                     d >= MIN_PASS_DISTANCE
                         && d <= max_distance
-                        && kicker_lane_clear(c.position)
+                        && ctx.player().has_clear_pass(c.id)
                 })
                 .min_by(|a, b| {
                     let da = ctx.player().distance_to_player(a.id);

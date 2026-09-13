@@ -537,6 +537,18 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
+        // Pavel (2026-09-13): bring kicker mode's already-verified
+        // "delay" / marking-distance discipline into the full (non-
+        // kicker) engine too, now that kicker mode is being turned back
+        // off. Real defensive doctrine (soccer coaching: "delaying" —
+        // don't dive into a challenge, hold ~3-6m and wait for the
+        // right moment or support) plus the sourced StatsBomb ~2m
+        // "meaningful pressure" threshold this session already used for
+        // `has_clear_pass`.
+        if let Some(velocity) = Self::marking_delay_velocity(&processing_ctx, result.velocity) {
+            result.velocity = Some(velocity);
+        }
+
         // engine audit Module 3 (2026-08-29): universal offside-line
         // hold. Applied LAST among the velocity overrides so it clamps
         // whatever the final proposed x-movement is, regardless of which
@@ -2318,6 +2330,82 @@ impl<'p> StateProcessor<'p> {
             return None; // no clamp needed, let the existing velocity stand
         }
         Some(Vector3::new(clamped_x - player.position.x, v.y, v.z))
+    }
+
+    /// "Delay" / marking-distance discipline for the full (non-kicker)
+    /// engine (2026-09-13, Pavel's request — bring kicker mode's
+    /// already-verified marking-distance mechanism, `kicker_line_hold_
+    /// velocity`'s own MIN_MARK_GAP blend, into the full engine now that
+    /// kicker mode is being switched back off). Real defensive doctrine:
+    /// a covering defender doesn't dive into a challenge — he holds
+    /// distance (sourced ~3-6m range; `DELAY_GAP` uses the low, sourced
+    /// end — StatsBomb's own ~2m "meaningful pressure" tagging
+    /// threshold rounded up to the same 24-unit/3m floor kicker mode
+    /// already validated) and "delays" until the moment or support is
+    /// right.
+    ///
+    /// Deliberately shaped differently from the earlier `defensive_
+    /// lane_cover_velocity` experiment (2026-09-12, rolled back —
+    /// "players glued... moving for the override's sake rather than a
+    /// real reason... clustering, lost shape"): that one fully computed
+    /// and REPLACED a player's target every tick, with no reference to
+    /// whatever their own state had already decided. This is the
+    /// opposite shape — it reads the ALREADY-COMPUTED `proposed_
+    /// velocity` from the player's own state (same pattern as
+    /// `offside_line_hold_velocity` immediately above, which runs the
+    /// same way) and only blends in a proportional repulsion nudge when
+    /// that velocity would leave a player who ISN'T legitimately
+    /// engaging (pressing, tackling, chasing a loose ball, or the ball
+    /// carrier himself) unrealistically close to an opponent. It never
+    /// overrides positioning outright, and the existing full-engine
+    /// off-ball logic (mobility/rotation/decoy scoring, shape rules,
+    /// etc.) keeps deciding WHERE a player wants to be — this only
+    /// tempers the final approach distance.
+    fn marking_delay_velocity(
+        ctx: &StateProcessingContext,
+        proposed_velocity: Option<Vector3<f32>>,
+    ) -> Option<Vector3<f32>> {
+        let player = ctx.player;
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None; // the carrier's own movement is his own business
+        }
+        match ctx.player.state {
+            Defender(DefenderState::Pressing)
+            | Defender(DefenderState::Tackling)
+            | Defender(DefenderState::TakeBall)
+            | Midfielder(MidfielderState::Pressing)
+            | Midfielder(MidfielderState::Tackling)
+            | Midfielder(MidfielderState::TakeBall)
+            | Forward(ForwardState::Pressing)
+            | Forward(ForwardState::Tackling)
+            | Forward(ForwardState::TakeBall) => return None, // legitimately engaging — don't second-guess it
+            _ => {}
+        }
+        const DELAY_GAP: f32 = 24.0; // ~3m, the low end of the sourced 3-6m range
+        let nearest_opp = ctx
+            .players()
+            .opponents()
+            .nearby(DELAY_GAP)
+            .min_by(|a, b| {
+                let da = (player.position - a.position).magnitude();
+                let db = (player.position - b.position).magnitude();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        let Some(opp) = nearest_opp else {
+            return None;
+        };
+        let away = player.position - opp.position;
+        let d = away.magnitude();
+        if !(0.01..DELAY_GAP).contains(&d) {
+            return None;
+        }
+        let push_strength = ((DELAY_GAP - d) / DELAY_GAP).clamp(0.0, 1.0);
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        let repulsion = away.normalize() * max_speed;
+        let base = proposed_velocity.unwrap_or_else(Vector3::zeros);
+        Some(base * (1.0 - push_strength) + repulsion * push_strength)
     }
 }
 
