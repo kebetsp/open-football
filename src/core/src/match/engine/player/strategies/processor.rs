@@ -1282,8 +1282,40 @@ impl<'p> StateProcessor<'p> {
     /// staged for a restart (`restart_retreat_target` — corner/free-
     /// kick/throw-in/goal-kick teleport-and-hold machinery keeps working
     /// untouched).
+    ///
+    /// Update (2026-09-12, Pavel's follow-up): the pure line-hold above
+    /// had zero cross-team awareness at all, so a defender's line
+    /// target could — and, watching a live match, did — land right on
+    /// top of an opposing attacker (the rendered dots overlapping,
+    /// real-world sub-2.25m separation). Sourced target, from general
+    /// coaching/tactical knowledge rather than a specific dataset
+    /// (flagged, category (d)): a defender covering a passing lane (not
+    /// the presser) typically holds ~3-6m from the attacker he's
+    /// covering. Two additions: (1) the single teammate strictly
+    /// closest to the ball carrier is the designated presser and is
+    /// exempted (this function returns `None` for him, deferring to the
+    /// already-working, untouched Pressing→Tackling engagement logic,
+    /// which is meant to close all the way in); (2) every other
+    /// out-of-possession outfield player gets a live repulsion,
+    /// blended in proportionally to how far inside `MIN_MARK_GAP` (3m,
+    /// the low end of the sourced range — an enforced FLOOR, not a
+    /// ceiling; Pavel didn't ask for a maximum) the nearest opponent
+    /// currently is. Checked against CURRENT position every tick, not
+    /// the line target, so it also corrects a marker who's already too
+    /// close because the attacker moved into his space, not just one
+    /// whose own target was wrong.
     fn kicker_line_hold_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         use crate::r#match::player::strategies::common::kicker_mode::{self, line_index};
+
+        #[cfg(feature = "match-logs")]
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CHECK_TICKS: AtomicU64 = AtomicU64::new(0);
+            let n = CHECK_TICKS.fetch_add(1, Ordering::Relaxed);
+            if n % 4000 == 0 {
+                log::info!("KICKERMARKDIAG tick_sample={}", n);
+            }
+        }
 
         if !kicker_mode::is_active() {
             return None;
@@ -1308,6 +1340,44 @@ impl<'p> StateProcessor<'p> {
             return None; // corner/free-kick/throw-in/goal-kick staging wins
         }
 
+        let in_possession = ctx.team().is_control_ball();
+
+        // Designated presser: the single teammate strictly closest to
+        // the ball carrier is exempt from the line hold AND the
+        // marking-distance floor below — his job is to actually close
+        // the ball down, and the untouched Pressing/Tackling engagement
+        // logic (this function already exempts a live Tackling state
+        // above) already knows how to do that on its own.
+        if !in_possession {
+            if let Some(carrier) = ctx.players().opponents().with_ball().next() {
+                let my_dist = (player.position - carrier.position).magnitude();
+                let someone_closer = ctx.players().teammates().all().any(|tm| {
+                    if tm.tactical_positions.position_group()
+                        == crate::PlayerFieldPositionGroup::Goalkeeper
+                    {
+                        return false;
+                    }
+                    (tm.position - carrier.position).magnitude() < my_dist
+                });
+                if !someone_closer {
+                    #[cfg(feature = "match-logs")]
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static PRESSER_HITS: AtomicU64 = AtomicU64::new(0);
+                        let n = PRESSER_HITS.fetch_add(1, Ordering::Relaxed);
+                        if n % 200 == 0 {
+                            log::info!(
+                                "KICKERMARKDIAG presser id={} dist_to_carrier={:.1}",
+                                player.id,
+                                my_dist
+                            );
+                        }
+                    }
+                    return None; // I'm the presser this tick — let him engage freely
+                }
+            }
+        }
+
         let group = player.tactical_position.current_position.position_group();
         let field_w = ctx.context.field_size.width as f32;
         let field_h = ctx.context.field_size.height as f32;
@@ -1319,6 +1389,7 @@ impl<'p> StateProcessor<'p> {
 
         const LINE_GAP: f32 = 110.0; // ~14m between adjacent lines
         const MIN_DEPTH_FROM_GOAL: f32 = 60.0;
+        const MIN_MARK_GAP: f32 = 24.0; // 3m — the sourced floor, not a ceiling
 
         // "Progress" = distance from THIS player's own goal toward the
         // opponent's, regardless of side — all the geometry below works
@@ -1352,17 +1423,115 @@ impl<'p> StateProcessor<'p> {
         let my_line_progress = back_line_progress + LINE_GAP * line_index(group) as f32;
         let target_x = from_progress(my_line_progress).clamp(20.0, field_w - 20.0);
         let target_y = player.start_position.y.clamp(15.0, field_h - 15.0);
-        let target = Vector3::new(target_x, target_y, 0.0);
+        let mut target = Vector3::new(target_x, target_y, 0.0);
+
+        // realism-bug (2026-09-12, marking-distance follow-up): the
+        // purely-reactive repulsion below (based on live CURRENT
+        // position) turned out insufficient on its own — verified with
+        // raw diagnostic tracing (KICKERMARKDIAG): it fires repeatedly
+        // at persistent 7-22 unit separations rather than the gap
+        // actually widening, because the "opponent" causing it is very
+        // often just another outfield player independently walking to
+        // THEIR OWN line-hold target, which frequently lands in the
+        // same zone (mirrored formation slots + a shared, ball-position-
+        // driven depth reference put both sides' targets in similar
+        // places) — a footrace between two comparable top speeds
+        // doesn't reliably converge. Fixed at the root instead of only
+        // reacting to it: applied to EVERY outfield player regardless of
+        // possession (the presser and the ball carrier never reach this
+        // code — both already returned earlier), so the TARGET itself
+        // is never chosen inside an opponent's minimum-gap radius in the
+        // first place, not just reactively fled from after arriving.
+        if let Some(opp) = ctx
+            .players()
+            .opponents()
+            .nearby_at(target, MIN_MARK_GAP)
+            .min_by(|a, b| {
+                let da = (target - a.position).magnitude();
+                let db = (target - b.position).magnitude();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        {
+            let away = target - opp.position;
+            let d = away.magnitude();
+            if d > 0.01 && d < MIN_MARK_GAP {
+                target = opp.position + away.normalize() * MIN_MARK_GAP;
+            } else if d <= 0.01 {
+                // Degenerate case (target landed essentially on the
+                // opponent) — push along the line depth instead of a
+                // meaningless zero-length normalize.
+                target = opp.position + Vector3::new(dir * MIN_MARK_GAP, 0.0, 0.0);
+            }
+        }
 
         let to_target = target - player.position;
         let dist = to_target.magnitude();
-        if dist < 3.0 {
-            return Some(Vector3::zeros());
-        }
         let max_speed = player
             .skills
             .max_speed_with_condition(player.player_attributes.condition);
-        Some(to_target.normalize() * max_speed * 0.65)
+        let base_velocity = if dist < 3.0 {
+            Vector3::zeros()
+        } else {
+            to_target.normalize() * max_speed * 0.65
+        };
+
+        // Marking-distance floor (Pavel's follow-up, 2026-09-12): every
+        // non-presser, non-carrier outfield player holds at least
+        // MIN_MARK_GAP from the nearest opponent, checked against live
+        // current position every tick. Blended in proportionally, not a
+        // hard clamp, so it doesn't fight the line-hold pursuit outright
+        // the instant the gap is satisfied again.
+        //
+        // Made unconditional on possession (was out-of-possession-only
+        // in the first cut) after raw diagnostic tracing showed the
+        // one-sided version engaging repeatedly at a PERSISTENT 7-22
+        // unit separation rather than the gap actually widening: with
+        // only the defending side reacting, an in-possession attacker
+        // — who has nothing pushing them away — could keep walking
+        // toward wherever their own line-hold target sent them
+        // regardless of a defender fleeing from underneath them,
+        // netting a footrace at comparable top speed rather than real
+        // separation. The carrier and the presser both already return
+        // `None` well before reaching this code, so this can't
+        // interfere with either of them.
+        {
+            let nearest_opp = ctx
+                .players()
+                .opponents()
+                .nearby(MIN_MARK_GAP)
+                .min_by(|a, b| {
+                    let da = (player.position - a.position).magnitude();
+                    let db = (player.position - b.position).magnitude();
+                    da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            if let Some(opp) = nearest_opp {
+                let away = player.position - opp.position;
+                let d = away.magnitude();
+                if d > 0.01 && d < MIN_MARK_GAP {
+                    let push_strength = ((MIN_MARK_GAP - d) / MIN_MARK_GAP).clamp(0.0, 1.0);
+                    let repulsion = away.normalize() * max_speed;
+                    #[cfg(feature = "match-logs")]
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static ENGAGED_HITS: AtomicU64 = AtomicU64::new(0);
+                        let n = ENGAGED_HITS.fetch_add(1, Ordering::Relaxed);
+                        if n % 200 == 0 {
+                            log::info!(
+                                "KICKERMARKDIAG repulsion id={} group={:?} d={:.1} push={:.2} role_state={:?}",
+                                player.id,
+                                group,
+                                d,
+                                push_strength,
+                                ctx.player.state
+                            );
+                        }
+                    }
+                    return Some(base_velocity * (1.0 - push_strength) + repulsion * push_strength);
+                }
+            }
+        }
+
+        Some(base_velocity)
     }
 
     /// Milestone 13 (possession-decision-intelligence PRD) —
