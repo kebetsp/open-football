@@ -145,41 +145,41 @@ impl StateProcessingHandler for GoalkeeperStandingState {
         let optimal_position = self.calculate_optimal_position(ctx);
         let distance_to_optimal = ctx.player.position.distance_to(&optimal_position);
 
-        // GKs need to reposition quickly to track the ball
-        if distance_to_optimal < 5.0 {
-            // Close to position — small adjustments to stay ready
-            Some(
-                SteeringBehavior::Arrive {
-                    target: optimal_position,
-                    slowing_distance: 3.0,
-                }
-                .calculate(ctx.player)
-                .velocity
-                    * 0.7,
-            )
-        } else if distance_to_optimal < 15.0 {
-            // Repositioning needed — move with purpose
-            Some(
-                SteeringBehavior::Arrive {
-                    target: optimal_position,
-                    slowing_distance: 6.0,
-                }
-                .calculate(ctx.player)
-                .velocity
-                    * 1.0,
-            )
-        } else {
-            // Urgently out of position — sprint
-            Some(
-                SteeringBehavior::Arrive {
-                    target: optimal_position,
-                    slowing_distance: 10.0,
-                }
-                .calculate(ctx.player)
-                .velocity
-                    * 1.3,
-            )
-        }
+        // realism-bug (2026-09-13, "still bursts, not smooth" follow-up):
+        // this used to be three hard distance-threshold tiers (5.0/15.0
+        // units), each re-scaling the already-max_speed-bounded Arrive
+        // output by a DIFFERENT flat multiplier (0.7/1.0/1.3) with no
+        // smoothing between them. `GoalkeeperStandingState` is the
+        // keeper's default, most-common state (idle/tracking, not a
+        // dramatic save reaction — unlike GoalkeeperCatchingState's
+        // similar-looking but deliberately-tuned, sourced "explosive
+        // reaction" speed_boost, which this does NOT touch), and his
+        // `optimal_position` shifts continuously as the ball moves
+        // side-to-side along a fixed-X goal line -- so `distance_to_
+        // optimal` oscillates across these small boundaries constantly
+        // during ordinary play, snapping the multiplier on every
+        // crossing. Ground-truth confirmed (duel_debug): this single
+        // state was 28.2% of all vertical-classified jerk samples
+        // across the whole match, the largest single contributor.
+        // Replaced with one continuous Arrive call: `slowing_distance`
+        // and the post-Arrive scale both vary smoothly with distance
+        // instead of stepping, and the scale never exceeds 1.0 (never
+        // boosts past the keeper's real max_speed — there was no
+        // sourced rationale for the old 1.3x tier the way there is for
+        // Catching's).
+        let urgency = (distance_to_optimal / 15.0).clamp(0.0, 1.0); // 0 = calm, 1 = urgent
+        let slowing_distance = 3.0 + (10.0 - 3.0) * urgency; // 3..10, continuous
+        let scale = 0.7 + (1.0 - 0.7) * urgency; // 0.7..1.0, continuous, never boosts
+
+        Some(
+            SteeringBehavior::Arrive {
+                target: optimal_position,
+                slowing_distance,
+            }
+            .calculate(ctx.player)
+            .velocity
+                * scale,
+        )
     }
 
     fn process_conditions(&self, ctx: ConditionContext) {
@@ -257,11 +257,40 @@ impl GoalkeeperStandingState {
         let goal_to_ball = ball_position - goal_center;
         let distance_to_ball = goal_to_ball.magnitude();
 
+        // realism-bug (2026-09-13, "still bursts, not smooth" follow-up
+        // — the real dominant cause, found only after the speed-tier
+        // fix above barely moved the numbers): `on_own_side()` is a
+        // hard boolean, true/false purely on which side of the exact
+        // halfway line (`field_size.half_width`) the ball currently
+        // sits. The two branches below compute COMPLETELY different
+        // target Y positions — up to ~100 units of lateral offset
+        // (defensive sweeping, angle-bisection) vs. dead-centre on the
+        // goal (conservative, opponent's half) — with nothing between
+        // them. Every time the ball crosses halfway (routinely, many
+        // times a match, as possession swings back and forth) the
+        // keeper's TARGET itself snapped instantly by up to 100 units,
+        // regardless of how smoothly he steers toward it — the earlier
+        // speed-tier fix only smoothed how fast he chases a target that
+        // was still teleporting. The discontinuity is purely in Y
+        // (screen-vertical), matching the reported symptom exactly. Both
+        // formulas are real, sourced, already-tuned behaviour (see their
+        // own comments) — kept as-is, just computed unconditionally and
+        // BLENDED across a real transition band around halfway instead
+        // of hard-switched.
+        let half_width = ctx.context.field_size.half_width as f32;
+        let signed_own_side_depth = match ctx.player.side {
+            Some(PlayerSide::Left) => half_width - ball_position.x,
+            Some(PlayerSide::Right) => ball_position.x - half_width,
+            None => 0.0,
+        };
+        const HALFWAY_TRANSITION_BAND: f32 = 40.0; // ~5m either side -- reasoned, not sourced
+        let own_side_weight =
+            ((signed_own_side_depth / HALFWAY_TRANSITION_BAND) * 0.5 + 0.5).clamp(0.0, 1.0);
+
         // Base distance from goal line (in meters/units)
         let mut optimal_distance_from_goal = 12.0; // Start about 12 units from goal line
 
-        // Adjust based on ball position
-        if ctx.ball().on_own_side() {
+        let own_side_position = {
             // Ball on defensive half - position based on threat level
             let threat_distance = distance_to_ball.min(300.0) / 300.0; // Normalize to 0-1
 
@@ -350,22 +379,29 @@ impl GoalkeeperStandingState {
                 new_position.y = goal_center.y + direction_to_ball.y * ANGLE_COVERAGE_DEPTH * skill_factor;
             }
 
-            // Keep within penalty area
-            self.clamp_to_penalty_area(ctx, new_position)
-        } else {
+            new_position
+        };
+
+        let opponent_side_position = {
             // Ball on opponent's half - stay closer to goal but ready
-            optimal_distance_from_goal = 12.0 + command_of_area * 8.0;
+            let opponent_distance_from_goal = 12.0 + command_of_area * 8.0;
 
             let mut new_position = goal_center;
-            new_position.x += optimal_distance_from_goal
+            new_position.x += opponent_distance_from_goal
                 * (if ctx.player.side == Some(PlayerSide::Left) {
                     1.0
                 } else {
                     -1.0
                 });
 
-            self.clamp_to_penalty_area(ctx, new_position)
-        }
+            new_position
+        };
+
+        let blended = own_side_position * own_side_weight
+            + opponent_side_position * (1.0 - own_side_weight);
+
+        // Keep within penalty area
+        self.clamp_to_penalty_area(ctx, blended)
     }
 
     fn clamp_to_penalty_area(

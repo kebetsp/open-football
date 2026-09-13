@@ -1521,10 +1521,20 @@ impl<'p> StateProcessor<'p> {
         let max_speed = player
             .skills
             .max_speed_with_condition(player.player_attributes.condition);
-        let base_velocity = if dist < 3.0 {
-            Vector3::zeros()
+        // realism-bug (2026-09-13, "still bursts, not smooth" follow-up):
+        // a hard `dist < 3.0 => zero` cutoff meant the player's speed
+        // snapped instantly from 65%-max-speed to a dead stop the
+        // instant he crossed the 3-unit ring, rather than decelerating
+        // into it -- this is the shared off-ball line-hold override, so
+        // it drives most non-carrier outfield players' movement most of
+        // the match regardless of their nominal game state (their own
+        // state's own velocity() is superseded here). Smoothed to a
+        // continuous ramp -- same shape as SteeringBehavior::Arrive's
+        // own slowing-distance idea, applied consistently here too.
+        let base_velocity = if dist > 0.001 {
+            to_target.normalize() * max_speed * 0.65 * (dist / 3.0).clamp(0.0, 1.0)
         } else {
-            to_target.normalize() * max_speed * 0.65
+            Vector3::zeros()
         };
 
         // Marking-distance floor (Pavel's follow-up, 2026-09-12): every
