@@ -96,7 +96,15 @@ impl StateProcessingHandler for DefenderReturningState {
                 }
             }
 
-            if ctx.ball().is_towards_player_with_angle(0.8) && ctx.ball().distance() < 200.0 {
+            // docs/defensive-delay-and-engagement-timing.md,
+            // "single-defender-exclusivity fix for Intercepting".
+            if ctx.ball().is_towards_player_with_angle(0.8)
+                && ctx.ball().distance() < 200.0
+                && ctx
+                    .player()
+                    .defensive()
+                    .is_best_positioned_to_intercept(ctx.tick_context.positions.ball.position)
+            {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Intercepting,
                 ));

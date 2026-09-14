@@ -235,7 +235,21 @@ impl StateProcessingHandler for DefenderHoldingLineState {
                     ball_pos.x > ctx.player.position.x - 15.0
                 };
 
-                if is_behind_or_level {
+                // docs/defensive-delay-and-engagement-timing.md,
+                // "single-defender-exclusivity fix for Intercepting":
+                // this check used to be purely local (is the ball
+                // heading toward MY goal, am I behind-or-level with
+                // it) with zero teammate coordination -- every
+                // defender watching the same through ball independently
+                // satisfied it on the same tick, producing "all four
+                // defenders placed very high as if all of them were
+                // trying to intercept the pass". Only the genuinely
+                // fastest defender-group teammate to the ball's own
+                // point now breaks; the rest fall through and hold the
+                // line via this state's own normal zonal behavior.
+                if is_behind_or_level
+                    && ctx.player().defensive().is_best_positioned_to_intercept(ball_pos)
+                {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Intercepting,
                     ));
@@ -260,7 +274,24 @@ impl StateProcessingHandler for DefenderHoldingLineState {
         // zone" as a legitimate break-shape trigger, distinct from
         // "the ball merely exists somewhere on the pitch".
         if !ctx.ball().is_owned() {
-            if ctx.ball().distance() < 250.0 && ctx.ball().is_towards_player_with_angle(0.8) {
+            // docs/defensive-delay-and-engagement-timing.md,
+            // "single-defender-exclusivity fix for Intercepting": both
+            // Intercepting outcomes below used to fire for every
+            // defender who individually satisfied their own local
+            // distance/angle check against the same loose ball, with no
+            // teammate coordination -- the same "all four defenders
+            // step up together" bug as the through-ball branch above.
+            // Gated on the same exclusivity check; the Marking outcome
+            // (guarding a DIFFERENT, specific opponent) is untouched --
+            // that's a distinct decision, not a race to the loose ball.
+            let loose_ball_pos = ctx.tick_context.positions.ball.position;
+            let i_am_best_positioned =
+                ctx.player().defensive().is_best_positioned_to_intercept(loose_ball_pos);
+
+            if ctx.ball().distance() < 250.0
+                && ctx.ball().is_towards_player_with_angle(0.8)
+                && i_am_best_positioned
+            {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Intercepting,
                 ));
@@ -268,11 +299,18 @@ impl StateProcessingHandler for DefenderHoldingLineState {
 
             if ctx.ball().distance() < BALL_PROXIMITY_THRESHOLD {
                 let opponent_nearby = self.is_opponent_nearby(ctx);
-                return Some(StateChangeResult::with_defender_state(if opponent_nearby {
-                    DefenderState::Marking
-                } else {
-                    DefenderState::Intercepting
-                }));
+                if opponent_nearby {
+                    return Some(StateChangeResult::with_defender_state(
+                        DefenderState::Marking,
+                    ));
+                }
+                if i_am_best_positioned {
+                    return Some(StateChangeResult::with_defender_state(
+                        DefenderState::Intercepting,
+                    ));
+                }
+                // Not the best-positioned defender and no opponent to
+                // guard here -- fall through and hold the line.
             }
         }
 

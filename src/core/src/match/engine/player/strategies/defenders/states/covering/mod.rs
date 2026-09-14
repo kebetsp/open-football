@@ -204,7 +204,19 @@ impl StateProcessingHandler for DefenderCoveringState {
         // TEAMMATE. Reacting to our own team's circulation as a threat
         // is exactly the "scrambling" Pavel described; only a
         // genuinely loose ball is a real, role-independent trigger.
-        if !ball_ops.is_owned() && ball_ops.is_towards_player() && ball_ops.distance() < INTERCEPTION_DISTANCE {
+        // docs/defensive-delay-and-engagement-timing.md,
+        // "single-defender-exclusivity fix for Intercepting": same
+        // purely-local loose-ball check, same "all four defenders
+        // placed very high" risk, as the (already-fixed) HoldingLine
+        // equivalent — gated identically.
+        if !ball_ops.is_owned()
+            && ball_ops.is_towards_player()
+            && ball_ops.distance() < INTERCEPTION_DISTANCE
+            && ctx
+                .player()
+                .defensive()
+                .is_best_positioned_to_intercept(ctx.tick_context.positions.ball.position)
+        {
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Intercepting,
             ));

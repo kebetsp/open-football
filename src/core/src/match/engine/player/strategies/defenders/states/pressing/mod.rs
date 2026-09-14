@@ -174,7 +174,15 @@ impl StateProcessingHandler for DefenderPressingState {
                     DefenderState::TakeBall,
                 ));
             }
-            if ctx.ball().distance() < 60.0 && !ctx.ball().is_owned() {
+            // docs/defensive-delay-and-engagement-timing.md,
+            // "single-defender-exclusivity fix for Intercepting".
+            if ctx.ball().distance() < 60.0
+                && !ctx.ball().is_owned()
+                && ctx
+                    .player()
+                    .defensive()
+                    .is_best_positioned_to_intercept(ctx.tick_context.positions.ball.position)
+            {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Intercepting,
                 ));

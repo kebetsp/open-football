@@ -218,9 +218,18 @@ impl StateProcessingHandler for DefenderStandingState {
         // Loose-ball interception — ball incoming in our half, no owner yet.
         // Ball-carrier pressing is already handled by the role block at the
         // top of this function.
+        // docs/defensive-delay-and-engagement-timing.md,
+        // "single-defender-exclusivity fix for Intercepting". Note:
+        // `should_block_shot` above (a shot already in flight, tight
+        // range) is deliberately NOT gated here — a different, more
+        // time-critical scenario than this generic loose-ball race.
         if ctx.ball().on_own_side()
             && ball_ops.is_towards_player_with_angle(0.8)
             && ball_ops.distance() < INTERCEPTION_DISTANCE
+            && ctx
+                .player()
+                .defensive()
+                .is_best_positioned_to_intercept(ctx.tick_context.positions.ball.position)
         {
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Intercepting,
@@ -276,7 +285,16 @@ impl StateProcessingHandler for DefenderStandingState {
         }
 
         // White zone: loose ball on own side within range - go intercept or track back
-        if ctx.ball().on_own_side() && !ctx.ball().is_owned() && ctx.ball().distance() < 200.0 {
+        // docs/defensive-delay-and-engagement-timing.md,
+        // "single-defender-exclusivity fix for Intercepting".
+        if ctx.ball().on_own_side()
+            && !ctx.ball().is_owned()
+            && ctx.ball().distance() < 200.0
+            && ctx
+                .player()
+                .defensive()
+                .is_best_positioned_to_intercept(ctx.tick_context.positions.ball.position)
+        {
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Intercepting,
             ));

@@ -50,11 +50,22 @@ impl StateProcessingHandler for DefenderRestingState {
         if ball_distance < BALL_PROXIMITY_THRESHOLD {
             // If the ball is close, check for nearby opponents
             let opponent_nearby = self.is_opponent_nearby(ctx);
-            return Some(StateChangeResult::with_defender_state(if opponent_nearby {
-                DefenderState::Marking
-            } else {
-                DefenderState::Intercepting
-            }));
+            if opponent_nearby {
+                return Some(StateChangeResult::with_defender_state(
+                    DefenderState::Marking,
+                ));
+            }
+            // docs/defensive-delay-and-engagement-timing.md,
+            // "single-defender-exclusivity fix for Intercepting".
+            if ctx
+                .player()
+                .defensive()
+                .is_best_positioned_to_intercept(ctx.tick_context.positions.ball.position)
+            {
+                return Some(StateChangeResult::with_defender_state(
+                    DefenderState::Intercepting,
+                ));
+            }
         }
 
         // Previous "team under threat" exit (fires if 2+ opponents in

@@ -107,8 +107,18 @@ impl StateProcessingHandler for DefenderWalkingState {
         }
 
         // Priority 3: Intercept ball if it's coming towards player
+        // docs/defensive-delay-and-engagement-timing.md,
+        // "single-defender-exclusivity fix for Intercepting". (Priority
+        // 2.5 above -- press-vs-cover against a genuine ball carrier --
+        // has its own separate, un-gated coordination gap, a different
+        // category from this loose-ball race; deliberately left alone
+        // here, flagged for its own future pass.)
         if ctx.ball().is_towards_player_with_angle(0.8)
             && ctx.ball().distance() < INTERCEPTION_DISTANCE
+            && ctx
+                .player()
+                .defensive()
+                .is_best_positioned_to_intercept(ctx.tick_context.positions.ball.position)
         {
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Intercepting,

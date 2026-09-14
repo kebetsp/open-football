@@ -79,6 +79,22 @@ pub mod byline_run_diag {
     }
 }
 
+/// TEMPORARY realism-bug diagnostic (2026-09-14, single-defender-
+/// exclusivity fix for Intercepting): does `is_best_positioned_to_
+/// intercept` actually block a meaningful share of would-be-Intercepting
+/// decisions, or is CALLS≈WINS (meaning the old bug was never really
+/// firing for multiple defenders at once)? Removed once verified.
+#[cfg(feature = "match-logs")]
+pub mod intercept_exclusivity_diag {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub static CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static WINS: AtomicU64 = AtomicU64::new(0);
+    pub fn reset() {
+        CALLS.store(0, Ordering::Relaxed);
+        WINS.store(0, Ordering::Relaxed);
+    }
+}
+
 // Coordination constants
 const ENGAGEMENT_DISTANCE: f32 = 20.0; // Distance at which a defender is considered "engaging" an opponent
 #[allow(dead_code)]
@@ -815,6 +831,71 @@ impl<'p> DefensiveOperationsImpl<'p> {
             .teammates()
             .nearby_at(cover_point, COVER_ARRIVED_RADIUS)
             .any(|t| t.id != my_id)
+    }
+
+    /// Is THIS defender the single fastest defender-group teammate to
+    /// reach `point` (typically the ball's own current position, for a
+    /// loose/through ball with no carrier)?
+    ///
+    /// docs/defensive-delay-and-engagement-timing.md, "single-defender-
+    /// exclusivity fix for Intercepting" (2026-09-14): `DefenderHoldingLineState`'s
+    /// three `Intercepting` transitions (the through-ball branch and the
+    /// two loose-ball branches) were each a pure per-player check --
+    /// "is the ball heading toward MY goal, within MY distance/angle
+    /// threshold" -- with zero teammate coordination. Since all four
+    /// defenders watch the same shared goal and the same loose ball,
+    /// this condition is very likely to be satisfied for several or all
+    /// of them on the same tick, which is the confirmed mechanism behind
+    /// Pavel's report ("all four defenders placed very high as if all of
+    /// them were trying to intercept the pass").
+    ///
+    /// Reuses `time_to_intercept` (`on_ball_value.rs`) -- the same real
+    /// race-in-time model (condition-adjusted max speed + reaction floor)
+    /// already trusted for the passing-lane and D8 cover-role work --
+    /// rather than a flat distance comparison, so a genuinely faster
+    /// covering teammate correctly wins even from further away. Same
+    /// rank-0 tie-break convention as `defensive_role_for_ball_carrier_
+    /// unified` (lower id wins an exact tie) for determinism.
+    ///
+    /// Scoped to defender-group teammates only, matching the reported
+    /// symptom ("all four defenders") -- not the wider unified Primary/
+    /// Cover/Help/Hold pool, which answers a different question (who
+    /// should engage an opponent WHO HAS THE BALL) and doesn't apply
+    /// here (these three branches are all gated on a ball with no
+    /// owner). Whether midfielders should also compete for this is an
+    /// open question, not resolved by this pass -- see the doc's own
+    /// "not yet investigated" note before extending scope.
+    pub fn is_best_positioned_to_intercept(&self, point: Vector3<f32>) -> bool {
+        #[cfg(feature = "match-logs")]
+        intercept_exclusivity_diag::CALLS.fetch_add(1, Ordering::Relaxed);
+
+        let my_id = self.ctx.player.id;
+        let my_lite = MatchPlayerLite {
+            id: my_id,
+            position: self.ctx.player.position,
+            tactical_positions: self.ctx.player.tactical_position.current_position,
+        };
+        let my_time = time_to_intercept(self.ctx, &my_lite, point);
+
+        let result = !self
+            .ctx
+            .players()
+            .teammates()
+            .defenders()
+            .any(|d| {
+                if d.id == my_id {
+                    return false;
+                }
+                let t = time_to_intercept(self.ctx, &d, point);
+                t < my_time || (t == my_time && d.id < my_id)
+            });
+
+        #[cfg(feature = "match-logs")]
+        if result {
+            intercept_exclusivity_diag::WINS.fetch_add(1, Ordering::Relaxed);
+        }
+
+        result
     }
 
     /// Most dangerous non-ball-carrier opponent within Help scan radius

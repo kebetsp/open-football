@@ -29,7 +29,15 @@ impl StateProcessingHandler for DefenderTrackingBackState {
         }
 
         // Check if the ball is close and moving towards the player
-        if ctx.ball().distance() < BALL_INTERCEPTION_DISTANCE && ctx.ball().is_towards_player() {
+        // docs/defensive-delay-and-engagement-timing.md,
+        // "single-defender-exclusivity fix for Intercepting".
+        if ctx.ball().distance() < BALL_INTERCEPTION_DISTANCE
+            && ctx.ball().is_towards_player()
+            && ctx
+                .player()
+                .defensive()
+                .is_best_positioned_to_intercept(ctx.tick_context.positions.ball.position)
+        {
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Intercepting,
             ));
