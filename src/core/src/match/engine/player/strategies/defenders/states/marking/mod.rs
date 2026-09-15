@@ -70,6 +70,33 @@ impl StateProcessingHandler for DefenderMarkingState {
             ));
         }
 
+        // 2026-09-14 (Pavel's direct report, same mechanism as the
+        // Guarding fix above it in this same investigation): unlike
+        // Guarding, Marking had NO direct "a ball carrier is nearby,
+        // react to him" check at all. `find_best_marking_target` below,
+        // when a carrier exists, first tries `find_help_target()` --
+        // which explicitly EXCLUDES ball carriers from its own scan
+        // ("Help role: pick the most dangerous NON-CARRIER opponent").
+        // If that finds any qualifying alternate target within its 28u
+        // scan radius, this state tracked THAT player instead, silently
+        // ignoring a live, ball-carrying opponent who might be right in
+        // front of it. Checked first, unconditionally: any carrier
+        // within realistic marking/engagement range is this defender's
+        // job before any off-ball target selection runs.
+        if let Some(ball_carrier) = ctx.players().opponents().with_ball().next() {
+            let dist_to_carrier = ball_carrier.distance(ctx);
+            if ctx.player().defensive().can_engage_tackle(dist_to_carrier) {
+                return Some(StateChangeResult::with_defender_state(
+                    DefenderState::Tackling,
+                ));
+            }
+            if dist_to_carrier < 60.0 {
+                return Some(StateChangeResult::with_defender_state(
+                    DefenderState::Pressing,
+                ));
+            }
+        }
+
         // 2. Find best opponent to mark using coordination system
         // First try to find an unmarked opponent if current target is being engaged by another defender
         let opponent_to_mark = self.find_best_marking_target(ctx);

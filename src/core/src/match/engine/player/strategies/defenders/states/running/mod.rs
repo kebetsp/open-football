@@ -576,15 +576,75 @@ impl DefenderRunningState {
         let ball_dist = ctx.ball().distance();
         let near_start =
             ctx.player().position_to_distance() != PlayerDistanceFromStartPosition::Big;
+
+        // 2026-09-14 (Pavel's direct report; raw-data confirmed 315
+        // Running<->HoldingLine flip episodes/match, most with NO live
+        // ball carrier nearby at all -- the earlier LowBlock carve-out
+        // above only closed the ball-proximity slice of this, not the
+        // root cause). `near_start` and HoldingLine's own exit check
+        // (`distance_from_line > MAX_DEFENSIVE_LINE_DEVIATION`, 35u)
+        // measure two DIFFERENT things: this one is a coarse Small/
+        // Medium/Big bucket off the player's STATIC start_position
+        // (Medium tops out at 250u!); that one is a tight 35u band off
+        // a DYNAMIC, ball-influenced zonal target recomputed every
+        // tick. A defender sitting well inside "near_start" (up to
+        // 250u out) is routinely still >35u from the zonal target --
+        // Running sends him to HoldingLine, HoldingLine immediately
+        // bounces him back, every tick, neither state's real logic
+        // (jockey, press, tackle, hold shape) ever getting an
+        // uninterrupted tick to actually execute. Fixed with genuine
+        // hysteresis: judge re-entry against the SAME zonal target
+        // HoldingLine itself exits on, at a stricter threshold
+        // (REENTRY_ZONAL_DEVIATION < MAX_DEFENSIVE_LINE_DEVIATION) so
+        // the two states can't keep re-triggering each other at the
+        // same boundary.
+        const REENTRY_ZONAL_DEVIATION: f32 = 20.0;
+        let zonal_target = crate::r#match::defenders::states::DefenderHoldingLineState::default()
+            .calculate_zonal_position(ctx, ctx.tick_context.positions.ball.position);
+        let near_zonal_target =
+            (ctx.player.position.x - zonal_target.x).abs() <= REENTRY_ZONAL_DEVIATION;
+
         match phase {
             // Settled defence in a low block — four defenders form a
             // compact horizontal line. Route to HoldingLine if we're
             // roughly in place; Returning if we're out of position.
+            //
+            // 2026-09-14 (Pavel's direct report -- a defender closing on
+            // a ball receiver flickers Running<->HoldingLine every tick
+            // instead of committing to jockey/press/tackle): this branch
+            // was missing the exact same "ball nearby, I'm the best
+            // chaser -> fall through to the reactive logic below"
+            // carve-out the MidBlock branch right below already has.
+            // Unconditionally redirecting to HoldingLine meant Running's
+            // entire chase/tackle/intercept logic (further down in this
+            // function) was structurally unreachable whenever phase read
+            // LowBlock and the defender was within 250u of his own slot
+            // -- i.e. almost every realistic close-down. HoldingLine's
+            // own deviation check (35u from its dynamic zonal target,
+            // MAX_DEFENSIVE_LINE_DEVIATION) then kicks him straight back
+            // out to Running, which immediately bounces him back here --
+            // a same-tick flicker with neither state's substantive
+            // engagement logic ever getting an uninterrupted tick to
+            // commit. LowBlock is a tighter, deeper phase than MidBlock,
+            // so the reasoned choice is a smaller reach (still enough to
+            // cover a genuine 1v1 closing-down distance) rather than
+            // MidBlock's 60u verbatim -- flagged as an estimate, not
+            // sourced.
             GamePhase::LowBlock => {
+                if ball_dist < 45.0 && ctx.team().is_best_player_to_chase_ball() {
+                    return None; // fall through to the tackling/chase logic
+                }
                 if !near_start {
                     return Some(StateChangeResult::with_defender_state(
                         DefenderState::Returning,
                     ));
+                }
+                if !near_zonal_target {
+                    // Still genuinely walking back toward the zonal spot
+                    // -- stay in Running (its own velocity() steers
+                    // there) instead of forcing a HoldingLine transition
+                    // that would immediately bounce back out.
+                    return None;
                 }
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::HoldingLine,
@@ -602,6 +662,9 @@ impl DefenderRunningState {
                 // hold the line.
                 if ball_dist < 60.0 && ctx.team().is_best_player_to_chase_ball() {
                     return None; // fall through to the tackling logic
+                }
+                if !near_zonal_target {
+                    return None;
                 }
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::HoldingLine,

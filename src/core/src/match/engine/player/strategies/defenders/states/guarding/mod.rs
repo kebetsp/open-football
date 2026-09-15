@@ -107,22 +107,28 @@ impl StateProcessingHandler for DefenderGuardingState {
                     DefenderState::Tackling,
                 ));
             }
-            if dist_to_carrier < 60.0 {
-                // Ball carrier is close — check if heading toward us or our goal
-                let carrier_vel = ctx.tick_context.positions.players.velocity(ball_carrier.id);
-                let carrier_speed = carrier_vel.magnitude();
-                if carrier_speed > 0.1 {
-                    let to_defender = (ctx.player.position - ball_carrier.position).normalize();
-                    let own_goal = ctx.ball().direction_to_own_goal();
-                    let to_goal = (own_goal - ball_carrier.position).normalize();
-                    let approaching_defender = carrier_vel.normalize().dot(&to_defender) > 0.2;
-                    let approaching_goal = carrier_vel.normalize().dot(&to_goal) > 0.3;
-                    if approaching_defender || approaching_goal {
-                        return Some(StateChangeResult::with_defender_state(
-                            DefenderState::Pressing,
-                        ));
-                    }
-                }
+            // 2026-09-14 (Pavel's direct report -- a defender closing on
+            // an opponent who then receives the ball doesn't tackle,
+            // sidesteps past him, and runs off unrelated to the play):
+            // this used to require BOTH proximity (<60u) AND a velocity-
+            // alignment heuristic ("is he moving toward me or my goal")
+            // before reacting -- a heuristic meant for an AMBIENT threat
+            // scan (is this distant carrier worth my attention at all),
+            // wrongly applied to the specific carrier already inside my
+            // guarding range. Worse: step 3/4 below can never catch a
+            // guarded opponent who just received the ball either --
+            // `find_guard_target` explicitly excludes ball carriers from
+            // its own candidate scan ("that's for pressing/tackling"),
+            // so the "if the guarded opponent has the ball" check further
+            // down is dead code. Any carrier within our own guarding
+            // range is now unconditionally this defender's job -- a real
+            // defender reacts the instant the ball enters his zone, he
+            // doesn't wait for the carrier's velocity vector to satisfy
+            // a threat-scan heuristic.
+            if dist_to_carrier < MAX_GUARD_RANGE {
+                return Some(StateChangeResult::with_defender_state(
+                    DefenderState::Pressing,
+                ));
             }
         }
 

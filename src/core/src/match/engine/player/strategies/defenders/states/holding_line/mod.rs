@@ -8,7 +8,10 @@ use crate::r#match::{
     ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
 };
 
-const MAX_DEFENSIVE_LINE_DEVIATION: f32 = 35.0; // Tighter line — less room for attackers
+// pub(crate): reused by DefenderRunningState's phase_dispatch (2026-09-14
+// hysteresis fix, see that file) so both sides of the HoldingLine<->Running
+// boundary judge "in position" against the same reference point.
+pub(crate) const MAX_DEFENSIVE_LINE_DEVIATION: f32 = 35.0; // Tighter line — less room for attackers
 const BALL_PROXIMITY_THRESHOLD: f32 = 150.0; // React to ball from further out
 const MARKING_DISTANCE_THRESHOLD: f32 = 50.0; // Pick up attackers from further away
 const PRESSING_DISTANCE_THRESHOLD: f32 = 60.0; // Step out to press ball carrier earlier
@@ -371,7 +374,13 @@ impl StateProcessingHandler for DefenderHoldingLineState {
 impl DefenderHoldingLineState {
     /// Calculate zonal defensive position - creates natural staggered formation
     /// Each defender positions based on their assigned opponent or zone
-    fn calculate_zonal_position(
+    ///
+    /// pub(crate): reused by DefenderRunningState's phase_dispatch (2026-09-14
+    /// hysteresis fix) so a re-entry decision judges "close enough to my
+    /// zonal spot" against the exact same dynamic target this state's own
+    /// exit check (MAX_DEFENSIVE_LINE_DEVIATION) uses, instead of an
+    /// unrelated static-start-position measure.
+    pub(crate) fn calculate_zonal_position(
         &self,
         ctx: &StateProcessingContext,
         ball_position: Vector3<f32>,
