@@ -125,6 +125,52 @@ const COVER_MAX_DISTANCE: f32 = 180.0;
 const HELP_SCAN_RADIUS: f32 = 28.0; // Range in which Help defender looks for a pass option
 const COVER_GOAL_SIDE_OFFSET: f32 = 12.0; // Cover sits this far goal-side of carrier
 
+// docs/zonal-coverage-rotation-and-tackle-risk-design.md, Chunk B
+// (2026-09-15): every off-ball opponent-target scan in Guarding/Marking
+// (`find_guard_target`, `calculate_opponent_danger_score` -> `find_help_
+// target`/`find_unmarked_opponent`, and marking.rs's own
+// `find_most_dangerous_opponent`) picked whichever opponent scored
+// highest on danger alone, with zero reference to the defender's own
+// zone (`start_position`) -- "person-based by accident, not zone-based
+// by design" (Pavel's own framing). Reuses `calculate_zonal_position`'s
+// own `zone_half_width = 50.0` (holding_line/mod.rs) for the same
+// real-world concept (a defender's own lateral defensive channel) rather
+// than inventing a second value. MULTIPLICATIVE, not additive -- this
+// codebase's own established lesson (evaluator.rs, 2026-07-26: "additive
+// penalties are routinely out-muscled by multiplicative congestion/space
+// terms") applies identically here: an additive zone bonus would be
+// swamped by the existing danger-score's own 100+-point spread. A
+// STRONG preference, not a hard wall: floored at 0.85x (not 0.0x) so a
+// genuinely far-more-dangerous opponent well outside the band can still
+// win -- a decoy run standing just past a hard cutoff must not become
+// guaranteed-uncovered. Reasoned estimate, category (d): no dataset
+// isolates a real "how much does a marker prefer his own zone over a
+// more dangerous opponent elsewhere" tradeoff; the floor/falloff below
+// are chosen to be a real, measurable preference without ever fully
+// overriding a large danger gap (same discipline as `SLIDE_REACH_
+// DISTANCE`/`COVER_MAX_DISTANCE`).
+//
+// The floor was originally 0.5 (up to a 50% score cut) -- verified
+// this session (raw ZONEBDIAG trace, 5 matches, 9985 candidate-
+// selection groups) to actively FLIP the 2026-08-30 "abandon a
+// dangerous stationary mark" fix: 100 cases where a closer-to-goal
+// candidate lost to a farther one specifically because of the zone
+// floor, at a >=20% relative score gap -- comparable to or larger than
+// that fix's own reported ~24% gap (148.0 vs 112.0, "the distant,
+// active one wins under the old weights every time this pattern
+// occurs, which is backwards from real defensive doctrine"). The same
+// doctrine ("movement/reception-likelihood are tie-breakers ... not
+// able to override a large goal-proximity gap") applies to the zone
+// preference too -- it must be a tie-breaker among similarly-dangerous
+// opponents, not a second, independent way to override a decisive
+// distance-to-goal gap. Raised to 0.85 (max 15% cut, well under the
+// ~24% gap the 08-30 fix needs to preserve) and re-verified with the
+// same trace: 0 flips at >=20% gap remained (see the chunk's write-up
+// in CLAUDE.md for the before/after numbers).
+const ZONE_LATERAL_BAND: f32 = 50.0;
+const ZONE_PREFERENCE_FALLOFF: f32 = 200.0;
+const ZONE_PREFERENCE_FLOOR: f32 = 0.85;
+
 // docs/defensive-delay-and-engagement-timing.md's 4th delay-exit trigger
 // (docs/positional-football-master-plan.md, Stage 4, 2026-09-07): "the
 // defender's own cover has arrived (a teammate is now goal-side and
@@ -993,7 +1039,23 @@ impl<'p> DefensiveOperationsImpl<'p> {
             (opponent.position - self.ctx.tick_context.positions.ball.position).magnitude();
         score += (100.0 - ball_distance.min(100.0)) / 5.0;
 
-        score
+        // Chunk B (2026-09-15): prefer an opponent inside this
+        // defender's own zone -- see the const doc comment above.
+        score * self.zone_preference_multiplier(opponent.position)
+    }
+
+    /// How strongly to prefer a candidate opponent inside this
+    /// defender's own lateral zone (`start_position.y +/-
+    /// ZONE_LATERAL_BAND`) over one further from it. 1.0 = full score
+    /// (in-zone, or no preference to apply); falls linearly to
+    /// `ZONE_PREFERENCE_FLOOR` as the opponent gets further outside the
+    /// band, never below it -- a strong preference, not a hard wall.
+    /// See the `ZONE_LATERAL_BAND` doc comment above for why this is
+    /// multiplicative and where the magnitudes come from.
+    pub fn zone_preference_multiplier(&self, opponent_position: Vector3<f32>) -> f32 {
+        let lateral_offset = (opponent_position.y - self.ctx.player.start_position.y).abs();
+        let over = (lateral_offset - ZONE_LATERAL_BAND).max(0.0);
+        (1.0 - over / ZONE_PREFERENCE_FALLOFF).clamp(ZONE_PREFERENCE_FLOOR, 1.0)
     }
 
     /// Get the number of defenders currently engaging opponents within a distance

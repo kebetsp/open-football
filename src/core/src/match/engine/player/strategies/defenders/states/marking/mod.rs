@@ -362,6 +362,15 @@ impl DefenderMarkingState {
                 .clamp(0.0, 1.0);
             danger_score += receiver_threat * 30.0;
 
+            // Chunk B (2026-09-15,
+            // docs/zonal-coverage-rotation-and-tackle-risk-design.md):
+            // same zone preference as guarding.rs's own `find_guard_
+            // target` and `calculate_opponent_danger_score` (defensive.rs)
+            // -- one shared multiplier, three call sites, so the whole
+            // Guarding/Marking off-ball scan family agrees on what "my
+            // zone" means.
+            danger_score *= ctx.player().defensive().zone_preference_multiplier(opponent.position);
+
             if danger_score > best_score {
                 best_score = danger_score;
                 best_opponent = Some(opponent);

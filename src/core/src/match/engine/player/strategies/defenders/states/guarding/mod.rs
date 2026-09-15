@@ -329,6 +329,18 @@ impl DefenderGuardingState {
                 .clamp(0.0, 1.0);
             score += receiver_threat * 12.0;
 
+            // Chunk B (2026-09-15,
+            // docs/zonal-coverage-rotation-and-tackle-risk-design.md):
+            // prefer an opponent inside this defender's own zone over
+            // one further from it -- see the shared
+            // `zone_preference_multiplier` doc comment (defensive.rs)
+            // for why this is multiplicative and where the magnitudes
+            // come from. Factor 5 above already gives a small, additive
+            // "prefer nearby opponents" nudge (max 20 of ~167 points) --
+            // this is a distinct, stronger, zone-anchored preference on
+            // top of it, not a replacement.
+            score *= ctx.player().defensive().zone_preference_multiplier(opponent.position);
+
             if score > best_score {
                 best_score = score;
                 best_target = Some(opponent);
