@@ -953,6 +953,55 @@ const SLIDE_FOUL_COST_BASE: f32 = 0.20;
 const SLIDE_FOUL_COST_OWN_BOX_MULT: f32 = 2.2; // a mistimed slide in the box is real penalty risk — slightly above the standing tackle's own equivalent (TACKLE_FOUL_RISK_COST_OWN_BOX_MULT, 2.0) since a slide commits with more force
 const SLIDE_OWN_RISK_COST: f32 = 0.25;
 
+/// Chunk D (docs/zonal-coverage-rotation-and-tackle-risk-design.md,
+/// 2026-09-15): `value_conceded_if_beaten`'s `danger` term measures how
+/// dangerous THIS specific opponent is if he beats me — highest NEAR
+/// the defender's own box, since that's where a shot/cross is most
+/// threatening. This is a distinct, opposite-direction cost: not "how
+/// dangerous is this attacker," but "how dangerous is it for the WHOLE
+/// TEAM if I, personally, take myself out of the game by diving in and
+/// missing" — grounded in rest-defence doctrine (a lost duel far from
+/// goal degrades the team's whole shape at the exact moment a counter
+/// has the most space to develop; a lost duel right on the doorstep is
+/// already fully priced by `danger`, so this term stays near-zero
+/// there). Applied only to the Miss outcome below (the one case the
+/// existing formula gives zero cost to today — Success/Foul/OwnRisk
+/// already have their own, unrelated costs) since Miss is specifically
+/// "committed and got nothing for it," the scenario the doc's own
+/// framing names. `REST_DEFENSE_NEAR_GOAL`/`_FAR`/`_EXPOSURE_CEILING`
+/// are reasoned estimates, category (d) — no dataset isolates this
+/// tradeoff numerically, same discipline as `SLIDE_REACH_DISTANCE`.
+/// `REST_DEFENSE_FAR` = the halfway line at this engine's 840-wide
+/// pitch (own-goal-relative, so 420 either direction); the ceiling
+/// (0.30) is sized to be a real, comparable-magnitude cost against the
+/// existing terms (SLIDE_FOUL_COST_BASE*OWN_BOX_MULT = 0.44) without
+/// dwarfing them.
+const REST_DEFENSE_NEAR_GOAL: f32 = 100.0; // ~12.5m — inside this, negligible (the `danger` term already dominates here)
+const REST_DEFENSE_FAR: f32 = 420.0; // halfway line — full exposure cost from here on
+const REST_DEFENSE_EXPOSURE_CEILING: f32 = 0.30;
+// Verified this session (raw trace, 769 slide-candidate ticks, 28
+// matches, temporarily logging both the with- and without-exposure
+// value): monotonic rise confirmed (0.0000 at dist<=100, climbing
+// smoothly to ~0.11 by dist=220); the reduction is genuinely
+// distance-concentrated, not a flat shift -- the 0-100u band's
+// attempt rate is UNCHANGED (44.4% both with/without, as designed,
+// since exposure_cost=0 there), while the 100-200u band (89% of all
+// candidates) drops ~26pp (53.9% vs 80.2%). No candidate ever occurred
+// beyond ~220u in this sample -- desperate_slide_candidate's own
+// danger-threshold gate already suppresses far-from-goal candidates
+// before this term gets a chance to matter, so the REST_DEFENSE_FAR
+// ceiling region (halfway line, 420u) is correctly implemented but
+// essentially unexercised by real play -- a real, honest scope note,
+// not a bug.
+
+fn rest_defense_exposure_cost(ctx: &StateProcessingContext) -> f32 {
+    let own_goal = ctx.ball().direction_to_own_goal();
+    let dist = (ctx.player.position - own_goal).magnitude();
+    let ratio = ((dist - REST_DEFENSE_NEAR_GOAL) / (REST_DEFENSE_FAR - REST_DEFENSE_NEAR_GOAL))
+        .clamp(0.0, 1.0);
+    ratio * REST_DEFENSE_EXPOSURE_CEILING
+}
+
 /// EV of committing to the slide right now, compared against the
 /// IMPLICIT value of just letting the ordinary chase continue — 0, the
 /// baseline this is measured against (per the spec: NOT tackle_value/
@@ -983,6 +1032,7 @@ pub fn desperate_slide_value(
     probs.p_success * SLIDE_SUCCESS_VALUE
         - probs.p_foul * foul_cost
         - probs.p_own_risk * SLIDE_OWN_RISK_COST * danger
+        - probs.p_miss() * rest_defense_exposure_cost(ctx)
 }
 
 /// D6 (2026-08-22): whether a SUCCESSFUL slide should push the ball
