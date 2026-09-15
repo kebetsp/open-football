@@ -233,10 +233,17 @@ impl StateProcessingHandler for DefenderCoveringState {
         if let Some(cover_point) = ctx.player().defensive().cover_target_position() {
             if let Some(opponent) = ctx.players().opponents().with_ball().next() {
                 let opp_velocity = opponent.velocity(ctx);
-                // Small tether toward tactical position prevents all
-                // defenders collapsing onto the same spot when multiple
-                // are in Cover-adjacent states.
-                let tether = 0.2;
+                // Tether toward tactical position prevents all defenders
+                // collapsing onto the same spot when multiple are in
+                // Cover-adjacent states. Chunk A (2026-09-15,
+                // docs/zonal-coverage-rotation-and-tackle-risk-design.md):
+                // was a flat 0.2 regardless of how far this defender
+                // actually is from the action; now scales with distance
+                // (see `cover_zone_blend_weight`'s own doc comment) so a
+                // Cover defender near the outer edge of his range isn't
+                // dragged fully off his own zone just for being second-
+                // closest.
+                let tether = ctx.player().defensive().cover_zone_blend_weight();
                 let target = cover_point * (1.0 - tether) + ctx.player.start_position * tether;
                 let to_target = target - ctx.player.position;
                 let distance = to_target.magnitude();

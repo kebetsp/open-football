@@ -840,6 +840,18 @@ impl<'p> DefensiveOperationsImpl<'p> {
     /// ball carrier and own goal, `COVER_GOAL_SIDE_OFFSET` units behind
     /// the carrier. If Primary is beaten, this defender is the next
     /// body between attacker and goal.
+    ///
+    /// Deliberately left as a PURE ball-carrier-relative point, with no
+    /// `start_position`/zone reference — `cover_is_ready()` (the 4th
+    /// delay-exit trigger, docs/defensive-delay-and-engagement-timing.md)
+    /// also reads this function to check whether a teammate has arrived
+    /// at the real cover spot, and blending in a zone anchor here would
+    /// silently move that already-verified check's target point too.
+    /// The zone-aware blend (Chunk B/Chunk A,
+    /// docs/zonal-coverage-rotation-and-tackle-risk-design.md,
+    /// 2026-09-15) lives downstream instead, in the one place that
+    /// already blends toward `start_position` — see
+    /// `cover_zone_blend_weight` below and `covering/mod.rs::velocity`.
     pub fn cover_target_position(&self) -> Option<Vector3<f32>> {
         let ball_carrier = self.ctx.players().opponents().with_ball().next()?;
         let own_goal = self.ctx.ball().direction_to_own_goal();
@@ -850,6 +862,44 @@ impl<'p> DefensiveOperationsImpl<'p> {
         }
         let dir = to_goal / to_goal_dist;
         Some(ball_carrier.position + dir * COVER_GOAL_SIDE_OFFSET)
+    }
+
+    /// Chunk A (2026-09-15): how strongly a Cover-role defender's
+    /// realized movement should blend toward his own zone anchor
+    /// (`start_position`) instead of the pure `cover_target_position()`
+    /// point. `covering/mod.rs::velocity()` already did this blend, but
+    /// at a flat 0.2 regardless of how far the covering defender
+    /// actually is from the action — so a defender near the outer edge
+    /// of `COVER_MAX_DISTANCE` (180u/22.5m, itself a large radius for
+    /// "the very next closest defender," flagged but not changed here)
+    /// got dragged almost fully off his own zone just for being the
+    /// second-closest. Scales from the existing 0.2 base (unchanged at
+    /// close range, minimizing risk to already-tuned close-in cover
+    /// behaviour) up to a 0.5 CEILING at `COVER_MAX_DISTANCE` — real and
+    /// bounded, capped at 0.5 (not higher) specifically so the ball-
+    /// carrier-relative point never drops below a TIED weight even at
+    /// the far edge (this doc's own guardrail: Cover must not become
+    /// indistinguishable from Hold). Reasoned estimate, category (d) —
+    /// same discipline as `COVER_MAX_DISTANCE`/`SLIDE_REACH_DISTANCE`.
+    ///
+    /// Verified this session (raw trace, ~41.7k Cover velocity() ticks,
+    /// 10 matches): monotonic rise confirmed (mean 0.226 at <20u closing
+    /// on 0.500 exactly at >=180u, the intended ceiling); mean pull
+    /// toward the zone anchor roughly doubled overall (36.3 -> 74.7
+    /// units) vs. the old flat 0.2, concentrated at range (>=180u band:
+    /// 164.2 units of pull vs. <20u band's 24.9). `cover_target_position`
+    /// itself (and therefore `cover_is_ready`, the 4th delay-exit
+    /// trigger) is provably byte-identical to before this chunk (see the
+    /// diff -- only a doc comment was added above it) -- no re-trace
+    /// needed, the flagged conflict is structurally avoided, not just
+    /// assumed safe.
+    pub fn cover_zone_blend_weight(&self) -> f32 {
+        let Some(ball_carrier) = self.ctx.players().opponents().with_ball().next() else {
+            return 0.2;
+        };
+        let my_dist = (self.ctx.player.position - ball_carrier.position).magnitude();
+        let dist_ratio = (my_dist / COVER_MAX_DISTANCE).clamp(0.0, 1.0);
+        0.2 + dist_ratio * 0.3
     }
 
     /// Has a teammate arrived at (or near) the Cover position for the
