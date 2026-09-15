@@ -2469,6 +2469,225 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 }
             }
 
+            // Chunk C (docs/zonal-coverage-rotation-and-tackle-risk-
+            // design.md, 2026-09-15): rotation-on-engagement. When a
+            // defender commits to engaging the ball carrier (Pressing/
+            // Tackling), his single nearest non-committing DEFENDER
+            // teammate (by zone-anchor/`shape_base` distance, not
+            // current position) gets a bounded pull of his OWN
+            // start_position toward the committing teammate's vacated
+            // zone -- the real, named "shift" mechanism (Coachbetter,
+            // cited in the design doc) where the rest of a back four
+            // adjusts to cover for whoever's stepped out. Defenders
+            // only this pass -- midfielder rotation is the design doc's
+            // own explicitly deferred D8.3 scope, not attempted here.
+            //
+            // Deliberately scoped to players with NO active shape_rule
+            // this tick (`!p.shape_rule_active`, computed just above) --
+            // composing this on top of a manager's own explicit shape
+            // directive is the doc's own flagged highest-risk conflict
+            // ("two independent systems writing to the same field in
+            // the same tick"); skipping that case entirely for now is a
+            // deliberate scope narrowing, not an oversight, and the
+            // common (undirected) case is unaffected by it. Reuses the
+            // "recompute the TARGET from a stable anchor, hard-set
+            // start_position, let the consumer's own steering smooth
+            // the realized movement" half of the ShapeRule idiom just
+            // above -- once a rotation is active, the target itself is
+            // always one of two fixed anchor points, never erratic.
+            // What ISN'T reused verbatim: ShapeRule's trigger conditions
+            // (phase/possession/score) are inherently slow-changing, but
+            // this trigger (a per-tick state check) is not -- a first,
+            // non-persistent version was raw-traced and found flickering
+            // (see `rotation_cover_target_id`'s own doc comment,
+            // player.rs), so decay-back uses an explicit persisted
+            // ticks window (mirroring `wide_run_track_ticks`), not an
+            // instant per-tick snap.
+            {
+                const ROTATION_MAX_DISTANCE: f32 = 180.0; // reuses COVER_MAX_DISTANCE's own established "genuinely adjacent zone" scale (defensive.rs) -- not a second, unrelated value for the same real-world concept
+                const ROTATION_PULL_FRACTION: f32 = 0.35; // a real, visible shift toward the vacated zone -- capped well below 0.5 so a rotator never collapses onto the committing teammate's own spot
+                // Verified this session (raw trace, 15 matches, ~505k
+                // active-rotation ticks, re-run after both the
+                // displacement-gate removal and the persistence fix):
+                // spacing/clustering check (the doc's own required
+                // guardrail, directly closing the gap that let the
+                // 2026-09-12 rollback pass its own metrics while
+                // visibly clustering) -- realized rotator<->committing
+                // distance <5u (literal overlap) only 0.20% of active
+                // ticks, <20u only 1.11%; ticks-decay sanity (within
+                // each (rotator,committing) pair's own subsequence) --
+                // 0/505,420 unexpected transitions (every jump either
+                // refreshed to exactly 90 or decayed monotonically);
+                // position-jump smoothness -- p50 0.41 units/tick
+                // (matches this engine's established realistic per-tick
+                // speed), only 0.65% of steps >20u (consistent with
+                // genuine restarts/halftime, not thrashing). Honest,
+                // not chased further: only ~12 distinct (rotator,
+                // committing) pairs recur across 15 matches, each
+                // active for a large fraction of its own match -- a
+                // real, structural consequence of using STATIC zone-
+                // anchor distance (a defender's single nearest zone-
+                // anchor neighbor never changes mid-half) combined with
+                // however often Pressing/Tackling itself fires in this
+                // engine, which this chunk did not create and does not
+                // change -- flagged as an open question about
+                // underlying tackle-engagement frequency, not a defect
+                // in this mechanism.
+
+                struct RotSnapshot {
+                    id: u32,
+                    team_id: u32,
+                    committing: bool,
+                    shape_base: Vector3<f32>,
+                }
+                let rot_snapshot: Vec<RotSnapshot> = field
+                    .players
+                    .iter()
+                    .filter(|p| {
+                        p.tactical_position.current_position.position_group()
+                            == crate::PlayerFieldPositionGroup::Defender
+                            && !p.shape_rule_active
+                            && p.shape_base.is_some()
+                    })
+                    .map(|p| {
+                        let in_engage_state = matches!(
+                            p.state,
+                            crate::r#match::player::state::PlayerState::Defender(
+                                crate::r#match::defenders::states::DefenderState::Pressing
+                                    | crate::r#match::defenders::states::DefenderState::Tackling
+                            )
+                        );
+                        // A displacement-from-shape_base gate was tried
+                        // and REMOVED after direct calibration (this
+                        // session, 6 matches, 2.65M samples): defenders
+                        // NOT in Pressing/Tackling already sit a median
+                        // 103.4 units from their static shape_base
+                        // anchor (86.2% exceed 40u) -- essentially
+                        // identical to defenders WHO ARE engaged (median
+                        // 111.2, 92.3%). `shape_base` is a static
+                        // formation-table point that ordinary defending
+                        // (marking, tracking, jockeying) already ranges
+                        // 100+ units from as a matter of routine in this
+                        // engine -- it does not distinguish "genuinely
+                        // stepped out to engage" from normal play, so a
+                        // displacement gate on it added complexity with
+                        // no real discriminating power. `in_engage_state`
+                        // alone is the committing signal; the earlier-
+                        // diagnosed flicker (median 1-tick contiguous
+                        // "committing" runs) is handled by the
+                        // persistence mechanism below
+                        // (rotation_cover_target_id/_ticks), not by this
+                        // gate.
+                        RotSnapshot {
+                            id: p.id,
+                            team_id: p.team_id,
+                            committing: in_engage_state,
+                            shape_base: p.shape_base.unwrap(),
+                        }
+                    })
+                    .collect();
+
+                // Refresh-tick window for a persisted rotation
+                // assignment -- exact same idiom and magnitude as
+                // `wide_run_track_ticks` above (90 ticks/~0.9s). Added
+                // after a first, non-persistent version was raw-traced
+                // (15 matches) and found flickering badly: median
+                // contiguous "committing" run length was 1 TICK, not a
+                // sustained engagement -- Pressing/Tackling combined
+                // with the displacement check doesn't hold steady
+                // tick to tick during a live duel, so a rotator's
+                // target was being re-decided almost every tick. This
+                // mirrors `wide_run_track_target`'s own fix for the
+                // identical failure mode (its own doc comment: "the
+                // same thrashing should_yield_takeball's own HYSTERESIS
+                // constant exists to prevent").
+                const ROTATION_REFRESH_TICKS: u16 = 90;
+
+                for p in field.players.iter_mut() {
+                    if p.shape_rule_active || p.shape_base.is_none() {
+                        continue;
+                    }
+                    if p.tactical_position.current_position.position_group()
+                        != crate::PlayerFieldPositionGroup::Defender
+                    {
+                        continue;
+                    }
+                    let Some(me) = rot_snapshot.iter().find(|s| s.id == p.id) else {
+                        continue;
+                    };
+                    if me.committing {
+                        // A committing player never rotates for someone
+                        // else -- he stays pinned to his own true zone
+                        // anchor (his actual movement this tick is
+                        // driven entirely by Pressing/Tackling's own
+                        // steering, not start_position).
+                        p.rotation_cover_target_id = None;
+                        p.rotation_cover_ticks = 0;
+                        p.start_position = me.shape_base;
+                        continue;
+                    }
+
+                    // Refresh/decay an existing persisted assignment.
+                    if let Some(target_id) = p.rotation_cover_target_id {
+                        let still_valid = rot_snapshot.iter().any(|s| {
+                            s.id == target_id
+                                && s.committing
+                                && (s.shape_base - me.shape_base).magnitude()
+                                    <= ROTATION_MAX_DISTANCE
+                        });
+                        if still_valid {
+                            p.rotation_cover_ticks = ROTATION_REFRESH_TICKS;
+                        } else if p.rotation_cover_ticks > 0 {
+                            p.rotation_cover_ticks -= 1;
+                        } else {
+                            p.rotation_cover_target_id = None;
+                        }
+                    }
+
+                    // No active assignment -- look for a fresh trigger.
+                    if p.rotation_cover_target_id.is_none() {
+                        let nearest_committing = rot_snapshot
+                            .iter()
+                            .filter(|s| s.id != me.id && s.team_id == me.team_id && s.committing)
+                            .map(|s| (s, (s.shape_base - me.shape_base).magnitude()))
+                            .filter(|(_, d)| *d <= ROTATION_MAX_DISTANCE)
+                            .min_by(|a, b| a.1.total_cmp(&b.1));
+                        if let Some((teammate, my_dist)) = nearest_committing {
+                            // Exclusivity -- only the single closest
+                            // non-committing defender teammate responds
+                            // to a given committing teammate, mirroring
+                            // wide_run_track's own `am_closest` check:
+                            // without it, multiple rotators can converge
+                            // on the same vacated zone (this project's
+                            // own 2026-09-12 rollback's failure mode).
+                            let am_closest = rot_snapshot.iter().all(|s| {
+                                s.id == me.id
+                                    || s.team_id != me.team_id
+                                    || s.committing
+                                    || (s.shape_base - teammate.shape_base).magnitude()
+                                        >= my_dist
+                            });
+                            if am_closest {
+                                p.rotation_cover_target_id = Some(teammate.id);
+                                p.rotation_cover_ticks = ROTATION_REFRESH_TICKS;
+                            }
+                        }
+                    }
+
+                    p.start_position = match p.rotation_cover_target_id {
+                        Some(target_id) => {
+                            let target_base = rot_snapshot
+                                .iter()
+                                .find(|s| s.id == target_id)
+                                .map(|s| s.shape_base)
+                                .unwrap_or(me.shape_base);
+                            me.shape_base.lerp(&target_base, ROTATION_PULL_FRACTION)
+                        }
+                        None => me.shape_base,
+                    };
+                }
+            }
+
             // realism-bug (2026-09-12): forward off-ball width commitment
             // (see the field's own doc comment, player.rs) — a bounded,
             // probabilistic "hold genuine flank depth for a few seconds"

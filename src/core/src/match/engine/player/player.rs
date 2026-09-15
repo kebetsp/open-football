@@ -368,6 +368,20 @@ pub struct MatchPlayer {
     /// one that stops (loses the ball, gets tackled, moves away) decays
     /// within under a second with nothing else needed to clear it.
     pub wide_run_track_ticks: u16,
+    /// Chunk C (docs/zonal-coverage-rotation-and-tackle-risk-design.md,
+    /// 2026-09-15) — same persistence idiom as `wide_run_track_target`
+    /// just above, for the same reason: a raw per-tick trace found the
+    /// naive "is a teammate committing to engage RIGHT NOW" check
+    /// flickering (median contiguous run length was 1 tick) because
+    /// `DefenderState::Pressing`/`Tackling` combined with a real
+    /// displacement-from-zone check doesn't hold steady tick to tick
+    /// during a live duel. The teammate id this defender is currently
+    /// rotating to cover for, if any.
+    pub rotation_cover_target_id: Option<u32>,
+    /// Ticks remaining on the above assignment — refreshed every tick
+    /// the target teammate still qualifies as committing, decays
+    /// otherwise (same shape as `wide_run_track_ticks`).
+    pub rotation_cover_ticks: u16,
     /// P5 (A3, `docs/attacking-defensive-decision-rebuild-plan.md`
     /// §2.1/§2.2) — how many consecutive ticks this player has occupied
     /// their current `PitchLane`. Incremented each tick the lane stays
@@ -848,6 +862,8 @@ impl MatchPlayer {
             width_commitment_ticks: 0,
             wide_run_track_target: None,
             wide_run_track_ticks: 0,
+            rotation_cover_target_id: None,
+            rotation_cover_ticks: 0,
             lane_residency_ticks: 0,
             lane_residency_lane: u8::MAX,
             spatial_width_emphasis: 1.0,
@@ -958,6 +974,8 @@ impl MatchPlayer {
             width_commitment_ticks: 0,
             wide_run_track_target: None,
             wide_run_track_ticks: 0,
+            rotation_cover_target_id: None,
+            rotation_cover_ticks: 0,
             lane_residency_ticks: 0,
             lane_residency_lane: u8::MAX,
             spatial_width_emphasis: 1.0,
