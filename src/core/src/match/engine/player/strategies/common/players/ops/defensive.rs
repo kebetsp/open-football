@@ -170,6 +170,11 @@ const COVER_GOAL_SIDE_OFFSET: f32 = 12.0; // Cover sits this far goal-side of ca
 const ZONE_LATERAL_BAND: f32 = 50.0;
 const ZONE_PREFERENCE_FALLOFF: f32 = 200.0;
 const ZONE_PREFERENCE_FLOOR: f32 = 0.85;
+// See `ball_relevance_multiplier`'s own doc comment for the full
+// reasoning (2026-09-16).
+const BALL_RELEVANCE_NEAR: f32 = 150.0; // ~19m -- inside this, no penalty at all
+const BALL_RELEVANCE_FALLOFF: f32 = 300.0;
+const BALL_RELEVANCE_FLOOR: f32 = 0.15;
 
 // docs/defensive-delay-and-engagement-timing.md's 4th delay-exit trigger
 // (docs/positional-football-master-plan.md, Stage 4, 2026-09-07): "the
@@ -1091,7 +1096,18 @@ impl<'p> DefensiveOperationsImpl<'p> {
 
         // Chunk B (2026-09-15): prefer an opponent inside this
         // defender's own zone -- see the const doc comment above.
-        score * self.zone_preference_multiplier(opponent.position)
+        let score = score * self.zone_preference_multiplier(opponent.position);
+
+        // 2026-09-16 (Pavel's direct report -- see
+        // `ball_relevance_multiplier`'s own doc comment for the full
+        // trace/verification). This function (consumed by
+        // `find_help_target`/`find_unmarked_opponent`) is confirmed via
+        // a branch-identifying diagnostic to be the dominant path for
+        // Marking's off-ball target selection (99.8% of decisions,
+        // vs. 0.2% for `find_most_dangerous_opponent`, which was fixed
+        // first and turned out to barely matter) -- this, not the rare
+        // fallback, is where the actual fix belongs.
+        score * self.ball_relevance_multiplier(opponent.position)
     }
 
     /// How strongly to prefer a candidate opponent inside this
@@ -1106,6 +1122,51 @@ impl<'p> DefensiveOperationsImpl<'p> {
         let lateral_offset = (opponent_position.y - self.ctx.player.start_position.y).abs();
         let over = (lateral_offset - ZONE_LATERAL_BAND).max(0.0);
         (1.0 - over / ZONE_PREFERENCE_FALLOFF).clamp(ZONE_PREFERENCE_FLOOR, 1.0)
+    }
+
+    /// 2026-09-16 (Pavel's direct report: "Red #4 spent minutes 1 to 5
+    /// chasing Blue #7 in the middle of the pitch while the ball hasn't
+    /// even been there. That's the opposite of what we were trying to
+    /// do"). Removing `find_guard_target`/`find_most_dangerous_opponent`'s
+    /// additive "closeness to this defender" bonus (the first fix tried)
+    /// did NOT meaningfully change the measured lock-on rate -- a raw
+    /// target-selection trace (8 defenders, 8 matches, before/after)
+    /// showed EVERY SINGLE DEFENDER locking onto exactly one specific
+    /// opponent for 60-72% of all target-assigned ticks, both before and
+    /// after that removal. The real driver: both functions' dominant
+    /// terms (proximity to OUR goal, up to 40-50 points; the opponent's
+    /// own skill-based receiver-threat composite, up to 30 points) are
+    /// entirely independent of where the ball currently is, while the
+    /// one ball-proximity term either function has is comparatively tiny
+    /// (10-25 points) -- so whichever opposing player happens to sit
+    /// closest to goal with the best receiver_threat skill wins the
+    /// scoring competition almost every time this scan runs, regardless
+    /// of the actual phase of play. This is a genuine, previously-
+    /// unaddressed gap, not something Chunk B introduced (confirmed via
+    /// A/B: mean concentration 0.614 with Chunk B's own zone preference
+    /// neutralized vs 0.632 with it active -- statistically the same).
+    ///
+    /// Mirrors `zone_preference_multiplier`'s own multiplicative-
+    /// dampener architecture (this codebase's own established lesson,
+    /// evaluator.rs 2026-07-26: "additive penalties are routinely
+    /// out-muscled by multiplicative... terms -- behavioral overrides
+    /// must be multiplicative"), keyed on the OPPONENT's distance from
+    /// the ball rather than the defender's zone -- a genuinely different
+    /// axis from `zone_preference_multiplier`, not a duplicate of it. A
+    /// real, still-nonzero floor (not 0.0): a plausible long-ball target
+    /// standing well away from the current phase of play shouldn't
+    /// become entirely invisible, just heavily deprioritized against any
+    /// opponent who's actually part of the live action. Reasoned
+    /// estimate, category (d) -- no dataset isolates this tradeoff
+    /// numerically; magnitudes chosen so a genuinely live, in-play
+    /// opponent (within ~19m of the ball) pays no penalty at all, while
+    /// one on the opposite side of the pitch is suppressed to a small
+    /// residual.
+    pub fn ball_relevance_multiplier(&self, opponent_position: Vector3<f32>) -> f32 {
+        let ball_position = self.ctx.tick_context.positions.ball.position;
+        let dist_to_ball = (opponent_position - ball_position).magnitude();
+        let over = (dist_to_ball - BALL_RELEVANCE_NEAR).max(0.0);
+        (1.0 - over / BALL_RELEVANCE_FALLOFF).clamp(BALL_RELEVANCE_FLOOR, 1.0)
     }
 
     /// Get the number of defenders currently engaging opponents within a distance

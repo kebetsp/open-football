@@ -309,9 +309,32 @@ impl DefenderGuardingState {
                 score += 30.0; // Big bonus for unmarked attackers
             }
 
-            // Factor 5: Closeness to this defender (prefer guarding nearby opponents)
-            let dist_to_us = opponent.distance(ctx);
-            score += (60.0 - dist_to_us.min(60.0)) / 3.0; // Max 20 points
+            // Factor 5 (removed 2026-09-16, Pavel's direct report: "Red
+            // #4 spent minutes 1 to 5 chasing Blue #7 in the middle of
+            // the pitch while the ball hasn't even been there"): this
+            // used to add an ADDITIVE scoring bonus for whichever
+            // opponent was currently closest to THIS defender -- but
+            // this function's own result drives this same defender's
+            // velocity() (chases toward whoever wins). That's a closed
+            // positive-feedback loop with no counter-signal: pick the
+            // nearest-scoring candidate -> move toward him -> he now
+            // scores even higher on "closeness to me" (an artifact of
+            // my own movement, not his independent danger) -> keep
+            // picking him. Verified via a raw target-selection trace
+            // (2026-09-16): defenders locked onto a single opponent
+            // 61-70%+ of all target-assigned ticks, confirmed via A/B
+            // to be UNRELATED to Chunk B's zone preference (mean
+            // concentration 0.614 with Chunk B's multiplier neutralized
+            // vs 0.632 with it active -- statistically the same, so
+            // this bug pre-dates Chunk B and Chunk B did not cause it).
+            // The `nearby(MAX_GUARD_RANGE)` scan above already gates
+            // eligibility (a hard cutoff); this term went further and
+            // rewarded MORE closeness on top of that, which is exactly
+            // what created the runaway attractor. Removed entirely --
+            // a real defender picks who to mark by the opponent's own
+            // independent danger (goal proximity, ball proximity,
+            // receiving threat), not by "who happens to already be
+            // near me."
 
             // Factor 6: Receiver-threat blend (off_the_ball + finishing
             // + pace + acceleration + anticipation, skill-curved). A
@@ -335,11 +358,15 @@ impl DefenderGuardingState {
             // one further from it -- see the shared
             // `zone_preference_multiplier` doc comment (defensive.rs)
             // for why this is multiplicative and where the magnitudes
-            // come from. Factor 5 above already gives a small, additive
-            // "prefer nearby opponents" nudge (max 20 of ~167 points) --
-            // this is a distinct, stronger, zone-anchored preference on
-            // top of it, not a replacement.
+            // come from.
             score *= ctx.player().defensive().zone_preference_multiplier(opponent.position);
+
+            // 2026-09-16: real ball-relevance gate -- see
+            // `ball_relevance_multiplier`'s own doc comment (defensive.rs)
+            // for the full trace/verification. Removing the old Factor 5
+            // (closeness to defender) alone did not fix Pavel's report;
+            // this is the term that actually did.
+            score *= ctx.player().defensive().ball_relevance_multiplier(opponent.position);
 
             if score > best_score {
                 best_score = score;

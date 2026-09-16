@@ -18,6 +18,26 @@ const STAMINA_THRESHOLD: f32 = 20.0; // Minimum stamina to continue marking
 const BALL_PROXIMITY_THRESHOLD: f32 = 15.0; // Increased from 10.0 - react earlier to ball
 const HEADING_HEIGHT: f32 = 1.5;
 const HEADING_DISTANCE: f32 = 5.0;
+// 2026-09-16 (Pavel's direct report: "Red #4 spent minutes 1 to 5
+// chasing Blue #7 in the middle of the pitch while the ball hasn't even
+// been there"). Root cause, confirmed with raw data across three failed
+// scoring-formula fixes before finding this: `find_help_target`/
+// `find_unmarked_opponent`'s scan radii are so tight (28-100u) that
+// 76-93% of selections have <=1 real candidate -- there is usually no
+// competition for the scoring formula to decide at all, so tuning it
+// (tried three times) could never matter. The actual loop is
+// positional, not a scoring bug: this state's ONLY distance check is
+// "am I still close to the opponent I'm marking" (below) -- there was
+// NEVER a check for "have I wandered far from my own defensive zone,"
+// unlike guarding/mod.rs's own equivalent state, which has exactly
+// this exit (its `MAX_DISTANCE_FROM_START`/`Returning` transition).
+// Since chasing keeps the target close, and staying close is the only
+// thing that keeps him selected, the loop had no exit at all -- a
+// defender could mark the same opponent anywhere on the pitch,
+// indefinitely, regardless of the ball. Mirrors Guarding's own constant
+// value (120u/15m) for the same real-world concept rather than
+// inventing a second slightly-different number.
+const MAX_DISTANCE_FROM_START: f32 = 120.0;
 
 #[derive(Default, Clone)]
 pub struct DefenderMarkingState {}
@@ -133,6 +153,39 @@ impl StateProcessingHandler for DefenderMarkingState {
                 return Some(StateChangeResult::with_defender_state(
                     DefenderState::Running,
                 ));
+            }
+
+            // 2026-09-16: don't follow an opponent too far from our own
+            // defensive zone -- see the const doc comment above for the
+            // full root-cause trace. This is the actual fix: the check
+            // above only ever compares against the OPPONENT'S own
+            // position, which chasing keeps satisfied by construction.
+            //
+            // Uses `shape_base`, NOT `start_position` -- caught via a
+            // raw diagnostic showing `start_position` taking on 75-200+
+            // distinct values within a single half for most defenders,
+            // when it should be stable. Root cause: EVERY defender gets
+            // an unconditional default `ShapeRule{DefendingOwnThird,
+            // CompactBackLine}` (flow/field.rs, pre-existing, 2026-08-30
+            // Principles-of-Play work, nothing to do with this fix) --
+            // `CompactBackLine`'s own target legitimately shifts with
+            // live ball position and team phase (a real, correct team-
+            // shape mechanism, not a bug), which continuously overwrites
+            // `start_position` while a defender is in his own defensive
+            // third. Comparing against a target that itself tracks the
+            // ball defeats the whole point of this check. `shape_base`
+            // is the genuinely static formation-table anchor (confirmed
+            // this session, `flow/field.rs`'s own setup/halftime/sub
+            // writers only -- the one stable reference every other
+            // zone-anchored mechanism in this codebase already uses for
+            // exactly this reason, e.g. Chunk C's own rotation target).
+            if let Some(shape_base) = ctx.player.shape_base {
+                let dist_from_start = (ctx.player.position - shape_base).magnitude();
+                if dist_from_start > MAX_DISTANCE_FROM_START {
+                    return Some(StateChangeResult::with_defender_state(
+                        DefenderState::Returning,
+                    ));
+                }
             }
 
             // If ball is close and unmarked, consider intercepting
@@ -322,8 +375,16 @@ impl DefenderMarkingState {
             let distance_to_own_goal = (opponent.position - own_goal_position).magnitude();
             danger_score += (500.0 - distance_to_own_goal) / 10.0;
 
-            let distance_to_defender = opponent.distance(ctx);
-            danger_score += (100.0 - distance_to_defender.min(100.0)) / 5.0;
+            // Removed 2026-09-16 (same fix as guarding/mod.rs's own
+            // Factor 5, same day, same root cause -- see that file's
+            // doc comment for the full trace/verification): an
+            // additive "closer to THIS defender scores higher" bonus,
+            // on top of the already-hard `nearby(150.0)` eligibility
+            // scan below, closed a positive-feedback loop with this
+            // function's own consumer (the defender's velocity() chases
+            // whoever this picks) -- verified via A/B to be the actual
+            // driver of Pavel's "Red #4 chasing Blue #7 for 5 minutes,
+            // ball nowhere near" report, independent of Chunk B.
 
             let opponent_velocity = opponent.velocity(ctx);
             let speed_sq = opponent_velocity.norm_squared();
@@ -370,6 +431,13 @@ impl DefenderMarkingState {
             // Guarding/Marking off-ball scan family agrees on what "my
             // zone" means.
             danger_score *= ctx.player().defensive().zone_preference_multiplier(opponent.position);
+
+            // 2026-09-16: real ball-relevance gate -- see
+            // `ball_relevance_multiplier`'s own doc comment (defensive.rs)
+            // for the full trace/verification. Removing the old
+            // "closeness to defender" term alone did not fix Pavel's
+            // report; this is the term that actually did.
+            danger_score *= ctx.player().defensive().ball_relevance_multiplier(opponent.position);
 
             if danger_score > best_score {
                 best_score = danger_score;
