@@ -394,12 +394,42 @@ impl DefenderHoldingLineState {
         let distance_from_center = (tactical_position.y - field_center_y).abs();
         let is_wide_defender = distance_from_center > 40.0;
 
-        // Find the nearest opponent in this defender's zone
+        // Find the nearest opponent in this defender's zone.
+        //
+        // 2026-09-21 (Pavel's direct report: CBs abandon the defensive
+        // third "by a mile", central zone wide open, forwards
+        // unchallenged): this used to scan `.nearby(100.0)`, which
+        // searches around `ctx.player.position` -- the defender's
+        // CURRENT position, not his zone anchor. If the defender is
+        // already out of position (the clearest real case: both CBs
+        // pushed up for their own team's attacking corner, per
+        // `DefenderState::AttackingCorner` above, and the corner is
+        // lost), this scan finds whichever opposing players happen to
+        // be milling around THAT same wrong location (their own
+        // defenders/keeper, clearing the corner) and locks the "hold
+        // line" target 8 units goal-side of one of THEM -- who is
+        // themselves deep near the far goal, so the resulting target
+        // stays deep too. A raw trace caught this directly: a CB
+        // nominally in `Holding Line` drifted FORWARD (667->768u from
+        // his own goal) over several seconds post-corner, because this
+        // scan kept re-finding an irrelevant opponent near his own
+        // out-of-position location. Exactly the same closed feedback
+        // loop (no counter-signal) already fixed once for
+        // Marking/Guarding's off-ball target selection
+        // (`ball_relevance_multiplier`, 2026-09-16) -- a separate,
+        // previously-unfixed instance living in this state's own
+        // private zonal-target function. Fixed by scanning around the
+        // defender's ZONE ANCHOR (`tactical_position` == `start_position`,
+        // already correctly phase/ball-aware via the shape-rule
+        // machinery) instead -- an out-of-position defender's real zone
+        // is back near his own goal, so this scan now correctly finds
+        // nobody there and falls through to the "no opponent in zone"
+        // branch below, which pulls him back toward that anchor.
         let zone_half_width = 50.0;
         let nearest_opponent_in_zone = ctx
             .players()
             .opponents()
-            .nearby(100.0)
+            .nearby_at(tactical_position, 100.0)
             .filter(|opp| {
                 let lateral_dist = (opp.position.y - tactical_position.y).abs();
                 lateral_dist < zone_half_width
