@@ -121,6 +121,22 @@ const LINE_MIN_DEPTH_UNITS: f32 = 96.0; // 12.0m from goal
 /// here too, since it directly answers "nobody needs them that high."
 const LINE_MAX_DEPTH_UNITS: f32 = 260.0; // 32.5m from goal
 
+/// Real compactness doctrine: the midfield line holds roughly this far
+/// ahead of the back line, both moving together as the ball's own
+/// depth changes — real teams keep a compact ~25-35m block from back
+/// line to front line, of which the back-to-midfield gap is a portion.
+/// Added 2026-09-22, after Pavel asked directly why defenders were
+/// visibly running forward while midfielders stood still: Step F
+/// previously computed ONE shared depth for the whole leftover pool,
+/// with no distinction between a defender and a midfielder at all —
+/// when that single target happened to land near where midfielders
+/// already naturally sit, defenders had to visibly close a real gap to
+/// reach it while midfielders barely moved, looking exactly like two
+/// unrelated groups with "different instincts" rather than one
+/// synchronised shape. Reasoned estimate (category d, no sourced exact
+/// figure for this specific gap).
+const MIDFIELD_LINE_GAP_UNITS: f32 = 120.0; // 15.0m ahead of the back line
+
 /// How much a hold-shape player's lateral (width) position is pulled
 /// toward the ball's own side — real compactness doctrine (shift as a
 /// block toward the ball, don't spread evenly across the width of the
@@ -708,12 +724,22 @@ fn assign_team(
     // through the first 1-3 seconds, raw-traced this session.
     let predicted_carrier_pos = focal_pos + focal_vel * LINE_LEAD_TICKS;
     let predicted_ball_dist_to_goal = (predicted_carrier_pos - own_goal).magnitude();
-    let line_depth = (predicted_ball_dist_to_goal * LINE_PUSH_FACTOR)
+    // Back-line depth is the existing formula, unchanged; the midfield
+    // line holds a real, fixed gap ahead of it (see
+    // `MIDFIELD_LINE_GAP_UNITS`'s own doc comment) — both driven by the
+    // SAME ball-distance signal, so they move together rather than one
+    // line reacting and the other sitting still.
+    let back_line_depth = (predicted_ball_dist_to_goal * LINE_PUSH_FACTOR)
         .clamp(LINE_MIN_DEPTH_UNITS, LINE_MAX_DEPTH_UNITS);
-    let target_x = own_goal.x + attack_dir * line_depth;
+    let mid_line_depth = back_line_depth + MIDFIELD_LINE_GAP_UNITS;
 
     let mut hold_shape_ids: Vec<u32> = Vec::new();
     for c in pool.iter().filter(|c| !assigned.contains(&c.id)) {
+        let line_depth = match c.position_group {
+            PlayerFieldPositionGroup::Midfielder => mid_line_depth,
+            _ => back_line_depth,
+        };
+        let target_x = own_goal.x + attack_dir * line_depth;
         let target_y = c.start_position.y * (1.0 - WIDTH_PULL_FRACTION)
             + predicted_carrier_pos.y * WIDTH_PULL_FRACTION;
         let mut target = Vector3::new(target_x, target_y, 0.0);
