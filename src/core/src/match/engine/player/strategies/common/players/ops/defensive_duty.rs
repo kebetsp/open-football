@@ -27,7 +27,11 @@
 //! pre-existing decision-function dependencies.
 
 use crate::PlayerFieldPositionGroup;
+use crate::r#match::defenders::states::DefenderState;
+use crate::r#match::forwarders::states::ForwardState;
+use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::player::DefensiveDuty;
+use crate::r#match::player::state::PlayerState;
 use crate::r#match::{MatchContext, MatchField, PlayerSide};
 use nalgebra::Vector3;
 
@@ -199,6 +203,13 @@ struct Cand {
     /// used as a source of new information, only as a tie-break toward
     /// "keep the existing assignment."
     prev_duty: DefensiveDuty,
+    /// True while this player is in the `TakeBall` state — the
+    /// established, already-proven mechanism (`should_force_takeball`)
+    /// that commits the single genuinely-closest teammate to chase a
+    /// loose ball. Used only to exclude that one player from this
+    /// system's own loose-ball assignments below, so the two mechanisms
+    /// never fight over the same player.
+    is_taking_ball: bool,
 }
 
 /// One player's resolved assignment for this tick.
@@ -211,12 +222,32 @@ struct Assignment {
 
 /// Entry point — called once per full tick from `game_tick_inner`,
 /// before player AI dispatch. Resets every player's
-/// `ai_defensive_duty` to `None` each call, then assigns real duties
-/// to the out-of-possession team's defenders/midfielders when an
-/// opponent clearly holds the ball. A loose ball, or the team itself
-/// holding it, leaves this system fully inactive for that team this
-/// tick (loose-ball recovery and on-ball decisions are separate,
-/// not-yet-rewritten domains — untouched by design).
+/// `ai_defensive_duty` to `None` each call, then assigns real duties.
+/// Two cases: (1) an opponent clearly holds the ball — the original
+/// single-team path, unchanged; (2) the ball is loose (a genuine
+/// contest, 50/50, or post-block scramble) — BOTH teams organise
+/// around the ball's own position, since either side could plausibly
+/// end up with it. A team's own in-possession phase (its own clear
+/// carrier) still leaves this system fully inactive for THAT team —
+/// on-ball decisions are a separate, not-yet-rewritten domain.
+///
+/// Case (2) was added 2026-09-22, after Pavel watched a genuine 5-a-6
+/// scramble just outside the box resolve with the back four already
+/// abandoning it — the ORIGINAL design deliberately scoped loose balls
+/// out entirely ("a different, not-yet-rewritten domain"), which meant
+/// this whole system went fully dark exactly during real football's
+/// most chaotic, highest-stakes moments: a contested ball near either
+/// box. Whichever player is already the established, genuinely-
+/// closest chaser (`TakeBall` state, the separate, working
+/// `should_force_takeball` mechanism) is excluded from these new
+/// assignments so the two systems never fight over the same player —
+/// this system only governs everyone ELSE, using the same Mark/Cover/
+/// HoldShape/Scramble machinery already proven for the clear-
+/// possession case, anchored on the ball's own position instead of a
+/// specific carrier's. Press/Engage (Steps C/H) are skipped for a
+/// loose ball by design — closing on a ball nobody owns yet is exactly
+/// what `TakeBall` already does; duplicating it here would only
+/// create a second, uncoordinated chaser.
 pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
     // Reset-and-return helper for the early-exit paths below (no clear
     // carrier, carrier not found, defending side unknown) — a genuine
@@ -229,14 +260,10 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
         }
     }
 
-    let Some(carrier_id) = field.ball.current_owner else {
-        reset_all(field);
-        return;
-    };
-
     // Captures each player's PREVIOUS tick's duty (`prev_duty`) before
     // any reset happens this tick — the only source of continuity
-    // Steps C/D/E's stickiness bias reads from.
+    // Steps C/D/E's stickiness bias reads from. Built unconditionally
+    // (needed by both cases below) before any reset happens.
     let cands: Vec<Cand> = field
         .players
         .iter()
@@ -251,35 +278,100 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             start_position: p.start_position,
             side: p.side,
             prev_duty: p.ai_defensive_duty,
+            is_taking_ball: matches!(
+                p.state,
+                PlayerState::Defender(DefenderState::TakeBall)
+                    | PlayerState::Midfielder(MidfielderState::TakeBall)
+                    | PlayerState::Forward(ForwardState::TakeBall)
+            ),
         })
         .collect();
 
-    let Some(carrier) = cands.iter().find(|c| c.id == carrier_id).copied() else {
-        reset_all(field);
-        return;
-    };
-
-    let defending_team = if carrier.team_id == field.home_team_id {
-        field.away_team_id
-    } else {
-        field.home_team_id
-    };
-
-    let Some(defending_side) = cands
-        .iter()
-        .find(|c| c.team_id == defending_team)
-        .and_then(|c| c.side)
-    else {
-        reset_all(field);
-        return;
-    };
-    let own_goal = match defending_side {
+    let goal_for_side = |side: PlayerSide| match side {
         PlayerSide::Left => context.goal_positions.left,
         PlayerSide::Right => context.goal_positions.right,
     };
 
-    let assignments = assign_team(&cands, defending_team, carrier, own_goal, defending_side);
+    let assignments: Vec<Assignment> = if let Some(carrier_id) = field.ball.current_owner {
+        // Case 1: an opponent clearly holds the ball — the original,
+        // single-team path.
+        let Some(carrier) = cands.iter().find(|c| c.id == carrier_id).copied() else {
+            reset_all(field);
+            return;
+        };
+        let defending_team = if carrier.team_id == field.home_team_id {
+            field.away_team_id
+        } else {
+            field.home_team_id
+        };
+        let Some(defending_side) = cands
+            .iter()
+            .find(|c| c.team_id == defending_team)
+            .and_then(|c| c.side)
+        else {
+            reset_all(field);
+            return;
+        };
+        assign_team(
+            &cands,
+            defending_team,
+            carrier.team_id,
+            carrier.position,
+            carrier.velocity,
+            Some(carrier.id),
+            goal_for_side(defending_side),
+            defending_side,
+        )
+    } else {
+        // Case 2: a genuine loose ball — both teams organise around
+        // the ball's own position (see this function's own doc
+        // comment for why). If a team has no players left to derive a
+        // side from (e.g. every outfielder sent off — a degenerate
+        // edge case), that team is simply skipped rather than aborting
+        // the whole tick for the other team too.
+        let ball_pos = field.ball.position;
+        let ball_vel = field.ball.velocity;
+        let mut all = Vec::new();
+        for (team_id, opponent_team) in [
+            (field.home_team_id, field.away_team_id),
+            (field.away_team_id, field.home_team_id),
+        ] {
+            let Some(side) = cands.iter().find(|c| c.team_id == team_id).and_then(|c| c.side)
+            else {
+                continue;
+            };
+            all.extend(assign_team(
+                &cands,
+                team_id,
+                opponent_team,
+                ball_pos,
+                ball_vel,
+                None,
+                goal_for_side(side),
+                side,
+            ));
+        }
+        all
+    };
+
     reset_all(field);
+
+    // Diagnostic-only helpers: the ball's own current position (a valid
+    // stand-in for "the danger point" in both cases — it's where the
+    // carrier is when there is one) and each logged player's OWN
+    // team's goal (since Case 2 can log assignments from both teams in
+    // the same pass, there's no single shared `own_goal` any more).
+    #[cfg(feature = "match-logs")]
+    let ball_pos_for_log = field.ball.position;
+    #[cfg(feature = "match-logs")]
+    let own_goal_for = |player_id: u32| -> Vector3<f32> {
+        cands
+            .iter()
+            .find(|c| c.id == player_id)
+            .and_then(|c| c.side)
+            .map(goal_for_side)
+            .unwrap_or(Vector3::zeros())
+    };
 
     #[cfg(feature = "match-logs")]
     for a in &assignments {
@@ -289,7 +381,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                     let opp_dist_goal = cands
                         .iter()
                         .find(|c| c.id == opponent_id)
-                        .map(|o| (o.position - own_goal).magnitude())
+                        .map(|o| (o.position - own_goal_for(a.id)).magnitude())
                         .unwrap_or(-1.0);
                     crate::match_log_info!(
                         "DEFDUTY_MARK t={} marker={} marker_group={:?} marker_dist_start={:.1} opp={} opp_dist_goal={:.1}",
@@ -303,7 +395,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                 }
             }
             DefensiveDuty::Cover => {
-                let dist = (a.target - carrier.position).magnitude();
+                let dist = (a.target - ball_pos_for_log).magnitude();
                 crate::match_log_info!(
                     "DEFDUTY_COVER t={} cover={} ball_dist_from_target={:.1}",
                     context.total_match_time,
@@ -324,7 +416,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                         presser.position_group,
                         (presser.position - presser.start_position).magnitude(),
                         opponent_id,
-                        (carrier.position - own_goal).magnitude()
+                        (ball_pos_for_log - own_goal_for(a.id)).magnitude()
                     );
                 }
             }
@@ -333,7 +425,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                     "DEFDUTY_SCRAMBLE t={} p={} ball_dist_goal={:.1}",
                     context.total_match_time,
                     a.id,
-                    (carrier.position - own_goal).magnitude()
+                    (ball_pos_for_log - own_goal_for(a.id)).magnitude()
                 );
             }
             // Diagnostic, kept permanently (feature-gated, zero cost
@@ -341,13 +433,14 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             // before Pavel's "defenders don't space/drop" report,
             // 2026-09-22.
             DefensiveDuty::HoldShape => {
+                let og = own_goal_for(a.id);
                 crate::match_log_info!(
                     "DEFDUTY_HOLDSHAPE t={} p={} ball_dist_goal={:.1} target_dist_goal={:.1} player_dist_goal={:.1}",
                     context.total_match_time,
                     a.id,
-                    (carrier.position - own_goal).magnitude(),
-                    (a.target - own_goal).magnitude(),
-                    (cands.iter().find(|c| c.id == a.id).map(|c| c.position).unwrap_or(a.target) - own_goal).magnitude()
+                    (ball_pos_for_log - og).magnitude(),
+                    (a.target - og).magnitude(),
+                    (cands.iter().find(|c| c.id == a.id).map(|c| c.position).unwrap_or(a.target) - og).magnitude()
                 );
             }
             _ => {}
@@ -364,13 +457,18 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
 }
 
 /// Steps C-H of the design doc's spec, for one defending team against
-/// one known ball carrier. Pure function of the snapshot — no field
-/// mutation happens here, keeping the allocation logic simple and
-/// independently reasoned-about.
+/// one danger point — either a known ball carrier (`carrier_id: Some`,
+/// `focal_pos`/`focal_vel` are his own) or, for a genuine loose ball,
+/// the ball's own position/velocity with `carrier_id: None`. Pure
+/// function of the snapshot — no field mutation happens here, keeping
+/// the allocation logic simple and independently reasoned-about.
 fn assign_team(
     cands: &[Cand],
     defending_team: u32,
-    carrier: Cand,
+    opponent_team: u32,
+    focal_pos: Vector3<f32>,
+    focal_vel: Vector3<f32>,
+    carrier_id: Option<u32>,
     own_goal: Vector3<f32>,
     defending_side: PlayerSide,
 ) -> Vec<Assignment> {
@@ -383,6 +481,14 @@ fn assign_team(
                 PlayerFieldPositionGroup::Defender | PlayerFieldPositionGroup::Midfielder
             )
         })
+        // Loose-ball case only: whoever's already the established,
+        // genuinely-closest chaser (`TakeBall`) is excluded from these
+        // assignments so this system and `should_force_takeball` never
+        // fight over the same player. Irrelevant for the clear-
+        // possession case (nobody on the DEFENDING side is ever in
+        // TakeBall then, since that state only fires for a side that
+        // doesn't yet have a clear carrier).
+        .filter(|c| carrier_id.is_some() || !c.is_taking_ball)
         .copied()
         .collect();
     if pool.is_empty() {
@@ -393,11 +499,14 @@ fn assign_team(
     let mut assigned: Vec<u32> = Vec::new();
 
     // --- Step C: exactly one presser, chosen by real closing time. ---
-    // Resolved but not pushed yet — engagement (Step H) depends on
-    // whether Step E finds real cover, so the final Assignment is
-    // pushed once that's known.
+    // Skipped entirely for a loose ball (`carrier_id: None`) — closing
+    // on a ball nobody owns yet is exactly what `should_force_takeball`
+    // already does; duplicating it here would only create a second,
+    // uncoordinated chaser. Resolved but not pushed yet — engagement
+    // (Step H) depends on whether Step E finds real cover, so the
+    // final Assignment is pushed once that's known.
     let mut presser: Option<Cand> = None;
-    {
+    if let Some(carrier_id) = carrier_id {
         // Real defensive-zone doctrine: a defender is only eligible to
         // press when the carrier is genuinely in his zone (see
         // `PRESS_DEFENDER_ZONE_UNITS`'s own doc comment) — UNLESS no
@@ -405,7 +514,7 @@ fn assign_team(
         // case. A closing-time race with no zone awareness was sending
         // defenders 35-44m upfield to press players who were plainly a
         // midfielder's job.
-        let ball_dist_to_goal_for_zone = (carrier.position - own_goal).magnitude();
+        let ball_dist_to_goal_for_zone = (focal_pos - own_goal).magnitude();
         let any_midfielder_available = pool
             .iter()
             .any(|c| c.position_group == PlayerFieldPositionGroup::Midfielder);
@@ -417,11 +526,11 @@ fn assign_team(
             {
                 continue;
             }
-            let dist = (c.position - carrier.position).magnitude();
+            let dist = (c.position - focal_pos).magnitude();
             let closing_ticks = dist / c.max_speed.max(0.01);
             let sticky = matches!(
                 c.prev_duty,
-                DefensiveDuty::Press { opponent_id } if opponent_id == carrier.id
+                DefensiveDuty::Press { opponent_id } if opponent_id == carrier_id
             );
             let effective = closing_ticks * if sticky { STICKY_FACTOR } else { 1.0 };
             if best.is_none_or(|(_, _, be)| effective < be) {
@@ -437,11 +546,10 @@ fn assign_team(
     }
 
     // --- Step D: rank non-carrier opponents by danger, assign markers. ---
-    let opponent_team = carrier.team_id;
     let mut threats: Vec<(Cand, f32)> = cands
         .iter()
-        .filter(|c| c.team_id == opponent_team && c.id != carrier.id)
-        .filter(|c| (c.position - carrier.position).magnitude() <= THREAT_SCAN_RADIUS_UNITS)
+        .filter(|c| c.team_id == opponent_team && Some(c.id) != carrier_id)
+        .filter(|c| (c.position - focal_pos).magnitude() <= THREAT_SCAN_RADIUS_UNITS)
         // Distinct from the scan radius above (distance from the BALL —
         // "could he plausibly receive a pass"): this is distance from
         // OUR OWN GOAL — "is he actually a threat to it right now."
@@ -523,14 +631,14 @@ fn assign_team(
     // degrades gracefully (always picks whoever's genuinely closest to
     // where cover should stand) rather than falling through to an
     // unrelated "deepest overall" pick.
-    let ball_dist_to_goal = (carrier.position - own_goal).magnitude();
-    let to_goal = own_goal - carrier.position;
+    let ball_dist_to_goal = (focal_pos - own_goal).magnitude();
+    let to_goal = own_goal - focal_pos;
     let dir = if to_goal.magnitude() > 1.0 {
         to_goal.normalize()
     } else {
         Vector3::new(1.0, 0.0, 0.0)
     };
-    let target = carrier.position + dir * COVER_STANDOFF_UNITS;
+    let target = focal_pos + dir * COVER_STANDOFF_UNITS;
     let cover = pool
         .iter()
         .filter(|c| !assigned.contains(&c.id))
@@ -553,22 +661,24 @@ fn assign_team(
     }
     let cover_arrived = cover.is_some();
 
-    // --- Step H: engagement, now that cover is known. ---
-    if let Some(presser) = presser {
-        let dist_to_carrier = (presser.position - carrier.position).magnitude();
+    // --- Step H: engagement, now that cover is known. Only reachable
+    // when Step C actually ran (a real carrier existed) — `presser` is
+    // never `Some` for a loose ball. ---
+    if let (Some(presser), Some(carrier_id)) = (presser, carrier_id) {
+        let dist_to_carrier = (presser.position - focal_pos).magnitude();
         let engage = (cover_arrived && dist_to_carrier <= ENGAGE_WITH_COVER_UNITS)
             || dist_to_carrier <= ENGAGE_WITHOUT_COVER_UNITS;
-        let to_goal = own_goal - carrier.position;
+        let to_goal = own_goal - focal_pos;
         let dir = if to_goal.magnitude() > 1.0 {
             to_goal.normalize()
         } else {
             Vector3::new(1.0, 0.0, 0.0)
         };
-        let target = carrier.position + dir * JOCKEY_DISTANCE_UNITS;
+        let target = focal_pos + dir * JOCKEY_DISTANCE_UNITS;
         results.push(Assignment {
             id: presser.id,
             duty: DefensiveDuty::Press {
-                opponent_id: carrier.id,
+                opponent_id: carrier_id,
             },
             target,
             engage,
@@ -584,7 +694,7 @@ fn assign_team(
     // `LINE_LEAD_TICKS`' own doc comment for why: a purely reactive
     // target measurably lagged a fast-developing attack by 19-36m
     // through the first 1-3 seconds, raw-traced this session.
-    let predicted_carrier_pos = carrier.position + carrier.velocity * LINE_LEAD_TICKS;
+    let predicted_carrier_pos = focal_pos + focal_vel * LINE_LEAD_TICKS;
     let predicted_ball_dist_to_goal = (predicted_carrier_pos - own_goal).magnitude();
     let line_depth = (predicted_ball_dist_to_goal * LINE_PUSH_FACTOR)
         .clamp(LINE_MIN_DEPTH_UNITS, LINE_MAX_DEPTH_UNITS);
@@ -632,7 +742,7 @@ fn assign_team(
 
     // --- Step G: crisis override, hold-shape pool only. ---
     if ball_dist_to_goal <= CRISIS_RADIUS_UNITS {
-        let danger_point = own_goal + (carrier.position - own_goal) * 0.6;
+        let danger_point = own_goal + (focal_pos - own_goal) * 0.6;
         let mut rank = 0i32;
         for a in results.iter_mut() {
             if !hold_shape_ids.contains(&a.id) {
