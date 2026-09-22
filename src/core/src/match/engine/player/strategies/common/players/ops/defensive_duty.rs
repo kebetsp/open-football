@@ -57,6 +57,33 @@ const THREAT_SCAN_RADIUS_UNITS: f32 = 280.0;
 /// opponent on the pitch, only the currently dangerous ones.
 const DANGER_FLOOR: f32 = 0.15;
 
+/// Real defensive-zone doctrine: a centre-back or full-back stepping up
+/// to press is normal inside the defensive third plus a margin; a
+/// carrier further out than this is a midfielder's job, not a
+/// defender's. Reasoned estimate (category d, real pitch thirds —
+/// defensive/middle/attacking each ~35m of a 105m pitch — but no
+/// sourced dataset for the exact defender-press cutoff). Verified
+/// necessary by raw trace (Pavel's "defenders press midfielders"
+/// report, 2026-09-22): without this gate, 27% of all defender-press
+/// assignments had the carrier beyond 35m from goal (up to 44m at the
+/// 90th percentile) — genuinely midfield territory, not a defender's
+/// zone — because Step C's pure closing-time race has no concept of
+/// "whose job this is," only "who gets there fastest."
+const PRESS_DEFENDER_ZONE_UNITS: f32 = 320.0; // 40.0m
+
+/// A hard cap on how far from OUR OWN GOAL an opponent can be and
+/// still be worth pulling a defender out of shape to individually
+/// mark — distinct from `THREAT_SCAN_RADIUS_UNITS` (distance from the
+/// BALL, which only checks "could this opponent plausibly receive a
+/// pass," not "is he actually near enough to our goal to be a real
+/// defensive concern"). Verified necessary by raw trace (same report):
+/// without this gate, marked opponents sat a median 46.2m from goal,
+/// and 48.1% were beyond 50m — nearly half of all individual marking
+/// assignments were tracking a player who wasn't a genuine threat to
+/// our goal at all. Real teams hold a compact shape against a deep-
+/// lying opponent rather than chasing him individually that far out.
+const MARK_MAX_DIST_UNITS: f32 = 320.0; // 40.0m, matches the press zone
+
 /// Marking tightness bounds — touch-tight at the edge of our box,
 /// several metres of breathing room in the middle third (enough to see
 /// the ball and cut the passing lane, not so close it matters yet).
@@ -258,12 +285,22 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
     for a in &assignments {
         match a.duty {
             DefensiveDuty::Mark { opponent_id } => {
-                crate::match_log_info!(
-                    "DEFDUTY_MARK t={} marker={} opp={}",
-                    context.total_match_time,
-                    a.id,
-                    opponent_id
-                );
+                if let Some(marker) = cands.iter().find(|c| c.id == a.id) {
+                    let opp_dist_goal = cands
+                        .iter()
+                        .find(|c| c.id == opponent_id)
+                        .map(|o| (o.position - own_goal).magnitude())
+                        .unwrap_or(-1.0);
+                    crate::match_log_info!(
+                        "DEFDUTY_MARK t={} marker={} marker_group={:?} marker_dist_start={:.1} opp={} opp_dist_goal={:.1}",
+                        context.total_match_time,
+                        a.id,
+                        marker.position_group,
+                        (marker.position - marker.start_position).magnitude(),
+                        opponent_id,
+                        opp_dist_goal
+                    );
+                }
             }
             DefensiveDuty::Cover => {
                 let dist = (a.target - carrier.position).magnitude();
@@ -274,6 +311,23 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                     dist
                 );
             }
+            // Diagnostic, kept permanently (feature-gated, zero cost
+            // without match-logs): confirms `PRESS_DEFENDER_ZONE_UNITS`
+            // stays respected as this system evolves. Added for Pavel's
+            // "defenders press midfielders" report, 2026-09-22.
+            DefensiveDuty::Press { opponent_id } => {
+                if let Some(presser) = cands.iter().find(|c| c.id == a.id) {
+                    crate::match_log_info!(
+                        "DEFDUTY_PRESS t={} presser={} presser_group={:?} presser_dist_start={:.1} carrier={} own_goal_dist={:.1}",
+                        context.total_match_time,
+                        a.id,
+                        presser.position_group,
+                        (presser.position - presser.start_position).magnitude(),
+                        opponent_id,
+                        (carrier.position - own_goal).magnitude()
+                    );
+                }
+            }
             DefensiveDuty::Scramble => {
                 crate::match_log_info!(
                     "DEFDUTY_SCRAMBLE t={} p={} ball_dist_goal={:.1}",
@@ -282,10 +336,10 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                     (carrier.position - own_goal).magnitude()
                 );
             }
-            // TEMP diagnostic (Pavel's "defenders don't space from
-            // attackers" report, 2026-09-22): HoldShape was never
-            // logged at all before now. Remove once this investigation
-            // is done.
+            // Diagnostic, kept permanently (feature-gated, zero cost
+            // without match-logs): HoldShape was never logged at all
+            // before Pavel's "defenders don't space/drop" report,
+            // 2026-09-22.
             DefensiveDuty::HoldShape => {
                 crate::match_log_info!(
                     "DEFDUTY_HOLDSHAPE t={} p={} ball_dist_goal={:.1} target_dist_goal={:.1} player_dist_goal={:.1}",
@@ -344,8 +398,25 @@ fn assign_team(
     // pushed once that's known.
     let mut presser: Option<Cand> = None;
     {
+        // Real defensive-zone doctrine: a defender is only eligible to
+        // press when the carrier is genuinely in his zone (see
+        // `PRESS_DEFENDER_ZONE_UNITS`'s own doc comment) — UNLESS no
+        // midfielder exists in the pool at all, the genuine last-resort
+        // case. A closing-time race with no zone awareness was sending
+        // defenders 35-44m upfield to press players who were plainly a
+        // midfielder's job.
+        let ball_dist_to_goal_for_zone = (carrier.position - own_goal).magnitude();
+        let any_midfielder_available = pool
+            .iter()
+            .any(|c| c.position_group == PlayerFieldPositionGroup::Midfielder);
         let mut best: Option<(Cand, f32, f32)> = None; // (cand, real closing_ticks, effective)
         for c in &pool {
+            if c.position_group == PlayerFieldPositionGroup::Defender
+                && ball_dist_to_goal_for_zone > PRESS_DEFENDER_ZONE_UNITS
+                && any_midfielder_available
+            {
+                continue;
+            }
             let dist = (c.position - carrier.position).magnitude();
             let closing_ticks = dist / c.max_speed.max(0.01);
             let sticky = matches!(
@@ -371,6 +442,11 @@ fn assign_team(
         .iter()
         .filter(|c| c.team_id == opponent_team && c.id != carrier.id)
         .filter(|c| (c.position - carrier.position).magnitude() <= THREAT_SCAN_RADIUS_UNITS)
+        // Distinct from the scan radius above (distance from the BALL —
+        // "could he plausibly receive a pass"): this is distance from
+        // OUR OWN GOAL — "is he actually a threat to it right now."
+        // See `MARK_MAX_DIST_UNITS`'s own doc comment.
+        .filter(|c| (c.position - own_goal).magnitude() <= MARK_MAX_DIST_UNITS)
         .map(|c| {
             let dist_to_goal = (c.position - own_goal).magnitude();
             let proximity = 1.0 - (dist_to_goal / THREAT_SCAN_RADIUS_UNITS).clamp(0.0, 1.0);
