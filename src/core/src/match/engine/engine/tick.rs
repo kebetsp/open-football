@@ -1,5 +1,6 @@
 use super::*;
 use crate::r#match::engine::player::events::players::FoulResolver;
+use crate::r#match::player::strategies::players::ops::defensive_duty::assign_defensive_duties;
 use nalgebra::Vector3;
 
 /// TEMPORARY realism-bug diagnostic (2026-08-27, cross-deflection
@@ -113,6 +114,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // TakeBall force-override fires for a player who already has
         // the ball.
         tick_ctx.refresh_ball(field);
+        // Off-ball defensive positioning, from null (docs/decision-from-
+        // null.md, docs/off-ball-defensive-positioning-from-null.md):
+        // one team-wide allocation of duty (press/mark/cover/hold-shape/
+        // scramble) computed fresh each full tick, before player AI
+        // dispatch, so the individual per-player state handlers below
+        // see this tick's real assignment rather than deciding blind.
+        assign_defensive_duties(field, context);
         Self::play_players(field, context, tick_ctx, events);
 
         EventDispatcher::dispatch(events, field, context, match_data, true);

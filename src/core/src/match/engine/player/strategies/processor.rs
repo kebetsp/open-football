@@ -457,14 +457,23 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
-        // realism-bug (2026-08-27): defensive wide-run tracking. Applied
-        // AFTER the assignment override so an explicit press/mark target
-        // still wins outright (also re-checked inside the function
-        // itself), and BEFORE the shot-block reaction so an already-live
-        // shot takes priority over a broader tracking duty. No tempo
-        // multiplier — tracking a genuine wide run is a real defensive
-        // urgency, not a tempo-scaled positioning preference.
-        if let Some(velocity) = Self::wide_run_track_override_velocity(&processing_ctx) {
+        // Off-ball defensive positioning, from null (docs/decision-from-
+        // null.md, docs/off-ball-defensive-positioning-from-null.md).
+        // Supersedes `wide_run_track_override_velocity` and
+        // `marking_delay_velocity` outright — both are left in this file
+        // as dead code (not called) rather than deleted, per the
+        // project's own "leave old modules present but bypassed while
+        // testing new ones, archive once verified" working note; do not
+        // re-enable either call site alongside this one. Applied AFTER
+        // the assignment override so an explicit manager press/mark
+        // target still wins outright (also re-checked inside the
+        // function), and BEFORE the shot-block reaction / shot-lane
+        // cover / rebound-crash so those narrower, time-critical,
+        // not-yet-rewritten reactive mechanics still take priority over
+        // ordinary duty positioning when they're genuinely live. No
+        // tempo multiplier — defensive positioning urgency isn't a
+        // tempo-scaled preference.
+        if let Some(velocity) = Self::ai_defensive_duty_velocity(&processing_ctx) {
             result.velocity = Some(velocity);
         }
 
@@ -537,17 +546,9 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
-        // Pavel (2026-09-13): bring kicker mode's already-verified
-        // "delay" / marking-distance discipline into the full (non-
-        // kicker) engine too, now that kicker mode is being turned back
-        // off. Real defensive doctrine (soccer coaching: "delaying" —
-        // don't dive into a challenge, hold ~3-6m and wait for the
-        // right moment or support) plus the sourced StatsBomb ~2m
-        // "meaningful pressure" threshold this session already used for
-        // `has_clear_pass`.
-        if let Some(velocity) = Self::marking_delay_velocity(&processing_ctx, result.velocity) {
-            result.velocity = Some(velocity);
-        }
+        // `marking_delay_velocity` superseded (see the
+        // `ai_defensive_duty_velocity` call site above) — function body
+        // left in place, not called, per docs/decision-from-null.md.
 
         // engine audit Module 3 (2026-08-29): universal offside-line
         // hold. Applied LAST among the velocity overrides so it clamps
@@ -647,6 +648,19 @@ impl<'p> StateProcessor<'p> {
         // already-built reward bias actually gets a chance to apply
         // before the ball is lost, not after.
         if let Some(state_result) = Self::carrier_contained_pass_override(&processing_ctx) {
+            return complete_result(state_result, result);
+        }
+
+        // Off-ball defensive positioning, from null (docs/decision-from-
+        // null.md, docs/off-ball-defensive-positioning-from-null.md).
+        // Checked last in the early-return chain, before the old
+        // per-state `handler.process()` — when it fires, the old
+        // state's own decision logic never runs at all for this player
+        // this tick (not called, not just overridden afterward). Backs
+        // off entirely once already mid-tackle (state == Tackling),
+        // handing the physical duel outcome to the kept, not-rewritten
+        // TacklingState mechanic for the rest of that challenge.
+        if let Some(state_result) = Self::ai_defensive_engage_override(&processing_ctx) {
             return complete_result(state_result, result);
         }
 
@@ -1763,6 +1777,125 @@ impl<'p> StateProcessor<'p> {
             .skills
             .max_speed_with_condition(player.player_attributes.condition);
         Some(to_target.normalize() * max_speed)
+    }
+
+    /// Off-ball defensive positioning, from null
+    /// (docs/decision-from-null.md,
+    /// docs/off-ball-defensive-positioning-from-null.md). Steers toward
+    /// this tick's `ai_defensive_target`, already computed team-wide by
+    /// `assign_defensive_duties` (`common/players/ops/defensive_duty.rs`)
+    /// before player AI dispatch. Backs off for a manager-directed
+    /// player (explicit `press_target`/`mark_target` always wins), the
+    /// ball carrier himself (on-ball domain, untouched), and mid-tackle
+    /// (`Tackling` state — the kept physical-duel mechanic owns movement
+    /// for the rest of that challenge).
+    fn ai_defensive_duty_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None;
+        }
+        let player = ctx.player;
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None;
+        }
+        if matches!(
+            player.ai_defensive_duty,
+            crate::r#match::player::DefensiveDuty::None
+        ) {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None;
+        }
+        if matches!(
+            player.state,
+            Defender(DefenderState::Tackling) | Midfielder(MidfielderState::Tackling)
+        ) {
+            return None;
+        }
+        let to_target = player.ai_defensive_target - player.position;
+        let dist = to_target.magnitude();
+        if dist < 2.0 {
+            return Some(Vector3::zeros());
+        }
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some(to_target.normalize() * max_speed)
+    }
+
+    /// Off-ball defensive positioning, from null — the state-transition
+    /// half of `ai_defensive_duty_velocity` above (see that function's
+    /// own doc comment for the shared gating). Checked early in
+    /// `process_inner`'s chain, before `handler.process()` — when it
+    /// fires, the player's OLD per-state decision logic (Marking,
+    /// Covering, Pressing, HoldingLine, Guarding, ...) never runs at all
+    /// this tick, not just afterward. Always returns a state matching
+    /// the current duty (a real, established pattern in this file —
+    /// `kickoff_pass_override`/`throw_in_pass_override`/
+    /// `free_kick_pass_override` all force the same state every tick
+    /// their window is open) — a duty->state mapping used purely as an
+    /// animation/stats label, since movement itself is fully owned by
+    /// `ai_defensive_duty_velocity`, not by whatever the mapped state's
+    /// own `velocity()` would compute (that call still happens, per this
+    /// pipeline's own established convention, but its result is always
+    /// discarded once this override fires).
+    fn ai_defensive_engage_override(ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None;
+        }
+        let player = ctx.player;
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None;
+        }
+        // Already mid-tackle: hand off entirely to the kept, physical
+        // duel mechanic for the rest of this challenge.
+        if matches!(
+            player.state,
+            Defender(DefenderState::Tackling) | Midfielder(MidfielderState::Tackling)
+        ) {
+            return None;
+        }
+        use crate::r#match::player::DefensiveDuty;
+        let is_defender = matches!(
+            player.tactical_position.current_position.position_group(),
+            PlayerFieldPositionGroup::Defender
+        );
+        match player.ai_defensive_duty {
+            DefensiveDuty::None => None,
+            DefensiveDuty::Press { .. } if player.ai_defensive_engage => Some(if is_defender {
+                StateChangeResult::with_defender_state(DefenderState::Tackling)
+            } else {
+                StateChangeResult::with_midfielder_state(MidfielderState::Tackling)
+            }),
+            DefensiveDuty::Press { .. } => Some(if is_defender {
+                StateChangeResult::with_defender_state(DefenderState::Pressing)
+            } else {
+                StateChangeResult::with_midfielder_state(MidfielderState::Pressing)
+            }),
+            DefensiveDuty::Mark { .. } => Some(if is_defender {
+                StateChangeResult::with_defender_state(DefenderState::Marking)
+            } else {
+                StateChangeResult::with_midfielder_state(MidfielderState::Guarding)
+            }),
+            DefensiveDuty::Cover => Some(if is_defender {
+                StateChangeResult::with_defender_state(DefenderState::Covering)
+            } else {
+                StateChangeResult::with_midfielder_state(MidfielderState::Standing)
+            }),
+            DefensiveDuty::HoldShape => Some(if is_defender {
+                StateChangeResult::with_defender_state(DefenderState::HoldingLine)
+            } else {
+                StateChangeResult::with_midfielder_state(MidfielderState::Standing)
+            }),
+            DefensiveDuty::Scramble => Some(if is_defender {
+                StateChangeResult::with_defender_state(DefenderState::Guarding)
+            } else {
+                StateChangeResult::with_midfielder_state(MidfielderState::Guarding)
+            }),
+        }
     }
 
     /// realism-bug (2026-09-12, `docs/positional-play-master-design.md`

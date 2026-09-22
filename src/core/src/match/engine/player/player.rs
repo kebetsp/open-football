@@ -231,6 +231,35 @@ impl ShapeRule {
     }
 }
 
+/// Off-ball defensive duty, assigned team-wide once per tick by
+/// `assign_defensive_duties` (docs/off-ball-defensive-positioning-from-
+/// null.md — domain 1 of the from-null decision rewrite,
+/// docs/decision-from-null.md). Replaces the old per-player, scan-from-
+/// my-own-position marking/covering/pressing decisions for defenders and
+/// midfielders out of possession against a clear opponent ball carrier.
+/// `None` whenever the system isn't engaged this tick (team in
+/// possession, ball loose, goalkeeper, forward — forwards' own
+/// defensive duty is a distinct, not-yet-built domain).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum DefensiveDuty {
+    #[default]
+    None,
+    /// Closing down the ball carrier at a real jockeying distance.
+    Press { opponent_id: u32 },
+    /// Tracking a specific dangerous opponent goal-side, at a tightness
+    /// that scales with how threatening their position is.
+    Mark { opponent_id: u32 },
+    /// Holding a goal-side position on the ball-to-goal line, ready to
+    /// become the new presser instantly if the presser is beaten.
+    Cover,
+    /// Holding a coordinated zonal shape position — no live individual
+    /// responsibility this tick.
+    HoldShape,
+    /// Box-emergency override: converge on genuine danger near our own
+    /// goal, fanned out to avoid stacking on a teammate.
+    Scramble,
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchPlayer {
     pub id: u32,
@@ -305,6 +334,21 @@ pub struct MatchPlayer {
     /// our team is out of possession (goal-side stick, plus the press
     /// chase when they receive).
     pub mark_target: Option<u32>,
+    /// This tick's off-ball defensive duty, from the from-null rewrite
+    /// (see `DefensiveDuty`'s own doc comment). Distinct from
+    /// `press_target`/`mark_target` above, which are manager-issued
+    /// explicit directives and always take priority over this default
+    /// AI assignment.
+    pub ai_defensive_duty: DefensiveDuty,
+    /// Where this tick's `ai_defensive_duty` says to stand — already
+    /// computed by the assignment pass; the velocity override just
+    /// steers there.
+    pub ai_defensive_target: Vector3<f32>,
+    /// True only for the assigned presser, only on the tick he commits
+    /// to an actual tackle attempt (the from-null spec's Step H). The
+    /// physical outcome of the attempt is a kept, not-rewritten
+    /// mechanic (`DefenderTacklingState`/`MidfielderTacklingState`).
+    pub ai_defensive_engage: bool,
     /// Cross-player attacking trigger: when teammate `.0` has the ball,
     /// this player's effective directive becomes `.1` (evaluated per
     /// possession change in the engine loop).
@@ -856,6 +900,9 @@ impl MatchPlayer {
             directive_base: None,
             press_target: None,
             mark_target: None,
+            ai_defensive_duty: DefensiveDuty::None,
+            ai_defensive_target: Vector3::zeros(),
+            ai_defensive_engage: false,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
@@ -968,6 +1015,9 @@ impl MatchPlayer {
             directive_base: None,
             press_target: None,
             mark_target: None,
+            ai_defensive_duty: DefensiveDuty::None,
+            ai_defensive_target: Vector3::zeros(),
+            ai_defensive_engage: false,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
