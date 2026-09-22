@@ -2099,6 +2099,27 @@ impl<'p> StateProcessor<'p> {
         if player.press_target.is_some() || player.mark_target.is_some() {
             return None; // an explicit assignment always wins
         }
+        // Yield outright to the from-null domain-1 system
+        // (docs/off-ball-defensive-positioning-from-null.md) whenever it
+        // has assigned this player a real duty this tick. Found via
+        // Pavel's direct "defenders don't drop/space" report
+        // (2026-09-22), raw-traced (temporary SLCDIAG diagnostic): this
+        // function was firing for 1172 player-ticks in one match, 71% of
+        // which already had `ai_defensive_duty::Cover` and 25%
+        // `Scramble` from the new system — i.e. this OLD, uncoordinated
+        // "predicted shot corridor" mechanism (built for the unrelated
+        // Module 9/10 deflection-rate investigation, before domain 1
+        // existed) was silently overwriting the new system's Cover
+        // selection and Scramble fan-out for the large majority of its
+        // firings, since it runs later in the override chain and just
+        // wins. `assign_defensive_duties`'s own "is there a clear ball
+        // carrier" gate is effectively identical to this function's own
+        // `carrier = ...next()?` below, so this only actually falls
+        // through for genuinely uncovered cases (e.g. a loose ball),
+        // not a narrowing of when useful shot-corridor cover happens.
+        if !matches!(player.ai_defensive_duty, crate::r#match::player::DefensiveDuty::None) {
+            return None;
+        }
         // Matches `defensive_role_for_ball_carrier_unified`'s own pool
         // (every defender plus every reachable midfielder) — restricting
         // this to defenders only would silently starve the override

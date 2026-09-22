@@ -84,6 +84,42 @@ const LINE_MAX_DEPTH_UNITS: f32 = 320.0; // 40.0m from goal
 /// pitch).
 const WIDTH_PULL_FRACTION: f32 = 0.30;
 
+/// How far ahead of the ball carrier's CURRENT position the line-depth
+/// calculation looks, extrapolated from the carrier's own live
+/// velocity. Raw-traced before adding this (Pavel's "defenders don't
+/// drop into the box" report, 2026-09-22): the un-anticipated line
+/// target tracked the ball's instantaneous position correctly, but a
+/// player's realized depth during a genuinely fast-developing attack
+/// lagged the target by a median 19-36m through the first 1-3 seconds
+/// of a sustained possession, only closing (to <1m) after 4-5+ seconds
+/// — i.e. the line was purely reactive and never got a head start,
+/// exactly the class of bug this project's `shot_lane_cover_
+/// override_velocity` already solved once for an individual defender's
+/// cover target ("a target that keeps moving away at up to the
+/// carrier's own full pace only closes by the DIFFERENCE in speeds,
+/// not full speed"). 80 ticks (0.8s) is a reasoned estimate (category
+/// d, no sourced dataset for "how far ahead a real back line reads an
+/// attack") — long enough to give the whole line a meaningful head
+/// start on a real sprint-speed break, short enough that a carrier
+/// changing direction doesn't send the line lurching toward a stale
+/// prediction.
+const LINE_LEAD_TICKS: f32 = 80.0;
+
+/// Real off-ball spacing from a nearby attacker — Pavel's own coaching
+/// reference point ("3-6m between them and attackers"); this is the
+/// hard floor of that band (below 3m, push away; within the 3-6m band
+/// itself no correction is needed, real defending doesn't need to be
+/// exactly one specific distance, just not glued to an attacker).
+/// Below this, a hold-shape player's target gets pushed directly away
+/// from his own single nearest opponent (not a shared point — each
+/// player reacts to HIS OWN nearest attacker, which is naturally
+/// spread across different attackers for different defenders, so this
+/// is anti-clustering by construction, not by explicit fan-out logic
+/// like Step G's). Scales with the same danger-based tightness idea as
+/// Step D's marking bounds, but applies universally (every hold-shape
+/// player, not just the top-ranked marked threats).
+const ATTACKER_SPACING_UNITS: f32 = 24.0; // 3.0m — never closer than this
+
 /// Ball within this distance of our own goal is a genuine box crisis —
 /// real defenders stop tracking individual assignments and just get
 /// bodies between the danger and the goal. Roughly the penalty area
@@ -126,6 +162,7 @@ struct Cand {
     id: u32,
     team_id: u32,
     position: Vector3<f32>,
+    velocity: Vector3<f32>,
     max_speed: f32,
     position_group: PlayerFieldPositionGroup,
     start_position: Vector3<f32>,
@@ -181,6 +218,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             id: p.id,
             team_id: p.team_id,
             position: p.position,
+            velocity: p.velocity,
             max_speed: p.skills.max_speed_with_condition(p.player_attributes.condition),
             position_group: p.tactical_position.current_position.position_group(),
             start_position: p.start_position,
@@ -242,6 +280,20 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                     context.total_match_time,
                     a.id,
                     (carrier.position - own_goal).magnitude()
+                );
+            }
+            // TEMP diagnostic (Pavel's "defenders don't space from
+            // attackers" report, 2026-09-22): HoldShape was never
+            // logged at all before now. Remove once this investigation
+            // is done.
+            DefensiveDuty::HoldShape => {
+                crate::match_log_info!(
+                    "DEFDUTY_HOLDSHAPE t={} p={} ball_dist_goal={:.1} target_dist_goal={:.1} player_dist_goal={:.1}",
+                    context.total_match_time,
+                    a.id,
+                    (carrier.position - own_goal).magnitude(),
+                    (a.target - own_goal).magnitude(),
+                    (cands.iter().find(|c| c.id == a.id).map(|c| c.position).unwrap_or(a.target) - own_goal).magnitude()
                 );
             }
             _ => {}
@@ -452,18 +504,51 @@ fn assign_team(
         PlayerSide::Left => 1.0,
         PlayerSide::Right => -1.0,
     };
-    let line_depth =
-        (ball_dist_to_goal * LINE_PUSH_FACTOR).clamp(LINE_MIN_DEPTH_UNITS, LINE_MAX_DEPTH_UNITS);
+    // Anticipated carrier position, not the raw instantaneous one — see
+    // `LINE_LEAD_TICKS`' own doc comment for why: a purely reactive
+    // target measurably lagged a fast-developing attack by 19-36m
+    // through the first 1-3 seconds, raw-traced this session.
+    let predicted_carrier_pos = carrier.position + carrier.velocity * LINE_LEAD_TICKS;
+    let predicted_ball_dist_to_goal = (predicted_carrier_pos - own_goal).magnitude();
+    let line_depth = (predicted_ball_dist_to_goal * LINE_PUSH_FACTOR)
+        .clamp(LINE_MIN_DEPTH_UNITS, LINE_MAX_DEPTH_UNITS);
     let target_x = own_goal.x + attack_dir * line_depth;
 
     let mut hold_shape_ids: Vec<u32> = Vec::new();
     for c in pool.iter().filter(|c| !assigned.contains(&c.id)) {
         let target_y = c.start_position.y * (1.0 - WIDTH_PULL_FRACTION)
-            + carrier.position.y * WIDTH_PULL_FRACTION;
+            + predicted_carrier_pos.y * WIDTH_PULL_FRACTION;
+        let mut target = Vector3::new(target_x, target_y, 0.0);
+        // Real spacing from the single nearest attacker (any opponent —
+        // not just the carrier or the small set of top-ranked marked
+        // threats Step D already covers). Each hold-shape player reacts
+        // to HIS OWN nearest opponent from HIS OWN current position, so
+        // this is anti-clustering by construction: different defenders
+        // naturally have different nearest attackers, there's no shared
+        // point for multiple of them to converge on.
+        if let Some(nearest_opp) = cands
+            .iter()
+            .filter(|o| o.team_id == opponent_team)
+            .min_by(|a, b| {
+                let da = (a.position - c.position).magnitude();
+                let db = (b.position - c.position).magnitude();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+        {
+            let gap = (c.position - nearest_opp.position).magnitude();
+            if gap < ATTACKER_SPACING_UNITS {
+                let push_dir = if gap > 1.0 {
+                    (c.position - nearest_opp.position) / gap
+                } else {
+                    Vector3::new(-attack_dir, 0.0, 0.0)
+                };
+                target += push_dir * (ATTACKER_SPACING_UNITS - gap);
+            }
+        }
         results.push(Assignment {
             id: c.id,
             duty: DefensiveDuty::HoldShape,
-            target: Vector3::new(target_x, target_y, 0.0),
+            target,
             engage: false,
         });
         hold_shape_ids.push(c.id);
