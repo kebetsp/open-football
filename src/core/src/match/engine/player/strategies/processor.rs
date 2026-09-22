@@ -320,20 +320,6 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(base * 0.35 + pull * tempo * 0.65);
         }
 
-        // §12.5 universal off-ball separation: same-team outfielders
-        // inside the §11.9 exclusion radius of each other separate, in
-        // EVERY phase — defensive shape included. A weighted blend that
-        // progressively replaces the state's own movement at close range
-        // (an additive nudge loses to the state's convergence pull).
-        // Applied BEFORE the press/mark overrides so explicit
-        // man-assignments still win outright.
-        if let Some((separation, w)) =
-            crate::r#match::player::strategies::common::spacing::separation_nudge(&processing_ctx)
-        {
-            let base = result.velocity.unwrap_or_else(Vector3::zeros);
-            result.velocity = Some(base * (1.0 - w) + separation * w);
-        }
-
         // Realism-bug 2026-07-26 (passing follow-up): blend the
         // receiver's own movement toward an incoming pass's actual aim
         // point. A full-tree grep confirmed nothing previously read
@@ -551,13 +537,34 @@ impl<'p> StateProcessor<'p> {
         // left in place, not called, per docs/decision-from-null.md.
 
         // engine audit Module 3 (2026-08-29): universal offside-line
-        // hold. Applied LAST among the velocity overrides so it clamps
-        // whatever the final proposed x-movement is, regardless of which
-        // state or earlier override produced it — see the function's own
-        // doc comment for the full rationale.
+        // hold. Applied before the final separation correction (moved
+        // below, 2026-09-22) so it clamps whatever the movement was
+        // BEFORE that last correction, regardless of which state or
+        // earlier override produced it — see the function's own doc
+        // comment for the full rationale.
         if let Some(velocity) = Self::offside_line_hold_velocity(&processing_ctx, result.velocity)
         {
             result.velocity = Some(velocity);
+        }
+
+        // §12.5 universal off-ball separation ("players cannot be on
+        // top of each other" — Pavel's direct report, 2026-09-22, after
+        // watching kickoff send defenders to the exact same spot as
+        // their own midfielders). MOVED to run genuinely last, after
+        // EVERY other override including `ai_defensive_duty_velocity`
+        // and `offside_line_hold_velocity` — it previously ran early
+        // (right after the base state handler), which meant any later
+        // override, including the whole from-null defensive-duty
+        // system added this session, simply overwrote its blended
+        // result outright with a raw target-steer and discarded the
+        // separation entirely. A weighted blend, not a hard clamp, so
+        // it still yields proportionally rather than fighting whatever
+        // real tactical movement was already decided.
+        if let Some((separation, w)) =
+            crate::r#match::player::strategies::common::spacing::separation_nudge(&processing_ctx)
+        {
+            let base = result.velocity.unwrap_or_else(Vector3::zeros);
+            result.velocity = Some(base * (1.0 - w) + separation * w);
         }
 
         // common logic

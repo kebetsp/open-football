@@ -107,7 +107,19 @@ const COVER_STANDOFF_UNITS: f32 = 64.0; // 8.0m
 /// pushes all the way to halfway regardless of ball position.
 const LINE_PUSH_FACTOR: f32 = 0.55;
 const LINE_MIN_DEPTH_UNITS: f32 = 96.0; // 12.0m from goal
-const LINE_MAX_DEPTH_UNITS: f32 = 320.0; // 40.0m from goal
+/// Lowered from 320u/40m (2026-09-22, Pavel's "why do they run
+/// forward, stay in your line" report). 40m is not a realistic ceiling
+/// for a default defensive line depth — that's essentially the
+/// halfway line, and real doctrine puts even an aggressive, organised
+/// high defensive line at roughly 30-35m from goal at its most
+/// advanced, not as a routine baseline. Reasoned estimate (category
+/// d), not a fix for a specific measured bug at this exact constant —
+/// the actual kickoff collision was traced to a separate, now-fixed
+/// issue (the universal separation correction being overwritten by
+/// this system, see processor.rs's `separation_nudge` repositioning,
+/// same date) — but 40m was too generous regardless and is tightened
+/// here too, since it directly answers "nobody needs them that high."
+const LINE_MAX_DEPTH_UNITS: f32 = 260.0; // 32.5m from goal
 
 /// How much a hold-shape player's lateral (width) position is pulled
 /// toward the ball's own side — real compactness doctrine (shift as a
