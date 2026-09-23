@@ -422,18 +422,61 @@ fn carry_best_heading(
     (best_heading, best_open)
 }
 
+/// Real football's phase-of-possession doctrine, added 2026-09-23 after
+/// Pavel watched an isolated forward try to dribble through a packed
+/// defense 30m out instead of recycling to midfield: WHO is primarily
+/// responsible for carrying the ball forward changes by zone. Defenders
+/// build out through their own third; midfielders progress the ball
+/// through the middle third; forwards (and advanced wide players) carry
+/// and take players on in the final third, where an individual action
+/// actually threatens goal. Outside a role's own zone, carrying/
+/// dribbling is discounted, not forbidden (a genuinely wide-open lane
+/// still carries some value) -- suppressed enough that a real
+/// pass-back/recycle option (already retained by `pass_value`'s own
+/// `PASS_RETENTION_BASE`) wins the comparison instead, exactly the
+/// "turn back and play with midfield" pattern Pavel described. Zone
+/// boundaries and multipliers are reasoned estimates (category d, real
+/// thirds-of-the-pitch coaching doctrine, no sourced numeric dataset) --
+/// a target for the raw-trace verification pass, not treated as final.
+const OWN_THIRD_BOUNDARY: f32 = 280.0; // ~35m
+const FINAL_THIRD_BOUNDARY: f32 = 560.0; // ~70m
+
+fn carry_priority_mult(group: PlayerFieldPositionGroup, own_goal_dist: f32) -> f32 {
+    let zone = if own_goal_dist < OWN_THIRD_BOUNDARY {
+        0
+    } else if own_goal_dist < FINAL_THIRD_BOUNDARY {
+        1
+    } else {
+        2
+    };
+    match (group, zone) {
+        (PlayerFieldPositionGroup::Defender, 0) => 1.0,
+        (PlayerFieldPositionGroup::Defender, 1) => 0.55,
+        (PlayerFieldPositionGroup::Defender, _) => 0.35,
+        (PlayerFieldPositionGroup::Midfielder, 0) => 0.75,
+        (PlayerFieldPositionGroup::Midfielder, 1) => 1.0,
+        (PlayerFieldPositionGroup::Midfielder, _) => 0.85,
+        (PlayerFieldPositionGroup::Forward, 0) => 0.35,
+        (PlayerFieldPositionGroup::Forward, 1) => 0.45,
+        (PlayerFieldPositionGroup::Forward, _) => 1.0,
+        _ => 1.0,
+    }
+}
+
 fn carry_value(
     from: Vector3<f32>,
     forward: Vector3<f32>,
     own_goal: Vector3<f32>,
     opponents: &[MatchPlayerLite],
+    group: PlayerFieldPositionGroup,
 ) -> (f32, Vector3<f32>) {
     let (heading, open_dist) = carry_best_heading(from, forward, opponents);
     let openness_frac = (open_dist / CARRY_LOOKAHEAD).clamp(0.0, 1.0);
     let align = ((heading.dot(&forward) + 1.0) / 2.0).clamp(0.0, 1.0);
     let pressure = 1.0 - openness(from, opponents);
     let risk = turnover_cost(own_goal, from) * pressure * CARRY_RISK_MULT;
-    let value = CARRY_SPACE_WEIGHT * openness_frac * (0.4 + 0.6 * align) - risk;
+    let priority = carry_priority_mult(group, (from - own_goal).magnitude());
+    let value = CARRY_SPACE_WEIGHT * openness_frac * (0.4 + 0.6 * align) * priority - risk;
     let target = from + heading * open_dist.max(20.0);
     (value, target)
 }
@@ -467,6 +510,7 @@ fn dribble_value(
     forward: Vector3<f32>,
     own_goal: Vector3<f32>,
     opponents: &[MatchPlayerLite],
+    group: PlayerFieldPositionGroup,
 ) -> Option<(f32, Vector3<f32>)> {
     let blocker = nearest_blocker(from, forward, opponents)?;
     let beyond = blocker.position + forward * 30.0;
@@ -474,7 +518,8 @@ fn dribble_value(
     let payoff = (payoff_open / CARRY_LOOKAHEAD).clamp(0.0, 1.0);
     let skill = (ctx.player.skills.technical.dribbling / 20.0).clamp(0.0, 1.0);
     let risk = turnover_cost(own_goal, from) * DRIBBLE_RISK_MULT;
-    let value = DRIBBLE_BASE_WEIGHT * skill * (0.3 + 0.7 * payoff) - risk;
+    let priority = carry_priority_mult(group, (from - own_goal).magnitude());
+    let value = DRIBBLE_BASE_WEIGHT * skill * (0.3 + 0.7 * payoff) * priority - risk;
     let lateral = Vector3::new(-forward.y, forward.x, 0.0);
     let blocker_lateral_offset = (blocker.position - from).dot(&lateral);
     let side = if blocker_lateral_offset >= 0.0 { -1.0 } else { 1.0 };
@@ -561,13 +606,13 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
         }
     }
 
-    let (cv, ctarget) = carry_value(from, forward, own_goal, &opponents);
+    let (cv, ctarget) = carry_value(from, forward, own_goal, &opponents, group);
     if cv > best_value {
         best_value = cv;
         best_action = Action::Carry(ctarget);
     }
 
-    if let Some((dv, dtarget)) = dribble_value(ctx, from, forward, own_goal, &opponents) {
+    if let Some((dv, dtarget)) = dribble_value(ctx, from, forward, own_goal, &opponents, group) {
         if dv > best_value {
             best_value = dv;
             best_action = Action::Dribble(dtarget);
