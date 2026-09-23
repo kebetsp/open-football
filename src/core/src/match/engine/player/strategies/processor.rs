@@ -463,6 +463,24 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
+        // On-ball attacking decisions, from null (docs/decision-from-
+        // null.md domain 2, docs/on-ball-attacking-decisions-from-
+        // null.md). Naturally mutually exclusive with the defensive-duty
+        // override immediately above — a player with an active
+        // `ai_defensive_duty` is by construction on the team WITHOUT the
+        // ball (domain 1's own Case 1 pool is always `defending_team`),
+        // so ordering between the two doesn't matter functionally; kept
+        // adjacent for readability, as the other "from-null" system.
+        // Carry/Dribble get full authority over movement here (the old
+        // state's own `velocity()` call above still runs, per this
+        // pipeline's established convention, but its result is always
+        // discarded once this fires); Shoot/Pass/Clear don't move the
+        // player this tick (freezing here is intentional — the discrete
+        // dispatch below fires the same tick, no artificial delay).
+        if let Some(velocity) = Self::on_ball_ai_velocity(&processing_ctx) {
+            result.velocity = Some(velocity);
+        }
+
         // realism-bug (2026-08-30, deflection-rate investigation):
         // pre-shot corridor cover. Applied AFTER wide-run tracking and
         // BEFORE the reactive shot-block lunge, so an already-live shot
@@ -631,6 +649,41 @@ impl<'p> StateProcessor<'p> {
         // rather than separately gated, since ordering alone makes it
         // inert.
         if let Some(state_result) = Self::kicker_mode_pass_override(&processing_ctx) {
+            return complete_result(state_result, result);
+        }
+
+        // On-ball attacking decisions, from null (docs/decision-from-
+        // null.md domain 2, docs/on-ball-attacking-decisions-from-
+        // null.md). Placed here — after the Law-driven/diagnostic
+        // overrides above (kickoff/throw-in/free-kick/kicker-mode, all
+        // of which this domain's own gate already defers to internally,
+        // so running before them changes nothing for those windows) and
+        // BEFORE `carrier_contained_pass_override` immediately below —
+        // deliberately, not incidentally: a real leak found by raw
+        // event-reason tracing (`DEF_COUNTER_ATTACK`/
+        // `DEF_PATIENT_POSSESSION`/`MID_PASSING_STATE`/etc. still firing
+        // for undirected, non-restart players) traced to exactly this
+        // ordering — `carrier_contained_pass_override` reads the old
+        // ambient `carrier_contained_reset_ticks` heuristic (armed
+        // elsewhere in `run.rs`, independent of anything this domain
+        // controls) and force-transitions the role's Passing state
+        // OUTRIGHT, short-circuiting before this override ever got a
+        // chance to run. Moving this check ahead of it — the same
+        // "ordering alone makes it structurally unreachable" convention
+        // `kicker_mode_pass_override`'s own doc comment already
+        // establishes for the identical override — makes
+        // `carrier_contained_pass_override` (and everything after it,
+        // including `handler.process()` itself) genuinely unreachable
+        // for any player this domain governs, not just usually
+        // overridden. This override ALWAYS returns `Some(...)` whenever
+        // its own gate applies (a duty->state mapping used purely as an
+        // animation/stats label for Carry/Dribble/Hold, since movement
+        // is fully owned by `on_ball_ai_velocity` above; a real
+        // dispatched event for Shoot/Pass/Clear) — never just for the
+        // "interesting" cases, matching the exact discipline
+        // `ai_defensive_engage_override` already established for domain
+        // 1 below.
+        if let Some(state_result) = Self::on_ball_ai_action_override(&processing_ctx) {
             return complete_result(state_result, result);
         }
 
@@ -1958,6 +2011,174 @@ impl<'p> StateProcessor<'p> {
                 Role::Forward => StateChangeResult::with_forward_state(ForwardState::Pressing),
             }),
         }
+    }
+
+    /// On-ball attacking decisions, from null — the movement half. See
+    /// `common::players::ops::on_ball_decision::decide_on_ball_action`'s
+    /// own doc comment for the full design; `docs/decision-from-null.md`
+    /// domain 2 / `docs/on-ball-attacking-decisions-from-null.md`.
+    /// Carry/Dribble get a real steering vector toward the chosen
+    /// target, at the player's own real max speed (an arrive-style stop
+    /// near the target, mirroring `ai_defensive_duty_velocity`'s own
+    /// `dist < 2.0` hard-stop convention). Hold shields the ball with a
+    /// small nudge away from the single nearest opponent rather than
+    /// literal stillness. Shoot/Pass/Clear return a zero velocity for
+    /// this one tick — the discrete dispatch happens immediately in
+    /// `on_ball_ai_action_override` below, no artificial holding period.
+    fn on_ball_ai_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        use crate::r#match::player::strategies::common::players::ops::on_ball_decision::{
+            Action, decide_on_ball_action,
+        };
+        match decide_on_ball_action(ctx)? {
+            Action::Carry(target) | Action::Dribble(target) => {
+                let to_target = target - ctx.player.position;
+                let dist = to_target.magnitude();
+                if dist < 2.0 {
+                    return Some(Vector3::zeros());
+                }
+                let max_speed = ctx
+                    .player
+                    .skills
+                    .max_speed_with_condition(ctx.player.player_attributes.condition);
+                Some((to_target / dist) * max_speed)
+            }
+            Action::Hold => {
+                let nearest = ctx
+                    .players()
+                    .opponents()
+                    .nearby(60.0)
+                    .min_by(|a, b| {
+                        let da = (a.position - ctx.player.position).magnitude();
+                        let db = (b.position - ctx.player.position).magnitude();
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                match nearest {
+                    Some(opp) => {
+                        let away = ctx.player.position - opp.position;
+                        let dist = away.magnitude();
+                        if dist < 0.5 {
+                            Some(Vector3::zeros())
+                        } else {
+                            let max_speed = ctx
+                                .player
+                                .skills
+                                .max_speed_with_condition(ctx.player.player_attributes.condition);
+                            Some((away / dist) * max_speed * 0.25)
+                        }
+                    }
+                    None => Some(Vector3::zeros()),
+                }
+            }
+            Action::Shoot | Action::Pass(_) | Action::Clear => Some(Vector3::zeros()),
+        }
+    }
+
+    /// On-ball attacking decisions, from null — the state-transition /
+    /// event-dispatch half. ALWAYS returns `Some(...)` whenever
+    /// `decide_on_ball_action` returns an action (mirrors
+    /// `ai_defensive_engage_override`'s own "always returns a state
+    /// matching the current duty" discipline, not just for the
+    /// "interesting" Shoot/Pass/Clear cases) — the old per-role
+    /// Running/Dribbling/Passing/Shooting/Clearing `process()` bodies
+    /// genuinely never run for this player while this domain governs
+    /// him. State labels for Carry/Dribble/Hold are purely an
+    /// animation/stats convention (movement is fully owned by
+    /// `on_ball_ai_velocity` above); `DefenderState` has no `Dribbling`
+    /// variant, so a defender's dribble is labelled `Running` — a
+    /// cosmetic gap only, not a behavioural one.
+    fn on_ball_ai_action_override(ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        use crate::r#match::player::events::{PassingEventContext, PlayerEvent, ShootingEventContext};
+        use crate::r#match::player::strategies::common::players::ops::on_ball_decision::{
+            Action, build_clear_velocity, decide_on_ball_action,
+        };
+        let action = decide_on_ball_action(ctx)?;
+        enum Role {
+            Defender,
+            Midfielder,
+            Forward,
+        }
+        let role = match ctx.player.tactical_position.current_position.position_group() {
+            PlayerFieldPositionGroup::Defender => Role::Defender,
+            PlayerFieldPositionGroup::Midfielder => Role::Midfielder,
+            PlayerFieldPositionGroup::Forward => Role::Forward,
+            _ => return None,
+        };
+        Some(match action {
+            Action::Shoot => {
+                let target = ctx.player().opponent_goal_position();
+                let shoot_ctx = ShootingEventContext::new()
+                    .with_player_id(ctx.player.id)
+                    .with_target(target)
+                    .with_reason("ONBALL_AI_SHOOT")
+                    .build(ctx);
+                let event = Event::PlayerEvent(PlayerEvent::Shoot(shoot_ctx));
+                match role {
+                    Role::Defender => {
+                        StateChangeResult::with_defender_state_and_event(DefenderState::Running, event)
+                    }
+                    Role::Midfielder => StateChangeResult::with_midfielder_state_and_event(
+                        MidfielderState::Running,
+                        event,
+                    ),
+                    Role::Forward => {
+                        StateChangeResult::with_forward_state_and_event(ForwardState::Running, event)
+                    }
+                }
+            }
+            Action::Pass(to_id) => {
+                let pass_ctx = PassingEventContext::new()
+                    .with_from_player_id(ctx.player.id)
+                    .with_to_player_id(to_id)
+                    .with_reason("ONBALL_AI_PASS")
+                    .build(ctx);
+                let event = Event::PlayerEvent(PlayerEvent::PassTo(pass_ctx));
+                match role {
+                    Role::Defender => {
+                        StateChangeResult::with_defender_state_and_event(DefenderState::Running, event)
+                    }
+                    Role::Midfielder => StateChangeResult::with_midfielder_state_and_event(
+                        MidfielderState::Running,
+                        event,
+                    ),
+                    Role::Forward => {
+                        StateChangeResult::with_forward_state_and_event(ForwardState::Running, event)
+                    }
+                }
+            }
+            Action::Clear => {
+                let velocity = build_clear_velocity(ctx);
+                let event = Event::PlayerEvent(PlayerEvent::ClearBall(velocity));
+                match role {
+                    Role::Defender => {
+                        StateChangeResult::with_defender_state_and_event(DefenderState::Standing, event)
+                    }
+                    Role::Midfielder => StateChangeResult::with_midfielder_state_and_event(
+                        MidfielderState::Standing,
+                        event,
+                    ),
+                    Role::Forward => {
+                        StateChangeResult::with_forward_state_and_event(ForwardState::Standing, event)
+                    }
+                }
+            }
+            Action::Carry(_) => match role {
+                Role::Defender => StateChangeResult::with_defender_state(DefenderState::Running),
+                Role::Midfielder => StateChangeResult::with_midfielder_state(MidfielderState::Running),
+                Role::Forward => StateChangeResult::with_forward_state(ForwardState::Running),
+            },
+            Action::Dribble(_) => match role {
+                Role::Defender => StateChangeResult::with_defender_state(DefenderState::Running),
+                Role::Midfielder => {
+                    StateChangeResult::with_midfielder_state(MidfielderState::Dribbling)
+                }
+                Role::Forward => StateChangeResult::with_forward_state(ForwardState::Dribbling),
+            },
+            Action::Hold => match role {
+                Role::Defender => StateChangeResult::with_defender_state(DefenderState::Standing),
+                Role::Midfielder => StateChangeResult::with_midfielder_state(MidfielderState::Standing),
+                Role::Forward => StateChangeResult::with_forward_state(ForwardState::Standing),
+            },
+        })
     }
 
     /// realism-bug (2026-09-12, `docs/positional-play-master-design.md`

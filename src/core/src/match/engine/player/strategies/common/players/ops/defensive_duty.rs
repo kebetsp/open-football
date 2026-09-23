@@ -368,8 +368,54 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             goal_for_side(opposite_side(defending_side)),
             defending_side,
         )
+    } else if let Some(passer_id) = field.ball.pending_pass_passer {
+        // Case 2a (added 2026-09-23, folded in from domain 2's carry-over
+        // list — docs/decision-from-null.md's carry-over section,
+        // docs/on-ball-attacking-decisions-from-null.md's own scope
+        // note): an ordinary directed pass in flight, NOT a genuine loose
+        // ball. `current_owner` goes `None` the instant a pass is struck
+        // and stays that way until the receiver claims it — but the
+        // PASSING team is still, in every real football sense,
+        // comfortably in possession for that window; only the DEFENDING
+        // team should organise, exactly as Case 1 already does for a
+        // known carrier. Diagnosed and quantified before this fix
+        // (`DEFDUTY_CASE2`, still logged below): ~25-26% of what used to
+        // be genuine Case-2 firings coincided with this exact signal,
+        // needlessly pulling the passing team's own players back into
+        // defensive duty mid-pass. Routes through the SAME single-team
+        // `assign_team` Case 1 uses, anchored on the ball's own live
+        // position/velocity (no single "carrier" mid-flight) rather than
+        // a specific player's position.
+        let Some(passer) = cands.iter().find(|c| c.id == passer_id) else {
+            reset_all(field);
+            return;
+        };
+        let defending_team = if passer.team_id == field.home_team_id {
+            field.away_team_id
+        } else {
+            field.home_team_id
+        };
+        let Some(defending_side) = cands
+            .iter()
+            .find(|c| c.team_id == defending_team)
+            .and_then(|c| c.side)
+        else {
+            reset_all(field);
+            return;
+        };
+        assign_team(
+            &cands,
+            defending_team,
+            passer.team_id,
+            field.ball.position,
+            field.ball.velocity,
+            None,
+            goal_for_side(defending_side),
+            goal_for_side(opposite_side(defending_side)),
+            defending_side,
+        )
     } else {
-        // Case 2: a genuine loose ball — both teams organise around
+        // Case 2b: a genuine loose ball — both teams organise around
         // the ball's own position (see this function's own doc
         // comment for why). If a team has no players left to derive a
         // side from (e.g. every outfielder sent off — a degenerate
@@ -379,22 +425,12 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
         let ball_vel = field.ball.velocity;
         // Diagnostic, kept permanently (feature-gated, zero cost without
         // match-logs): added 2026-09-23, Pavel's "defense/midfield never
-        // cross halfway" question. Checks how often this loose-ball
-        // ("genuine 50/50") branch fires during what's actually just the
-        // ordinary, uncontested mid-flight of a directed pass, not a
-        // real contest — pooled over 3 matches, ~25-26% of Case-2
-        // firings coincide with either signal below being set. This is
-        // a real, domain-1-introduced, still-open contributor (not yet
-        // fixed): treating a safe pass-in-flight as a genuine loose ball
-        // needlessly pulls the passing team's OWN players back into
-        // defensive duty for that window. The larger share of "defenders
-        // sit deep during our own possession" is NOT this — `HoldingLine`
-        // is reachable from many pre-existing, not-yet-rewritten OLD
-        // defender states (Standing/Running/Pressing/Guarding/
-        // TrackingBack/Resting/Heading) independent of this system, and
-        // Case 1 (clear possession) can never assign a duty to the team
-        // that owns the ball by construction — confirmed by code read,
-        // not just this log.
+        // cross halfway" question — the finding that motivated the Case
+        // 2a branch above. Now only fires for genuine loose balls (the
+        // in-flight-pass case is routed away by the `pending_pass_passer`
+        // branch above), so this counter's own "coincides with a pass
+        // signal" share should read near zero going forward; kept to
+        // verify that directly rather than assumed.
         #[cfg(feature = "match-logs")]
         crate::match_log_info!(
             "DEFDUTY_CASE2 t={} has_pass_target={} has_pending_passer={} owner_prev={:?}",
