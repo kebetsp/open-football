@@ -352,6 +352,38 @@ fn shoot_value(from: Vector3<f32>, goal_centre: Vector3<f32>, opponents: &[Match
     SHOOT_BASE_WEIGHT * clarity * distance_factor
 }
 
+/// Real football's phase-of-possession doctrine, corrected 2026-09-23
+/// after Pavel's own follow-up clarification: "I do not say that
+/// midfielders should carry, or that forward should carry in a certain
+/// zone... it is about who is doing what as a group of players." The
+/// prior `carry_priority_mult` (still kept, still real — see its own
+/// doc comment) discourages an isolated player from personally
+/// dribbling outside his line's zone, but the actual mechanism Pavel
+/// described is about PASSING: the ball should flow through and between
+/// the members of whichever line is currently responsible for
+/// progressing it (defenders circulating in the own third, midfielders
+/// combining with each other through the middle third), only reaching
+/// the next line once that line has genuinely done its job — not that
+/// any individual player needs to carry it there himself. This is a
+/// pass-TARGET preference, not an action preference.
+fn responsible_line_for_zone(own_goal_dist: f32) -> PlayerFieldPositionGroup {
+    if own_goal_dist < OWN_THIRD_BOUNDARY {
+        PlayerFieldPositionGroup::Defender
+    } else if own_goal_dist < FINAL_THIRD_BOUNDARY {
+        PlayerFieldPositionGroup::Midfielder
+    } else {
+        PlayerFieldPositionGroup::Forward
+    }
+}
+
+/// Modest, reasoned bonus (category d, no sourced dataset) for passing
+/// to a teammate in the line currently responsible for this zone —
+/// small enough that a genuinely excellent, safe, progressive pass to a
+/// different line still wins on its own merits (this is a preference,
+/// not a veto), large enough to matter when several options are
+/// otherwise close.
+const LINE_PRIORITY_BONUS: f32 = 0.18;
+
 fn pass_value(
     ctx: &StateProcessingContext,
     from: Vector3<f32>,
@@ -367,6 +399,10 @@ fn pass_value(
     let cost = turnover_cost(own_goal, to);
     let mut value = PASS_RETENTION_BASE + PASS_PROGRESS_WEIGHT * prog + PASS_OPENNESS_WEIGHT * open
         - PASS_RISK_WEIGHT * risk * cost;
+    let responsible = responsible_line_for_zone((from - own_goal).magnitude());
+    if teammate.tactical_positions.position_group() == responsible {
+        value += LINE_PRIORITY_BONUS;
+    }
     if ctx.tick_context.ball.last_owner == Some(teammate.id) && prog < PASS_BACK_PROGRESS_EXEMPT {
         value -= PASS_BACK_TO_PASSER_PENALTY;
     }
@@ -463,10 +499,60 @@ fn carry_priority_mult(group: PlayerFieldPositionGroup, own_goal_dist: f32) -> f
     }
 }
 
+/// How many opponents genuinely stand between `from` and the opponent's
+/// goal, in the direction of the run -- a real measurement of "is this
+/// a clear break or a packed wall," not an assumption from zone alone.
+/// Pavel's own follow-up clarification (2026-09-23): "a forward on a
+/// counterattack may receive the ball in the central circle and make a
+/// run towards the goal if there is no (or just one) defender ahead of
+/// him. But if there is a clear wall of opponents, and he is far from
+/// the goal, there is no reason to be a hero — just play with your
+/// teammates." A flat zone discount alone can't tell these two
+/// situations apart; this measurement can.
+fn defenders_ahead_count(
+    from: Vector3<f32>,
+    forward: Vector3<f32>,
+    opponent_goal: Vector3<f32>,
+    opponents: &[MatchPlayerLite],
+) -> usize {
+    let to_goal_dist = (opponent_goal - from).magnitude();
+    opponents
+        .iter()
+        .filter(|o| {
+            let to_opp = o.position - from;
+            let along = to_opp.dot(&forward);
+            along > 0.0 && along < to_goal_dist
+        })
+        .count()
+}
+
+/// A genuine break (0-1 defenders between the carrier and goal) bypasses
+/// the zone-based discount entirely — running at goal is exactly the
+/// right decision there, regardless of which third of the pitch it
+/// starts from. A real "wall" (this many defenders or more ahead) gets
+/// the full, zone-based discount. Between the two, the discount scales
+/// linearly rather than snapping — reasoned estimates (category d), not
+/// sourced.
+const CLEAR_BREAK_MAX_DEFENDERS: usize = 1;
+const WALL_DEFENDERS: usize = 4;
+
+fn effective_carry_priority(base_priority: f32, defenders_ahead: usize) -> f32 {
+    if defenders_ahead <= CLEAR_BREAK_MAX_DEFENDERS {
+        1.0
+    } else if defenders_ahead >= WALL_DEFENDERS {
+        base_priority
+    } else {
+        let t = (defenders_ahead - CLEAR_BREAK_MAX_DEFENDERS) as f32
+            / (WALL_DEFENDERS - CLEAR_BREAK_MAX_DEFENDERS) as f32;
+        1.0 * (1.0 - t) + base_priority * t
+    }
+}
+
 fn carry_value(
     from: Vector3<f32>,
     forward: Vector3<f32>,
     own_goal: Vector3<f32>,
+    opponent_goal: Vector3<f32>,
     opponents: &[MatchPlayerLite],
     group: PlayerFieldPositionGroup,
 ) -> (f32, Vector3<f32>) {
@@ -475,7 +561,9 @@ fn carry_value(
     let align = ((heading.dot(&forward) + 1.0) / 2.0).clamp(0.0, 1.0);
     let pressure = 1.0 - openness(from, opponents);
     let risk = turnover_cost(own_goal, from) * pressure * CARRY_RISK_MULT;
-    let priority = carry_priority_mult(group, (from - own_goal).magnitude());
+    let base_priority = carry_priority_mult(group, (from - own_goal).magnitude());
+    let defenders_ahead = defenders_ahead_count(from, forward, opponent_goal, opponents);
+    let priority = effective_carry_priority(base_priority, defenders_ahead);
     let value = CARRY_SPACE_WEIGHT * openness_frac * (0.4 + 0.6 * align) * priority - risk;
     let target = from + heading * open_dist.max(20.0);
     (value, target)
@@ -509,6 +597,7 @@ fn dribble_value(
     from: Vector3<f32>,
     forward: Vector3<f32>,
     own_goal: Vector3<f32>,
+    opponent_goal: Vector3<f32>,
     opponents: &[MatchPlayerLite],
     group: PlayerFieldPositionGroup,
 ) -> Option<(f32, Vector3<f32>)> {
@@ -518,7 +607,12 @@ fn dribble_value(
     let payoff = (payoff_open / CARRY_LOOKAHEAD).clamp(0.0, 1.0);
     let skill = (ctx.player.skills.technical.dribbling / 20.0).clamp(0.0, 1.0);
     let risk = turnover_cost(own_goal, from) * DRIBBLE_RISK_MULT;
-    let priority = carry_priority_mult(group, (from - own_goal).magnitude());
+    let base_priority = carry_priority_mult(group, (from - own_goal).magnitude());
+    // The blocker himself is always one of the counted defenders ahead —
+    // beating just him (nobody else in the way) is a genuine 1v1, not a
+    // wall; several defenders stacked behind him is.
+    let defenders_ahead = defenders_ahead_count(from, forward, opponent_goal, opponents);
+    let priority = effective_carry_priority(base_priority, defenders_ahead);
     let value = DRIBBLE_BASE_WEIGHT * skill * (0.3 + 0.7 * payoff) * priority - risk;
     let lateral = Vector3::new(-forward.y, forward.x, 0.0);
     let blocker_lateral_offset = (blocker.position - from).dot(&lateral);
@@ -606,13 +700,15 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
         }
     }
 
-    let (cv, ctarget) = carry_value(from, forward, own_goal, &opponents, group);
+    let (cv, ctarget) = carry_value(from, forward, own_goal, attacking_goal, &opponents, group);
     if cv > best_value {
         best_value = cv;
         best_action = Action::Carry(ctarget);
     }
 
-    if let Some((dv, dtarget)) = dribble_value(ctx, from, forward, own_goal, &opponents, group) {
+    if let Some((dv, dtarget)) =
+        dribble_value(ctx, from, forward, own_goal, attacking_goal, &opponents, group)
+    {
         if dv > best_value {
             best_value = dv;
             best_action = Action::Dribble(dtarget);
