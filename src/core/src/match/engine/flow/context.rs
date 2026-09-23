@@ -301,6 +301,26 @@ pub struct MatchContext {
     /// the moment any real stoppage begins (foul restart, corner, goal
     /// kick, throw-in, goal, half-time).
     pub awaiting_stoppage: Vec<PendingAdvantage>,
+
+    /// Off-ball attacking positioning (domain 3 of the from-null decision
+    /// rewrite, docs/off-ball-attacking-positioning-from-null.md): a
+    /// ratcheted "how far forward has this side's attack genuinely
+    /// established itself" reference distance from their own goal, per
+    /// side (index 0 = `PlayerSide::Left`, 1 = `PlayerSide::Right`).
+    /// `assign_attacking_support` reads/updates this every tick it runs
+    /// and feeds it into the Width/Advance duty depth formulas instead
+    /// of the ball's raw instantaneous depth. Real football doesn't
+    /// collapse a team's whole attacking shape the instant a forward
+    /// lays the ball off to a deeper teammate — a side that has
+    /// genuinely advanced holds that shape through a brief recycling
+    /// pass, only truly resetting if the ball stays deep for a
+    /// sustained spell. Ratchets up instantly (tracks a genuine advance
+    /// in real time, unchanged responsiveness) but only decays slowly
+    /// on a backward touch. Added 2026-09-23 after Pavel's direct
+    /// report: "whenever forward is passing back to midfield,
+    /// midfielders move back... instead of progressing as a team, there
+    /// is a constant pull back."
+    pub attack_reference_depth: [f32; 2],
 }
 
 /// Snapshot of a foul that the referee elected to let play continue
@@ -447,6 +467,7 @@ impl MatchContext {
             today: Utc::now().naive_utc().date(),
             pending_advantage: Vec::new(),
             awaiting_stoppage: Vec::new(),
+            attack_reference_depth: [0.0, 0.0],
         }
     }
 

@@ -200,9 +200,25 @@ const ATTACKER_SPACING_UNITS: f32 = 24.0; // 3.0m — never closer than this
 /// in-flight shot (that measurement doesn't exist at this call site).
 const CRISIS_RADIUS_UNITS: f32 = 176.0; // 22.0m
 
-/// Lateral fan-out spacing between scramble responders, so a crisis
-/// converges bodies on the danger without literally stacking them.
-const SCRAMBLE_FAN_SPACING_UNITS: f32 = 24.0; // 3.0m
+/// Lateral spacing between neighbouring scramble responders once
+/// they're spread evenly across the box (see the Step G rewrite below)
+/// — real marking distance for a crisis moment, not a tight huddle.
+/// Widened 2026-09-23 (Pavel's direct report: "defenders and attackers
+/// are all grouped somewhere around penalty spot — nobody is covering
+/// areas to the left or to the right"): the previous 24u/3m increment,
+/// applied as a small fixed step out from a single central point,
+/// meant even a genuine crisis with 4-6 responders only ever spanned
+/// ~9-15m of a real ~40m-wide box — a tight central clump by
+/// construction, regardless of how many bodies were actually
+/// available to cover it.
+const SCRAMBLE_SPREAD_STEP_UNITS: f32 = 56.0; // ~7.0m between neighbours
+
+/// Hard cap on how far from the danger point's own centre line the
+/// scramble spread can reach on either side — stays inside the real
+/// box width (a real box is ~40m wide, so ~161u half-width at this
+/// project's scale) rather than sending a defender to stand outside
+/// the box chasing a phantom lane, however many responders there are.
+const SCRAMBLE_MAX_HALF_SPAN_UNITS: f32 = 140.0; // ~17.5m either side
 
 /// A tackle attempt is only live once the presser is genuinely this
 /// close AND cover has arrived (missing is no longer fatal) — or, if
@@ -540,11 +556,18 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                 }
             }
             DefensiveDuty::Scramble => {
+                // target_x/target_y added 2026-09-23 (Pavel's "grouped
+                // around penalty spot, nobody covering left/right"
+                // report) — the original line only logged ball distance,
+                // which can't show whether the scramble spread actually
+                // widened.
                 crate::match_log_info!(
-                    "DEFDUTY_SCRAMBLE t={} p={} ball_dist_goal={:.1}",
+                    "DEFDUTY_SCRAMBLE t={} p={} ball_dist_goal={:.1} target_x={:.1} target_y={:.1}",
                     context.total_match_time,
                     a.id,
-                    (ball_pos_for_log - own_goal_for(a.id)).magnitude()
+                    (ball_pos_for_log - own_goal_for(a.id)).magnitude(),
+                    a.target.x,
+                    a.target.y
                 );
             }
             // Diagnostic, kept permanently (feature-gated, zero cost
@@ -931,31 +954,42 @@ fn assign_team(
     // not just the hold-shape half. ---
     if ball_dist_to_goal <= CRISIS_RADIUS_UNITS {
         let danger_point = own_goal + (focal_pos - own_goal) * 0.6;
-        let mut rank = 0i32;
-        for a in results.iter_mut() {
-            if !hold_shape_ids.contains(&a.id) {
-                continue;
-            }
-            a.duty = DefensiveDuty::Scramble;
-            let fan_side = if rank % 2 == 0 { 1.0 } else { -1.0 };
-            let fan_step = ((rank + 1) / 2) as f32;
-            let offset = Vector3::new(0.0, fan_side * fan_step * SCRAMBLE_FAN_SPACING_UNITS, 0.0);
-            a.target = danger_point + offset;
-            rank += 1;
-        }
+        // Full responder list gathered FIRST so the spread below can be
+        // spaced evenly across the whole group in one pass, rather than
+        // fanning outward one at a time from a fixed small step (the
+        // previous design, which bunched everyone near the centre
+        // regardless of how many responders there actually were — see
+        // `SCRAMBLE_SPREAD_STEP_UNITS`'s own doc comment). Real crisis
+        // defending covers the WIDTH of the danger area (near-post,
+        // central, far-post) rather than clustering on one spot.
+        let mut scramble_ids: Vec<u32> = hold_shape_ids.clone();
         for c in pool.iter().filter(|c| {
             c.position_group == PlayerFieldPositionGroup::Forward && !assigned.contains(&c.id)
         }) {
-            let fan_side = if rank % 2 == 0 { 1.0 } else { -1.0 };
-            let fan_step = ((rank + 1) / 2) as f32;
-            let offset = Vector3::new(0.0, fan_side * fan_step * SCRAMBLE_FAN_SPACING_UNITS, 0.0);
-            results.push(Assignment {
-                id: c.id,
-                duty: DefensiveDuty::Scramble,
-                target: danger_point + offset,
-                engage: false,
-            });
-            rank += 1;
+            scramble_ids.push(c.id);
+        }
+        let n = scramble_ids.len();
+        for (i, id) in scramble_ids.into_iter().enumerate() {
+            let offset_y = if n <= 1 {
+                0.0
+            } else {
+                let half_span =
+                    ((n - 1) as f32 * SCRAMBLE_SPREAD_STEP_UNITS / 2.0).min(SCRAMBLE_MAX_HALF_SPAN_UNITS);
+                let step = (2.0 * half_span) / (n - 1) as f32;
+                -half_span + i as f32 * step
+            };
+            let target = danger_point + Vector3::new(0.0, offset_y, 0.0);
+            if let Some(existing) = results.iter_mut().find(|a| a.id == id) {
+                existing.duty = DefensiveDuty::Scramble;
+                existing.target = target;
+            } else {
+                results.push(Assignment {
+                    id,
+                    duty: DefensiveDuty::Scramble,
+                    target,
+                    engage: false,
+                });
+            }
         }
     }
 
