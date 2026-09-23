@@ -2233,7 +2233,17 @@ impl<'p> StateProcessor<'p> {
         let max_speed = player
             .skills
             .max_speed_with_condition(player.player_attributes.condition);
-        Some(to_target.normalize() * max_speed)
+        let v = to_target.normalize() * max_speed;
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!(
+            "ATTACKVEL t={} id={} dist={:.1} max_speed={:.3} v_mag={:.3}",
+            ctx.context.total_match_time,
+            player.id,
+            dist,
+            max_speed,
+            v.magnitude()
+        );
+        Some(v)
     }
 
     /// Off-ball attacking positioning/support, from null — the

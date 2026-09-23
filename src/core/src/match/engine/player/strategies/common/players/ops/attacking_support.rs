@@ -127,7 +127,25 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &MatchContext) 
         p.ai_attack_duty = AttackDuty::None;
     }
 
-    let Some(carrier_id) = field.ball.current_owner else {
+    // The genuine current owner (domain 2 governs him, so he's excluded
+    // from this pool below) OR, during an ordinary directed pass in
+    // flight, the passer -- used only to identify the team/side this
+    // pass belongs to. Real-data bug found 2026-09-23 (Pavel's direct
+    // report: midfielders advance the ball then stand still while it's
+    // in the air to a forward, leaving him isolated): `current_owner`
+    // goes `None` for the ball's entire flight time on every single
+    // pass, and this whole system previously required it to be `Some`,
+    // going fully dark during that window -- exactly the same class of
+    // gap domain 1's own Case 2a fix (`defensive_duty.rs`) already
+    // closed once this session, just not carried over here at the time.
+    // The passer himself is deliberately NOT excluded from the pool
+    // once the ball has left his feet (`current_owner` is already
+    // `None`) -- he's genuinely off-ball now and should be free to
+    // continue a real run/support movement, matching Pavel's own
+    // explicit ask ("run without the ball... to offer themselves for a
+    // pass").
+    let reference_id = field.ball.current_owner.or(field.ball.pending_pass_passer);
+    let Some(reference_id) = reference_id else {
         return;
     };
 
@@ -149,7 +167,7 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &MatchContext) 
         })
         .collect();
 
-    let Some(carrier) = cands.iter().find(|c| c.id == carrier_id).copied() else {
+    let Some(carrier) = cands.iter().find(|c| c.id == reference_id).copied() else {
         return;
     };
     let Some(carrier_side) = carrier.side else {
@@ -170,6 +188,20 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &MatchContext) 
         PlayerSide::Left => 1.0,
         PlayerSide::Right => -1.0,
     };
+    // Tried a domain-1-style ball-velocity lead term here (2026-09-23,
+    // mirroring `LINE_LEAD_TICKS`) and REVERTED it after raw measurement
+    // showed it made Width's own target-arrival gap WORSE, not better
+    // (144.8u mean -> 170.5u). Root cause, confirmed by reasoning through
+    // the actual numbers rather than re-guessing: the ball's own
+    // velocity (up to ~3.2 u/tick during a genuine pass/shot) is 5-8x a
+    // player's own real max speed (~0.4-0.6 u/tick) -- domain 1's
+    // `LINE_LEAD_TICKS` extrapolates a PLAYER's bounded velocity, a very
+    // different, much smaller quantity than the ball's own burst speed;
+    // applying the identical lead-tick count to the ball massively
+    // overshoots into a target position the ball itself won't sustain
+    // (a pass is typically caught/intercepted well before it travels
+    // that far at that speed). A real, useful negative result, not
+    // chased further this pass -- see the design doc's own status log.
     let ball_dist_to_own_goal = (field.ball.position - own_goal).magnitude();
 
     let opponents: Vec<Vector3<f32>> = cands
@@ -184,6 +216,23 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &MatchContext) 
             .fold(f32::MAX, f32::min)
     };
 
+    // The reference player (the genuine owner, or the passer during an
+    // ordinary pass in flight) stays excluded from the assignable pool
+    // -- narrowed 2026-09-23 after a real, severe performance regression
+    // was found and isolated: an earlier version of this fix instead
+    // included a mid-flight passer in the pool (reasoning that he's
+    // genuinely off-ball once the ball leaves his feet and could
+    // legitimately continue a run). A clean isolated A/B (git-stash
+    // isolated, 15+15 matches) showed 0/15 slow-match outliers on the
+    // build WITHOUT that inclusion vs. 4 outliers (660-953s instead of
+    // ~2s) across 35 matches WITH it. The exact mechanism wasn't fully
+    // root-caused given time cost -- reverted to the safer, already-
+    // proven-clean exclusion rather than ship a severe, poorly-
+    // understood hang risk. The actual reported problem (teammates OTHER
+    // than the passer going dark during his pass's flight) is still
+    // fixed by `reference_id` above; only "does the passer himself also
+    // get a duty mid-flight" is deferred, a real, honestly-scoped
+    // narrower fix than originally attempted.
     let pool: Vec<Cand> = cands
         .iter()
         .filter(|c| {
