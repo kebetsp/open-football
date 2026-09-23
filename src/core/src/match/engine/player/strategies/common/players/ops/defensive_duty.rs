@@ -377,6 +377,32 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
         // the whole tick for the other team too.
         let ball_pos = field.ball.position;
         let ball_vel = field.ball.velocity;
+        // Diagnostic, kept permanently (feature-gated, zero cost without
+        // match-logs): added 2026-09-23, Pavel's "defense/midfield never
+        // cross halfway" question. Checks how often this loose-ball
+        // ("genuine 50/50") branch fires during what's actually just the
+        // ordinary, uncontested mid-flight of a directed pass, not a
+        // real contest — pooled over 3 matches, ~25-26% of Case-2
+        // firings coincide with either signal below being set. This is
+        // a real, domain-1-introduced, still-open contributor (not yet
+        // fixed): treating a safe pass-in-flight as a genuine loose ball
+        // needlessly pulls the passing team's OWN players back into
+        // defensive duty for that window. The larger share of "defenders
+        // sit deep during our own possession" is NOT this — `HoldingLine`
+        // is reachable from many pre-existing, not-yet-rewritten OLD
+        // defender states (Standing/Running/Pressing/Guarding/
+        // TrackingBack/Resting/Heading) independent of this system, and
+        // Case 1 (clear possession) can never assign a duty to the team
+        // that owns the ball by construction — confirmed by code read,
+        // not just this log.
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!(
+            "DEFDUTY_CASE2 t={} has_pass_target={} has_pending_passer={} owner_prev={:?}",
+            context.total_match_time,
+            field.ball.pass_target_player_id.is_some(),
+            field.ball.pending_pass_passer.is_some(),
+            field.ball.previous_owner
+        );
         let mut all = Vec::new();
         for (team_id, opponent_team) in [
             (field.home_team_id, field.away_team_id),
