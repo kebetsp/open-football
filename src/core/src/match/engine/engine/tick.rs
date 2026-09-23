@@ -1,5 +1,6 @@
 use super::*;
 use crate::r#match::engine::player::events::players::FoulResolver;
+use crate::r#match::player::strategies::players::ops::attacking_support::assign_attacking_support;
 use crate::r#match::player::strategies::players::ops::defensive_duty::assign_defensive_duties;
 use nalgebra::Vector3;
 
@@ -121,6 +122,14 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // dispatch, so the individual per-player state handlers below
         // see this tick's real assignment rather than deciding blind.
         assign_defensive_duties(field, context);
+        // Off-ball attacking positioning/support, from null (docs/
+        // decision-from-null.md domain 3, docs/off-ball-attacking-
+        // positioning-from-null.md): one team-wide allocation of duty
+        // (rest-defense/width/advance) for the IN-POSSESSION team's
+        // non-carrier outfielders, computed fresh each tick, same
+        // pattern and placement as the defensive-duty pass immediately
+        // above.
+        assign_attacking_support(field, context);
         Self::play_players(field, context, tick_ctx, events);
 
         EventDispatcher::dispatch(events, field, context, match_data, true);

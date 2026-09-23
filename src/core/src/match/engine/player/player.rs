@@ -260,6 +260,33 @@ pub enum DefensiveDuty {
     Scramble,
 }
 
+/// Off-ball attacking positioning/support, assigned team-wide once per
+/// tick by `assign_attacking_support` (docs/off-ball-attacking-
+/// positioning-from-null.md — domain 3 of the from-null decision
+/// rewrite, docs/decision-from-null.md). Governs every outfield
+/// teammate of the current ball carrier (never the carrier himself —
+/// his own decision is domain 2's `on_ball_decision`). `None` whenever
+/// the system isn't engaged this tick (team out of possession, ball
+/// loose, goalkeeper, directed player).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum AttackDuty {
+    #[default]
+    None,
+    /// One of the deepest-positioned defenders, deliberately held back
+    /// regardless of ball advancement — real football's rest-defense
+    /// balance.
+    RestDefense,
+    /// A genuinely wide player holding the flank, tracking the ball's
+    /// own advancement.
+    Width,
+    /// A central player advancing as part of a coordinated attacking
+    /// line, tracking the ball's depth.
+    Advance,
+    /// An advanced player pushing into genuinely open space beyond the
+    /// line position — a real forward/decoy run.
+    Penetrate,
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchPlayer {
     pub id: u32,
@@ -349,6 +376,11 @@ pub struct MatchPlayer {
     /// physical outcome of the attempt is a kept, not-rewritten
     /// mechanic (`DefenderTacklingState`/`MidfielderTacklingState`).
     pub ai_defensive_engage: bool,
+    /// This tick's off-ball attacking positioning/support duty, from the
+    /// from-null rewrite (see `AttackDuty`'s own doc comment).
+    pub ai_attack_duty: AttackDuty,
+    /// Where this tick's `ai_attack_duty` says to stand.
+    pub ai_attack_target: Vector3<f32>,
     /// Cross-player attacking trigger: when teammate `.0` has the ball,
     /// this player's effective directive becomes `.1` (evaluated per
     /// possession change in the engine loop).
@@ -903,6 +935,8 @@ impl MatchPlayer {
             ai_defensive_duty: DefensiveDuty::None,
             ai_defensive_target: Vector3::zeros(),
             ai_defensive_engage: false,
+            ai_attack_duty: AttackDuty::None,
+            ai_attack_target: Vector3::zeros(),
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
@@ -1018,6 +1052,8 @@ impl MatchPlayer {
             ai_defensive_duty: DefensiveDuty::None,
             ai_defensive_target: Vector3::zeros(),
             ai_defensive_engage: false,
+            ai_attack_duty: AttackDuty::None,
+            ai_attack_target: Vector3::zeros(),
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,

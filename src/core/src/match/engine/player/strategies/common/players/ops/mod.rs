@@ -1,6 +1,7 @@
 pub mod slot_coverage;
 pub use slot_coverage::*;
 
+pub mod attacking_support;
 pub mod defender_skill;
 pub mod defensive;
 pub mod defensive_duty;
@@ -22,6 +23,7 @@ pub mod skill_composites;
 pub mod traits_bias;
 pub mod xg;
 
+pub use attacking_support::*;
 pub use defender_skill::*;
 pub use defensive::*;
 pub use defensive_duty::*;

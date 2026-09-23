@@ -481,6 +481,18 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
+        // Off-ball attacking positioning/support, from null (docs/
+        // decision-from-null.md domain 3, docs/off-ball-attacking-
+        // positioning-from-null.md). Naturally mutually exclusive with
+        // both the defensive-duty override and the on-ball-decision
+        // override above — a player with an active `ai_attack_duty` is
+        // by construction a non-carrier teammate on the team WITH the
+        // ball. Full authority over movement, same convention as the
+        // other two from-null systems.
+        if let Some(velocity) = Self::attacking_support_velocity(&processing_ctx) {
+            result.velocity = Some(velocity);
+        }
+
         // realism-bug (2026-08-30, deflection-rate investigation):
         // pre-shot corridor cover. Applied AFTER wide-run tracking and
         // BEFORE the reactive shot-block lunge, so an already-live shot
@@ -684,6 +696,18 @@ impl<'p> StateProcessor<'p> {
         // `ai_defensive_engage_override` already established for domain
         // 1 below.
         if let Some(state_result) = Self::on_ball_ai_action_override(&processing_ctx) {
+            return complete_result(state_result, result);
+        }
+
+        // Off-ball attacking positioning/support, from null (docs/
+        // decision-from-null.md domain 3). Same "ordering alone makes
+        // the old ambient overrides structurally unreachable" placement
+        // as domain 2 immediately above — before `carrier_contained_
+        // pass_override`/`handler.process()`. ALWAYS returns `Some(...)`
+        // whenever its own gate applies (a duty label, purely cosmetic —
+        // movement is fully owned by `attacking_support_velocity`
+        // above), matching domains 1 and 2's own established discipline.
+        if let Some(state_result) = Self::attacking_support_action_override(&processing_ctx) {
             return complete_result(state_result, result);
         }
 
@@ -2178,6 +2202,87 @@ impl<'p> StateProcessor<'p> {
                 Role::Midfielder => StateChangeResult::with_midfielder_state(MidfielderState::Standing),
                 Role::Forward => StateChangeResult::with_forward_state(ForwardState::Standing),
             },
+        })
+    }
+
+    /// Off-ball attacking positioning/support, from null — the movement
+    /// half. See `common::players::ops::attacking_support::
+    /// assign_attacking_support`'s own doc comment for the full design;
+    /// `docs/decision-from-null.md` domain 3 /
+    /// `docs/off-ball-attacking-positioning-from-null.md`. Real steering
+    /// toward the assigned target (rest-defense/width/advance),
+    /// arrive-style stop, same convention as
+    /// `ai_defensive_duty_velocity`.
+    fn attacking_support_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        use crate::r#match::player::AttackDuty;
+        let player = ctx.player;
+        if matches!(player.ai_attack_duty, AttackDuty::None) {
+            return None;
+        }
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None;
+        }
+        let to_target = player.ai_attack_target - player.position;
+        let dist = to_target.magnitude();
+        if dist < 4.0 {
+            return Some(Vector3::zeros());
+        }
+        let max_speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        Some(to_target.normalize() * max_speed)
+    }
+
+    /// Off-ball attacking positioning/support, from null — the
+    /// state-transition half of `attacking_support_velocity` above (see
+    /// that function's own doc comment for the shared gating). Always
+    /// returns a state matching the current duty when the gate applies —
+    /// a duty->state mapping used purely as an animation/stats label,
+    /// mirroring `ai_defensive_engage_override`'s own established
+    /// discipline for domain 1.
+    fn attacking_support_action_override(ctx: &StateProcessingContext) -> Option<StateChangeResult> {
+        use crate::r#match::player::AttackDuty;
+        let player = ctx.player;
+        if matches!(player.ai_attack_duty, AttackDuty::None) {
+            return None;
+        }
+        if player.press_target.is_some() || player.mark_target.is_some() {
+            return None;
+        }
+        if ctx.ball().owner_id() == Some(player.id) {
+            return None;
+        }
+        let role = match player.tactical_position.current_position.position_group() {
+            PlayerFieldPositionGroup::Defender => 0,
+            PlayerFieldPositionGroup::Midfielder => 1,
+            PlayerFieldPositionGroup::Forward => 2,
+            _ => return None,
+        };
+        Some(match (player.ai_attack_duty, role) {
+            (AttackDuty::RestDefense, 0) => StateChangeResult::with_defender_state(DefenderState::HoldingLine),
+            (AttackDuty::RestDefense, 1) => {
+                StateChangeResult::with_midfielder_state(MidfielderState::Standing)
+            }
+            (AttackDuty::RestDefense, _) => StateChangeResult::with_forward_state(ForwardState::Standing),
+            (AttackDuty::Width, 0) => StateChangeResult::with_defender_state(DefenderState::PushingUp),
+            (AttackDuty::Width, 1) => {
+                StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
+            }
+            (AttackDuty::Width, _) => StateChangeResult::with_forward_state(ForwardState::CreatingSpace),
+            (AttackDuty::Advance, 0) => StateChangeResult::with_defender_state(DefenderState::PushingUp),
+            (AttackDuty::Advance, 1) => {
+                StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
+            }
+            (AttackDuty::Advance, _) => StateChangeResult::with_forward_state(ForwardState::CreatingSpace),
+            (AttackDuty::Penetrate, 0) => StateChangeResult::with_defender_state(DefenderState::PushingUp),
+            (AttackDuty::Penetrate, 1) => {
+                StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
+            }
+            (AttackDuty::Penetrate, _) => StateChangeResult::with_forward_state(ForwardState::CreatingSpace),
+            (AttackDuty::None, _) => unreachable!("gated above"),
         })
     }
 
