@@ -285,6 +285,16 @@ pub enum AttackDuty {
     /// An advanced player pushing into genuinely open space beyond the
     /// line position — a real forward/decoy run.
     Penetrate,
+    /// The designated target of a pass already in flight
+    /// (`Ball.pass_target_player_id`). Overrides whatever Width/Advance
+    /// target this player would otherwise get — real football's most
+    /// basic rule for a receiver: adjust to the ball actually coming to
+    /// you, don't retreat away from it because an unrelated team-shape
+    /// formula recomputed your position this tick. Added 2026-09-23,
+    /// Pavel's direct, unhedged report: "#10 passes to #6 but #6
+    /// retracts so the pass lands short... the opponent came into the
+    /// space between them and took the ball."
+    Receive,
 }
 
 #[derive(Debug, Clone)]

@@ -337,6 +337,38 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     let mut results: Vec<Assignment> = Vec::new();
     let mut assigned: Vec<u32> = Vec::new();
 
+    // --- Step A.5: the designated pass RECEIVER, if any, gets a
+    // dedicated target -- the ball's own real flight destination
+    // (`Ball.pending_pass_target`), not whatever generic Width/Advance
+    // team-line formula would otherwise apply to him. Runs BEFORE every
+    // other step and excludes him from all of them via `assigned`.
+    //
+    // Real bug (Pavel, 2026-09-23, unhedged -- ground truth per this
+    // project's own Realism Diagnosis Framework, not a hypothesis to
+    // second-guess): "#10 passes to #6 but #6 retracts so the pass
+    // lands short... the opponent came into the space between them and
+    // took the ball." Root cause: Steps C/D's target formulas have no
+    // concept of "a pass is already live and aimed at me" -- they
+    // recompute a generic team-shape position every tick regardless,
+    // which can sit BEHIND a receiver who had drifted forward to offer
+    // himself, dragging him backward mid-flight and shortening the
+    // pass into the exact gap an opponent then steps into. A real
+    // receiver's job is to adjust to the ball coming to him, not
+    // retreat because an unrelated formula recomputed his line
+    // position this tick.
+    if let Some(receiver_id) = field.ball.pass_target_player_id {
+        if let Some(receiver) = pool.iter().find(|c| c.id == receiver_id) {
+            let target = field.ball.pending_pass_target.unwrap_or(receiver.position);
+            results.push(Assignment {
+                id: receiver.id,
+                duty: AttackDuty::Receive,
+                target,
+                redirected: false,
+            });
+            assigned.push(receiver.id);
+        }
+    }
+
     // --- Step B: rest-defense floor -- the N deepest-positioned
     // defenders hold their own anchor, real football's deliberate
     // balance so a turnover doesn't instantly expose an empty defense.
