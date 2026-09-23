@@ -1815,12 +1815,36 @@ impl<'p> StateProcessor<'p> {
         }
         if matches!(
             player.state,
-            Defender(DefenderState::Tackling) | Midfielder(MidfielderState::Tackling)
+            Defender(DefenderState::Tackling)
+                | Midfielder(MidfielderState::Tackling)
+                | Forward(ForwardState::Tackling)
         ) {
             return None;
         }
         let to_target = player.ai_defensive_target - player.position;
         let dist = to_target.magnitude();
+        // Diagnostic, kept permanently (feature-gated, zero cost without
+        // match-logs): added 2026-09-23 to check Pavel's speculative
+        // "issues without proper delay" comment against a concrete
+        // hypothesis — that always steering at full max_speed until this
+        // function's own `dist < 2.0` hard stop would produce a visible
+        // lunge-then-freeze (or oscillating chase-and-lose-contact)
+        // pattern instead of controlled jockeying. Raw-traced across 100
+        // real press "runs" (>=5 consecutive samples): 0% showed the
+        // close-then-bounce-back-beyond-40u oscillation pattern, and the
+        // hard-stop threshold itself fires on only ~2% of samples — this
+        // specific hypothesis did not hold up against real data. Kept
+        // rather than removed: a real, useful negative result, and cheap
+        // to re-check if "proper delay" resurfaces with a sharper report.
+        #[cfg(feature = "match-logs")]
+        if matches!(player.ai_defensive_duty, crate::r#match::player::DefensiveDuty::Press { .. }) {
+            crate::match_log_info!(
+                "DEFDUTY_PRESSVEL t={} p={} dist={:.2}",
+                ctx.context.total_match_time,
+                player.id,
+                dist
+            );
+        }
         if dist < 2.0 {
             return Some(Vector3::zeros());
         }
@@ -1861,46 +1885,77 @@ impl<'p> StateProcessor<'p> {
         // duel mechanic for the rest of this challenge.
         if matches!(
             player.state,
-            Defender(DefenderState::Tackling) | Midfielder(MidfielderState::Tackling)
+            Defender(DefenderState::Tackling)
+                | Midfielder(MidfielderState::Tackling)
+                | Forward(ForwardState::Tackling)
         ) {
             return None;
         }
         use crate::r#match::player::DefensiveDuty;
-        let is_defender = matches!(
-            player.tactical_position.current_position.position_group(),
-            PlayerFieldPositionGroup::Defender
-        );
+        // Three-way role split, not the old defender/midfielder boolean
+        // — forwards (added 2026-09-23, press-triggering + crisis
+        // scramble) need their own state mapping, not the midfielder
+        // fallback, which would have set `PlayerState::Midfielder(..)`
+        // on a player whose actual role is Forward.
+        enum Role {
+            Defender,
+            Midfielder,
+            Forward,
+        }
+        let role = match player.tactical_position.current_position.position_group() {
+            PlayerFieldPositionGroup::Defender => Role::Defender,
+            PlayerFieldPositionGroup::Midfielder => Role::Midfielder,
+            _ => Role::Forward,
+        };
         match player.ai_defensive_duty {
             DefensiveDuty::None => None,
-            DefensiveDuty::Press { .. } if player.ai_defensive_engage => Some(if is_defender {
-                StateChangeResult::with_defender_state(DefenderState::Tackling)
-            } else {
-                StateChangeResult::with_midfielder_state(MidfielderState::Tackling)
+            DefensiveDuty::Press { .. } if player.ai_defensive_engage => Some(match role {
+                Role::Defender => StateChangeResult::with_defender_state(DefenderState::Tackling),
+                Role::Midfielder => {
+                    StateChangeResult::with_midfielder_state(MidfielderState::Tackling)
+                }
+                Role::Forward => StateChangeResult::with_forward_state(ForwardState::Tackling),
             }),
-            DefensiveDuty::Press { .. } => Some(if is_defender {
-                StateChangeResult::with_defender_state(DefenderState::Pressing)
-            } else {
-                StateChangeResult::with_midfielder_state(MidfielderState::Pressing)
+            DefensiveDuty::Press { .. } => Some(match role {
+                Role::Defender => StateChangeResult::with_defender_state(DefenderState::Pressing),
+                Role::Midfielder => {
+                    StateChangeResult::with_midfielder_state(MidfielderState::Pressing)
+                }
+                Role::Forward => StateChangeResult::with_forward_state(ForwardState::Pressing),
             }),
-            DefensiveDuty::Mark { .. } => Some(if is_defender {
-                StateChangeResult::with_defender_state(DefenderState::Marking)
-            } else {
-                StateChangeResult::with_midfielder_state(MidfielderState::Guarding)
+            // Mark/Cover/HoldShape never actually reach a Forward this
+            // pass (excluded from those duties in `defensive_duty.rs`'s
+            // pool selection) — the Forward arms below exist only so
+            // this match stays exhaustive, not because they're live.
+            DefensiveDuty::Mark { .. } => Some(match role {
+                Role::Defender => StateChangeResult::with_defender_state(DefenderState::Marking),
+                Role::Midfielder => {
+                    StateChangeResult::with_midfielder_state(MidfielderState::Guarding)
+                }
+                Role::Forward => StateChangeResult::with_forward_state(ForwardState::Pressing),
             }),
-            DefensiveDuty::Cover => Some(if is_defender {
-                StateChangeResult::with_defender_state(DefenderState::Covering)
-            } else {
-                StateChangeResult::with_midfielder_state(MidfielderState::Standing)
+            DefensiveDuty::Cover => Some(match role {
+                Role::Defender => StateChangeResult::with_defender_state(DefenderState::Covering),
+                Role::Midfielder => {
+                    StateChangeResult::with_midfielder_state(MidfielderState::Standing)
+                }
+                Role::Forward => StateChangeResult::with_forward_state(ForwardState::Standing),
             }),
-            DefensiveDuty::HoldShape => Some(if is_defender {
-                StateChangeResult::with_defender_state(DefenderState::HoldingLine)
-            } else {
-                StateChangeResult::with_midfielder_state(MidfielderState::Standing)
+            DefensiveDuty::HoldShape => Some(match role {
+                Role::Defender => {
+                    StateChangeResult::with_defender_state(DefenderState::HoldingLine)
+                }
+                Role::Midfielder => {
+                    StateChangeResult::with_midfielder_state(MidfielderState::Standing)
+                }
+                Role::Forward => StateChangeResult::with_forward_state(ForwardState::Standing),
             }),
-            DefensiveDuty::Scramble => Some(if is_defender {
-                StateChangeResult::with_defender_state(DefenderState::Guarding)
-            } else {
-                StateChangeResult::with_midfielder_state(MidfielderState::Guarding)
+            DefensiveDuty::Scramble => Some(match role {
+                Role::Defender => StateChangeResult::with_defender_state(DefenderState::Guarding),
+                Role::Midfielder => {
+                    StateChangeResult::with_midfielder_state(MidfielderState::Guarding)
+                }
+                Role::Forward => StateChangeResult::with_forward_state(ForwardState::Pressing),
             }),
         }
     }

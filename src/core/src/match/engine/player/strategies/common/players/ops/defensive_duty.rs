@@ -75,6 +75,19 @@ const DANGER_FLOOR: f32 = 0.15;
 /// "whose job this is," only "who gets there fastest."
 const PRESS_DEFENDER_ZONE_UNITS: f32 = 320.0; // 40.0m
 
+/// The forward-side mirror of `PRESS_DEFENDER_ZONE_UNITS`. Real doctrine:
+/// a forward's off-ball defensive job is triggering pressure high up the
+/// pitch — closing down the opposition's goalkeeper/centre-backs/pivot
+/// while they're building out — not chasing back to help a settled
+/// defensive shape. A carrier this far from the OPPONENT's goal (i.e.
+/// already progressed well past the forward line) is a defender's or
+/// midfielder's job, not a forward's. Same magnitude and same reasoned-
+/// estimate status as the defender gate (category d, real pitch-thirds
+/// doctrine, no sourced exact cutoff) — deliberately kept symmetric
+/// rather than independently guessed, since it's the same underlying
+/// "whose job is this zone" question from the opposite end of the pitch.
+const PRESS_FORWARD_ZONE_UNITS: f32 = 320.0; // 40.0m
+
 /// A hard cap on how far from OUR OWN GOAL an opponent can be and
 /// still be worth pulling a defender out of shape to individually
 /// mark — distinct from `THREAT_SCAN_RADIUS_UNITS` (distance from the
@@ -319,6 +332,10 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
         PlayerSide::Left => context.goal_positions.left,
         PlayerSide::Right => context.goal_positions.right,
     };
+    let opposite_side = |side: PlayerSide| match side {
+        PlayerSide::Left => PlayerSide::Right,
+        PlayerSide::Right => PlayerSide::Left,
+    };
 
     let assignments: Vec<Assignment> = if let Some(carrier_id) = field.ball.current_owner {
         // Case 1: an opponent clearly holds the ball — the original,
@@ -348,6 +365,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             carrier.velocity,
             Some(carrier.id),
             goal_for_side(defending_side),
+            goal_for_side(opposite_side(defending_side)),
             defending_side,
         )
     } else {
@@ -376,6 +394,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                 ball_vel,
                 None,
                 goal_for_side(side),
+                goal_for_side(opposite_side(side)),
                 side,
             ));
         }
@@ -398,6 +417,15 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             .find(|c| c.id == player_id)
             .and_then(|c| c.side)
             .map(goal_for_side)
+            .unwrap_or(Vector3::zeros())
+    };
+    #[cfg(feature = "match-logs")]
+    let opponent_goal_for = |player_id: u32| -> Vector3<f32> {
+        cands
+            .iter()
+            .find(|c| c.id == player_id)
+            .and_then(|c| c.side)
+            .map(|s| goal_for_side(opposite_side(s)))
             .unwrap_or(Vector3::zeros())
     };
 
@@ -438,13 +466,14 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             DefensiveDuty::Press { opponent_id } => {
                 if let Some(presser) = cands.iter().find(|c| c.id == a.id) {
                     crate::match_log_info!(
-                        "DEFDUTY_PRESS t={} presser={} presser_group={:?} presser_dist_start={:.1} carrier={} own_goal_dist={:.1}",
+                        "DEFDUTY_PRESS t={} presser={} presser_group={:?} presser_dist_start={:.1} carrier={} own_goal_dist={:.1} opp_goal_dist={:.1}",
                         context.total_match_time,
                         a.id,
                         presser.position_group,
                         (presser.position - presser.start_position).magnitude(),
                         opponent_id,
-                        (ball_pos_for_log - own_goal_for(a.id)).magnitude()
+                        (ball_pos_for_log - own_goal_for(a.id)).magnitude(),
+                        (ball_pos_for_log - opponent_goal_for(a.id)).magnitude()
                     );
                 }
             }
@@ -498,15 +527,32 @@ fn assign_team(
     focal_vel: Vector3<f32>,
     carrier_id: Option<u32>,
     own_goal: Vector3<f32>,
+    opponent_goal: Vector3<f32>,
     defending_side: PlayerSide,
 ) -> Vec<Assignment> {
+    // Forwards are included in the pool (needed so they're eligible for
+    // Step C's press-trigger race and Step G's crisis scramble, both
+    // added 2026-09-23 — see those steps' own doc comments) but, per
+    // this pass's deliberately narrow scope, are excluded from Steps
+    // D/E/F (mark/cover/hold-shape) below. Their off-ball defensive job
+    // is genuinely different from a defender's or midfielder's — mainly
+    // triggering pressure high up the pitch, not holding a defensive
+    // line or individually marking — and building that properly (a real
+    // screening/passing-lane-blocking target for the non-pressing case)
+    // is left for its own follow-up rather than folded in here. A
+    // forward who isn't pressing and isn't in a genuine crisis simply
+    // gets no duty this tick (`DefensiveDuty::None`) and falls through
+    // to his own, separate, not-yet-rewritten off-ball attacking
+    // positioning logic — a different domain, deliberately untouched.
     let pool: Vec<Cand> = cands
         .iter()
         .filter(|c| c.team_id == defending_team)
         .filter(|c| {
             matches!(
                 c.position_group,
-                PlayerFieldPositionGroup::Defender | PlayerFieldPositionGroup::Midfielder
+                PlayerFieldPositionGroup::Defender
+                    | PlayerFieldPositionGroup::Midfielder
+                    | PlayerFieldPositionGroup::Forward
             )
         })
         // Loose-ball case only: whoever's already the established,
@@ -546,11 +592,30 @@ fn assign_team(
         let any_midfielder_available = pool
             .iter()
             .any(|c| c.position_group == PlayerFieldPositionGroup::Midfielder);
+        // Forward-side mirror of the defender zone-gate above (see
+        // `PRESS_FORWARD_ZONE_UNITS`'s own doc comment): a forward is
+        // only eligible to press when the carrier is genuinely deep in
+        // the opponent's own territory, UNLESS no defender or midfielder
+        // exists as an alternative — same last-resort structure as the
+        // defender gate, just from the opposite end of the pitch.
+        let ball_dist_to_opp_goal_for_zone = (focal_pos - opponent_goal).magnitude();
+        let any_def_or_mid_available = pool.iter().any(|c| {
+            matches!(
+                c.position_group,
+                PlayerFieldPositionGroup::Defender | PlayerFieldPositionGroup::Midfielder
+            )
+        });
         let mut best: Option<(Cand, f32, f32)> = None; // (cand, real closing_ticks, effective)
         for c in &pool {
             if c.position_group == PlayerFieldPositionGroup::Defender
                 && ball_dist_to_goal_for_zone > PRESS_DEFENDER_ZONE_UNITS
                 && any_midfielder_available
+            {
+                continue;
+            }
+            if c.position_group == PlayerFieldPositionGroup::Forward
+                && ball_dist_to_opp_goal_for_zone > PRESS_FORWARD_ZONE_UNITS
+                && any_def_or_mid_available
             {
                 continue;
             }
@@ -599,9 +664,14 @@ fn assign_team(
     threats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     for (opponent, danger) in threats {
+        // Forwards excluded from marker selection this pass (see the
+        // pool-construction comment above) — individual marking isn't a
+        // forward's off-ball job here.
         let marker = pool
             .iter()
-            .filter(|c| !assigned.contains(&c.id))
+            .filter(|c| {
+                !assigned.contains(&c.id) && c.position_group != PlayerFieldPositionGroup::Forward
+            })
             .min_by(|a, b| {
                 let sticky_a = matches!(
                     a.prev_duty,
@@ -667,9 +737,13 @@ fn assign_team(
         Vector3::new(1.0, 0.0, 0.0)
     };
     let target = focal_pos + dir * COVER_STANDOFF_UNITS;
+    // Forwards excluded from cover selection this pass, same reasoning
+    // as Step D above — covering isn't a forward's off-ball job here.
     let cover = pool
         .iter()
-        .filter(|c| !assigned.contains(&c.id))
+        .filter(|c| {
+            !assigned.contains(&c.id) && c.position_group != PlayerFieldPositionGroup::Forward
+        })
         .min_by(|a, b| {
             let sticky_a = matches!(a.prev_duty, DefensiveDuty::Cover);
             let sticky_b = matches!(b.prev_duty, DefensiveDuty::Cover);
@@ -733,8 +807,15 @@ fn assign_team(
         .clamp(LINE_MIN_DEPTH_UNITS, LINE_MAX_DEPTH_UNITS);
     let mid_line_depth = back_line_depth + MIDFIELD_LINE_GAP_UNITS;
 
+    // Forwards excluded from ordinary hold-shape too (see the pool-
+    // construction comment above) — they don't hold the back/mid line.
+    // A forward who isn't pressing gets no duty here; Step G below still
+    // pulls him into a genuine box crisis separately.
     let mut hold_shape_ids: Vec<u32> = Vec::new();
-    for c in pool.iter().filter(|c| !assigned.contains(&c.id)) {
+    for c in pool
+        .iter()
+        .filter(|c| !assigned.contains(&c.id) && c.position_group != PlayerFieldPositionGroup::Forward)
+    {
         let line_depth = match c.position_group {
             PlayerFieldPositionGroup::Midfielder => mid_line_depth,
             _ => back_line_depth,
@@ -778,7 +859,14 @@ fn assign_team(
         hold_shape_ids.push(c.id);
     }
 
-    // --- Step G: crisis override, hold-shape pool only. ---
+    // --- Step G: crisis override. Relabels the hold-shape pool
+    // (defenders/midfielders), then also pulls in any forward who isn't
+    // already pressing (added 2026-09-23) — a genuine goalmouth crisis
+    // is exactly the moment real football stops asking "whose job is
+    // this" and gets every available body between the danger and the
+    // goal, forwards included. Both groups share the same `rank`
+    // counter so the fan-out spacing accounts for everyone converging,
+    // not just the hold-shape half. ---
     if ball_dist_to_goal <= CRISIS_RADIUS_UNITS {
         let danger_point = own_goal + (focal_pos - own_goal) * 0.6;
         let mut rank = 0i32;
@@ -791,6 +879,20 @@ fn assign_team(
             let fan_step = ((rank + 1) / 2) as f32;
             let offset = Vector3::new(0.0, fan_side * fan_step * SCRAMBLE_FAN_SPACING_UNITS, 0.0);
             a.target = danger_point + offset;
+            rank += 1;
+        }
+        for c in pool.iter().filter(|c| {
+            c.position_group == PlayerFieldPositionGroup::Forward && !assigned.contains(&c.id)
+        }) {
+            let fan_side = if rank % 2 == 0 { 1.0 } else { -1.0 };
+            let fan_step = ((rank + 1) / 2) as f32;
+            let offset = Vector3::new(0.0, fan_side * fan_step * SCRAMBLE_FAN_SPACING_UNITS, 0.0);
+            results.push(Assignment {
+                id: c.id,
+                duty: DefensiveDuty::Scramble,
+                target: danger_point + offset,
+                engage: false,
+            });
             rank += 1;
         }
     }
