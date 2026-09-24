@@ -989,7 +989,37 @@ impl Ball {
 
         // CRITICAL: Early validation - if current owner is too far AND ball is moving, clear ownership
         // This catches cases where ball flies away from owner but ownership wasn't properly cleared
-        const MAX_OWNERSHIP_DISTANCE: f32 = 2.0; // Maximum distance to maintain ownership (tightened)
+        //
+        // realism-bug (2026-09-24, "team follows the ball" investigation):
+        // this was 2.0 units (~0.25m at this engine's 8u/m scale) --
+        // exactly `motion.rs`'s own SNAP_DISTANCE (the point-blank
+        // radius where the ball snaps to the owner's exact position),
+        // NOT a genuine "detached" distance. `motion.rs`'s ball-tracking
+        // mechanic (`move_to_with_players`) deliberately keeps the ball
+        // anywhere from 0 up to `MAX_OWNER_TELEPORT_DISTANCE_SQUARED`
+        // (15.0 units) away from a moving owner as a normal, working
+        // part of dribbling -- so this check was firing on almost every
+        // tick of an ordinary, uncontested dribble (confirmed with raw
+        // traces: ball 1-4.9 units from the SAME carrier throughout,
+        // nearest opponent 14-20 units away, no tackle in range),
+        // clearing `current_owner` for no real reason. Every off-ball
+        // teammate on both teams keys their positioning off
+        // `current_owner` (`assign_defensive_duties`/
+        // `assign_attacking_support`, both from-null domains), so this
+        // flicker was silently reverting the WHOLE TEAM to old,
+        // pre-rewrite per-role logic for a large fraction of match time
+        // (measured: >100ms gaps in domain 3's own carrier resolution
+        // added up to ~70% of a match) -- not a brief loose-ball edge
+        // case, the default state. A real tackle win is a separate,
+        // discrete-event mechanism (`PlayerEvent::TacklingBall`,
+        // dispatched from `attempt_sliding_tackle`'s own success path),
+        // not gated by this distance check at all, so raising it cannot
+        // weaken legitimate dispossession. Raised to match `motion.rs`'s
+        // own already-established "genuinely too far, this shouldn't
+        // happen" threshold (15.0) instead of inventing a new number --
+        // the two checks were answering the identical physical question
+        // and disagreeing with each other.
+        const MAX_OWNERSHIP_DISTANCE: f32 = 15.0;
         const MAX_OWNERSHIP_DISTANCE_SQUARED: f32 = MAX_OWNERSHIP_DISTANCE * MAX_OWNERSHIP_DISTANCE;
         const MIN_VELOCITY_FOR_DISTANCE_CHECK: f32 = 0.5; // Check distance if ball is moving at all
 
@@ -1012,6 +1042,12 @@ impl Ball {
                         if dot < 0.0 {
                             // Ball is moving away from owner
                             // Owner is too far and ball is flying away - clear ownership
+                            #[cfg(feature = "match-logs")]
+                            crate::match_log_info!(
+                                "OWNERCLEAR site=distance_dot dist={:.2} speed={:.3}",
+                                distance_squared.sqrt(),
+                                ball_speed_sq.sqrt()
+                            );
                             self.previous_owner = self.current_owner;
                             self.current_owner = None;
                             self.ownership_duration = 0;
@@ -1021,6 +1057,8 @@ impl Ball {
                 }
             } else {
                 // Owner player not found - clear ownership
+                #[cfg(feature = "match-logs")]
+                crate::match_log_info!("OWNERCLEAR site=owner_not_found");
                 self.previous_owner = self.current_owner;
                 self.current_owner = None;
                 self.ownership_duration = 0;
@@ -1241,6 +1279,11 @@ impl Ball {
                     return;
                 }
             } else {
+                #[cfg(feature = "match-logs")]
+                crate::match_log_info!(
+                    "OWNERCLEAR site=owner_not_in_nearby_radius owner={:?}",
+                    current_owner_id
+                );
                 self.previous_owner = self.current_owner;
                 self.current_owner = None;
             }

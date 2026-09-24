@@ -321,7 +321,25 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     // dark during that window (found 2026-09-23, fixed the same day --
     // kept here unchanged, this redesign only replaces the phase/depth
     // formulas downstream of this identification step).
-    let reference_id = field.ball.current_owner.or(field.ball.pending_pass_passer);
+    //
+    // realism-bug (2026-09-24, "team follows the ball" investigation,
+    // continued): `pending_pass_passer` itself doesn't cover a settled
+    // dribble/hold, or the window between a pass being credited
+    // complete (stats-wise, `credit_completed_pass`) and the ball
+    // physically reaching the receiver -- a raw-traced example showed
+    // a 2.25s gap where BOTH fields were `None` while a player was
+    // plainly, continuously in control. `previous_owner` is kept
+    // truthful by `check_ball_ownership` on real ball-distance grounds
+    // (cleared only once its owner is genuinely >5 units from the
+    // ball's live position), so it's a reliable last fallback here --
+    // same fix, same reasoning, applied to both from-null domains
+    // (see the matching Case 2c added to `defensive_duty.rs` the same
+    // session).
+    let reference_id = field
+        .ball
+        .current_owner
+        .or(field.ball.pending_pass_passer)
+        .or(field.ball.previous_owner);
     let Some(reference_id) = reference_id else {
         return;
     };
@@ -350,6 +368,14 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     let Some(carrier_side) = carrier.side else {
         return;
     };
+
+    #[cfg(feature = "match-logs")]
+    crate::match_log_info!(
+        "CARRIERDIAG t={} carrier_id={} carrier_team={}",
+        context.total_match_time,
+        carrier.id,
+        carrier.team_id
+    );
 
     let goal_for_side = |side: PlayerSide| match side {
         PlayerSide::Left => context.goal_positions.left,

@@ -353,6 +353,15 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
         PlayerSide::Right => PlayerSide::Left,
     };
 
+    #[cfg(feature = "match-logs")]
+    crate::match_log_info!(
+        "CASEDIAG t={} owner={:?} pending_passer={:?} previous_owner={:?} pass_target={:?}",
+        context.total_match_time,
+        field.ball.current_owner,
+        field.ball.pending_pass_passer,
+        field.ball.previous_owner,
+        field.ball.pass_target_player_id
+    );
     let assignments: Vec<Assignment> = if let Some(carrier_id) = field.ball.current_owner {
         // Case 1: an opponent clearly holds the ball — the original,
         // single-team path.
@@ -423,6 +432,54 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             &cands,
             defending_team,
             passer.team_id,
+            field.ball.position,
+            field.ball.velocity,
+            None,
+            goal_for_side(defending_side),
+            goal_for_side(opposite_side(defending_side)),
+            defending_side,
+        )
+    } else if let Some(prev_owner_id) = field.ball.previous_owner {
+        // Case 2c (added 2026-09-24, "team follows the ball" investigation
+        // continued): a settled dribble/hold, or a pass whose completion
+        // was already credited (stats-wise) before the ball has
+        // physically reached the receiver. Neither `current_owner` nor
+        // `pending_pass_passer` represents this — `current_owner` is set
+        // for only a single tick at the instant of a touch, and the
+        // pass-completion credit path (`credit_completed_pass`) clears
+        // `pending_pass_passer` the moment the pass is deemed to succeed,
+        // which can run well before the ball's own physics simulation
+        // (`motion.rs`) actually gets it there — a raw-traced example
+        // showed a 2.25s gap between that credit and the receiver's real
+        // claim. `previous_owner`, by contrast, is kept truthful by
+        // `check_ball_ownership` itself on real ball-distance grounds
+        // (cleared only once the previous owner is more than
+        // `BALL_DISTANCE_THRESHOLD`/5 units from the ball's CURRENT
+        // position) — so `Some(_)` here means someone was genuinely,
+        // physically in possession moments ago and the ball hasn't
+        // meaningfully separated from them since. Same single-team
+        // routing as Case 2a: only the OTHER team organises.
+        let Some(prev_owner) = cands.iter().find(|c| c.id == prev_owner_id) else {
+            reset_all(field);
+            return;
+        };
+        let defending_team = if prev_owner.team_id == field.home_team_id {
+            field.away_team_id
+        } else {
+            field.home_team_id
+        };
+        let Some(defending_side) = cands
+            .iter()
+            .find(|c| c.team_id == defending_team)
+            .and_then(|c| c.side)
+        else {
+            reset_all(field);
+            return;
+        };
+        assign_team(
+            &cands,
+            defending_team,
+            prev_owner.team_id,
             field.ball.position,
             field.ball.velocity,
             None,

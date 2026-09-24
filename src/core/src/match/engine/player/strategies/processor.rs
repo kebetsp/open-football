@@ -501,6 +501,39 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
+        // TEMP DIAGNOSTIC (2026-09-24, "team follows the ball" investigation):
+        // is this outfield player covered by NEITHER domain 1 (defensive
+        // duty) NOR domain 3 (attacking support) this tick? If so, he's
+        // falling all the way back to his old, pre-rewrite per-role
+        // state's own velocity() -- some of which still contain literal
+        // ball-x-coupled shape formulas.
+        #[cfg(feature = "match-logs")]
+        {
+            let p = processing_ctx.player;
+            let is_gk = matches!(
+                p.tactical_position.current_position.position_group(),
+                PlayerFieldPositionGroup::Goalkeeper
+            );
+            let has_ball = processing_ctx.ball().owner_id() == Some(p.id);
+            if !is_gk
+                && !has_ball
+                && matches!(p.ai_defensive_duty, crate::r#match::player::DefensiveDuty::None)
+                && matches!(p.ai_attack_duty, crate::r#match::player::AttackDuty::None)
+            {
+                let ball_pos = processing_ctx.tick_context.positions.ball.position;
+                crate::match_log_info!(
+                    "UNCOVEREDDIAG t={} id={} team={} px={:.1} py={:.1} bx={:.1} by={:.1}",
+                    processing_ctx.context.total_match_time,
+                    p.id,
+                    p.team_id,
+                    p.position.x,
+                    p.position.y,
+                    ball_pos.x,
+                    ball_pos.y
+                );
+            }
+        }
+
         // realism-bug (2026-08-30, deflection-rate investigation):
         // pre-shot corridor cover. Applied AFTER wide-run tracking and
         // BEFORE the reactive shot-block lunge, so an already-live shot

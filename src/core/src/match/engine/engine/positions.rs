@@ -58,7 +58,14 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             }
             match_data.add_player_positions(player.id, timestamp, player.position);
             if track_events {
-                match_data.add_player_state(player.id, timestamp, player.state.compact_id(), &player.state);
+                match_data.add_player_state(
+                    player.id,
+                    timestamp,
+                    player.state.compact_id(),
+                    &player.state,
+                    player.ai_attack_duty,
+                    player.ai_defensive_duty,
+                );
 
                 // Ground-truth duel debug (2026-08-05, requested to
                 // replace guessing at carrier-vs-presser standoffs from

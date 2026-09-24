@@ -2796,9 +2796,22 @@ impl PlayerEventDispatcher {
     }
 
     fn handle_claim_ball_event(player_id: u32, field: &mut MatchField, context: &MatchContext) {
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!(
+            "CLAIMDIAG entry t={} pid={} owner={:?} pass_target={:?} in_flight={} cooldown={} pending_passer={:?}",
+            context.total_match_time,
+            player_id,
+            field.ball.current_owner,
+            field.ball.pass_target_player_id,
+            field.ball.flags.in_flight_state,
+            field.ball.claim_cooldown,
+            field.ball.pending_pass_passer
+        );
         // §9.4.1 same-touch rule: the restart taker cannot be the next
         // toucher of his own delivery.
         if field.ball.restart_taker_lock == Some(player_id) {
+            #[cfg(feature = "match-logs")]
+            crate::match_log_info!("CLAIMDIAG reject=restart_lock pid={}", player_id);
             return;
         }
         // CLAIM COOLDOWN: Prevent rapid ping-pong between players
@@ -2826,9 +2839,16 @@ impl PlayerEventDispatcher {
         if field.ball.flags.in_flight_state > 0 {
             if let Some(target_id) = field.ball.pass_target_player_id {
                 if player_id != target_id {
+                    #[cfg(feature = "match-logs")]
+                    crate::match_log_info!(
+                        "CLAIMDIAG reject=in_flight_non_target pid={} target={}",
+                        player_id, target_id
+                    );
                     return; // Reject claim from non-target during in-flight
                 }
             } else {
+                #[cfg(feature = "match-logs")]
+                crate::match_log_info!("CLAIMDIAG reject=in_flight_no_target pid={}", player_id);
                 // Ball is in flight with no target (e.g., shot) - reject all claims
                 return;
             }
@@ -2838,6 +2858,11 @@ impl PlayerEventDispatcher {
         if field.ball.claim_cooldown > 0 {
             if let Some(current_owner) = field.ball.current_owner {
                 if current_owner != player_id {
+                    #[cfg(feature = "match-logs")]
+                    crate::match_log_info!(
+                        "CLAIMDIAG reject=cooldown pid={} owner={}",
+                        player_id, current_owner
+                    );
                     // Ball was just claimed by someone else - reject this claim
                     return;
                 }
@@ -2916,6 +2941,8 @@ impl PlayerEventDispatcher {
                 field.ball.clear_pending_pass_metadata();
             }
         }
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!("CLAIMDIAG grant pid={}", player_id);
         field.ball.previous_owner = field.ball.current_owner;
         field.ball.current_owner = Some(player_id);
         field.ball.pass_target_player_id = None;

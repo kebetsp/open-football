@@ -1,3 +1,4 @@
+use crate::r#match::player::{AttackDuty, DefensiveDuty};
 use nalgebra::Vector3;
 use serde::Serialize;
 use serde::Serializer;
@@ -177,8 +178,11 @@ pub struct ResultMatchPositionData {
     events: Vec<MatchEventData>,
     /// Per-player state changes — only populated when track_events is true.
     player_states: HashMap<u32, Vec<PlayerStateEntry>>,
-    /// Fast dedup: last recorded state compact ID per player (avoids String allocation)
-    last_state_ids: HashMap<u32, u16>,
+    /// Fast dedup: last recorded (state, attack duty, defensive duty)
+    /// combined key per player (avoids String allocation). Packed as
+    /// `state_id | (attack_discriminant << 16) | (defensive_discriminant << 20)`
+    /// — see `add_player_state`.
+    last_state_ids: HashMap<u32, u32>,
     /// Ground-truth duel debug snapshots (see `DuelDebugEntry`) — only
     /// populated when track_events is true, and only for players near
     /// the ball at recording time.
@@ -598,26 +602,48 @@ impl ResultMatchPositionData {
 
     /// Record a player state change. Uses a cheap integer ID for fast dedup,
     /// only allocating the display String when the state actually changed.
+    ///
+    /// realism-bug (2026-09-24, "team follows the ball" investigation):
+    /// the FSM state name alone ("Midfielder: Walking") can't say WHICH
+    /// velocity source actually drove that tick's movement -- domain 1
+    /// (`ai_defensive_duty`) or domain 3 (`ai_attack_duty`) can silently
+    /// override a state's own `velocity()` without the recorded state
+    /// name ever changing, and when NEITHER duty is assigned, the raw
+    /// state velocity (some of it pre-dating the from-null rewrite, e.g.
+    /// `MidfielderWalkingState`'s own ball-x-coupled shape anchor) is
+    /// what actually fires. Folding both duties into the same already-
+    /// exposed `positions.states` stream turns any match's own JSON
+    /// into a genuine per-tick decision trace -- pick a moment, read off
+    /// state + duty for every player, no special log build required --
+    /// rather than a one-off diagnostic that only answers the question
+    /// it was hand-written for.
     pub fn add_player_state(
         &mut self,
         player_id: u32,
         timestamp: u64,
         state_id: u16,
         state: &impl Display,
+        attack_duty: AttackDuty,
+        defensive_duty: DefensiveDuty,
     ) {
         if !self.track_events {
             return;
         }
 
+        let atk_disc = Self::attack_duty_discriminant(&attack_duty);
+        let def_disc = Self::defensive_duty_discriminant(&defensive_duty);
+        let combined_key: u32 =
+            (state_id as u32) | ((atk_disc as u32) << 16) | ((def_disc as u32) << 20);
+
         // Fast dedup using integer comparison — avoids to_string() ~90% of the time
-        if let Some(&last_id) = self.last_state_ids.get(&player_id) {
-            if last_id == state_id {
+        if let Some(&last_key) = self.last_state_ids.get(&player_id) {
+            if last_key == combined_key {
                 return;
             }
         }
 
-        self.last_state_ids.insert(player_id, state_id);
-        let state_name = state.to_string();
+        self.last_state_ids.insert(player_id, combined_key);
+        let state_name = format!("{} [atk:{:?} def:{:?}]", state, attack_duty, defensive_duty);
 
         if let Some(entries) = self.player_states.get_mut(&player_id) {
             entries.push(PlayerStateEntry {
@@ -632,6 +658,35 @@ impl ResultMatchPositionData {
                     state: state_name,
                 }],
             );
+        }
+    }
+
+    /// Small, stable discriminant (0-15) for `AttackDuty` — used only for
+    /// the dedup key above, not a general-purpose ordering. Update this
+    /// if a new variant is added (compiler will warn via non-exhaustive
+    /// match if a variant is missed).
+    #[inline]
+    fn attack_duty_discriminant(d: &AttackDuty) -> u8 {
+        match d {
+            AttackDuty::None => 0,
+            AttackDuty::Width => 1,
+            AttackDuty::Advance => 2,
+            AttackDuty::Penetrate => 3,
+            AttackDuty::Receive => 4,
+        }
+    }
+
+    /// Small, stable discriminant (0-15) for `DefensiveDuty` — same
+    /// purpose/caveat as `attack_duty_discriminant` above.
+    #[inline]
+    fn defensive_duty_discriminant(d: &DefensiveDuty) -> u8 {
+        match d {
+            DefensiveDuty::None => 0,
+            DefensiveDuty::Press { .. } => 1,
+            DefensiveDuty::Mark { .. } => 2,
+            DefensiveDuty::Cover => 3,
+            DefensiveDuty::HoldShape => 4,
+            DefensiveDuty::Scramble => 5,
         }
     }
 
