@@ -408,11 +408,35 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     // --- Step A.5: the designated pass RECEIVER, if any, gets a
     // dedicated target -- the ball's own real flight destination, not
     // whatever generic Width/Advance target would otherwise apply to
-    // him. Unchanged from the earlier round (`AttackDuty::Receive`'s own
-    // doc comment) -- this redesign doesn't touch it.
+    // him.
+    //
+    // realism-bug (2026-09-24, passing-direction investigation): the
+    // target here used to be `pending_pass_target` alone -- a STATIC
+    // point equal to the receiver's own position at the exact instant
+    // the ball was struck, with zero regard for his own momentum.
+    // `handle_pass_to_event` (players.rs) already computes a strictly
+    // better target for this -- `ideal_target`, which leads the ball
+    // toward wherever the receiver's own current run will carry him,
+    // and stores it on the player as `incoming_pass_target` -- but
+    // nothing here ever read it, so a receiver already mid-run got
+    // frozen at his kick-instant position instead of continuing to
+    // meet the ball in stride. Raw match data (10 matches, 3011
+    // classified forward/backward passes) showed this specific gap is
+    // NOT what was driving Pavel's reported "players run away from a
+    // back pass" symptom -- the divergence this fixes is actually
+    // larger for forward passes than backward ones, and the intended
+    // receiver's real drift-from-target at true pass resolution was
+    // already ~0.2-0.7% for every dispatch path, both directions --
+    // but it's a real, separate correctness gap (a receiver's own run
+    // should count, whichever way it's headed) worth closing on its
+    // own merits regardless.
     if let Some(receiver_id) = field.ball.pass_target_player_id {
         if let Some(receiver) = pool.iter().find(|c| c.id == receiver_id) {
-            let target = field.ball.pending_pass_target.unwrap_or(receiver.position);
+            let target = field
+                .get_player(receiver_id)
+                .and_then(|p| p.incoming_pass_target)
+                .or(field.ball.pending_pass_target)
+                .unwrap_or(receiver.position);
             results.push(Assignment {
                 id: receiver.id,
                 duty: AttackDuty::Receive,
