@@ -2051,7 +2051,7 @@ impl<'p> StateProcessor<'p> {
     /// `on_ball_ai_action_override` below, no artificial holding period.
     fn on_ball_ai_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         use crate::r#match::player::strategies::common::players::ops::on_ball_decision::{
-            Action, decide_on_ball_action,
+            Action, decide_on_ball_action, own_goal_position,
         };
         match decide_on_ball_action(ctx)? {
             Action::Carry(target) | Action::Dribble(target) => {
@@ -2083,11 +2083,51 @@ impl<'p> StateProcessor<'p> {
                         if dist < 0.5 {
                             Some(Vector3::zeros())
                         } else {
+                            // Real shielding doctrine, not a straight-line
+                            // retreat -- Pavel's direct report, 2026-09-24:
+                            // "midfielders go back after forwards pass to
+                            // them." Traced with a raw, confirmed-reception
+                            // match trace (not the decision log, which can
+                            // log a pass that's never actually completed):
+                            // a midfielder receiving from a forward entered
+                            // `Action::Hold` and stayed there ~1.8s straight
+                            // while drifting ~73 units toward his OWN goal,
+                            // because this nudge only ever pointed away from
+                            // the single nearest opponent, with zero regard
+                            // for which direction that happened to be -- and
+                            // a defender is, realistically, usually
+                            // positioned goal-side of the holder, so "away
+                            // from him" is very often "toward my own goal."
+                            // A real player shielding the ball angles his
+                            // body away from the challenge (a lateral
+                            // adjustment), he doesn't backpedal toward his
+                            // own goal for well over a second. Strip out
+                            // whatever part of "away from the nearest
+                            // opponent" points toward OUR OWN goal, keeping
+                            // only the lateral component.
+                            let own_goal = own_goal_position(ctx);
+                            let to_own_goal = own_goal - ctx.player.position;
+                            let lateral = if to_own_goal.magnitude() > 1.0 {
+                                let goal_dir = to_own_goal.normalize();
+                                let backward = away.dot(&goal_dir).max(0.0);
+                                away - goal_dir * backward
+                            } else {
+                                away
+                            };
+                            let lateral_dist = lateral.magnitude();
                             let max_speed = ctx
                                 .player
                                 .skills
                                 .max_speed_with_condition(ctx.player.player_attributes.condition);
-                            Some((away / dist) * max_speed * 0.25)
+                            if lateral_dist < 0.5 {
+                                // The nearest opponent sits almost directly
+                                // ahead/behind on the goal axis, with no
+                                // real lateral escape -- stand and shield
+                                // rather than pick an arbitrary direction.
+                                Some(Vector3::zeros())
+                            } else {
+                                Some((lateral / lateral_dist) * max_speed * 0.25)
+                            }
                         }
                     }
                     None => Some(Vector3::zeros()),

@@ -202,7 +202,11 @@ fn is_directed_or_restart_pending(ctx: &StateProcessingContext) -> bool {
     ctx.tick_context.ball.pass_origin_restart != PassOriginRestart::OpenPlay
 }
 
-fn own_goal_position(ctx: &StateProcessingContext) -> Vector3<f32> {
+/// `pub(crate)` (2026-09-24) so `processor.rs`'s `on_ball_ai_velocity`
+/// can reuse this exact measurement for the `Action::Hold` shielding fix
+/// (see that call site's own doc comment) rather than re-deriving the
+/// identical side-to-goal lookup a second time.
+pub(crate) fn own_goal_position(ctx: &StateProcessingContext) -> Vector3<f32> {
     match ctx.player.side {
         Some(PlayerSide::Left) => ctx.context.goal_positions.left,
         Some(PlayerSide::Right) => ctx.context.goal_positions.right,
