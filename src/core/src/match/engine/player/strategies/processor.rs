@@ -479,6 +479,14 @@ impl<'p> StateProcessor<'p> {
         // dispatch below fires the same tick, no artificial delay).
         if let Some(velocity) = Self::on_ball_ai_velocity(&processing_ctx) {
             result.velocity = Some(velocity);
+            #[cfg(feature = "match-logs")]
+            crate::match_log_info!(
+                "HOLDTRACE_A t={} id={} v=({:.4},{:.4})",
+                processing_ctx.context.total_match_time,
+                processing_ctx.player.id,
+                velocity.x,
+                velocity.y
+            );
         }
 
         // Off-ball attacking positioning/support, from null (docs/
@@ -595,6 +603,16 @@ impl<'p> StateProcessor<'p> {
         {
             let base = result.velocity.unwrap_or_else(Vector3::zeros);
             result.velocity = Some(base * (1.0 - w) + separation * w);
+        }
+        #[cfg(feature = "match-logs")]
+        if let Some(v) = result.velocity {
+            crate::match_log_info!(
+                "HOLDTRACE_Z t={} id={} v=({:.4},{:.4})",
+                processing_ctx.context.total_match_time,
+                processing_ctx.player.id,
+                v.x,
+                v.y
+            );
         }
 
         // common logic

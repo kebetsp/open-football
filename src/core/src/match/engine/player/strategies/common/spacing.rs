@@ -566,8 +566,35 @@ pub fn separation_nudge(ctx: &StateProcessingContext) -> Option<(Vector3<f32>, f
         if dist >= EXCLUSION_RADIUS {
             continue;
         }
+        // Real separation doctrine, not a straight-line retreat/advance
+        // -- Pavel's direct report, 2026-09-24, same investigation as
+        // the Action::Hold shielding fix (processor.rs): a real player
+        // creates space from a crowded teammate by SIDESTEPPING, not by
+        // walking straight backward (or forward) along the goal axis.
+        // "Away from teammate X" has no notion of which direction that
+        // happens to be, and a crowding teammate positioned ahead of
+        // this player (the common case — teammates bunch up in the
+        // direction of play) pushed him straight toward his own goal
+        // for as long as the crowding persisted, at up to full
+        // replacement weight (`w` reaching 1.0 inside ~8u). The pitch's
+        // x-axis is the goal-to-goal (depth) axis throughout this
+        // engine, y the lateral (width) axis — strip the x-component
+        // from each teammate's "away from him" direction, keeping only
+        // the lateral push; depth is the underlying state/duty's job,
+        // not this anti-overlap mechanic's. Falls back to the same
+        // deterministic id-based lateral split already used for an
+        // exact overlap when the crowding teammate sits almost
+        // directly on the goal axis (no real lateral escape either).
         let dir = if dist > 0.5 {
-            d / dist
+            let lateral = Vector3::new(0.0, d.y, 0.0);
+            let lateral_dist = lateral.y.abs();
+            if lateral_dist > 0.5 {
+                lateral / lateral_dist
+            } else if ctx.player.id > t.id {
+                Vector3::new(0.0, 1.0, 0.0)
+            } else {
+                Vector3::new(0.0, -1.0, 0.0)
+            }
         } else if ctx.player.id > t.id {
             // Deterministic split for exact overlap.
             Vector3::new(0.0, 1.0, 0.0)

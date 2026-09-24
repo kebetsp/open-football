@@ -76,9 +76,23 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // boundary clamp here would drag them to (0, 0) — the pitch's
         // top-left corner — which then gets recorded as a ghost sample
         // by `write_match_positions`.
+        #[cfg(feature = "match-logs")]
+        let owner_before = field.ball.current_owner;
         for player in field.players.iter_mut().filter(|p| !p.is_sent_off) {
             player.check_boundary_collision(context);
             player.move_to();
+            #[cfg(feature = "match-logs")]
+            if owner_before == Some(player.id) {
+                crate::match_log_info!(
+                    "OWNERVEL t={} id={} tick=light v=({:.4},{:.4}) pos=({:.1},{:.1})",
+                    context.total_match_time,
+                    player.id,
+                    player.velocity.x,
+                    player.velocity.y,
+                    player.position.x,
+                    player.position.y
+                );
+            }
         }
 
         if events.has_events() {
@@ -130,7 +144,23 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // pattern and placement as the defensive-duty pass immediately
         // above.
         assign_attacking_support(field, context);
+        #[cfg(feature = "match-logs")]
+        let owner_before_full = field.ball.current_owner;
         Self::play_players(field, context, tick_ctx, events);
+        #[cfg(feature = "match-logs")]
+        if let Some(owner_id) = owner_before_full {
+            if let Some(p) = field.players.iter().find(|p| p.id == owner_id) {
+                crate::match_log_info!(
+                    "OWNERVEL t={} id={} tick=full v=({:.4},{:.4}) pos=({:.1},{:.1})",
+                    context.total_match_time,
+                    p.id,
+                    p.velocity.x,
+                    p.velocity.y,
+                    p.position.x,
+                    p.position.y
+                );
+            }
+        }
 
         EventDispatcher::dispatch(events, field, context, match_data, true);
 
