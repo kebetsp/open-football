@@ -474,8 +474,17 @@ fn carry_best_heading(
 /// boundaries and multipliers are reasoned estimates (category d, real
 /// thirds-of-the-pitch coaching doctrine, no sourced numeric dataset) --
 /// a target for the raw-trace verification pass, not treated as final.
-const OWN_THIRD_BOUNDARY: f32 = 280.0; // ~35m
-const FINAL_THIRD_BOUNDARY: f32 = 560.0; // ~70m
+///
+/// `pub(crate)` (2026-09-24) so `attacking_support.rs` (domain 3, off-ball
+/// attacking positioning) can key its own possession-phase logic
+/// (build-up/progression/final-third) off the SAME real pitch-thirds
+/// boundary as this module's own on-ball carrying priority, rather than
+/// independently re-deriving what is physically the identical fact about
+/// the pitch -- exactly the kind of constant drift between two places
+/// that mean the same thing this project's own history has been bitten
+/// by before. The value/meaning here is unchanged; only visibility moved.
+pub(crate) const OWN_THIRD_BOUNDARY: f32 = 280.0; // ~35m
+pub(crate) const FINAL_THIRD_BOUNDARY: f32 = 560.0; // ~70m
 
 fn carry_priority_mult(group: PlayerFieldPositionGroup, own_goal_dist: f32) -> f32 {
     let zone = if own_goal_dist < OWN_THIRD_BOUNDARY {

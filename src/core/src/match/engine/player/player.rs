@@ -272,18 +272,24 @@ pub enum DefensiveDuty {
 pub enum AttackDuty {
     #[default]
     None,
-    /// One of the deepest-positioned defenders, deliberately held back
-    /// regardless of ball advancement — real football's rest-defense
-    /// balance.
-    RestDefense,
     /// A genuinely wide player holding the flank, tracking the ball's
-    /// own advancement.
+    /// own advancement and this side's current possession phase
+    /// (build-up/progression/final-third).
     Width,
     /// A central player advancing as part of a coordinated attacking
-    /// line, tracking the ball's depth.
+    /// line, tracking this side's current possession phase. Real
+    /// football's "someone stays back for balance" property emerges
+    /// from this duty's own per-role, per-phase depth caps (a central
+    /// defender's cap stays shallow even in the final third; a
+    /// wide/wingback defender's does not) — replacing the old fixed
+    /// rest-defense headcount rule entirely (2026-09-24, phase-based
+    /// redesign, `docs/off-ball-attacking-positioning-phase-redesign.md`),
+    /// per Pavel's own framing: "we do not need 'stay back' — you play
+    /// as the line, we go back as the line."
     Advance,
     /// An advanced player pushing into genuinely open space beyond the
-    /// line position — a real forward/decoy run.
+    /// line position — a real forward/decoy run, or a forward's
+    /// "in-behind" choice during the progression phase.
     Penetrate,
     /// The designated target of a pass already in flight
     /// (`Ball.pass_target_player_id`). Overrides whatever Width/Advance

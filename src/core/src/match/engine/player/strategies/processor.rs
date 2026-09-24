@@ -2272,11 +2272,6 @@ impl<'p> StateProcessor<'p> {
             _ => return None,
         };
         Some(match (player.ai_attack_duty, role) {
-            (AttackDuty::RestDefense, 0) => StateChangeResult::with_defender_state(DefenderState::HoldingLine),
-            (AttackDuty::RestDefense, 1) => {
-                StateChangeResult::with_midfielder_state(MidfielderState::Standing)
-            }
-            (AttackDuty::RestDefense, _) => StateChangeResult::with_forward_state(ForwardState::Standing),
             (AttackDuty::Width, 0) => StateChangeResult::with_defender_state(DefenderState::PushingUp),
             (AttackDuty::Width, 1) => {
                 StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
