@@ -339,7 +339,10 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         .ball
         .current_owner
         .or(field.ball.pending_pass_passer)
-        .or(field.ball.previous_owner);
+        .or(field.ball.previous_owner)
+        // 2026-09-25: same fallback as `defensive_duty.rs`'s Case 2c — a
+        // recent controlled touch means that team still has the ball.
+        .or_else(|| field.ball.possessing_touch());
     let Some(reference_id) = reference_id else {
         return;
     };

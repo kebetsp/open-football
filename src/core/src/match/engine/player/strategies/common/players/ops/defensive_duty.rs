@@ -439,7 +439,16 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             goal_for_side(opposite_side(defending_side)),
             defending_side,
         )
-    } else if let Some(prev_owner_id) = field.ball.previous_owner {
+    } else if let Some(prev_owner_id) = field
+        .ball
+        .previous_owner
+        // 2026-09-25: `previous_owner` alone left ~31% of ticks in the
+        // loose-ball branch below; 97% of those were a moving ball within
+        // 3s of a CONTROLLED touch (a pass/clearance/carry that outran
+        // its owner) — still that touch's team's ball. Only an
+        // uncontrolled or stale last touch is genuinely loose.
+        .or_else(|| field.ball.possessing_touch())
+    {
         // Case 2c (added 2026-09-24, "team follows the ball" investigation
         // continued): a settled dribble/hold, or a pass whose completion
         // was already credited (stats-wise) before the ball has
@@ -511,6 +520,19 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             field.ball.pass_target_player_id.is_some(),
             field.ball.pending_pass_passer.is_some(),
             field.ball.previous_owner
+        );
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!(
+            "DARKCLASS t={} dead={} pending_taker={} lt_team={:?} lt_ctrl={} lt_age={} speed={:.2} pass_origin={:?} home={}",
+            context.total_match_time,
+            context.total_match_time < context.dead_ball_until_ms,
+            field.ball.restart_pending_taker.is_some(),
+            field.ball.last_touch_team_id,
+            field.ball.last_touch_was_controlled,
+            field.ball.current_tick_cached.saturating_sub(field.ball.last_touch_tick),
+            field.ball.velocity.norm(),
+            field.ball.pass_origin_restart,
+            field.home_team_id
         );
         let mut all = Vec::new();
         for (team_id, opponent_team) in [

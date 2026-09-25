@@ -625,6 +625,30 @@ impl Ball {
         self.last_touch_was_controlled = controlled;
     }
 
+    /// How long after a controlled touch the toucher's team is still
+    /// treated as "in possession" of a ball nobody owns right now
+    /// (~3s at 100 ticks/s). Measured 2026-09-25: of the ticks where no
+    /// owner/passer/previous-owner resolved, 96.4% were within 3s of a
+    /// controlled touch and only 0.1% were older.
+    pub const POSSESSION_TOUCH_WINDOW_TICKS: u64 = 300;
+
+    /// The player whose team should be treated as in possession of a ball
+    /// that currently has no owner: the last CONTROLLED touch (claim,
+    /// interception, reception — not a block/deflection/failed save), if
+    /// recent. A struck pass, a clearance in flight, or a carry that has
+    /// outrun its owner is still that team's ball; only an uncontrolled
+    /// or long-stale last touch is a genuine loose ball.
+    pub fn possessing_touch(&self) -> Option<u32> {
+        if self.last_touch_was_controlled
+            && self.current_tick_cached.saturating_sub(self.last_touch_tick)
+                <= Self::POSSESSION_TOUCH_WINDOW_TICKS
+        {
+            self.last_touch_player_id
+        } else {
+            None
+        }
+    }
+
     /// Clear the offside snapshot. Called on opponent touch, claim, foul,
     /// or pass expiry.
     pub fn clear_offside_snapshot(&mut self) {
