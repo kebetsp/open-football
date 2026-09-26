@@ -2,6 +2,7 @@ pub mod slot_coverage;
 pub use slot_coverage::*;
 
 pub mod attacking_support;
+pub mod box_attack;
 pub mod defender_skill;
 pub mod defensive;
 pub mod defensive_duty;

@@ -77,6 +77,9 @@ use crate::r#match::player::AttackDuty;
 use crate::r#match::player::strategies::common::players::ops::on_ball_decision::{
     FINAL_THIRD_BOUNDARY, OWN_THIRD_BOUNDARY,
 };
+use crate::r#match::player::strategies::common::players::ops::box_attack::{
+    RunCandidate, plan_box_runs,
+};
 use crate::r#match::player::strategies::common::spacing::is_front_two_tactic;
 use crate::r#match::{MatchContext, MatchField, PlayerSide};
 use crate::MatchTacticType;
@@ -466,6 +469,13 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
 
     let mut results: Vec<Assignment> = Vec::new();
     let mut assigned: Vec<u32> = Vec::new();
+    let team_tactic = if carrier.team_id == context.field_home_team_id {
+        context.starting_home_tactic
+    } else {
+        context.starting_away_tactic
+    }
+    .unwrap_or(MatchTacticType::T442);
+    let front_two_early = is_front_two_tactic(team_tactic);
 
     // --- Step A.5: the designated pass RECEIVER, if any, gets a
     // dedicated target -- the ball's own real flight destination, not
@@ -509,19 +519,60 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         }
     }
 
+    // --- Domain 4: while the carrier is within crossing/shooting range of
+    // the goal line, up to four forwards/midfielders are sent to specific
+    // penalty-area zones (`box_attack::plan_box_runs`) instead of taking
+    // this file's Width/Advance/Penetrate targets. Runs only in the Final
+    // phase; the plan is cleared on any other tick.
+    let side_index = if carrier_side == PlayerSide::Left { 0 } else { 1 };
+    if matches!(phase, Phase::Final) {
+        let run_cands: Vec<RunCandidate> = pool
+            .iter()
+            .filter(|c| !assigned.contains(&c.id))
+            .map(|c| RunCandidate {
+                id: c.id,
+                position: c.position,
+                group: c.position_group,
+                wide_tag: is_wide(c.position_type, front_two_early),
+            })
+            .collect();
+        let opp_outfield: Vec<Vector3<f32>> = cands
+            .iter()
+            .filter(|c| {
+                c.team_id != carrier.team_id
+                    && c.position_group != PlayerFieldPositionGroup::Goalkeeper
+            })
+            .map(|c| c.position)
+            .collect();
+        let inward = (own_goal.x - opponent_goal.x).signum();
+        let runs = plan_box_runs(
+            context,
+            side_index,
+            opponent_goal,
+            inward,
+            field.ball.position,
+            &run_cands,
+            &opp_outfield,
+        );
+        for (id, point) in runs {
+            results.push(Assignment {
+                id,
+                duty: AttackDuty::BoxRun,
+                target: point,
+                redirected: false,
+            });
+            assigned.push(id);
+        }
+    } else {
+        context.box_plan[side_index] = Default::default();
+    }
+
     // --- Step C: width -- any remaining wide-slotted player holds the
     // flank, at a depth keyed to role + current phase (`width_depth`).
     let target_x_from_depth = |depth: f32| own_goal.x + attack_dir * depth;
-    let team_tactic = if carrier.team_id == context.field_home_team_id {
-        context.starting_home_tactic
-    } else {
-        context.starting_away_tactic
-    }
-    .unwrap_or(MatchTacticType::T442);
-    let front_two = is_front_two_tactic(team_tactic);
     let wide_cands: Vec<Cand> = pool
         .iter()
-        .filter(|c| !assigned.contains(&c.id) && is_wide(c.position_type, front_two))
+        .filter(|c| !assigned.contains(&c.id) && is_wide(c.position_type, front_two_early))
         .copied()
         .collect();
     let field_height = context.field_size.height as f32;
@@ -586,7 +637,7 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     let mut pocket_occupancy = [0i32, 0i32]; // [left, right]
 
     for c in pool.iter().filter(|c| !assigned.contains(&c.id)) {
-        let anchor_y = if front_two
+        let anchor_y = if front_two_early
             && c.position_group == PlayerFieldPositionGroup::Forward
             && (c.start_position.y - field_height / 2.0).abs() > 1.0
         {

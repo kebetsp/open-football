@@ -172,6 +172,9 @@ pub enum Action {
     Dribble(Vector3<f32>),
     Clear,
     Hold,
+    /// Domain 4 (`box_attack.rs`): a pass to a runner aimed at his
+    /// assigned box zone (a cross or cut-back), not at where he stands.
+    Deliver { to: u32, target: Vector3<f32> },
 }
 
 /// Step A's gate: true when a manager-issued directive already governs
@@ -220,7 +223,7 @@ pub(crate) fn own_goal_position(ctx: &StateProcessingContext) -> Vector3<f32> {
 /// tick to tick; skills and condition don't, or drift slowly enough that
 /// this snapshot is an honest approximation, matching existing usage
 /// elsewhere in the codebase for the identical lookup).
-fn real_max_speed(ctx: &StateProcessingContext, id: u32) -> f32 {
+pub(crate) fn real_max_speed(ctx: &StateProcessingContext, id: u32) -> f32 {
     ctx.context
         .players
         .by_id(id)
@@ -228,7 +231,7 @@ fn real_max_speed(ctx: &StateProcessingContext, id: u32) -> f32 {
         .unwrap_or(0.45)
 }
 
-fn rotate_xy(v: Vector3<f32>, angle_rad: f32) -> Vector3<f32> {
+pub(crate) fn rotate_xy(v: Vector3<f32>, angle_rad: f32) -> Vector3<f32> {
     let (s, c) = angle_rad.sin_cos();
     Vector3::new(v.x * c - v.y * s, v.x * s + v.y * c, 0.0)
 }
@@ -243,7 +246,7 @@ fn rotate_xy(v: Vector3<f32>, angle_rad: f32) -> Vector3<f32> {
 /// threat, not a sum — one well-placed defender kills a passing lane; a
 /// handful of distant ones don't compound linearly the way a naive sum
 /// would suggest.
-fn intercept_risk(
+pub(crate) fn intercept_risk(
     ctx: &StateProcessingContext,
     from: Vector3<f32>,
     to: Vector3<f32>,
@@ -291,14 +294,14 @@ fn turnover_cost(own_goal: Vector3<f32>, point: Vector3<f32>) -> f32 {
     (1.0 - dist / TURNOVER_REFERENCE_DIST).clamp(0.05, 1.0)
 }
 
-fn nearest_opponent_dist(point: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
+pub(crate) fn nearest_opponent_dist(point: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
     opponents
         .iter()
         .map(|o| (o.position - point).magnitude())
         .fold(f32::MAX, f32::min)
 }
 
-fn openness(point: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
+pub(crate) fn openness(point: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
     if opponents.is_empty() {
         return 1.0;
     }
@@ -416,7 +419,7 @@ fn pass_value(
 /// How far the player could advance in `heading` before the nearest
 /// opponent's own realistic reach into that lane would contest it,
 /// capped at `CARRY_LOOKAHEAD`.
-fn open_distance_in_heading(
+pub(crate) fn open_distance_in_heading(
     from: Vector3<f32>,
     heading: Vector3<f32>,
     opponents: &[MatchPlayerLite],
@@ -582,7 +585,7 @@ fn carry_value(
     (value, target)
 }
 
-fn nearest_blocker<'a>(
+pub(crate) fn nearest_blocker<'a>(
     from: Vector3<f32>,
     forward: Vector3<f32>,
     opponents: &'a [MatchPlayerLite],
@@ -669,6 +672,13 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
     if is_directed_or_restart_pending(ctx) {
         return None;
     }
+    // A shot this player has just struck is already in flight (the ball
+    // is released a tick later): he decides nothing further. Without this
+    // one action was dispatched as several Shoot events 40ms apart (a third
+    // of all shots in a 10-match sample, 2026-09-26).
+    if ctx.tick_context.ball.cached_shot_target.is_some() {
+        return Some(Action::Hold);
+    }
     let group = ctx.player.tactical_position.current_position.position_group();
     if group == PlayerFieldPositionGroup::Goalkeeper {
         return None;
@@ -688,6 +698,13 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
     };
 
     let opponents: Vec<MatchPlayerLite> = ctx.players().opponents().nearby(300.0).collect();
+
+    // Domain 4 owns the whole final third (ball >= FINAL_THIRD_BOUNDARY from
+    // our own goal): the progress-based pass value and the angle-less
+    // shoot_value below never run for a carrier there.
+    if super::box_attack::governs((from - own_goal).magnitude()) {
+        return Some(super::box_attack::decide_final_third(ctx, from, attacking_goal, &opponents));
+    }
 
     let mut best_action = Action::Hold;
     let mut best_value = HOLD_VALUE;
@@ -744,6 +761,7 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
             Action::Dribble(t) => ("Dribble", t.x, t.y),
             Action::Clear => ("Clear", 0.0, 0.0),
             Action::Hold => ("Hold", 0.0, 0.0),
+            Action::Deliver { to, .. } => ("Deliver", to as f32, 0.0),
         };
         crate::match_log_info!(
             "ONBALLACT t={} id={} group={:?} action={} value={:.3} own_goal_dist={:.1} tx={:.1} ty={:.1} fx={:.2} fy={:.2}",

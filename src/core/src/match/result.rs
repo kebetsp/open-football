@@ -673,6 +673,7 @@ impl ResultMatchPositionData {
             AttackDuty::Advance => 2,
             AttackDuty::Penetrate => 3,
             AttackDuty::Receive => 4,
+            AttackDuty::BoxRun => 5,
         }
     }
 

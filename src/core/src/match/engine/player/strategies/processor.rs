@@ -2197,7 +2197,9 @@ impl<'p> StateProcessor<'p> {
                     None => Some(Vector3::zeros()),
                 }
             }
-            Action::Shoot | Action::Pass(_) | Action::Clear => Some(Vector3::zeros()),
+            Action::Shoot | Action::Pass(_) | Action::Clear | Action::Deliver { .. } => {
+                Some(Vector3::zeros())
+            }
         }
     }
 
@@ -2258,6 +2260,27 @@ impl<'p> StateProcessor<'p> {
                     .with_from_player_id(ctx.player.id)
                     .with_to_player_id(to_id)
                     .with_reason("ONBALL_AI_PASS")
+                    .build(ctx);
+                let event = Event::PlayerEvent(PlayerEvent::PassTo(pass_ctx));
+                match role {
+                    Role::Defender => {
+                        StateChangeResult::with_defender_state_and_event(DefenderState::Running, event)
+                    }
+                    Role::Midfielder => StateChangeResult::with_midfielder_state_and_event(
+                        MidfielderState::Running,
+                        event,
+                    ),
+                    Role::Forward => {
+                        StateChangeResult::with_forward_state_and_event(ForwardState::Running, event)
+                    }
+                }
+            }
+            Action::Deliver { to, target } => {
+                let pass_ctx = PassingEventContext::new()
+                    .with_from_player_id(ctx.player.id)
+                    .with_to_player_id(to)
+                    .with_pass_target(target)
+                    .with_reason("BOX_DELIVER")
                     .build(ctx);
                 let event = Event::PlayerEvent(PlayerEvent::PassTo(pass_ctx));
                 match role {
@@ -2391,6 +2414,11 @@ impl<'p> StateProcessor<'p> {
                 StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
             }
             (AttackDuty::Penetrate, _) => StateChangeResult::with_forward_state(ForwardState::CreatingSpace),
+            (AttackDuty::BoxRun, 0) => StateChangeResult::with_defender_state(DefenderState::PushingUp),
+            (AttackDuty::BoxRun, 1) => {
+                StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
+            }
+            (AttackDuty::BoxRun, _) => StateChangeResult::with_forward_state(ForwardState::CreatingSpace),
             (AttackDuty::Receive, 0) => StateChangeResult::with_defender_state(DefenderState::PushingUp),
             (AttackDuty::Receive, 1) => {
                 StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)

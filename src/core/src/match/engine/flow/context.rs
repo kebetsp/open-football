@@ -76,6 +76,29 @@ pub struct SubstitutionRecord {
     pub reason: crate::r#match::engine::flow::result::SubstitutionReason,
 }
 
+/// Domain 4 (`box_attack.rs`) plan types, defined here so `MatchContext`
+/// can store the plan (the strategies module tree is private).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxZone {
+    PenaltySpot,
+    FarPost,
+    Edge,
+    NearPost,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BoxRunner {
+    pub id: u32,
+    pub zone: BoxZone,
+    pub point: Vector3<f32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BoxPlan {
+    pub active: bool,
+    pub runners: Vec<BoxRunner>,
+}
+
 pub struct MatchContext {
     pub state: GameState,
     pub time: MatchTime,
@@ -232,6 +255,12 @@ pub struct MatchContext {
     /// transition.
     pub starting_home_tactic: Option<MatchTacticType>,
     pub starting_away_tactic: Option<MatchTacticType>,
+
+    /// Domain 4 (`box_attack.rs`): per attacking side (0 = Left, 1 =
+    /// Right) who is running to which penalty-area zone. Written once per
+    /// tick by `assign_attacking_support`, read by the on-ball decision
+    /// so the carrier knows where the runners are going.
+    pub box_plan: [BoxPlan; 2],
 
     /// Per-team skill composite aggregates, cached between refresh
     /// passes. The raw recompute walks every active player and
@@ -439,6 +468,7 @@ impl MatchContext {
             first_shape_change_minute: None,
             starting_home_tactic: None,
             starting_away_tactic: None,
+            box_plan: Default::default(),
             home_skill_aggregates: TeamSkillAggregates::neutral(),
             away_skill_aggregates: TeamSkillAggregates::neutral(),
             second_half_start_ms: 0,

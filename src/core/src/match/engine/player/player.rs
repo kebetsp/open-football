@@ -291,6 +291,10 @@ pub enum AttackDuty {
     /// line position — a real forward/decoy run, or a forward's
     /// "in-behind" choice during the progression phase.
     Penetrate,
+    /// Domain 4 (`box_attack.rs`): an attacker assigned to arrive in a
+    /// specific penalty-area zone (near post, far post, penalty spot,
+    /// box edge) while the carrier is within crossing/shooting range.
+    BoxRun,
     /// The designated target of a pass already in flight
     /// (`Ball.pass_target_player_id`). Overrides whatever Width/Advance
     /// target this player would otherwise get — real football's most

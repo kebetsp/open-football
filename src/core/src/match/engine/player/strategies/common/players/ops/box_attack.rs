@@ -1,0 +1,477 @@
+//! Domain 4 — attacking the penalty area and delivering into it, designed
+//! from null. Read `docs/box-attack-from-null.md` first (football answers,
+//! sourcing, guards) and `docs/off-ball-attack-gap-analysis.md` (why this
+//! domain exists).
+//!
+//! **Ownership.** While the ball is in the final third, this module owns
+//! the carrier's decision (`decide_final_third`, called from
+//! `decide_on_ball_action` in place of domain 2's evaluation) and, once
+//! the carrier is within crossing/shooting range of the goal line, the
+//! off-ball runners' targets (`plan_box_runs`, called from
+//! `assign_attacking_support` in place of domain 3's Final-phase
+//! Width/Advance/Penetrate targets for the players it assigns).
+//!
+//! **Currency.** Every option is valued as expected goals, and 0 on losing
+//! the ball, so a shot, a cross, a pass, a carry and a take-on compare on
+//! one scale. The numbers come from StatsBomb open data (Bundesliga
+//! 2023/24, 34 matches, priority (a)): the shot model is a fit of
+//! StatsBomb's own xG to distance, goal angle, blockers and keeper cover;
+//! the cross completion (0.35), the cross-to-shot rate and the value of
+//! keeping the ball in the final third (0.022 xG per possession) are
+//! measured; the take-on success rate (52.7%) is measured. Anything else
+//! is flagged "estimate" at its constant.
+//!
+//! **Call-graph check (`docs/decision-from-null.md`).** Depends on
+//! measurements only (positions, goal geometry, `GOAL_WIDTH`, skills) plus
+//! domain 2's own from-null geometry helpers (`intercept_risk`,
+//! `openness`, `open_distance_in_heading`, `nearest_blocker`,
+//! `nearest_opponent_dist`, `rotate_xy`). No pre-rewrite decision function
+//! is called; the old `xg` module and `on_ball_value` are not touched.
+
+use crate::PlayerFieldPositionGroup;
+use crate::r#match::engine::goal::GOAL_WIDTH;
+use crate::r#match::player::strategies::common::players::ops::on_ball_decision::{
+    Action, FINAL_THIRD_BOUNDARY, intercept_risk, nearest_blocker, nearest_opponent_dist,
+    open_distance_in_heading, openness, rotate_xy,
+};
+use crate::r#match::{
+    BoxPlan, BoxRunner, BoxZone, MatchContext, MatchPlayerLite, StateProcessingContext,
+};
+use nalgebra::Vector3;
+
+const UNITS_PER_METRE: f32 = 8.0;
+
+// ---- Shot model: fit of StatsBomb xG on foot open-play shots (n=738).
+// logit(xG) = A + B*dist_m + C*angle_rad + D*blockers + E*keeper_cover
+const XG_A: f32 = -1.991;
+const XG_B_DIST_M: f32 = -0.081;
+const XG_C_ANGLE: f32 = 2.381;
+const XG_D_BLOCKER: f32 = -0.255;
+const XG_E_KEEPER: f32 = -0.519;
+/// A keeper's body is ~1m wide for the cover measure (matches the fit).
+const KEEPER_BODY_M: f32 = 1.0;
+
+/// Expected goals of a foot shot from `from` at the goal centred on
+/// `goal`, given the opposing players (goalkeeper included) around.
+pub fn shot_xg(from: Vector3<f32>, goal: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
+    let dx = (goal.x - from.x).abs();
+    if dx < 1.0 {
+        return 0.0;
+    }
+    let dy = from.y - goal.y;
+    let gw = GOAL_WIDTH;
+    let angle = ((dy - gw).atan2(dx) - (dy + gw).atan2(dx)).abs();
+    let dist_m = (dx * dx + dy * dy).sqrt() / UNITS_PER_METRE;
+    // Triangle shooter -> left post -> right post, in (x, y) space with the
+    // goal line at goal.x.
+    let a = (from.x, from.y);
+    let b = (goal.x, goal.y - gw);
+    let c = (goal.x, goal.y + gw);
+    let sign = |p: (f32, f32), q: (f32, f32), r: (f32, f32)| {
+        (p.0 - r.0) * (q.1 - r.1) - (q.0 - r.0) * (p.1 - r.1)
+    };
+    let inside = |p: (f32, f32)| {
+        let d1 = sign(p, a, b);
+        let d2 = sign(p, b, c);
+        let d3 = sign(p, c, a);
+        !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+    };
+    let mut blockers = 0.0f32;
+    let mut keeper_cover = 0.0f32;
+    for o in opponents {
+        let p = (o.position.x, o.position.y);
+        if !inside(p) {
+            continue;
+        }
+        if o.tactical_positions.position_group() == PlayerFieldPositionGroup::Goalkeeper {
+            let d_m = ((o.position.x - from.x).powi(2) + (o.position.y - from.y).powi(2)).sqrt()
+                / UNITS_PER_METRE;
+            keeper_cover = (KEEPER_BODY_M / d_m.max(0.5) / angle.max(1e-3)).min(1.0);
+        } else {
+            blockers += 1.0;
+        }
+    }
+    let logit = XG_A
+        + XG_B_DIST_M * dist_m
+        + XG_C_ANGLE * angle
+        + XG_D_BLOCKER * blockers.min(4.0)
+        + XG_E_KEEPER * keeper_cover;
+    (1.0 / (1.0 + (-logit).exp())).clamp(0.0, 0.6)
+}
+
+// ---- Value constants (sourced unless marked estimate).
+/// Value of having the ball at a location when the carrier does NOT shoot
+/// at once: the xG of the shots the possession goes on to produce, measured
+/// on every non-shot pass/carry/dribble by the possession team in the
+/// attacking third (StatsBomb, ~8,000 events). Central: 8-12m 0.102,
+/// 12-16.5m 0.062, 16.5-22m 0.046, 22-30m 0.031, 30-40m 0.020 -> fitted as
+/// 0.10*exp(-(d-10)/14). Wide (>= 10m off the centre line): flat 0.022-0.04,
+/// taken as 0.028. This is the number a shot has to beat.
+const CONT_CENTRAL_PEAK: f32 = 0.10;
+const CONT_CENTRAL_DECAY_M: f32 = 14.0;
+const CONT_WIDE: f32 = 0.028;
+/// A receiver shoots with some time pressure taken off the model
+/// (estimate; multiplier on his shot xG when valuing a pass to him).
+const RECV_SHOT_FACTOR: f32 = 0.75;
+
+fn continuation(point: Vector3<f32>, goal: Vector3<f32>) -> f32 {
+    let dx = (goal.x - point.x).abs();
+    let dy = (point.y - goal.y).abs();
+    let d_m = (dx * dx + dy * dy).sqrt() / UNITS_PER_METRE;
+    let central = if d_m <= 10.0 {
+        CONT_CENTRAL_PEAK
+    } else {
+        CONT_CENTRAL_PEAK * (-(d_m - 10.0) / CONT_CENTRAL_DECAY_M).exp()
+    };
+    let w = ((dy / UNITS_PER_METRE - 10.0) / 10.0).clamp(0.0, 1.0);
+    (1.0 - w) * central + w * CONT_WIDE
+}
+/// Open-play cross completion.
+const CROSS_COMPLETION: f32 = 0.35;
+/// Share of completed crosses that become a shot (a shot follows 20.5% of
+/// crosses within 4 events; 0.205/0.35).
+const P_SHOT_GIVEN_REACH: f32 = 0.6;
+/// Mean xG created per delivery (0.026-0.038 across origin depths).
+const CROSS_TYPICAL_EV: f32 = 0.03;
+/// Take-on success (StatsBomb Dribble complete / attempted).
+const TAKE_ON_SUCCESS: f32 = 0.527;
+/// A carry or take-on delays the chance and keeps the ball at some risk
+/// (estimate).
+const CARRY_DISCOUNT: f32 = 0.9;
+/// Standing still with the ball is worth almost nothing (estimate).
+const HOLD_VALUE: f32 = 0.004;
+/// A passer who just received from a teammate rarely returns it at once
+/// (estimate; multiplier on the pass value).
+const BACK_TO_PASSER_MULT: f32 = 0.6;
+
+/// A crossing position is wide (>= 12.5m off the centre line) and within
+/// 25m of the goal line (StatsBomb: ~76% of crosses start within 16.5m,
+/// the rest deeper).
+const CROSS_MIN_LATERAL: f32 = 100.0;
+const CROSS_MAX_DEPTH: f32 = 200.0;
+/// Reference for how open a delivery zone is (~7.5m).
+const ZONE_OPEN_REF: f32 = 60.0;
+/// How near a runner must be to his zone for the delivery to count as
+/// arriving together (estimate, ~15m -> scales the arrival factor).
+const ARRIVE_REF: f32 = 120.0;
+
+/// Real completion of a pass that ends in the penalty box (regular play,
+/// StatsBomb): 0.55 when played from outside the box, 0.42 from inside it
+/// (n=28 per match, 0.46 overall). The engine's lane model says ~0.94, so a
+/// pass to a teammate inside the box is capped at these values when
+/// weighing it against a delivery or a shot.
+const BOX_PASS_COMPLETION_FROM_OUTSIDE: f32 = 0.55;
+const BOX_PASS_COMPLETION_FROM_INSIDE: f32 = 0.42;
+/// Penalty area, in units (16.5m deep, 40.3m wide).
+const BOX_DEPTH: f32 = 132.0;
+const BOX_HALF_WIDTH: f32 = 161.0;
+
+fn in_box(point: Vector3<f32>, goal: Vector3<f32>) -> bool {
+    (goal.x - point.x).abs() <= BOX_DEPTH && (point.y - goal.y).abs() <= BOX_HALF_WIDTH
+}
+
+const PASS_MAX_RANGE: f32 = 320.0;
+const SHOT_MAX_RANGE: f32 = 300.0;
+const CARRY_STEP: f32 = 80.0;
+const CARRY_HEADINGS: usize = 7;
+const CARRY_FAN_HALF_DEG: f32 = 90.0;
+
+// ---- Runs.
+
+/// A player who can be sent to a zone.
+#[derive(Clone, Copy)]
+pub struct RunCandidate {
+    pub id: u32,
+    pub position: Vector3<f32>,
+    pub group: PlayerFieldPositionGroup,
+    /// True for wide-slotted roles (wingers, wide midfielders, full-backs).
+    pub wide_tag: bool,
+}
+
+/// Distance of a zone from the goal line and its lateral offset toward
+/// the carrier's side (units). Near post ~5.5m from the goal line just
+/// inside the post, far post ~6m beyond the far post, penalty-spot depth
+/// 11m, box edge 17m (StatsBomb: 50% of crosses land central at
+/// six-yard/penalty-spot depth, 26% in the channels, 17% at the edge).
+fn zone_geometry(zone: BoxZone) -> (f32, f32) {
+    match zone {
+        BoxZone::PenaltySpot => (88.0, 0.0),
+        BoxZone::FarPost => (48.0, -37.0),
+        BoxZone::Edge => (136.0, 0.0),
+        BoxZone::NearPost => (44.0, 30.0),
+    }
+}
+
+fn zone_point(zone: BoxZone, goal: Vector3<f32>, inward: f32, near_sign: f32) -> Vector3<f32> {
+    let (depth, lateral) = zone_geometry(zone);
+    Vector3::new(goal.x + inward * depth, goal.y + near_sign * lateral, 0.0)
+}
+
+/// Carrier within 25m of the goal line starts the runs; they stop once he
+/// is beyond 29m (hysteresis so the plan does not flicker at the line).
+const RUN_TRIGGER_DEPTH: f32 = 200.0;
+const RUN_RELEASE_DEPTH: f32 = 232.0;
+/// Bonus (units) for keeping a runner in the zone he already had.
+const STICKY_BONUS: f32 = 60.0;
+/// A runner nudges his point to the local gap: candidate offsets.
+const NUDGE_LATERAL: f32 = 16.0;
+const NUDGE_DEPTH: f32 = 12.0;
+
+/// Assigns up to four attackers to box zones for the side attacking
+/// `goal`, and records the plan on the context. Returns (id, point).
+pub fn plan_box_runs(
+    context: &mut MatchContext,
+    side_index: usize,
+    goal: Vector3<f32>,
+    inward: f32,
+    carrier_pos: Vector3<f32>,
+    candidates: &[RunCandidate],
+    opponents_outfield: &[Vector3<f32>],
+) -> Vec<(u32, Vector3<f32>)> {
+    let carrier_depth = (goal.x - carrier_pos.x).abs();
+    let was_active = context.box_plan[side_index].active;
+    let threshold = if was_active { RUN_RELEASE_DEPTH } else { RUN_TRIGGER_DEPTH };
+    if carrier_depth > threshold {
+        context.box_plan[side_index] = BoxPlan::default();
+        return Vec::new();
+    }
+    let lat = carrier_pos.y - goal.y;
+    let near_sign = if lat.abs() < 24.0 { 1.0 } else { lat.signum() };
+
+    // Near-side wide players keep the flank (overlap / switch option).
+    let eligible: Vec<&RunCandidate> = candidates
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.group,
+                PlayerFieldPositionGroup::Forward | PlayerFieldPositionGroup::Midfielder
+            )
+        })
+        .filter(|c| {
+            !(c.wide_tag
+                && (c.position.y - goal.y).signum() == near_sign
+                && (c.position.y - goal.y).abs() > 100.0)
+        })
+        .collect();
+
+    let previous = context.box_plan[side_index].runners.clone();
+    let mut used: Vec<u32> = Vec::new();
+    let mut assigned: Vec<BoxRunner> = Vec::new();
+    for zone in [BoxZone::PenaltySpot, BoxZone::FarPost, BoxZone::Edge, BoxZone::NearPost] {
+        let base = zone_point(zone, goal, inward, near_sign);
+        let mut best: Option<(f32, &RunCandidate)> = None;
+        for c in eligible.iter().filter(|c| !used.contains(&c.id)) {
+            let mut cost = (c.position - base).magnitude();
+            if previous.iter().any(|r| r.id == c.id && r.zone == zone) {
+                cost -= STICKY_BONUS;
+            }
+            if best.map_or(true, |(bc, _)| cost < bc) {
+                best = Some((cost, c));
+            }
+        }
+        let Some((_, cand)) = best else { continue };
+        used.push(cand.id);
+        // Nudge to the local gap between defenders, keeping clear of the
+        // points already given to teammates.
+        let mut best_pt = base;
+        let mut best_score = f32::MIN;
+        for dl in [-NUDGE_LATERAL, 0.0, NUDGE_LATERAL] {
+            for dd in [-NUDGE_DEPTH, 0.0, NUDGE_DEPTH] {
+                let pt = Vector3::new(base.x + inward * dd, base.y + dl, 0.0);
+                let opp_d = opponents_outfield
+                    .iter()
+                    .map(|o| (o - pt).magnitude())
+                    .fold(80.0f32, f32::min);
+                let mate_d = assigned
+                    .iter()
+                    .map(|r| (r.point - pt).magnitude())
+                    .fold(60.0f32, f32::min);
+                let score = opp_d.min(80.0) + mate_d.min(60.0) - 0.3 * (dl.abs() + dd.abs());
+                if score > best_score {
+                    best_score = score;
+                    best_pt = pt;
+                }
+            }
+        }
+        assigned.push(BoxRunner { id: cand.id, zone, point: best_pt });
+    }
+    let out = assigned.iter().map(|r| (r.id, r.point)).collect();
+    context.box_plan[side_index] = BoxPlan { active: true, runners: assigned };
+    out
+}
+
+// ---- On-ball decision.
+
+fn in_crossing_area(point: Vector3<f32>, goal: Vector3<f32>) -> bool {
+    (point.y - goal.y).abs() >= CROSS_MIN_LATERAL && (goal.x - point.x).abs() <= CROSS_MAX_DEPTH
+}
+
+/// Value of possessing the ball at `point` for a player who will act on it:
+/// his own shot, a typical delivery if he is in a crossing position, or
+/// carrying the possession on (`continuation`) — the best of the three.
+fn chance_at(point: Vector3<f32>, goal: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
+    let shoot = RECV_SHOT_FACTOR * shot_xg(point, goal, opponents);
+    let cross = if in_crossing_area(point, goal) {
+        CROSS_TYPICAL_EV * openness(point, opponents)
+    } else {
+        0.0
+    };
+    continuation(point, goal).max(shoot).max(cross)
+}
+
+/// The final-third decision for the ball carrier. Always returns an
+/// action (domain 4 governs the whole final third).
+pub fn decide_final_third(
+    ctx: &StateProcessingContext,
+    from: Vector3<f32>,
+    goal: Vector3<f32>,
+    opponents: &[MatchPlayerLite],
+) -> Action {
+    let mut best = Action::Hold;
+    let mut best_value = HOLD_VALUE;
+    let (mut d_shoot, mut d_deliver, mut d_pass, mut d_carry, mut d_take) =
+        (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+
+    // Shoot.
+    if (goal - from).magnitude() <= SHOT_MAX_RANGE {
+        let v = shot_xg(from, goal, opponents);
+        d_shoot = v;
+        if v > best_value {
+            best_value = v;
+            best = Action::Shoot;
+        }
+    }
+
+    // Deliver into a planned run zone (wide carriers).
+    let side_index = match ctx.player.side {
+        Some(crate::r#match::player::PlayerSide::Left) => 0,
+        _ => 1,
+    };
+    let plan = &ctx.context.box_plan[side_index];
+    if plan.active && in_crossing_area(from, goal) {
+        let crossing = ctx.player.skills.technical.crossing.clamp(1.0, 20.0) / 20.0;
+        let outfield: Vec<MatchPlayerLite> = opponents
+            .iter()
+            .filter(|o| o.tactical_positions.position_group() != PlayerFieldPositionGroup::Goalkeeper)
+            .cloned()
+            .collect();
+        for r in plan.runners.iter().filter(|r| r.id != ctx.player.id) {
+            let Some(runner) = ctx.players().teammates().all().find(|t| t.id == r.id) else {
+                continue;
+            };
+            let d_zone = nearest_opponent_dist(r.point, &outfield);
+            let open_mod = 0.55 + 0.9 * (d_zone.min(ZONE_OPEN_REF) / ZONE_OPEN_REF);
+            let arrive =
+                (1.0 - (runner.position - r.point).magnitude() / ARRIVE_REF).clamp(0.35, 1.0);
+            let p_reach = CROSS_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive;
+            let v = p_reach * P_SHOT_GIVEN_REACH * shot_xg(r.point, goal, opponents);
+            d_deliver = d_deliver.max(v);
+            if v > best_value {
+                best_value = v;
+                best = Action::Deliver { to: r.id, target: r.point };
+            }
+        }
+    }
+
+    // Pass.
+    for tm in ctx.players().teammates().nearby(PASS_MAX_RANGE) {
+        if tm.tactical_positions.position_group() == PlayerFieldPositionGroup::Goalkeeper {
+            continue;
+        }
+        if (tm.position - from).magnitude() < 5.0 {
+            continue;
+        }
+        let mut p_c = 1.0 - intercept_risk(ctx, from, tm.position, opponents);
+        if in_box(tm.position, goal) {
+            let cap = if in_box(from, goal) {
+                BOX_PASS_COMPLETION_FROM_INSIDE
+            } else {
+                BOX_PASS_COMPLETION_FROM_OUTSIDE
+            };
+            p_c = p_c.min(cap);
+        }
+        let mut v = p_c * chance_at(tm.position, goal, opponents);
+        if ctx.tick_context.ball.last_owner == Some(tm.id) {
+            v *= BACK_TO_PASSER_MULT;
+        }
+        d_pass = d_pass.max(v);
+        if v > best_value {
+            best_value = v;
+            best = Action::Pass(tm.id);
+        }
+    }
+
+    // Carry.
+    let to_goal = goal - from;
+    let forward = if to_goal.magnitude() > 1.0 {
+        let n = to_goal.normalize();
+        Vector3::new(n.x, n.y, 0.0)
+    } else {
+        Vector3::new(1.0, 0.0, 0.0)
+    };
+    let half = CARRY_FAN_HALF_DEG.to_radians();
+    for i in 0..CARRY_HEADINGS {
+        let t = i as f32 / (CARRY_HEADINGS - 1) as f32;
+        let heading = rotate_xy(forward, -half + 2.0 * half * t);
+        let open = open_distance_in_heading(from, heading, opponents);
+        let travel = open.min(CARRY_STEP);
+        if travel < 15.0 {
+            continue;
+        }
+        let target = from + heading * travel;
+        // Ending the carry beside a defender is a take-on: success falls
+        // from ~0.95 with room to the sourced 0.527 with none.
+        let room = openness(target, opponents);
+        let p_keep = 0.95 * (open / CARRY_STEP).min(1.0) * (TAKE_ON_SUCCESS + (1.0 - TAKE_ON_SUCCESS) * room);
+        let v = CARRY_DISCOUNT * p_keep * chance_at(target, goal, opponents);
+        d_carry = d_carry.max(v);
+        if v > best_value {
+            best_value = v;
+            best = Action::Carry(target);
+        }
+    }
+
+    // Take-on.
+    if let Some(blocker) = nearest_blocker(from, forward, opponents) {
+        let beyond = blocker.position + forward * 30.0;
+        let skill = (ctx.player.skills.technical.dribbling / 20.0).clamp(0.0, 1.0);
+        let p_beat = TAKE_ON_SUCCESS * (0.7 + 0.6 * skill);
+        let v = CARRY_DISCOUNT * p_beat * chance_at(beyond, goal, opponents);
+        d_take = v;
+        if v > best_value {
+            let lateral = Vector3::new(-forward.y, forward.x, 0.0);
+            let side = if (blocker.position - from).dot(&lateral) >= 0.0 { -1.0 } else { 1.0 };
+            best = Action::Dribble(beyond + lateral * side * 14.0);
+        }
+    }
+
+    #[cfg(feature = "match-logs")]
+    crate::match_log_info!(
+        "BOXDIAG id={} lat_m={:.1} depth_m={:.1} plan={} runners={} shoot={:.3} deliver={:.3} pass={:.3} carry={:.3} take={:.3} chose={}",
+        ctx.player.id,
+        (from.y - goal.y).abs() / UNITS_PER_METRE,
+        (goal.x - from.x).abs() / UNITS_PER_METRE,
+        plan.active,
+        plan.runners.len(),
+        d_shoot,
+        d_deliver,
+        d_pass,
+        d_carry,
+        d_take,
+        match best {
+            Action::Shoot => "shoot",
+            Action::Deliver { .. } => "deliver",
+            Action::Pass(_) => "pass",
+            Action::Carry(_) => "carry",
+            Action::Dribble(_) => "take",
+            _ => "hold",
+        }
+    );
+
+    best
+}
+
+/// True when the ball is in the final third, i.e. domain 4 governs.
+pub fn governs(own_goal_dist: f32) -> bool {
+    own_goal_dist >= FINAL_THIRD_BOUNDARY
+}
