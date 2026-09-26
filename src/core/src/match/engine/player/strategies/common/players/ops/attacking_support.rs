@@ -77,7 +77,9 @@ use crate::r#match::player::AttackDuty;
 use crate::r#match::player::strategies::common::players::ops::on_ball_decision::{
     FINAL_THIRD_BOUNDARY, OWN_THIRD_BOUNDARY,
 };
+use crate::r#match::player::strategies::common::spacing::is_front_two_tactic;
 use crate::r#match::{MatchContext, MatchField, PlayerSide};
+use crate::MatchTacticType;
 use nalgebra::Vector3;
 
 /// Which third of the pitch OUR OWN attack currently occupies — the
@@ -176,13 +178,25 @@ fn advance_depth(group: PlayerFieldPositionGroup, phase: Phase) -> f32 {
 /// don't collapse onto the same point. Reasoned estimate (category d).
 const WIDTH_SAME_GROUP_STAGGER: f32 = 60.0;
 
-/// How much a marked/covered forward's Progression-phase target pulls
-/// back from its baseline depth to "come short" and offer a foot pass,
-/// instead of holding a line position a defender already has covered.
-/// Reasoned estimate (category d) — roughly the same real-world
-/// magnitude as domain 1's own `MIDFIELD_LINE_GAP_UNITS` (15m), applied
-/// here as a genuine drop-off distance rather than a line gap.
-const FORWARD_COME_SHORT_PULLBACK: f32 = 120.0; // ~15m
+/// A central forward in the Progression phase pins the shoulder of the
+/// opponent's last outfield defender: he stands this far short of that
+/// defender's depth (about 1.5m), so he is on the line but not beyond it.
+/// Reasoned estimate (category d); the downstream offside hold clamp keeps
+/// him legal regardless.
+const FORWARD_LINE_SHOULDER_MARGIN: f32 = 12.0;
+/// A front-two strike pair splits the centre-backs: each striker takes a
+/// channel this far to his own side of the pitch's centre line (~9m), so
+/// the pair stands ~18m apart instead of shoulder to shoulder. The side
+/// comes from his formation slot (already mirrored per team and half);
+/// only the distance is set here. The 4-4-2 slot table alone puts the pair
+/// 15m apart, which after the anchor blend measured a median 8m with 17%
+/// of the time within 6m. Reasoned estimate (category d).
+const FRONT_TWO_CHANNEL_OFFSET: f32 = 72.0;
+/// Cap on how deep that shoulder target may go (distance from own goal):
+/// 120u (~15m) short of the opponent's goal line, so a very deep block
+/// does not send the striker into the six-yard box while the ball is
+/// still in the middle third. Reasoned estimate (category d).
+const FORWARD_LINE_MAX_DEPTH_FROM_GOAL_LINE: f32 = 120.0;
 
 /// How much a central player's lateral position stays anchored to his
 /// own formation slot vs. drifting toward the ball — anti-clustering by
@@ -265,20 +279,32 @@ struct Assignment {
     redirected: bool,
 }
 
-fn is_wide(pt: PlayerPositionType) -> bool {
-    matches!(
-        pt,
-        PlayerPositionType::DefenderLeft
-            | PlayerPositionType::DefenderRight
-            | PlayerPositionType::MidfielderLeft
-            | PlayerPositionType::MidfielderRight
-            | PlayerPositionType::AttackingMidfielderLeft
-            | PlayerPositionType::AttackingMidfielderRight
-            | PlayerPositionType::WingbackLeft
-            | PlayerPositionType::WingbackRight
-            | PlayerPositionType::ForwardLeft
-            | PlayerPositionType::ForwardRight
-    )
+/// Whether a position tag denotes a genuinely wide player under the
+/// team's formation. The defender/midfielder/wingback tags are wide in
+/// every formation this engine fields. `ForwardLeft`/`ForwardRight` are
+/// the one ambiguous pair: the position enum has no "central striker
+/// beside a strike partner" variant, so in a front-two formation (4-4-2,
+/// 3-5-2) the two tags name the two central strikers, not wingers, while
+/// in a formation with a central forward between them (4-3-3) they are
+/// genuine wide forwards. `front_two` is read from the formation's own
+/// position table (a measurement), never from a hardcoded tactic list.
+/// Bug A of `docs/box-attack-from-null.md`: without this the 4-4-2
+/// strikers spent ~90% of attacking time on touchline targets.
+fn is_wide(pt: PlayerPositionType, front_two: bool) -> bool {
+    match pt {
+        PlayerPositionType::ForwardLeft | PlayerPositionType::ForwardRight => !front_two,
+        _ => matches!(
+            pt,
+            PlayerPositionType::DefenderLeft
+                | PlayerPositionType::DefenderRight
+                | PlayerPositionType::MidfielderLeft
+                | PlayerPositionType::MidfielderRight
+                | PlayerPositionType::AttackingMidfielderLeft
+                | PlayerPositionType::AttackingMidfielderRight
+                | PlayerPositionType::WingbackLeft
+                | PlayerPositionType::WingbackRight
+        ),
+    }
 }
 
 fn is_left_flank(pt: PlayerPositionType) -> bool {
@@ -406,6 +432,13 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         .filter(|c| c.team_id != carrier.team_id)
         .map(|c| c.position)
         .collect();
+    // Depth (distance from our own goal, along the attack direction) of
+    // the opponent's last OUTFIELD defender -- the line a striker pins.
+    let opp_last_line_depth: Option<f32> = cands
+        .iter()
+        .filter(|c| c.team_id != carrier.team_id && c.position_group != PlayerFieldPositionGroup::Goalkeeper)
+        .map(|c| (c.position.x - own_goal.x) * attack_dir)
+        .fold(None, |acc: Option<f32>, d| Some(acc.map_or(d, |a| a.max(d))));
     let nearest_opp_dist = |p: Vector3<f32>| -> f32 {
         opponents
             .iter()
@@ -479,9 +512,16 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     // --- Step C: width -- any remaining wide-slotted player holds the
     // flank, at a depth keyed to role + current phase (`width_depth`).
     let target_x_from_depth = |depth: f32| own_goal.x + attack_dir * depth;
+    let team_tactic = if carrier.team_id == context.field_home_team_id {
+        context.starting_home_tactic
+    } else {
+        context.starting_away_tactic
+    }
+    .unwrap_or(MatchTacticType::T442);
+    let front_two = is_front_two_tactic(team_tactic);
     let wide_cands: Vec<Cand> = pool
         .iter()
-        .filter(|c| !assigned.contains(&c.id) && is_wide(c.position_type))
+        .filter(|c| !assigned.contains(&c.id) && is_wide(c.position_type, front_two))
         .copied()
         .collect();
     let field_height = context.field_size.height as f32;
@@ -546,39 +586,45 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     let mut pocket_occupancy = [0i32, 0i32]; // [left, right]
 
     for c in pool.iter().filter(|c| !assigned.contains(&c.id)) {
-        let y = c.start_position.y * (1.0 - ADVANCE_WIDTH_PULL) + field.ball.position.y * ADVANCE_WIDTH_PULL;
+        let anchor_y = if front_two
+            && c.position_group == PlayerFieldPositionGroup::Forward
+            && (c.start_position.y - field_height / 2.0).abs() > 1.0
+        {
+            field_height / 2.0
+                + (c.start_position.y - field_height / 2.0).signum() * FRONT_TWO_CHANNEL_OFFSET
+        } else {
+            c.start_position.y
+        };
+        let y = anchor_y * (1.0 - ADVANCE_WIDTH_PULL) + field.ball.position.y * ADVANCE_WIDTH_PULL;
 
-        // Step 2's forward-specific choice: during Progression, a
-        // forward chooses between coming short to combine or making a
-        // run in behind, based on whether genuine space exists -- not a
-        // fixed formula depth. Every other player/phase combination
-        // uses the flat per-role, per-phase `advance_depth` table.
+        // A forward in the Progression phase holds the highest central
+        // line (`advance_depth`) and runs in behind when there is genuine
+        // space beyond the last defender. Being marked is NOT a reason to
+        // leave the line: a striker on the last line is always within a
+        // few metres of a centre-back — that is the job, not a sign he
+        // should drop. (The earlier "covered, so come short 15m" branch
+        // only looked healthy while the 4-4-2 strikers were mis-tagged as
+        // wingers and stood unmarked on the touchline; once Bug A put
+        // them in the middle it fired almost permanently — striker mean
+        // depth 382u vs 558-606u, ball never left the middle third, 0.03
+        // shots per match. Measured 2026-09-26.) A striker checking short
+        // to link play is a separate decision, not a default.
         let (mut target, mut duty) = if c.position_group == PlayerFieldPositionGroup::Forward
             && matches!(phase, Phase::Progression)
         {
-            let base_depth = advance_depth(PlayerFieldPositionGroup::Forward, phase);
-            let candidate = Vector3::new(target_x_from_depth(base_depth), y, 0.0);
-            if nearest_opp_dist(candidate) > PENETRATION_OPEN_THRESHOLD {
-                // Genuine space beyond the last defender -- commit to
-                // the run in behind.
-                let to_goal = opponent_goal - candidate;
-                let dist = to_goal.magnitude();
-                let pushed = if dist > 1.0 {
-                    candidate + (to_goal / dist) * PENETRATION_PUSH
-                } else {
-                    candidate
-                };
-                (pushed, AttackDuty::Penetrate)
-            } else {
-                // Marked/covered -- come short to offer a foot pass
-                // instead of holding a line position a defender already
-                // has covered.
-                let come_short_depth = (base_depth - FORWARD_COME_SHORT_PULLBACK).max(0.0);
-                (
-                    Vector3::new(target_x_from_depth(come_short_depth), y, 0.0),
-                    AttackDuty::Advance,
-                )
-            }
+            // On the shoulder of the opponent's last outfield defender
+            // (never shallower than the table's own Progression depth,
+            // never deeper than the cap). Being marked does not move him:
+            // a striker on the last line is always near a centre-back.
+            let table_depth = advance_depth(PlayerFieldPositionGroup::Forward, phase);
+            let pitch_len = (opponent_goal.x - own_goal.x).abs();
+            let cap = pitch_len - FORWARD_LINE_MAX_DEPTH_FROM_GOAL_LINE;
+            let depth = opp_last_line_depth
+                .map(|d| d - FORWARD_LINE_SHOULDER_MARGIN)
+                .unwrap_or(table_depth)
+                .max(table_depth)
+                .min(cap.max(table_depth));
+            (Vector3::new(target_x_from_depth(depth), y, 0.0), AttackDuty::Advance)
         } else {
             let depth = advance_depth(c.position_group, phase);
             (Vector3::new(target_x_from_depth(depth), y, 0.0), AttackDuty::Advance)

@@ -42,7 +42,7 @@ pub(crate) enum Side {
 /// touchline by every `flank_side` consumer (Step 1's `shape_rules`,
 /// Step 2's stretch-credit, and the width-hold override), plausibly
 /// explaining the goals/match drop found while re-verifying the override.
-fn is_front_two_tactic(tactic: MatchTacticType) -> bool {
+pub(crate) fn is_front_two_tactic(tactic: MatchTacticType) -> bool {
     let Some((_, positions)) = TACTICS_POSITIONS.iter().find(|(t, _)| *t == tactic) else {
         return false;
     };
