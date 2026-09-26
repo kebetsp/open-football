@@ -168,7 +168,10 @@ fn advance_depth(group: PlayerFieldPositionGroup, phase: Phase) -> f32 {
         // box anti-crowding redirect (below) then refines.
         (PlayerFieldPositionGroup::Forward, Phase::BuildUp) => 460.0,
         (PlayerFieldPositionGroup::Forward, Phase::Progression) => 480.0,
-        (PlayerFieldPositionGroup::Forward, Phase::Final) => 660.0,
+        // Link position: ~30m from the goal line (real centre-forwards take
+        // 56% of their final-third touches at 25-36m). The box is entered
+        // by the box-run plan only while a delivery is on.
+        (PlayerFieldPositionGroup::Forward, Phase::Final) => 600.0,
         _ => 400.0,
     }
 }

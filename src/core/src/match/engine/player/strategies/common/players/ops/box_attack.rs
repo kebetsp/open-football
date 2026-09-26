@@ -138,6 +138,22 @@ const TAKE_ON_SUCCESS: f32 = 0.527;
 /// A carry or take-on delays the chance and keeps the ball at some risk
 /// (estimate).
 const CARRY_DISCOUNT: f32 = 0.9;
+/// Extra value of KEEPING the ball, beyond the xG of this possession: a
+/// retained possession also pays off in later possessions (territory,
+/// no counter-attack), which the per-possession continuation value cannot
+/// show. A shot spends the possession, so it gets none. Calibrated, not
+/// measured: chosen so that the share of real centre-forward receptions
+/// that end in a shot by shot quality (StatsBomb: 1% below 0.02 xG, 9% at
+/// 0.02-0.04, 21% at 0.04-0.07, 28% at 0.07-0.12, 57% above 0.12) is
+/// reproduced — see docs/box-attack-from-null.md.
+const RETAIN_BONUS: f32 = 0.03;
+/// A carrier with a defender at his shoulder loses the ball far more often
+/// than one in space (real forwards lose 20-26% of final-third receptions
+/// but take a defender on in only ~4%). Success of a carry is scaled down
+/// by up to this fraction when the nearest opponent is on top of him
+/// (fading out by 3m). Calibrated, not measured.
+const CARRY_PRESSURE_LOSS: f32 = 0.35;
+const CARRY_PRESSURE_RANGE_M: f32 = 3.0;
 /// Standing still with the ball is worth almost nothing (estimate).
 const HOLD_VALUE: f32 = 0.004;
 /// A passer who just received from a teammate rarely returns it at once
@@ -211,6 +227,15 @@ fn zone_point(zone: BoxZone, goal: Vector3<f32>, inward: f32, near_sign: f32) ->
 /// is beyond 29m (hysteresis so the plan does not flicker at the line).
 const RUN_TRIGGER_DEPTH: f32 = 200.0;
 const RUN_RELEASE_DEPTH: f32 = 232.0;
+/// Runs also need the carrier to be in a crossing position — wide enough
+/// that a delivery is a live option (>= 12.5m off the centre line to
+/// start, released below 8.75m). With a central carrier the strikers stay
+/// out as link players: real centre-forwards receive 56% of their
+/// final-third touches at 25-36m from goal and only 27% in the box
+/// (StatsBomb), and after a reception shoot 13% / pass back 26% / pass
+/// sideways 15% / pass forward 19%.
+const RUN_TRIGGER_LATERAL: f32 = 100.0;
+const RUN_RELEASE_LATERAL: f32 = 70.0;
 /// Bonus (units) for keeping a runner in the zone he already had.
 const STICKY_BONUS: f32 = 60.0;
 /// A runner nudges his point to the local gap: candidate offsets.
@@ -229,9 +254,11 @@ pub fn plan_box_runs(
     opponents_outfield: &[Vector3<f32>],
 ) -> Vec<(u32, Vector3<f32>)> {
     let carrier_depth = (goal.x - carrier_pos.x).abs();
+    let carrier_lateral = (carrier_pos.y - goal.y).abs();
     let was_active = context.box_plan[side_index].active;
     let threshold = if was_active { RUN_RELEASE_DEPTH } else { RUN_TRIGGER_DEPTH };
-    if carrier_depth > threshold {
+    let lat_threshold = if was_active { RUN_RELEASE_LATERAL } else { RUN_TRIGGER_LATERAL };
+    if carrier_depth > threshold || carrier_lateral < lat_threshold {
         context.box_plan[side_index] = BoxPlan::default();
         return Vec::new();
     }
@@ -331,6 +358,8 @@ pub fn decide_final_third(
     let mut best_value = HOLD_VALUE;
     let (mut d_shoot, mut d_deliver, mut d_pass, mut d_carry, mut d_take) =
         (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    let (mut d_pf, mut d_pl, mut d_pb) = (0.0f32, 0.0f32, 0.0f32);
+    let toward = (goal.x - from.x).signum();
 
     // Shoot.
     if (goal - from).magnitude() <= SHOT_MAX_RANGE {
@@ -390,11 +419,13 @@ pub fn decide_final_third(
             };
             p_c = p_c.min(cap);
         }
-        let mut v = p_c * chance_at(tm.position, goal, opponents);
+        let mut v = p_c * (chance_at(tm.position, goal, opponents) + RETAIN_BONUS);
         if ctx.tick_context.ball.last_owner == Some(tm.id) {
             v *= BACK_TO_PASSER_MULT;
         }
         d_pass = d_pass.max(v);
+        let dxg = (tm.position.x - from.x) * toward;
+        if dxg > 24.0 { d_pf = d_pf.max(v) } else if dxg < -24.0 { d_pb = d_pb.max(v) } else { d_pl = d_pl.max(v) }
         if v > best_value {
             best_value = v;
             best = Action::Pass(tm.id);
@@ -409,6 +440,8 @@ pub fn decide_final_third(
     } else {
         Vector3::new(1.0, 0.0, 0.0)
     };
+    let opp_m = nearest_opponent_dist(from, opponents) / UNITS_PER_METRE;
+    let press_keep = 1.0 - CARRY_PRESSURE_LOSS * (1.0 - opp_m / CARRY_PRESSURE_RANGE_M).clamp(0.0, 1.0);
     let half = CARRY_FAN_HALF_DEG.to_radians();
     for i in 0..CARRY_HEADINGS {
         let t = i as f32 / (CARRY_HEADINGS - 1) as f32;
@@ -423,7 +456,7 @@ pub fn decide_final_third(
         // from ~0.95 with room to the sourced 0.527 with none.
         let room = openness(target, opponents);
         let p_keep = 0.95 * (open / CARRY_STEP).min(1.0) * (TAKE_ON_SUCCESS + (1.0 - TAKE_ON_SUCCESS) * room);
-        let v = CARRY_DISCOUNT * p_keep * chance_at(target, goal, opponents);
+        let v = CARRY_DISCOUNT * p_keep * press_keep * (chance_at(target, goal, opponents) + RETAIN_BONUS);
         d_carry = d_carry.max(v);
         if v > best_value {
             best_value = v;
@@ -436,7 +469,7 @@ pub fn decide_final_third(
         let beyond = blocker.position + forward * 30.0;
         let skill = (ctx.player.skills.technical.dribbling / 20.0).clamp(0.0, 1.0);
         let p_beat = TAKE_ON_SUCCESS * (0.7 + 0.6 * skill);
-        let v = CARRY_DISCOUNT * p_beat * chance_at(beyond, goal, opponents);
+        let v = CARRY_DISCOUNT * p_beat * press_keep * (chance_at(beyond, goal, opponents) + RETAIN_BONUS);
         d_take = v;
         if v > best_value {
             let lateral = Vector3::new(-forward.y, forward.x, 0.0);
@@ -447,7 +480,7 @@ pub fn decide_final_third(
 
     #[cfg(feature = "match-logs")]
     crate::match_log_info!(
-        "BOXDIAG id={} lat_m={:.1} depth_m={:.1} plan={} runners={} shoot={:.3} deliver={:.3} pass={:.3} carry={:.3} take={:.3} chose={}",
+        "BOXDIAG id={} lat_m={:.1} depth_m={:.1} plan={} runners={} shoot={:.3} deliver={:.3} pass={:.3} carry={:.3} take={:.3} pf={:.3} pl={:.3} pb={:.3} opp_m={:.1} chose={}",
         ctx.player.id,
         (from.y - goal.y).abs() / UNITS_PER_METRE,
         (goal.x - from.x).abs() / UNITS_PER_METRE,
@@ -458,6 +491,10 @@ pub fn decide_final_third(
         d_pass,
         d_carry,
         d_take,
+        d_pf,
+        d_pl,
+        d_pb,
+        nearest_opponent_dist(from, opponents) / UNITS_PER_METRE,
         match best {
             Action::Shoot => "shoot",
             Action::Deliver { .. } => "deliver",
