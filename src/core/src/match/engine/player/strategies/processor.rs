@@ -303,6 +303,19 @@ impl<'p> StateProcessor<'p> {
         let processing_ctx = self.into_ctx();
         let mut result = StateProcessingResult::new();
 
+        // Temporary diagnostic (2026-09-26): sample `is_control_ball` for
+        // one outfielder per team so it can be joined to the team-level
+        // definitions logged as POSSD in run.rs.
+        #[cfg(feature = "match-logs")]
+        if player_id == 105 || player_id == 205 {
+            crate::match_log_info!(
+                "POSSD_D t={} team={} ctrl={}",
+                processing_ctx.context.total_match_time,
+                processing_ctx.player.team_id,
+                processing_ctx.team().is_control_ball()
+            );
+        }
+
         if let Some(velocity) = handler.velocity(&processing_ctx) {
             // Apply coach tempo multiplier to all player movement
             let tempo = processing_ctx.team().coach_instruction().tempo_multiplier();

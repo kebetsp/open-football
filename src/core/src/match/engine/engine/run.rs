@@ -2358,6 +2358,44 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 raw_owner
                     .and_then(|id| field.players.iter().find(|p| p.id == id).map(|p| p.team_id))
             };
+            // Temporary diagnostic (2026-09-26): every team-level
+            // definition of "who has the ball" side by side.
+            #[cfg(feature = "match-logs")]
+            {
+                let team_of = |id: Option<u32>| -> Option<u32> {
+                    id.and_then(|i| field.players.iter().find(|p| p.id == i).map(|p| p.team_id))
+                };
+                let a_chain = team_of(
+                    field
+                        .ball
+                        .current_owner
+                        .or(field.ball.pending_pass_passer)
+                        .or(field.ball.previous_owner)
+                        .or_else(|| field.ball.possessing_touch()),
+                );
+                let b_tactical = if context.tactical_home.in_possession {
+                    Some(field.home_team_id)
+                } else if context.tactical_away.in_possession {
+                    Some(field.away_team_id)
+                } else {
+                    None
+                };
+                match_log_info!(
+                    "POSSD t={} home={} A={:?} B={:?} C={:?} owner={:?} passer={:?} prev={:?} lt_team={:?} lt_ctrl={} speed={:.2} dead={}",
+                    context.total_match_time,
+                    field.home_team_id,
+                    a_chain,
+                    b_tactical,
+                    current_owner_team,
+                    team_of(field.ball.current_owner),
+                    team_of(field.ball.pending_pass_passer),
+                    team_of(field.ball.previous_owner),
+                    field.ball.last_touch_team_id,
+                    field.ball.last_touch_was_controlled,
+                    field.ball.velocity.norm(),
+                    context.total_match_time < context.dead_ball_until_ms
+                );
+            }
             // Shape rules: first active rule wins; no active rule reverts
             // to the captured base. Ball-lane triggers are side-corrected
             // so "left" is always the manager's left wing.
