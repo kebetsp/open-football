@@ -404,6 +404,7 @@ fn pass_value(
     own_goal: Vector3<f32>,
     attacking_goal: Vector3<f32>,
     opponents: &[MatchPlayerLite],
+    carrier_open_frac: f32,
 ) -> f32 {
     let to = teammate.position;
     let prog = progress(from, to, attacking_goal);
@@ -419,8 +420,54 @@ fn pass_value(
     if ctx.tick_context.ball.last_owner == Some(teammate.id) && prog < PASS_BACK_PROGRESS_EXEMPT {
         value -= PASS_BACK_TO_PASSER_PENALTY;
     }
+    // Pavel's own third case, verbatim: "if you have a lot of empty space
+    // ahead, but there is another player running more centrally with
+    // approximately the same amount of empty space — pass to him." A
+    // genuine comparison against the CARRIER's own best open lane
+    // (`carrier_open_frac`, computed once by the caller from the same
+    // `open_distance_in_heading` measurement `carry_value` itself uses —
+    // reused, not re-derived), not an isolated per-teammate threshold.
+    // Only credited when the teammate is CLEARLY, not marginally, more
+    // open (`MORE_OPEN_TEAMMATE_MARGIN`) — the conflict check's own
+    // flagged ambiguity: a near-tie favours the carrier's own agency, a
+    // real gap favours involving the free man, per real football's
+    // "keep it simple, find the free man" default.
+    let teammate_forward = {
+        let d = attacking_goal - to;
+        if d.magnitude() > 1.0 {
+            let n = d.normalize();
+            Vector3::new(n.x, n.y, 0.0)
+        } else {
+            Vector3::new(1.0, 0.0, 0.0)
+        }
+    };
+    let teammate_open_frac =
+        (open_distance_in_heading(to, teammate_forward, opponents) / CARRY_LOOKAHEAD).clamp(0.0, 1.0);
+    if teammate_open_frac > carrier_open_frac + MORE_OPEN_TEAMMATE_MARGIN {
+        let bonus = MORE_OPEN_TEAMMATE_WEIGHT * (teammate_open_frac - carrier_open_frac);
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!(
+            "MOREOPENDIAG carrier_open={:.2} teammate_open={:.2} bonus={:.3} value={:.3}",
+            carrier_open_frac,
+            teammate_open_frac,
+            bonus,
+            value + bonus
+        );
+        value += bonus;
+    }
     value
 }
+
+/// Minimum openness margin (as a fraction of `CARRY_LOOKAHEAD`) before a
+/// teammate's own space counts as "clearly," not just marginally, more
+/// open than the carrier's — ~5m of extra clear running room. Category
+/// (d), a reasoned estimate — see `pass_value`'s own doc comment for the
+/// football reasoning behind requiring a real gap, not a bare tie.
+const MORE_OPEN_TEAMMATE_MARGIN: f32 = 0.20;
+/// Weight on the more-open-teammate bonus once the margin above is
+/// cleared — comparable in magnitude to `LINE_PRIORITY_BONUS`, a genuine
+/// nudge toward the free man, not an override of every other term.
+const MORE_OPEN_TEAMMATE_WEIGHT: f32 = 0.35;
 
 /// How far the player could advance in `heading` before the nearest
 /// opponent's own realistic reach into that lane would contest it,
@@ -724,12 +771,20 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
         }
     }
 
+    // The carrier's own best open lane right now — computed once here so
+    // `pass_value`'s "is a teammate CLEARLY more open than me" comparison
+    // (Pavel's own third case) measures against the same real geometry
+    // `carry_value` itself scores below, not a separately re-derived
+    // approximation of it.
+    let carrier_open_frac =
+        (carry_best_heading(from, forward, &opponents).1 / CARRY_LOOKAHEAD).clamp(0.0, 1.0);
+
     for tm in ctx.players().teammates().nearby(PASS_MAX_RANGE) {
         let dist = (tm.position - from).magnitude();
         if dist < 5.0 {
             continue;
         }
-        let v = pass_value(ctx, from, &tm, own_goal, attacking_goal, &opponents);
+        let v = pass_value(ctx, from, &tm, own_goal, attacking_goal, &opponents, carrier_open_frac);
         if v > best_value {
             best_value = v;
             best_action = Action::Pass(tm.id);

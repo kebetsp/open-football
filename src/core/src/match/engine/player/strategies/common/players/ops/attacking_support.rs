@@ -80,9 +80,7 @@ use crate::r#match::player::strategies::common::players::ops::on_ball_decision::
 use crate::r#match::player::strategies::common::players::ops::box_attack::{
     RunCandidate, plan_box_runs,
 };
-use crate::r#match::player::strategies::common::players::ops::off_ball_runs::{
-    RELAY_RADIUS, RunnerInput, plan_runs,
-};
+use crate::r#match::player::strategies::common::players::ops::off_ball_runs::{RunnerInput, plan_runs};
 use crate::r#match::player::strategies::common::spacing::is_front_two_tactic;
 use crate::r#match::{MatchContext, MatchField, MatchPlayerLite, PlayerSide};
 use crate::MatchTacticType;
@@ -275,10 +273,6 @@ struct Cand {
     start_position: Vector3<f32>,
     side: Option<PlayerSide>,
     is_directed: bool,
-    /// Real, condition-adjusted top speed — used both for our own
-    /// runners' arrival timing and for opponents' own timing (the off-
-    /// ball run planner, `off_ball_runs.rs`, needs it for both).
-    max_speed: f32,
 }
 
 struct Assignment {
@@ -443,7 +437,6 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
             is_directed: p.behavioral_directive.is_some()
                 || p.link_target.is_some()
                 || p.supply_target.is_some(),
-            max_speed: p.skills.max_speed_with_condition(p.player_attributes.condition),
         })
         .collect();
 
@@ -482,6 +475,8 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     // Recomputed fresh every tick from the ball's real position.
     let ball_dist_to_own_goal = (field.ball.position - own_goal).magnitude();
     let phase = phase_for(ball_dist_to_own_goal);
+    #[cfg(feature = "match-logs")]
+    crate::match_log_info!("PHASEDIAG t={} phase={:?} own_goal_dist={:.1}", context.total_match_time, phase, ball_dist_to_own_goal);
 
     let opponents: Vec<Vector3<f32>> = cands
         .iter()
@@ -642,21 +637,6 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
                 tactical_positions: c.position_type,
             })
             .collect();
-        let opponents_speed: Vec<(Vector3<f32>, f32)> = cands
-            .iter()
-            .filter(|c| c.team_id != carrier.team_id)
-            .map(|c| (c.position, c.max_speed))
-            .collect();
-        // A genuine relay: a teammate close enough to the carrier that he
-        // could realistically take a short ball and find a further-range
-        // target himself ("teammates may find that passing line after
-        // another small pass, or dribbling"). Excludes the carrier
-        // himself (already excluded from `pool`).
-        let relays: Vec<Vector3<f32>> = pool
-            .iter()
-            .filter(|c| (c.position - carrier.position).magnitude() <= RELAY_RADIUS)
-            .map(|c| c.position)
-            .collect();
         let run_field_height = context.field_size.height as f32;
         let runner_inputs: Vec<RunnerInput> = pool
             .iter()
@@ -670,7 +650,6 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
                     id: c.id,
                     position: c.position,
                     start_position: c.start_position,
-                    max_speed: c.max_speed,
                     is_wide: is_wide(c.position_type, front_two_early),
                     commit_ticks,
                     commit_target,
@@ -682,12 +661,10 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         let run_results = plan_runs(
             &runner_inputs,
             carrier.position,
-            &relays,
             own_goal,
             opponent_goal,
             attack_dir,
             &opponents_lite,
-            &opponents_speed,
             opp_last_line_depth,
             run_field_height,
         );

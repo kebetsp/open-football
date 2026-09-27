@@ -15,10 +15,41 @@
 //! should evaluate their chance for success, and avoid running if it is
 //! low. Otherwise, run." This module is that evaluation: several real
 //! candidate actions per runner, each valued as P(the carrier can
-//! realistically get the ball there) x (what the runner can do there once
-//! he has it) — reusing `box_attack::chance_at`, the exact same,
-//! already-sourced currency domain 4 already trusts for the identical
-//! question, rather than inventing a second one.
+//! realistically get the ball there) x (how genuinely open the
+//! destination itself is, `space_value`).
+//!
+//! **Rewritten 2026-09-27, twice, same day (`docs/winger-space-and-
+//! progressive-runs-fix-plan.md` §9 then §11).** The value was
+//! originally `reach x margin x box_attack::chance_at`. §9 fixed
+//! `chance_at` -> `space_value` (a run's worth is whether the
+//! DESTINATION is genuinely open, not whether the runner's own eventual
+//! shot/cross from there would score well — that's a separate, later
+//! decision) and softened the raw footrace clamp (`reach`/`margin`) into
+//! a sigmoid. Verified real, but Pavel watched the result and correctly
+//! said it made no visible difference — a further raw trace (21k+ real
+//! decisions, `docs/winger-space-and-progressive-runs-fix-plan.md`
+//! §11.2) found `reach`/`margin` were STILL the dominant reason `Hold`
+//! won ~97% of decisions even after `space_value` read correctly high
+//! for every genuine candidate: both ask "would this exact pass be
+//! deliverable, right now, from a standing start" — a defender is,
+//! geometrically, almost always closer to any real attacking-third
+//! target than an off-ball runner starting from a cold stop, so ANY
+//! footrace framing (hard clamp or smooth sigmoid alike) structurally
+//! disadvantages a genuine run relative to `Hold`'s free, no-travel-
+//! needed "race." Pavel's correction, verbatim: "You see the space, you
+//! use it. And that's it. As simple as can be... my old logic never had
+//! this reach/margin rubbish." **`reach_prob`/`timing_margin` and every
+//! constant/parameter that only fed them (`DIRECT_RANGE_FULL/ZERO`,
+//! `RELAY_DISCOUNT`, `RELAY_RADIUS`, `TIMING_SIGMOID_SCALE_TICKS`,
+//! the `relays`/`opponents_speed`/`max_speed` plumbing) are deleted
+//! outright, not left dead** — confirmed with Pavel directly rather than
+//! guessed at. The value is now `space_value(candidate) x (1 -
+//! staleness_penalty)` — nothing else. Whether the ball can actually get
+//! there at all is the CARRIER's own, separate, already-existing
+//! decision (`on_ball_decision.rs`'s `pass_value`/`Action::Through`,
+//! which independently checks progress/openness/risk before choosing to
+//! pass) — a run-planner shouldn't pre-judge that before the run has
+//! even developed.
 //!
 //! **What stays.** Domain 4's own box-zone assignment
 //! (`box_attack::plan_box_runs`, gated on the carrier being wide and
@@ -56,13 +87,12 @@
 //!
 //! Process check (`docs/decision-from-null.md`'s required self-audit):
 //! this module's call graph touches only raw position/skill data passed
-//! in by the caller, `box_attack::chance_at` (an already-sourced value
-//! function, not a decision), and `nalgebra::Vector3` geometry. No
-//! pre-existing decision function (old `ForwardCreatingSpaceState`,
+//! in by the caller and `nalgebra::Vector3` geometry (`space_value` is a
+//! plain nearest-opponent-distance measurement, a fact, not a judgment).
+//! No pre-existing decision function (old `ForwardCreatingSpaceState`,
 //! `MidfielderRunningState`'s off-ball branch, or any sibling) is called.
 
 use crate::r#match::player::AttackDuty;
-use crate::r#match::player::strategies::common::players::ops::box_attack::chance_at;
 use crate::r#match::MatchPlayerLite;
 use nalgebra::Vector3;
 
@@ -71,28 +101,30 @@ use nalgebra::Vector3;
 // hierarchy for this class of question). Flagged as a target for the raw-
 // trace verification pass, not treated as final.
 
-/// Real max range for a direct ball to a runner's chosen target — full
-/// credit up to here, fading to zero further out. ~25m at this engine's
-/// 8 units/metre scale.
-const DIRECT_RANGE_FULL: f32 = 200.0;
-/// Beyond this, a direct ball to the target isn't a realistic option at
-/// all. ~45m.
-const DIRECT_RANGE_ZERO: f32 = 360.0;
-/// A teammate within this of the carrier is a genuine relay option —
-/// Pavel's own framing: "teammates may find that passing line after
-/// another small pass, or dribbling, or something else." ~20m. The
-/// caller (`attacking_support.rs`) builds the `relays` list from this
-/// radius before calling `plan_runs` — kept `pub(crate)` so both sides
-/// use the exact same figure rather than risking two independently
-/// hand-typed copies drifting apart.
-pub(crate) const RELAY_RADIUS: f32 = 160.0;
-/// A relayed reach is discounted — a second action has to happen first
-/// before the ball can realistically arrive.
-const RELAY_DISCOUNT: f32 = 0.55;
-/// How far ahead of a real defender's own arrival a runner must be at his
-/// target to count as meaningfully, not just technically, open there.
-/// ~1.2s at this engine's 100-tick/s simulation rate.
-const ARRIVAL_MARGIN_TICKS: f32 = 40.0;
+/// Nearest-opponent distance at which a run's DESTINATION reads as
+/// "fully open" (space_value saturates at 1.0 beyond this) — the same
+/// real-world reference (~7.5m, enough room to receive and turn
+/// unpressured) `on_ball_decision.rs`'s own `OPEN_REFERENCE_DIST` uses
+/// for the identical question on the carrier's side of the ball. Kept as
+/// a separate local constant rather than importing that module's private
+/// one — same number, same reasoning, no cross-module coupling for a
+/// single shared magnitude.
+const SPACE_REFERENCE_DIST: f32 = 60.0;
+
+/// How genuinely open a candidate run TARGET is — nearest real opponent
+/// distance, normalised. This is the term that replaced `box_attack::
+/// chance_at` in `plan_runs`'s value formula (see this file's own header
+/// for why): a run's worth is whether the space is really there, not
+/// whether the runner's own shot/cross from that exact point would score
+/// well — that's a separate, later decision. No opponents in range at
+/// all reads as fully open.
+fn space_value(pt: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
+    let nearest = opponents.iter().map(|o| (o.position - pt).magnitude()).fold(f32::MAX, f32::min);
+    if nearest >= f32::MAX {
+        return 1.0;
+    }
+    (nearest / SPACE_REFERENCE_DIST).clamp(0.0, 1.0)
+}
 /// A frozen commitment's real duration — long enough for a run to
 /// actually develop, short enough that a stale one doesn't hang around
 /// once it plainly isn't paying off. ~2s.
@@ -144,57 +176,6 @@ const CHECK_SHORT_APPROACH: f32 = 0.5;
 /// the carrier's feet. ~15m.
 const CHECK_SHORT_MAX_CLOSE: f32 = 120.0;
 
-fn direct_reach_factor(dist: f32) -> f32 {
-    if dist <= DIRECT_RANGE_FULL {
-        1.0
-    } else if dist >= DIRECT_RANGE_ZERO {
-        0.0
-    } else {
-        1.0 - (dist - DIRECT_RANGE_FULL) / (DIRECT_RANGE_ZERO - DIRECT_RANGE_FULL)
-    }
-}
-
-/// P(the ball carrier can realistically get the ball to `target`) — a
-/// direct ball within realistic range, or, if a teammate genuinely close
-/// to the carrier could relay it on (`relays`, built by the caller from
-/// teammates within `RELAY_RADIUS` of the carrier), the (discounted)
-/// range from that relay instead. Deliberately NOT "is the passing lane
-/// open" — Pavel's own correction, verbatim: "not if the passing line is
-/// open but if the passing range is realistic."
-fn reach_prob(carrier_pos: Vector3<f32>, target: Vector3<f32>, relays: &[Vector3<f32>]) -> f32 {
-    let direct = direct_reach_factor((target - carrier_pos).magnitude());
-    let relayed = relays
-        .iter()
-        .map(|r| RELAY_DISCOUNT * direct_reach_factor((target - r).magnitude()))
-        .fold(0.0f32, f32::max);
-    direct.max(relayed)
-}
-
-/// How genuinely, meaningfully open the runner will be at `target` by the
-/// time he gets there, relative to the nearest real defender's own
-/// arrival — a real race in time, using each side's own condition-
-/// adjusted top speed (the caller already has this via
-/// `max_speed_with_condition`, the same measurement this engine's kept
-/// physics layer uses everywhere). No opponents in range at all reads as
-/// fully open.
-fn timing_margin(
-    from: Vector3<f32>,
-    target: Vector3<f32>,
-    my_speed: f32,
-    opponents_speed: &[(Vector3<f32>, f32)],
-) -> f32 {
-    let my_time = (target - from).magnitude() / my_speed.max(0.05);
-    let mut opp_time = f32::MAX;
-    for (pos, spd) in opponents_speed {
-        let t = (target - pos).magnitude() / spd.max(0.05);
-        opp_time = opp_time.min(t);
-    }
-    if opp_time >= f32::MAX {
-        return 1.0;
-    }
-    ((opp_time - my_time) / ARRIVAL_MARGIN_TICKS).clamp(0.0, 1.0)
-}
-
 /// The value of a candidate held near the runner's own current spot
 /// decays with dwell time without receiving the ball, so runs alternate
 /// instead of freezing on one candidate forever.
@@ -244,7 +225,6 @@ pub struct RunnerInput {
     pub id: u32,
     pub position: Vector3<f32>,
     pub start_position: Vector3<f32>,
-    pub max_speed: f32,
     /// True for a genuinely wide-tagged role (winger/wide midfielder, or
     /// a wide forward in a non-front-two formation) — only these get a
     /// byline candidate; a central forward/attacking midfielder does not.
@@ -346,12 +326,10 @@ fn duty_for(kind: RunKind) -> AttackDuty {
 pub fn plan_runs(
     runners: &[RunnerInput],
     carrier_pos: Vector3<f32>,
-    relays: &[Vector3<f32>],
     own_goal: Vector3<f32>,
     opponent_goal: Vector3<f32>,
     attack_dir: f32,
     opponents_lite: &[MatchPlayerLite],
-    opponents_speed: &[(Vector3<f32>, f32)],
     opp_last_line_depth: Option<f32>,
     field_height: f32,
 ) -> Vec<RunOutput> {
@@ -382,25 +360,71 @@ pub fn plan_runs(
             field_height,
         );
         let mut best: Option<(f32, RunKind, Vector3<f32>)> = None;
+        #[cfg(feature = "match-logs")]
+        let (mut hold_val, mut best_alt_val, mut best_alt_kind): (f32, f32, u8) = (0.0, 0.0, 255);
         for (kind, pt) in candidates {
             if kind == RunKind::InBehind && in_behind_count >= MAX_IN_BEHIND_RUNNERS {
+                #[cfg(feature = "match-logs")]
+                crate::match_log_info!("RUNREJECTDIAG id={} kind={} reason=maxinbehind", r.id, kind as u8);
                 continue;
             }
             if kind != RunKind::Hold
                 && (too_close_to_others(pt, &taken) || in_carrier_lane(pt, carrier_pos, opponent_goal))
             {
+                #[cfg(feature = "match-logs")]
+                crate::match_log_info!(
+                    "RUNREJECTDIAG id={} kind={} reason={}",
+                    r.id,
+                    kind as u8,
+                    if too_close_to_others(pt, &taken) { "tooclose" } else { "carrierlane" }
+                );
                 continue;
             }
-            let reach = reach_prob(carrier_pos, pt, relays);
-            let margin = timing_margin(r.position, pt, r.max_speed, opponents_speed);
-            let chance = chance_at(pt, opponent_goal, opponents_lite);
-            let mut value = reach * margin * chance;
-            value *= 1.0 - staleness_penalty(pt, r.position, r.stale_ticks);
+            let space = space_value(pt, opponents_lite);
+            let value = space * (1.0 - staleness_penalty(pt, r.position, r.stale_ticks));
+            #[cfg(feature = "match-logs")]
+            crate::match_log_info!(
+                "RUNCANDDIAG id={} kind={} space={:.4} val={:.4}",
+                r.id,
+                kind as u8,
+                space,
+                value
+            );
+            #[cfg(feature = "match-logs")]
+            if kind == RunKind::Hold {
+                hold_val = value;
+            } else if value > best_alt_val {
+                best_alt_val = value;
+                best_alt_kind = kind as u8;
+            }
             if best.is_none_or(|(bv, ..)| value > bv) {
                 best = Some((value, kind, pt));
             }
         }
-        let Some((_, kind, pt)) = best else { continue };
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!(
+            "HOLDVSALTDIAG id={} hold_val={:.4} best_alt_val={:.4} best_alt_kind={} gap={:.4}",
+            r.id,
+            hold_val,
+            best_alt_val,
+            best_alt_kind,
+            hold_val - best_alt_val
+        );
+        let Some((val, kind, pt)) = best else { continue };
+        #[cfg(feature = "match-logs")]
+        {
+            let nearest_opp = opponents_lite
+                .iter()
+                .map(|o| (o.position - r.position).magnitude())
+                .fold(f32::MAX, f32::min);
+            crate::match_log_info!(
+                "RUNWINDIAG id={} kind={} val={:.4} nearest_opp_to_runner={:.1}",
+                r.id,
+                kind as u8,
+                val,
+                nearest_opp
+            );
+        }
         if kind == RunKind::InBehind {
             in_behind_count += 1;
         }
