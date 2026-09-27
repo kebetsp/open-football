@@ -175,6 +175,12 @@ pub enum Action {
     /// Domain 4 (`box_attack.rs`): a pass to a runner aimed at his
     /// assigned box zone (a cross or cut-back), not at where he stands.
     Deliver { to: u32, target: Vector3<f32> },
+    /// Off-ball attacking runs, from null (`off_ball_runs.rs`): a pass
+    /// aimed at a teammate's frozen, committed run target (`.1`), not at
+    /// his current position — a real through ball, played into the
+    /// space he is running into rather than at his feet. The conflict
+    /// check's own item 5: "a run pays off only if he can play it."
+    Through { to: u32, target: Vector3<f32> },
 }
 
 /// Step A's gate: true when a manager-issued directive already governs
@@ -728,6 +734,30 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
             best_value = v;
             best_action = Action::Pass(tm.id);
         }
+        // Off-ball attacking runs, from null (`off_ball_runs.rs`): a
+        // genuine through ball into a teammate's frozen run target,
+        // valued on this domain's own progress/openness/risk currency
+        // (unchanged philosophy — `pass_value`'s own terms), just aimed
+        // at where he is running into instead of where he stands. Reads
+        // `ctx.tick_context.run_commitments` (a fresh-every-tick cache),
+        // NOT `ctx.context.players` — the latter is a one-time snapshot
+        // that never sees this field (see `GameTickContext::run_
+        // commitments`'s own doc comment for why).
+        if let Some(&(_, target)) = ctx.tick_context.run_commitments.get(&tm.id) {
+            if (target - from).magnitude() >= 5.0 {
+                let prog = progress(from, target, attacking_goal);
+                let open = openness(target, &opponents);
+                let risk = intercept_risk(ctx, from, target, &opponents);
+                let cost = turnover_cost(own_goal, target);
+                let tv = PASS_RETENTION_BASE + PASS_PROGRESS_WEIGHT * prog
+                    + PASS_OPENNESS_WEIGHT * open
+                    - PASS_RISK_WEIGHT * risk * cost;
+                if tv > best_value {
+                    best_value = tv;
+                    best_action = Action::Through { to: tm.id, target };
+                }
+            }
+        }
     }
 
     let (cv, ctarget) = carry_value(from, forward, own_goal, attacking_goal, &opponents, group);
@@ -762,6 +792,7 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
             Action::Clear => ("Clear", 0.0, 0.0),
             Action::Hold => ("Hold", 0.0, 0.0),
             Action::Deliver { to, .. } => ("Deliver", to as f32, 0.0),
+            Action::Through { to, .. } => ("Through", to as f32, 0.0),
         };
         crate::match_log_info!(
             "ONBALLACT t={} id={} group={:?} action={} value={:.3} own_goal_dist={:.1} tx={:.1} ty={:.1} fx={:.2} fy={:.2}",

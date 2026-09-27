@@ -2,12 +2,43 @@ use crate::r#match::{
     MatchField, MatchObjectsPositions, PassOriginRestart, ShotTarget, Space, SpatialGrid,
 };
 use nalgebra::Vector3;
+use std::collections::HashMap;
 
 pub struct GameTickContext {
     pub positions: MatchObjectsPositions,
     pub grid: SpatialGrid,
     pub ball: BallMetadata,
     pub space: Space,
+    /// Off-ball attacking runs, from null (`off_ball_runs.rs`):
+    /// `(id, (run_commit_ticks, run_commit_target))` for every player
+    /// with an active run commitment this tick. This exists ONLY because
+    /// `StateProcessingContext.context.players` (`MatchContext::players`,
+    /// a `MatchPlayerCollection`) is a ONE-TIME clone taken at
+    /// `from_squads` and never re-synced from `field.players` mid-match
+    /// (confirmed by reading `MatchPlayerCollection::from_squads` — no
+    /// other call site assigns `context.players` at all) — the exact,
+    /// already-documented trap this project's own history names
+    /// elsewhere ("goals credit via `cached_shot_target`, not memory").
+    /// A first cut of the through-ball option read
+    /// `ctx.context.players.by_id(tm.id).run_commit_ticks` and measured
+    /// a hard, structural zero (0/30 matches) for exactly this reason —
+    /// `assign_attacking_support` writes `run_commit_ticks`/
+    /// `run_commit_target` onto live `field.players`, which that stale
+    /// snapshot can never see. Every OTHER per-tick-dynamic field this
+    /// engine exposes to `StateProcessingContext` (`ball`, `positions`,
+    /// `grid`, `space`) is rebuilt fresh from `field` every tick for
+    /// exactly this reason — this follows the same, already-established
+    /// pattern rather than inventing a new one.
+    pub run_commitments: HashMap<u32, (u16, Vector3<f32>)>,
+}
+
+fn collect_run_commitments(field: &MatchField) -> HashMap<u32, (u16, Vector3<f32>)> {
+    field
+        .players
+        .iter()
+        .filter(|p| p.run_commit_ticks > 0)
+        .map(|p| (p.id, (p.run_commit_ticks, p.run_commit_target)))
+        .collect()
 }
 
 impl GameTickContext {
@@ -19,6 +50,7 @@ impl GameTickContext {
             positions: MatchObjectsPositions::from(field),
             grid,
             space: Space::from(field),
+            run_commitments: collect_run_commitments(field),
         }
     }
 
@@ -28,6 +60,7 @@ impl GameTickContext {
         self.positions.update(field);
         self.grid.update(field);
         self.space.update(field);
+        self.run_commitments = collect_run_commitments(field);
     }
 
     /// Cheaper refresh used during shot-flight light ticks where only

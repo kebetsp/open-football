@@ -80,8 +80,11 @@ use crate::r#match::player::strategies::common::players::ops::on_ball_decision::
 use crate::r#match::player::strategies::common::players::ops::box_attack::{
     RunCandidate, plan_box_runs,
 };
+use crate::r#match::player::strategies::common::players::ops::off_ball_runs::{
+    RELAY_RADIUS, RunnerInput, plan_runs,
+};
 use crate::r#match::player::strategies::common::spacing::is_front_two_tactic;
-use crate::r#match::{MatchContext, MatchField, PlayerSide};
+use crate::r#match::{MatchContext, MatchField, MatchPlayerLite, PlayerSide};
 use crate::MatchTacticType;
 use nalgebra::Vector3;
 
@@ -272,6 +275,10 @@ struct Cand {
     start_position: Vector3<f32>,
     side: Option<PlayerSide>,
     is_directed: bool,
+    /// Real, condition-adjusted top speed — used both for our own
+    /// runners' arrival timing and for opponents' own timing (the off-
+    /// ball run planner, `off_ball_runs.rs`, needs it for both).
+    max_speed: f32,
 }
 
 struct Assignment {
@@ -324,6 +331,28 @@ fn is_left_flank(pt: PlayerPositionType) -> bool {
     )
 }
 
+/// Eligible for `off_ball_runs.rs`'s run planner — forwards, wide
+/// midfielders, and attacking midfielders (Pavel's own list, verbatim:
+/// "forwards do not need to run into the box ONLY while the ball carrier
+/// is wide and within 25m... going deeper for wingers... it is a must").
+/// Deliberately excludes central midfielders, defenders, and full-backs/
+/// wingbacks — they keep this file's own flat `width_depth`/
+/// `advance_depth` tables at every phase, unchanged.
+fn is_runner_role(pt: PlayerPositionType) -> bool {
+    matches!(
+        pt,
+        PlayerPositionType::ForwardLeft
+            | PlayerPositionType::ForwardCenter
+            | PlayerPositionType::ForwardRight
+            | PlayerPositionType::Striker
+            | PlayerPositionType::MidfielderLeft
+            | PlayerPositionType::MidfielderRight
+            | PlayerPositionType::AttackingMidfielderLeft
+            | PlayerPositionType::AttackingMidfielderCenter
+            | PlayerPositionType::AttackingMidfielderRight
+    )
+}
+
 /// Entry point — called once per full tick from `game_tick_inner`,
 /// right after `assign_defensive_duties`. Resets every player's
 /// `ai_attack_duty` to `None` each call, then, when a team clearly
@@ -342,6 +371,26 @@ fn is_left_flank(pt: PlayerPositionType) -> bool {
 pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchContext) {
     for p in field.players.iter_mut() {
         p.ai_attack_duty = AttackDuty::None;
+    }
+
+    // Off-ball attacking runs, from null (`off_ball_runs.rs`,
+    // `docs/off-ball-runs-from-null.md`): decay/release the persistent
+    // run commitment and staleness counters, once per tick, for every
+    // player — the same "released the moment he actually receives the
+    // ball" idiom already proven by `width_commitment_ticks` (`run.rs`),
+    // done here instead since this function already runs exactly once
+    // per tick with full `&mut MatchField` access, so no separate
+    // `engine/run.rs` decay site is needed for this mechanism.
+    for p in field.players.iter_mut() {
+        if field.ball.current_owner == Some(p.id) {
+            p.run_commit_ticks = 0;
+            p.run_stale_ticks = 0;
+        } else {
+            if p.run_commit_ticks > 0 {
+                p.run_commit_ticks -= 1;
+            }
+            p.run_stale_ticks = p.run_stale_ticks.saturating_add(1);
+        }
     }
 
     // The genuine current owner OR, during an ordinary directed pass in
@@ -394,6 +443,7 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
             is_directed: p.behavioral_directive.is_some()
                 || p.link_target.is_some()
                 || p.supply_target.is_some(),
+            max_speed: p.skills.max_speed_with_condition(p.player_attributes.condition),
         })
         .collect();
 
@@ -568,6 +618,91 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         }
     } else {
         context.box_plan[side_index] = Default::default();
+    }
+
+    // --- Off-ball attacking runs, from null (`off_ball_runs.rs`,
+    // `docs/off-ball-runs-from-null.md`). Forwards, wide midfielders, and
+    // attacking midfielders (`is_runner_role`) not already claimed by
+    // domain 4's box-zone assignment above evaluate real candidate runs
+    // (in behind, an open flank pocket, a wide-deep byline run, or
+    // checking short to link play) during the Progression and Final
+    // phases -- the replacement for those roles' flat `width_depth`/
+    // `advance_depth` targets in those phases (Pavel's own report:
+    // forwards previously only entered the box while the carrier was
+    // "wide and within 25m of the goal line," nothing sensible happened
+    // otherwise). BuildUp is untouched -- these roles fall through to
+    // Step C/D below exactly as before, per the design doc's own scope.
+    if matches!(phase, Phase::Progression | Phase::Final) {
+        let opponents_lite: Vec<MatchPlayerLite> = cands
+            .iter()
+            .filter(|c| c.team_id != carrier.team_id)
+            .map(|c| MatchPlayerLite {
+                id: c.id,
+                position: c.position,
+                tactical_positions: c.position_type,
+            })
+            .collect();
+        let opponents_speed: Vec<(Vector3<f32>, f32)> = cands
+            .iter()
+            .filter(|c| c.team_id != carrier.team_id)
+            .map(|c| (c.position, c.max_speed))
+            .collect();
+        // A genuine relay: a teammate close enough to the carrier that he
+        // could realistically take a short ball and find a further-range
+        // target himself ("teammates may find that passing line after
+        // another small pass, or dribbling"). Excludes the carrier
+        // himself (already excluded from `pool`).
+        let relays: Vec<Vector3<f32>> = pool
+            .iter()
+            .filter(|c| (c.position - carrier.position).magnitude() <= RELAY_RADIUS)
+            .map(|c| c.position)
+            .collect();
+        let run_field_height = context.field_size.height as f32;
+        let runner_inputs: Vec<RunnerInput> = pool
+            .iter()
+            .filter(|c| !assigned.contains(&c.id) && is_runner_role(c.position_type))
+            .map(|c| {
+                let (commit_ticks, commit_target, commit_duty, stale_ticks) = field
+                    .get_player(c.id)
+                    .map(|p| (p.run_commit_ticks, p.run_commit_target, p.run_commit_duty, p.run_stale_ticks))
+                    .unwrap_or((0, Vector3::zeros(), AttackDuty::None, 0));
+                RunnerInput {
+                    id: c.id,
+                    position: c.position,
+                    start_position: c.start_position,
+                    max_speed: c.max_speed,
+                    is_wide: is_wide(c.position_type, front_two_early),
+                    commit_ticks,
+                    commit_target,
+                    commit_duty,
+                    stale_ticks,
+                }
+            })
+            .collect();
+        let run_results = plan_runs(
+            &runner_inputs,
+            carrier.position,
+            &relays,
+            own_goal,
+            opponent_goal,
+            attack_dir,
+            &opponents_lite,
+            &opponents_speed,
+            opp_last_line_depth,
+            run_field_height,
+        );
+        for r in run_results {
+            if r.rearm {
+                if let Some(idx) = field.player_index(r.id) {
+                    field.players[idx].run_commit_ticks =
+                        crate::r#match::player::strategies::common::players::ops::off_ball_runs::COMMIT_TICKS;
+                    field.players[idx].run_commit_target = r.target;
+                    field.players[idx].run_commit_duty = r.duty;
+                }
+            }
+            results.push(Assignment { id: r.id, duty: r.duty, target: r.target, redirected: false });
+            assigned.push(r.id);
+        }
     }
 
     // --- Step C: width -- any remaining wide-slotted player holds the

@@ -2197,9 +2197,11 @@ impl<'p> StateProcessor<'p> {
                     None => Some(Vector3::zeros()),
                 }
             }
-            Action::Shoot | Action::Pass(_) | Action::Clear | Action::Deliver { .. } => {
-                Some(Vector3::zeros())
-            }
+            Action::Shoot
+            | Action::Pass(_)
+            | Action::Clear
+            | Action::Deliver { .. }
+            | Action::Through { .. } => Some(Vector3::zeros()),
         }
     }
 
@@ -2281,6 +2283,27 @@ impl<'p> StateProcessor<'p> {
                     .with_to_player_id(to)
                     .with_pass_target(target)
                     .with_reason("BOX_DELIVER")
+                    .build(ctx);
+                let event = Event::PlayerEvent(PlayerEvent::PassTo(pass_ctx));
+                match role {
+                    Role::Defender => {
+                        StateChangeResult::with_defender_state_and_event(DefenderState::Running, event)
+                    }
+                    Role::Midfielder => StateChangeResult::with_midfielder_state_and_event(
+                        MidfielderState::Running,
+                        event,
+                    ),
+                    Role::Forward => {
+                        StateChangeResult::with_forward_state_and_event(ForwardState::Running, event)
+                    }
+                }
+            }
+            Action::Through { to, target } => {
+                let pass_ctx = PassingEventContext::new()
+                    .with_from_player_id(ctx.player.id)
+                    .with_to_player_id(to)
+                    .with_pass_target(target)
+                    .with_reason("THROUGH_BALL")
                     .build(ctx);
                 let event = Event::PlayerEvent(PlayerEvent::PassTo(pass_ctx));
                 match role {
@@ -2424,6 +2447,11 @@ impl<'p> StateProcessor<'p> {
                 StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
             }
             (AttackDuty::Receive, _) => StateChangeResult::with_forward_state(ForwardState::CreatingSpace),
+            (AttackDuty::Run, 0) => StateChangeResult::with_defender_state(DefenderState::PushingUp),
+            (AttackDuty::Run, 1) => {
+                StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
+            }
+            (AttackDuty::Run, _) => StateChangeResult::with_forward_state(ForwardState::CreatingSpace),
             (AttackDuty::None, _) => unreachable!("gated above"),
         })
     }

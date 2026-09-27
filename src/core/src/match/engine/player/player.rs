@@ -305,6 +305,17 @@ pub enum AttackDuty {
     /// retracts so the pass lands short... the opponent came into the
     /// space between them and took the ball."
     Receive,
+    /// Off-ball attacking runs, from null
+    /// (`docs/off-ball-runs-from-null.md`, `off_ball_runs.rs`): a
+    /// forward/winger/attacking-midfielder committed to one of a real
+    /// candidate run (in-behind, an open flank pocket, a wide-deep
+    /// byline run, or checking short to link play) during the
+    /// Progression/Final phases of our own possession — the replacement
+    /// for those roles' flat `Width`/`Advance`/`Penetrate` targets in
+    /// those phases. `BoxRun` stays the separate, existing duty for
+    /// domain 4's own penalty-area zone assignment; this covers
+    /// everything short of that.
+    Run,
 }
 
 #[derive(Debug, Clone)]
@@ -401,6 +412,26 @@ pub struct MatchPlayer {
     pub ai_attack_duty: AttackDuty,
     /// Where this tick's `ai_attack_duty` says to stand.
     pub ai_attack_target: Vector3<f32>,
+    /// Off-ball attacking runs, from null
+    /// (`docs/off-ball-runs-from-null.md`). Ticks remaining on a frozen
+    /// run commitment (0 = inactive) — the same "freeze the target,
+    /// don't re-derive it every tick" idiom already proven by
+    /// `byline_commitment_ticks`/`give_and_go_run_ticks`. While active,
+    /// `assign_attacking_support` reuses `run_commit_target`/
+    /// `run_commit_duty` unchanged instead of re-evaluating candidates;
+    /// decremented once per tick and released the instant this player
+    /// actually receives the ball (`engine/run.rs` mirrors every other
+    /// commitment's own decay site, and `off_ball_runs.rs` reads it as
+    /// the "already claimed this run" fact when planning teammates).
+    pub run_commit_ticks: u16,
+    pub run_commit_target: Vector3<f32>,
+    pub run_commit_duty: AttackDuty,
+    /// Consecutive ticks since this player last had the ball — the
+    /// staleness input that makes the value of a spot he already holds
+    /// decay over time, so runs alternate (check short, run in behind,
+    /// byline, back) instead of freezing on one spot forever. Resets to
+    /// 0 the instant he receives the ball.
+    pub run_stale_ticks: u16,
     /// Cross-player attacking trigger: when teammate `.0` has the ball,
     /// this player's effective directive becomes `.1` (evaluated per
     /// possession change in the engine loop).
@@ -957,6 +988,10 @@ impl MatchPlayer {
             ai_defensive_engage: false,
             ai_attack_duty: AttackDuty::None,
             ai_attack_target: Vector3::zeros(),
+            run_commit_ticks: 0,
+            run_commit_target: Vector3::zeros(),
+            run_commit_duty: AttackDuty::None,
+            run_stale_ticks: 0,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
@@ -1074,6 +1109,10 @@ impl MatchPlayer {
             ai_defensive_engage: false,
             ai_attack_duty: AttackDuty::None,
             ai_attack_target: Vector3::zeros(),
+            run_commit_ticks: 0,
+            run_commit_target: Vector3::zeros(),
+            run_commit_duty: AttackDuty::None,
+            run_stale_ticks: 0,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,

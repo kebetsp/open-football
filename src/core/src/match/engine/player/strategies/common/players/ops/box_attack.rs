@@ -336,7 +336,14 @@ fn in_crossing_area(point: Vector3<f32>, goal: Vector3<f32>) -> bool {
 /// Value of possessing the ball at `point` for a player who will act on it:
 /// his own shot, a typical delivery if he is in a crossing position, or
 /// carrying the possession on (`continuation`) — the best of the three.
-fn chance_at(point: Vector3<f32>, goal: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
+///
+/// `pub(crate)` (2026-09-27) so `off_ball_runs.rs` (domain 3.5's off-ball
+/// run planner) can reuse this exact, already-sourced value function to
+/// answer "what can a runner do once he's at this target" instead of
+/// building a second, competing currency for the same question — the
+/// same reuse discipline this module's own header already establishes
+/// for domain 2's geometry helpers.
+pub(crate) fn chance_at(point: Vector3<f32>, goal: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
     let shoot = RECV_SHOT_FACTOR * shot_xg(point, goal, opponents);
     let cross = if in_crossing_area(point, goal) {
         CROSS_TYPICAL_EV * openness(point, opponents)
@@ -430,6 +437,22 @@ pub fn decide_final_third(
             best_value = v;
             best = Action::Pass(tm.id);
         }
+        // Off-ball attacking runs, from null (`off_ball_runs.rs`): a
+        // through ball into a teammate's frozen run target, on this
+        // domain's own chance_at/RETAIN_BONUS currency, aimed at where
+        // he is running into rather than where he stands. Reads
+        // `ctx.tick_context.run_commitments`, NOT `ctx.context.players`
+        // — see `GameTickContext::run_commitments`'s own doc comment.
+        if let Some(&(_, target)) = ctx.tick_context.run_commitments.get(&tm.id) {
+            if (target - from).magnitude() >= 5.0 {
+                let p_c2 = 1.0 - intercept_risk(ctx, from, target, opponents);
+                let tv = p_c2 * (chance_at(target, goal, opponents) + RETAIN_BONUS);
+                if tv > best_value {
+                    best_value = tv;
+                    best = Action::Through { to: tm.id, target };
+                }
+            }
+        }
     }
 
     // Carry.
@@ -498,6 +521,7 @@ pub fn decide_final_third(
         match best {
             Action::Shoot => "shoot",
             Action::Deliver { .. } => "deliver",
+            Action::Through { .. } => "through",
             Action::Pass(_) => "pass",
             Action::Carry(_) => "carry",
             Action::Dribble(_) => "take",
