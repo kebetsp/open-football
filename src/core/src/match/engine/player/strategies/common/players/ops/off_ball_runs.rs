@@ -110,6 +110,21 @@ use nalgebra::Vector3;
 /// one — same number, same reasoning, no cross-module coupling for a
 /// single shared magnitude.
 const SPACE_REFERENCE_DIST: f32 = 60.0;
+/// Two candidates within this much `value` of each other count as a
+/// genuine tie, not a real difference in merit. Found via a raw trace
+/// (2026-09-28, wide midfielders specifically): `InBehind` (generated
+/// before `Byline` in `build_candidates`) was winning 76.3% of decisions
+/// to `Byline`'s 7.3% -- despite `Byline`'s own mean `value` (0.998)
+/// being HIGHER than `InBehind`'s (0.964), because 85.3% of the time the
+/// two were within 0.02 of each other and a strict `>` comparison always
+/// keeps whichever candidate was set first. `InBehind`'s target for a
+/// wide player is only just beyond the last defender's line -- often far
+/// short of the actual byline -- so this wasn't a football preference,
+/// it was pure evaluation order silently suppressing the deeper option.
+/// ~1.2 units (0.15m) of nearest-opponent-distance difference at
+/// `SPACE_REFERENCE_DIST`'s own normalisation -- genuinely
+/// indistinguishable openness, not a meaningful gap.
+const TIE_BREAK_EPSILON: f32 = 0.02;
 
 /// How genuinely open a candidate run TARGET is — nearest real opponent
 /// distance, normalised. This is the term that replaced `box_attack::
@@ -397,7 +412,31 @@ pub fn plan_runs(
                 best_alt_val = value;
                 best_alt_kind = kind as u8;
             }
-            if best.is_none_or(|(bv, ..)| value > bv) {
+            // On a genuine near-tie (within `TIE_BREAK_EPSILON`), prefer
+            // whichever candidate is DEEPER -- a real football heuristic
+            // (all else equal, take the more advanced option), not a
+            // special case for any one `RunKind`. This is what actually
+            // fixes the InBehind-over-Byline bias documented on
+            // `TIE_BREAK_EPSILON`'s own doc comment: `Byline` is, by
+            // construction, always the deepest candidate a wide player
+            // can generate, so it now wins the near-ties it was already
+            // scoring at least as well on, instead of losing them purely
+            // to evaluation order.
+            let better = match best {
+                None => true,
+                Some((bv, _, bpt)) => {
+                    if value > bv + TIE_BREAK_EPSILON {
+                        true
+                    } else if value >= bv - TIE_BREAK_EPSILON {
+                        let depth = (pt.x - own_goal.x) * attack_dir;
+                        let best_depth = (bpt.x - own_goal.x) * attack_dir;
+                        depth > best_depth
+                    } else {
+                        false
+                    }
+                }
+            };
+            if better {
                 best = Some((value, kind, pt));
             }
         }
