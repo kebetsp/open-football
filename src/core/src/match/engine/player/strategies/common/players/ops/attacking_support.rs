@@ -627,7 +627,24 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     // "wide and within 25m of the goal line," nothing sensible happened
     // otherwise). BuildUp is untouched -- these roles fall through to
     // Step C/D below exactly as before, per the design doc's own scope.
-    if matches!(phase, Phase::Progression | Phase::Final) {
+    //
+    // TEMPORARILY DISABLED, 2026-09-28, on Pavel's explicit request ("I
+    // want to comment off ball runs, and I want to look at on ball
+    // runs") -- he wants to isolate the carrier's own on-ball decision
+    // logic (carry/dribble/pass in `on_ball_decision.rs`) with zero
+    // off-ball-run interaction, one change at a time. Forcing `false`
+    // here (not deleting the block) makes every runner-role player fall
+    // through to Step C/D's flat `width_depth`/`advance_depth` tables
+    // below, exactly as before `02a80ec` -- confirmed via `git diff
+    // 8f8db7f 02a80ec` that this block is the ONLY change that commit
+    // made to this file. It also, as a direct and correct side effect,
+    // starves `run_commit_ticks` (never set > 0 while this is off), so
+    // `GameTickContext::run_commitments` (`context.rs`) is always empty
+    // and `Action::Through` (in this file's sibling `on_ball_decision.rs`
+    // AND `box_attack.rs`) never fires via the run-commitment path
+    // either -- no separate change needed in either of those files. To
+    // re-enable: delete the `false &&` below.
+    if false && matches!(phase, Phase::Progression | Phase::Final) {
         let opponents_lite: Vec<MatchPlayerLite> = cands
             .iter()
             .filter(|c| c.team_id != carrier.team_id)
