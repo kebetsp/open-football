@@ -32,7 +32,7 @@ use crate::PlayerFieldPositionGroup;
 use crate::r#match::engine::goal::GOAL_WIDTH;
 use crate::r#match::player::strategies::common::players::ops::on_ball_decision::{
     Action, FINAL_THIRD_BOUNDARY, intercept_risk, nearest_blocker, nearest_opponent_dist,
-    open_distance_in_heading, open_distance_capped, carry_fair_scoring, openness, rotate_xy,
+    open_distance_in_heading, open_distance_capped, carry_fair_scoring, carry_sticky_mult, openness, rotate_xy,
 };
 use crate::r#match::{
     BoxPlan, BoxRunner, BoxZone, MatchContext, MatchPlayerLite, StateProcessingContext,
@@ -512,7 +512,8 @@ pub fn decide_final_third(
         // take-on risk (0.527..0.95 by room), and a pass pays no equivalent
         // multiplier, so the old 0.9 double-counted risk against carries.
         let disc = if fair { 1.0 } else { CARRY_DISCOUNT };
-        let v = disc * p_keep * press_keep * (chance_at(target, goal, opponents) + RETAIN_BONUS);
+        let v = disc * p_keep * press_keep * (chance_at(target, goal, opponents) + RETAIN_BONUS)
+            * carry_sticky_mult(ctx.player.velocity, heading);
         d_carry = d_carry.max(v);
         if v > best_value {
             best_value = v;

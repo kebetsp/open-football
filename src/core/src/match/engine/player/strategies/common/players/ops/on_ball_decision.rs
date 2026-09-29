@@ -82,6 +82,31 @@ const CARRY_RUN_LOOKAHEAD: f32 = 240.0;
 /// Same 0.20 retention floor a pass gets (`PASS_RETENTION_BASE`).
 const CARRY_RETENTION_BASE: f32 = 0.20;
 
+/// Run-continuity tie-break (2026-09-29): a candidate heading that continues
+/// the run the carrier is ALREADY on (his own live velocity, a physical
+/// fact) gets a small RELATIVE boost, so a marginal one-tick flip to a pass
+/// doesn't end a run that is going fine. Relative, not additive: it can only
+/// decide near-ties (within ~STICKY of each other), unlike the rolled-back
+/// 2026-09-28 additive momentum bias that overcorrected on the xG scale.
+pub(crate) fn carry_sticky_mult(vel: Vector3<f32>, heading: Vector3<f32>) -> f32 {
+    let k = sticky_knob();
+    let speed = (vel.x * vel.x + vel.y * vel.y).sqrt();
+    if k <= 0.0 || speed < 0.15 {
+        return 1.0;
+    }
+    let dir = Vector3::new(vel.x / speed, vel.y / speed, 0.0);
+    let align = dir.dot(&heading);
+    if align > 0.85 { 1.0 + k } else { 1.0 }
+}
+/// Size of the run-continuity boost. Swept 0/0.10/0.15/0.20/0.25/0.50 on 30
+/// matches each: wide final-third carries >= 10m 2.7/4.4/5.0/3.8/6.3/6.5%
+/// (batch noise ~1.5pt), forward shot share 13/17/16/14/18/22% (real 12.8%),
+/// shots per match rising 25 -> 35. 0.15 sits before the shot-share climb.
+const CARRY_STICKY: f32 = 0.15;
+fn sticky_knob() -> f32 {
+    if carry_fair_scoring() { CARRY_STICKY } else { 0.0 }
+}
+
 /// Same-binary A/B toggle (mirrors `OF_SCORE_BLIND`/`MOBILITY_ABLATE`):
 /// set `CARRY_FAIR_ABLATE` (any value) to restore the old carry scoring.
 pub(crate) fn carry_fair_scoring() -> bool {
@@ -601,6 +626,7 @@ fn carry_value(
     opponent_goal: Vector3<f32>,
     opponents: &[MatchPlayerLite],
     group: PlayerFieldPositionGroup,
+    vel: Vector3<f32>,
 ) -> (f32, Vector3<f32>) {
     let pressure = 1.0 - openness(from, opponents);
     let risk = turnover_cost(own_goal, from) * pressure * CARRY_RISK_MULT;
@@ -637,6 +663,7 @@ fn carry_value(
             let v = CARRY_RETENTION_BASE * short_open
                 + (PASS_PROGRESS_WEIGHT * prog + PASS_OPENNESS_WEIGHT * end_open) * priority
                 - risk;
+            let v = if v > 0.0 { v * carry_sticky_mult(vel, heading) } else { v };
             if v > best.0 {
                 best = (v, heading, open);
             }
@@ -822,7 +849,7 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
         }
     }
 
-    let (cv, ctarget) = carry_value(from, forward, own_goal, attacking_goal, &opponents, group);
+    let (cv, ctarget) = carry_value(from, forward, own_goal, attacking_goal, &opponents, group, ctx.player.velocity);
     if cv > best_value {
         best_value = cv;
         best_action = Action::Carry(ctarget);
