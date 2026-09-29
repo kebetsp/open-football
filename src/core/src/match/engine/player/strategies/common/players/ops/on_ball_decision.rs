@@ -160,6 +160,51 @@ const PASS_BACK_TO_PASSER_PENALTY: f32 = 0.25;
 /// advancing combination — the penalty only applies below this bar.
 const PASS_BACK_PROGRESS_EXEMPT: f32 = 0.15;
 
+// ---- Committed-run persistence — ported from the old, verified-working
+// `byline_commitment_ticks` mechanism (`ForwardDribblingState`/
+// `MidfielderDribblingState`, `engine/run.rs`'s arming block), not a
+// fresh per-tick score term. Per Pavel's explicit instruction
+// (2026-09-28, a direct correction of the prior session's own attempt):
+// "look at the old code where this part was working and implement that
+// logic... we will try to copy what was working." The old mechanism
+// measured 3.775 byline-run completions/match with 72.5% converting to
+// a cross before the domain-2/3/4 rewrite made its consumer (the old
+// per-role Dribbling states) structurally unreachable — this domain now
+// intercepts a committed player before the normal per-tick comparison
+// runs at all, the same structural shape the old mechanism had, rather
+// than adding one more competing score term (the just-reverted
+// `chance_at` + momentum-bias fix was exactly that, and never produced
+// a visually-confirmable change — see this file's own 2026-09-28 status
+// log). `run.rs` is the only place `byline_commitment_ticks` is written
+// (both its original wide/byline arming and a new central clear-break
+// arming path); this domain only ever reads it, matching every other
+// commitment field's read/write split in this codebase.
+/// Genuine, real double-team pressure — the ONLY thing that aborts a
+/// committed run mid-flight. Matches the old mechanism's own rule
+/// exactly: a lone marker tracking a wide run is normal defending, real
+/// wingers keep going against exactly that.
+const COMMIT_DOUBLE_TEAM_RADIUS: f32 = 8.0;
+/// Release once genuinely close enough to deliver from a wide lane —
+/// the old mechanism's own release gate (11m past the penalty spot,
+/// unchanged), tightened once already (2026-08-27) to match
+/// `ForwardCrossingState::is_in_wide_position`'s own margin after
+/// measuring 112/112 releases bouncing straight back otherwise.
+const COMMIT_RELEASE_DEPTH: f32 = 100.0;
+const COMMIT_RELEASE_WIDE_FRACTION: f32 = 0.2;
+/// A safety release with no old-code equivalent (the old mechanism only
+/// ever released via the wide-lane gate above, because it never armed
+/// centrally) — without this, a central clear-break commitment with no
+/// clean shot and no double-team would keep running straight at goal.x
+/// literally into the goalkeeper. ~5m.
+const COMMIT_RELEASE_MIN_DEPTH: f32 = 40.0;
+/// A committed run still yields to a genuinely clear, close chance —
+/// mirrors the old mechanism's own shot-dispatch priorities, which ran
+/// ahead of its byline-release check (Priority 0/1/1b in
+/// `ForwardDribblingState::process()`). Reasoned bar on this domain's
+/// own `shoot_value` scale (max plausible ~`SHOOT_BASE_WEIGHT`=0.90) —
+/// a target for the raw-trace verification pass, not sourced.
+const COMMIT_SHOOT_INTERRUPT: f32 = 0.5;
+
 /// The decision this domain produces for the current ball carrier. A
 /// discrete action (Shoot/Pass/Clear) is dispatched as a real event the
 /// same tick it's chosen; Carry/Dribble are steering targets consumed by
@@ -651,6 +696,44 @@ fn clear_value(own_goal_dist: f32, nearest_opp_dist: f32) -> f32 {
     }
 }
 
+/// While `ctx.player.byline_commitment_ticks > 0`: steer straight toward
+/// the goal line, holding the carrier's OWN current lane, instead of
+/// re-running the normal per-tick comparison — the ported old
+/// mechanism's real behaviour, not a re-derivation of it. Returns `None`
+/// once released (close enough to deliver) or aborted (a genuine
+/// double-team, or a clearly better shot right now), so the caller falls
+/// straight through to the normal decision this same tick.
+fn committed_run_action(
+    ctx: &StateProcessingContext,
+    from: Vector3<f32>,
+    attacking_goal: Vector3<f32>,
+    opponents: &[MatchPlayerLite],
+) -> Option<Action> {
+    let field_h = ctx.context.field_size.height as f32;
+    let y = from.y;
+    let depth = (attacking_goal.x - from.x).abs();
+    let currently_wide = y < field_h * COMMIT_RELEASE_WIDE_FRACTION
+        || y > field_h * (1.0 - COMMIT_RELEASE_WIDE_FRACTION);
+    if (currently_wide && depth <= COMMIT_RELEASE_DEPTH) || depth <= COMMIT_RELEASE_MIN_DEPTH {
+        return None;
+    }
+    let dist_to_goal = (attacking_goal - from).magnitude();
+    if dist_to_goal <= SHOOT_EVAL_RADIUS {
+        let v = shoot_value(from, attacking_goal, opponents);
+        if v > COMMIT_SHOOT_INTERRUPT {
+            return Some(Action::Shoot);
+        }
+    }
+    let close_defenders = opponents
+        .iter()
+        .filter(|o| (o.position - from).magnitude() <= COMMIT_DOUBLE_TEAM_RADIUS)
+        .count();
+    if close_defenders >= 2 {
+        return None;
+    }
+    Some(Action::Carry(Vector3::new(attacking_goal.x, y, 0.0)))
+}
+
 /// The Step A-D decision: which action scores highest for the current
 /// ball carrier, right now. `None` if this domain doesn't govern this
 /// player this tick (no ball, directed, goalkeeper, mid-restart-window).
@@ -704,6 +787,27 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
     };
 
     let opponents: Vec<MatchPlayerLite> = ctx.players().opponents().nearby(300.0).collect();
+
+    // Committed-run persistence — checked BEFORE the domain-4 handoff so
+    // a run armed in domain-2 territory keeps going, unmodified, across
+    // the FINAL_THIRD_BOUNDARY into domain-4 territory instead of
+    // stalling right at the boundary (the exact bug the just-reverted
+    // session's own run-continuity patch was fighting, from the other
+    // direction, on top of the old system's real behaviour instead of a
+    // momentum-biased score nudge).
+    if ctx.player.byline_commitment_ticks > 0 {
+        if let Some(action) = committed_run_action(ctx, from, attacking_goal, &opponents) {
+            #[cfg(feature = "match-logs")]
+            crate::match_log_info!(
+                "COMMITRUN t={} id={} ticks_left={} action={:?}",
+                ctx.context.total_match_time,
+                ctx.player.id,
+                ctx.player.byline_commitment_ticks,
+                action
+            );
+            return Some(action);
+        }
+    }
 
     // Domain 4 owns the whole final third (ball >= FINAL_THIRD_BOUNDARY from
     // our own goal): the progress-based pass value and the angle-less
