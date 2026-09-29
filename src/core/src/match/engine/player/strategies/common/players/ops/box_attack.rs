@@ -32,7 +32,7 @@ use crate::PlayerFieldPositionGroup;
 use crate::r#match::engine::goal::GOAL_WIDTH;
 use crate::r#match::player::strategies::common::players::ops::on_ball_decision::{
     Action, FINAL_THIRD_BOUNDARY, intercept_risk, nearest_blocker, nearest_opponent_dist,
-    open_distance_in_heading, openness, rotate_xy,
+    open_distance_in_heading, open_distance_capped, carry_fair_scoring, openness, rotate_xy,
 };
 use crate::r#match::{
     BoxPlan, BoxRunner, BoxZone, MatchContext, MatchPlayerLite, StateProcessingContext,
@@ -189,6 +189,15 @@ fn in_box(point: Vector3<f32>, goal: Vector3<f32>) -> bool {
 const PASS_MAX_RANGE: f32 = 320.0;
 const SHOT_MAX_RANGE: f32 = 300.0;
 const CARRY_STEP: f32 = 80.0;
+
+/// Fair-carry step (2026-09-29): with `CARRY_FAIR_ABLATE` unset a final-third
+/// carry may run up to 40m (was one 10m step), so a longer open run reaches
+/// a better `chance_at` end point. Swept 160/240/320/440 against the sourced
+/// target (StatsBomb Bundesliga 2023/24: 10.5% of wide final-third
+/// receptions are followed by a carry >= 10m); 320 gave the best guards
+/// (forward shot share 13% vs real 12.8%, spacing and defenders-at-a-shot
+/// unchanged), 440 gave the same carry rate.
+const FAIR_CARRY_STEP: f32 = 320.0;
 const CARRY_HEADINGS: usize = 7;
 const CARRY_FAN_HALF_DEG: f32 = 90.0;
 
@@ -469,17 +478,41 @@ pub fn decide_final_third(
     for i in 0..CARRY_HEADINGS {
         let t = i as f32 / (CARRY_HEADINGS - 1) as f32;
         let heading = rotate_xy(forward, -half + 2.0 * half * t);
-        let open = open_distance_in_heading(from, heading, opponents);
-        let travel = open.min(CARRY_STEP);
+        let fair = carry_fair_scoring();
+        let step_len = if fair { FAIR_CARRY_STEP } else { CARRY_STEP };
+        let open = if fair {
+            open_distance_capped(from, heading, opponents, step_len)
+        } else {
+            open_distance_in_heading(from, heading, opponents)
+        };
+        let travel = open.min(step_len);
         if travel < 15.0 {
             continue;
         }
-        let target = from + heading * travel;
+        let mut target = from + heading * travel;
+        let mut travel = travel;
+        if fair {
+            // A long fair-carry step can project past the goal line or off
+            // the pitch, where chance_at means nothing: keep the end point
+            // on the pitch (4u margin) and use the real distance.
+            let w = ctx.context.field_size.width as f32;
+            let h = ctx.context.field_size.height as f32;
+            target.x = target.x.clamp(4.0, w - 4.0);
+            target.y = target.y.clamp(4.0, h - 4.0);
+            travel = (target - from).magnitude();
+            if travel < 15.0 {
+                continue;
+            }
+        }
         // Ending the carry beside a defender is a take-on: success falls
         // from ~0.95 with room to the sourced 0.527 with none.
         let room = openness(target, opponents);
         let p_keep = 0.95 * (open / CARRY_STEP).min(1.0) * (TAKE_ON_SUCCESS + (1.0 - TAKE_ON_SUCCESS) * room);
-        let v = CARRY_DISCOUNT * p_keep * press_keep * (chance_at(target, goal, opponents) + RETAIN_BONUS);
+        // Fair path: no flat delay discount. `p_keep` already prices the
+        // take-on risk (0.527..0.95 by room), and a pass pays no equivalent
+        // multiplier, so the old 0.9 double-counted risk against carries.
+        let disc = if fair { 1.0 } else { CARRY_DISCOUNT };
+        let v = disc * p_keep * press_keep * (chance_at(target, goal, opponents) + RETAIN_BONUS);
         d_carry = d_carry.max(v);
         if v > best_value {
             best_value = v;

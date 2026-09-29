@@ -84,7 +84,7 @@ const CARRY_RETENTION_BASE: f32 = 0.20;
 
 /// Same-binary A/B toggle (mirrors `OF_SCORE_BLIND`/`MOBILITY_ABLATE`):
 /// set `CARRY_FAIR_ABLATE` (any value) to restore the old carry scoring.
-fn carry_fair_scoring() -> bool {
+pub(crate) fn carry_fair_scoring() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CARRY_FAIR_ABLATE").is_none())
 }
@@ -448,7 +448,7 @@ pub(crate) fn open_distance_in_heading(
 /// `open_distance_in_heading` at the old 140u cap; domain 2's carry uses
 /// the longer `CARRY_RUN_LOOKAHEAD` so a long open run is worth more than
 /// a short one (2026-09-29 fair-carry change).
-fn open_distance_capped(
+pub(crate) fn open_distance_capped(
     from: Vector3<f32>,
     heading: Vector3<f32>,
     opponents: &[MatchPlayerLite],
