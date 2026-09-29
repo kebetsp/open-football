@@ -77,6 +77,17 @@ const NOMINAL_PASS_SPEED: f32 = 2.2;
 /// How far ahead a carry/dribble open-space scan looks before giving up
 /// on finding more room. ~17.5m.
 const CARRY_LOOKAHEAD: f32 = 140.0;
+/// Domain-2 carry's own longer scan (~30m) for the fair-carry scoring.
+const CARRY_RUN_LOOKAHEAD: f32 = 240.0;
+/// Same 0.20 retention floor a pass gets (`PASS_RETENTION_BASE`).
+const CARRY_RETENTION_BASE: f32 = 0.20;
+
+/// Same-binary A/B toggle (mirrors `OF_SCORE_BLIND`/`MOBILITY_ABLATE`):
+/// set `CARRY_FAIR_ABLATE` (any value) to restore the old carry scoring.
+fn carry_fair_scoring() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRY_FAIR_ABLATE").is_none())
+}
 /// How close to a candidate running lane an opponent must sit to count
 /// as contesting it — a real defender's own reach/step-across distance.
 const LANE_CONTEST_RADIUS: f32 = 20.0;
@@ -430,11 +441,24 @@ pub(crate) fn open_distance_in_heading(
     heading: Vector3<f32>,
     opponents: &[MatchPlayerLite],
 ) -> f32 {
-    let mut best = CARRY_LOOKAHEAD;
+    open_distance_capped(from, heading, opponents, CARRY_LOOKAHEAD)
+}
+
+/// Same scan with an explicit cap. Domain 4 (`box_attack.rs`) shares
+/// `open_distance_in_heading` at the old 140u cap; domain 2's carry uses
+/// the longer `CARRY_RUN_LOOKAHEAD` so a long open run is worth more than
+/// a short one (2026-09-29 fair-carry change).
+fn open_distance_capped(
+    from: Vector3<f32>,
+    heading: Vector3<f32>,
+    opponents: &[MatchPlayerLite],
+    cap: f32,
+) -> f32 {
+    let mut best = cap;
     for opp in opponents {
         let to_opp = opp.position - from;
         let along = to_opp.dot(&heading);
-        if along < 0.0 || along > CARRY_LOOKAHEAD {
+        if along < 0.0 || along > cap {
             continue;
         }
         let closest_point = from + heading * along;
@@ -578,14 +602,52 @@ fn carry_value(
     opponents: &[MatchPlayerLite],
     group: PlayerFieldPositionGroup,
 ) -> (f32, Vector3<f32>) {
-    let (heading, open_dist) = carry_best_heading(from, forward, opponents);
-    let openness_frac = (open_dist / CARRY_LOOKAHEAD).clamp(0.0, 1.0);
-    let align = ((heading.dot(&forward) + 1.0) / 2.0).clamp(0.0, 1.0);
     let pressure = 1.0 - openness(from, opponents);
     let risk = turnover_cost(own_goal, from) * pressure * CARRY_RISK_MULT;
     let base_priority = carry_priority_mult(group, (from - own_goal).magnitude());
     let defenders_ahead = defenders_ahead_count(from, forward, opponent_goal, opponents);
     let priority = effective_carry_priority(base_priority, defenders_ahead);
+
+    if carry_fair_scoring() {
+        // Fair-carry scoring (2026-09-29): a carry is scored on the SAME
+        // currency as a pass (`pass_value`): the 0.20 retention floor, plus
+        // 0.55 x progress toward goal measured at the carry's END POINT
+        // (so a longer open run earns proportionally more), plus 0.30 x
+        // the openness of that end point (a pass's own destination-
+        // openness term; a first cut that kept the old space term as well
+        // overshot to 97.8% carry). Heading is chosen by this score, not by raw
+        // open distance (which tied at the cap and kept the first, -70deg,
+        // heading). The floor is scaled by openness so a blocked lane
+        // earns no retention credit. The role/zone priority still scales
+        // the progress and space terms (the "responsible line" doctrine).
+        let half = CARRY_FAN_HALF_ANGLE_DEG.to_radians();
+        let mut best = (f32::MIN, forward, 0.0f32);
+        for i in 0..CARRY_HEADING_COUNT {
+            let t = if CARRY_HEADING_COUNT > 1 {
+                i as f32 / (CARRY_HEADING_COUNT - 1) as f32
+            } else {
+                0.5
+            };
+            let heading = rotate_xy(forward, -half + 2.0 * half * t);
+            let open = open_distance_capped(from, heading, opponents, CARRY_RUN_LOOKAHEAD);
+            let end = from + heading * open.max(20.0);
+            let prog = progress(from, end, opponent_goal);
+            let short_open = (open / CARRY_LOOKAHEAD).clamp(0.0, 1.0);
+            let end_open = openness(end, opponents);
+            let v = CARRY_RETENTION_BASE * short_open
+                + (PASS_PROGRESS_WEIGHT * prog + PASS_OPENNESS_WEIGHT * end_open) * priority
+                - risk;
+            if v > best.0 {
+                best = (v, heading, open);
+            }
+        }
+        let target = from + best.1 * best.2.max(20.0);
+        return (best.0, target);
+    }
+
+    let (heading, open_dist) = carry_best_heading(from, forward, opponents);
+    let openness_frac = (open_dist / CARRY_LOOKAHEAD).clamp(0.0, 1.0);
+    let align = ((heading.dot(&forward) + 1.0) / 2.0).clamp(0.0, 1.0);
     let value = CARRY_SPACE_WEIGHT * openness_frac * (0.4 + 0.6 * align) * priority - risk;
     let target = from + heading * open_dist.max(20.0);
     (value, target)
