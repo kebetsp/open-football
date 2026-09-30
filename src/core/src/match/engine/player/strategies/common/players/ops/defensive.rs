@@ -427,7 +427,10 @@ impl<'p> DefensiveOperationsImpl<'p> {
     /// walking, none of them sharing a constant with Tackling or with
     /// each other. One source of truth now closes off the whole class,
     /// not just the instance that happened to get noticed.
-    pub const TACKLE_ENGAGEMENT_DISTANCE: f32 = 10.0;
+    // 2026-09-29: now the unified tackle system's engage distance (a
+    // 24u lunge/jockey envelope) — one constant shared with
+    // `tackle::choose`, so the entry gates and the decision can't drift.
+    pub const TACKLE_ENGAGEMENT_DISTANCE: f32 = super::tackle::ENGAGE_DISTANCE;
 
     /// Whether a defender-role state is close enough, and off cooldown,
     /// to legally transition into `Tackling` right now. Centralizes

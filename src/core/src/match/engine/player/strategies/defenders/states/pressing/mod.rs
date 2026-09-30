@@ -1,14 +1,13 @@
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondition};
-use crate::r#match::events::Event;
-use crate::r#match::player::events::{FoulSeverity, PlayerEvent, ShootingEventContext};
 use crate::r#match::player::strategies::common::players::ops::defender_skill::DefenderSkillProfile;
 use crate::r#match::player::strategies::common::players::ops::defensive::DefensiveOperationsImpl;
 use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
+use crate::r#match::player::strategies::common::players::ops::tackle;
 use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::{
-    ConditionContext, MatchPlayerLite, StateChangeResult, StateProcessingContext,
+    ConditionContext, StateChangeResult, StateProcessingContext,
     StateProcessingHandler, SteeringBehavior,
 };
 use nalgebra::Vector3;
@@ -111,12 +110,30 @@ impl StateProcessingHandler for DefenderPressingState {
             // chase_ball()` conventions the normal engage above already
             // uses, so it can't fire on repeat every tick or pile up
             // multiple defenders on the same ball.
+            // 2026-09-29: the slide is now part of the unified tackle
+            // system — `tackle::duel` picks it (or not) from the threat
+            // and the predicted contact, out to SLIDE_REACH.
             if distance_to_opponent >= DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE
+                && distance_to_opponent <= tackle::SLIDE_REACH
                 && ctx.player.can_attempt_tackle()
                 && ctx.team().is_best_player_to_chase_ball()
-                && dv::desperate_slide_value(ctx, &opponent, def_profile.tackle_profile) > 0.0
             {
-                return Some(self.attempt_desperate_slide(ctx, &opponent));
+                let skills = tackle::DuelSkills {
+                    tackle: def_profile.tackle_profile,
+                    discipline: def_profile.discipline,
+                    condition: def_profile.def_condition_mult,
+                };
+                if let tackle::DuelAction::Act(events) = tackle::duel(ctx, &opponent, skills) {
+                    let next = if events.is_empty() {
+                        DefenderState::Pressing
+                    } else {
+                        DefenderState::Standing
+                    };
+                    let mut result = StateChangeResult::with_defender_state(next);
+                    result.events.add_range(events);
+                    result.start_tackle_cooldown = true;
+                    return Some(result);
+                }
             }
 
             // Pressing distance scales with team intensity AND the
@@ -433,128 +450,3 @@ impl StateProcessingHandler for DefenderPressingState {
     }
 }
 
-impl DefenderPressingState {
-    /// D4.6 of docs/defensive-decision-logic-spec.md: rolls the RNG
-    /// against `dv::slide_outcome_probs` (the SAME probability table
-    /// `desperate_slide_value` used to decide this was worth trying, so
-    /// the decision and the roll can't drift apart) and dispatches the
-    /// matching outcome. Every outcome sets `start_tackle_cooldown` —
-    /// real doctrine: a slide leaves the defender briefly grounded and
-    /// out of the game, whether it connects or not, so he can't spam
-    /// another attempt next tick regardless of what happened.
-    fn attempt_desperate_slide(
-        &self,
-        ctx: &StateProcessingContext,
-        opponent: &MatchPlayerLite,
-    ) -> StateChangeResult {
-        #[cfg(feature = "match-logs")]
-        crate::tackle_stats::DEF_SLIDE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-
-        let tackle_profile = DefenderSkillProfile::from_ctx(ctx).tackle_profile;
-        let probs = dv::slide_outcome_probs(ctx, opponent, tackle_profile);
-        let rng = &ctx.context.rng;
-        let roll = rng.random_range(0.0f32..1.0);
-
-        let p_success = probs.p_success;
-        let p_partial = p_success + probs.p_partial;
-        let p_foul = p_partial + probs.p_foul;
-        let p_own_risk = p_foul + probs.p_own_risk;
-        // remainder (roll >= p_own_risk) is Miss.
-
-        let mut result = if roll < p_success {
-            // D6 (2026-08-22): "tackle to get the ball" and "tackle to
-            // push the ball away" are two different decisions. Winning
-            // the slide already denied the attacker either way — this
-            // only decides where the ball goes next: toward a boundary
-            // ONLY if that's genuinely reachable before an opponent gets
-            // there (dv::slide_should_push_to_boundary, the same race
-            // check concede_out_value now uses), otherwise a safe
-            // lay-off to the nearest teammate (handle_shoot_event's
-            // "DEF_SLIDE_SUCCESS_LAYOFF" branch).
-            let push_to_boundary = dv::slide_should_push_to_boundary(ctx);
-            #[cfg(feature = "match-logs")]
-            if push_to_boundary {
-                crate::tackle_stats::DEF_SLIDE_SUCCESS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                crate::tackle_stats::DEF_SLIDE_SUCCESS_LAYOFF.fetch_add(1, Ordering::Relaxed);
-            }
-            let reason = if push_to_boundary {
-                "DEF_SLIDE_SUCCESS"
-            } else {
-                "DEF_SLIDE_SUCCESS_LAYOFF"
-            };
-            StateChangeResult::with_defender_state_and_event(
-                DefenderState::Standing,
-                Event::PlayerEvent(PlayerEvent::Shoot(
-                    ShootingEventContext::new()
-                        .with_player_id(ctx.player.id)
-                        // Discarded and recomputed fresh at dispatch
-                        // time by handle_shoot_event's "DEF_SLIDE_
-                        // SUCCESS"/"DEF_SLIDE_SUCCESS_LAYOFF" branches —
-                        // same convention DEF_CONCEDE_OUT already
-                        // established for the identical reason (a tick
-                        // or two of drift makes a stale target pointless
-                        // to thread through).
-                        .with_target(ctx.tick_context.positions.ball.position)
-                        .with_reason(reason)
-                        .build(ctx),
-                )),
-            )
-        } else if roll < p_partial {
-            #[cfg(feature = "match-logs")]
-            crate::tackle_stats::DEF_SLIDE_PARTIAL.fetch_add(1, Ordering::Relaxed);
-            StateChangeResult::with_defender_state_and_event(
-                DefenderState::Standing,
-                Event::PlayerEvent(PlayerEvent::Shoot(
-                    ShootingEventContext::new()
-                        .with_player_id(ctx.player.id)
-                        .with_target(ctx.tick_context.positions.ball.position)
-                        .with_reason("DEF_SLIDE_PARTIAL")
-                        .build(ctx),
-                )),
-            )
-        } else if roll < p_foul {
-            #[cfg(feature = "match-logs")]
-            crate::tackle_stats::DEF_SLIDE_FOUL.fetch_add(1, Ordering::Relaxed);
-            // Mirrors DefenderTacklingState::attempt_sliding_tackle's
-            // own severity classification, simplified: a genuinely
-            // desperate/mistimed challenge skews more toward a
-            // card-worthy tackle than an ordinary contact foul.
-            let severity = if rng.random_range(0.0f32..1.0) < 0.03 {
-                FoulSeverity::Violent
-            } else if rng.random_range(0.0f32..1.0) < 0.35 {
-                FoulSeverity::Reckless
-            } else {
-                FoulSeverity::Normal
-            };
-            StateChangeResult::with_defender_state_and_event(
-                DefenderState::Standing,
-                Event::PlayerEvent(PlayerEvent::CommitFoul(ctx.player.id, severity)),
-            )
-        } else if roll < p_own_risk {
-            #[cfg(feature = "match-logs")]
-            crate::tackle_stats::DEF_SLIDE_OWN_RISK.fetch_add(1, Ordering::Relaxed);
-            StateChangeResult::with_defender_state_and_event(
-                DefenderState::Standing,
-                Event::PlayerEvent(PlayerEvent::Shoot(
-                    ShootingEventContext::new()
-                        .with_player_id(ctx.player.id)
-                        .with_target(ctx.tick_context.positions.ball.position)
-                        .with_reason("DEF_SLIDE_OWN_RISK")
-                        .build(ctx),
-                )),
-            )
-        } else {
-            #[cfg(feature = "match-logs")]
-            crate::tackle_stats::DEF_SLIDE_MISS.fetch_add(1, Ordering::Relaxed);
-            // Miss — the same outcome as not sliding at all, per the
-            // spec's own framing. The opponent keeps the ball; no ball
-            // event to dispatch, just the recovery cost below.
-            StateChangeResult::with_defender_state(DefenderState::Standing)
-        };
-        result.start_tackle_cooldown = true;
-        result
-    }
-}
-
-impl DefenderPressingState {}

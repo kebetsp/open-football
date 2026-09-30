@@ -1,13 +1,12 @@
-use crate::r#match::events::Event;
 use crate::r#match::midfielders::states::MidfielderState;
 use crate::r#match::midfielders::states::common::{ActivityIntensity, MidfielderCondition};
-use crate::r#match::player::events::{FoulSeverity, PlayerEvent, ShootingEventContext};
 use crate::r#match::player::strategies::common::players::MatchPlayerIteratorExt;
 use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
+use crate::r#match::player::strategies::common::players::ops::tackle;
 use crate::r#match::player::strategies::common::players::ops::midfielder_skill::MidfielderSkillProfile;
 use crate::r#match::player::strategies::players::DefensiveRole;
 use crate::r#match::{
-    ConditionContext, MatchPlayerLite, StateChangeResult, StateProcessingContext,
+    ConditionContext, StateChangeResult, StateProcessingContext,
     StateProcessingHandler,
 };
 use nalgebra::Vector3;
@@ -155,14 +154,30 @@ impl StateProcessingHandler for MidfielderPressingState {
             // the same `can_attempt_tackle()`/`is_best_player_to_chase_
             // ball()` gates so it can't fire on repeat or pile up
             // multiple midfielders on the same ball.
-            if opponent_distance >= 8.0
-                && opponent_distance <= dv::SLIDE_REACH_DISTANCE
+            // 2026-09-29: the slide is part of the unified tackle system
+            // now — `tackle::duel` decides from threat + predicted contact.
+            if opponent_distance
+                >= crate::r#match::player::strategies::common::players::ops::defensive::DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE
+                && opponent_distance <= tackle::SLIDE_REACH
                 && ctx.player.can_attempt_tackle()
                 && ctx.team().is_best_player_to_chase_ball()
             {
                 let mid_profile = MidfielderSkillProfile::from_ctx(ctx);
-                if dv::desperate_slide_value(ctx, &opponent, mid_profile.tackle_profile) > 0.0 {
-                    return Some(self.attempt_desperate_slide(ctx, &opponent));
+                let skills = tackle::DuelSkills {
+                    tackle: mid_profile.tackle_profile,
+                    discipline: mid_profile.discipline,
+                    condition: mid_profile.mid_condition_mult,
+                };
+                if let tackle::DuelAction::Act(events) = tackle::duel(ctx, &opponent, skills) {
+                    let next = if events.is_empty() {
+                        MidfielderState::Pressing
+                    } else {
+                        MidfielderState::Standing
+                    };
+                    let mut result = StateChangeResult::with_midfielder_state(next);
+                    result.events.add_range(events);
+                    result.start_tackle_cooldown = true;
+                    return Some(result);
                 }
             }
         }
@@ -385,110 +400,4 @@ impl MidfielderPressingState {
         moving_toward_ball && other_pressing_teammates < 2
     }
 
-    /// D5 of docs/defensive-decision-logic-spec.md: midfielder mirror of
-    /// `DefenderPressingState::attempt_desperate_slide` — rolls the same
-    /// shared `dv::slide_outcome_probs` table (Success/Partial/Foul/
-    /// OwnRisk/Miss) `desperate_slide_value` used to decide this was
-    /// worth trying, so the decision and the roll can't drift apart. The
-    /// dispatched events (`"DEF_SLIDE_SUCCESS"` etc.) are handled by the
-    /// same generic `handle_shoot_event`/`CommitFoul` branches the
-    /// defender wiring already uses (players.rs) — those branches key
-    /// off `shoot_event_model.from_player_id`/`ctx.player.id`, not the
-    /// player's role, so no execution-side changes were needed for this
-    /// generalization.
-    fn attempt_desperate_slide(
-        &self,
-        ctx: &StateProcessingContext,
-        opponent: &MatchPlayerLite,
-    ) -> StateChangeResult {
-        #[cfg(feature = "match-logs")]
-        crate::tackle_stats::MID_SLIDE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-
-        let tackle_profile = MidfielderSkillProfile::from_ctx(ctx).tackle_profile;
-        let probs = dv::slide_outcome_probs(ctx, opponent, tackle_profile);
-        let rng = &ctx.context.rng;
-        let roll = rng.random_range(0.0f32..1.0);
-
-        let p_success = probs.p_success;
-        let p_partial = p_success + probs.p_partial;
-        let p_foul = p_partial + probs.p_foul;
-        let p_own_risk = p_foul + probs.p_own_risk;
-        // remainder (roll >= p_own_risk) is Miss.
-
-        let mut result = if roll < p_success {
-            // D6 (2026-08-22): same distinction as the defender wiring —
-            // "tackle to get the ball" and "tackle to push the ball
-            // away" are two different decisions. Push toward a boundary
-            // only if the reachability race actually favours it,
-            // otherwise a safe lay-off to the nearest teammate.
-            let push_to_boundary = dv::slide_should_push_to_boundary(ctx);
-            #[cfg(feature = "match-logs")]
-            if push_to_boundary {
-                crate::tackle_stats::MID_SLIDE_SUCCESS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                crate::tackle_stats::MID_SLIDE_SUCCESS_LAYOFF.fetch_add(1, Ordering::Relaxed);
-            }
-            let reason = if push_to_boundary {
-                "DEF_SLIDE_SUCCESS"
-            } else {
-                "DEF_SLIDE_SUCCESS_LAYOFF"
-            };
-            StateChangeResult::with_midfielder_state_and_event(
-                MidfielderState::Standing,
-                Event::PlayerEvent(PlayerEvent::Shoot(
-                    ShootingEventContext::new()
-                        .with_player_id(ctx.player.id)
-                        .with_target(ctx.tick_context.positions.ball.position)
-                        .with_reason(reason)
-                        .build(ctx),
-                )),
-            )
-        } else if roll < p_partial {
-            #[cfg(feature = "match-logs")]
-            crate::tackle_stats::MID_SLIDE_PARTIAL.fetch_add(1, Ordering::Relaxed);
-            StateChangeResult::with_midfielder_state_and_event(
-                MidfielderState::Standing,
-                Event::PlayerEvent(PlayerEvent::Shoot(
-                    ShootingEventContext::new()
-                        .with_player_id(ctx.player.id)
-                        .with_target(ctx.tick_context.positions.ball.position)
-                        .with_reason("DEF_SLIDE_PARTIAL")
-                        .build(ctx),
-                )),
-            )
-        } else if roll < p_foul {
-            #[cfg(feature = "match-logs")]
-            crate::tackle_stats::MID_SLIDE_FOUL.fetch_add(1, Ordering::Relaxed);
-            let severity = if rng.random_range(0.0f32..1.0) < 0.03 {
-                FoulSeverity::Violent
-            } else if rng.random_range(0.0f32..1.0) < 0.35 {
-                FoulSeverity::Reckless
-            } else {
-                FoulSeverity::Normal
-            };
-            StateChangeResult::with_midfielder_state_and_event(
-                MidfielderState::Standing,
-                Event::PlayerEvent(PlayerEvent::CommitFoul(ctx.player.id, severity)),
-            )
-        } else if roll < p_own_risk {
-            #[cfg(feature = "match-logs")]
-            crate::tackle_stats::MID_SLIDE_OWN_RISK.fetch_add(1, Ordering::Relaxed);
-            StateChangeResult::with_midfielder_state_and_event(
-                MidfielderState::Standing,
-                Event::PlayerEvent(PlayerEvent::Shoot(
-                    ShootingEventContext::new()
-                        .with_player_id(ctx.player.id)
-                        .with_target(ctx.tick_context.positions.ball.position)
-                        .with_reason("DEF_SLIDE_OWN_RISK")
-                        .build(ctx),
-                )),
-            )
-        } else {
-            #[cfg(feature = "match-logs")]
-            crate::tackle_stats::MID_SLIDE_MISS.fetch_add(1, Ordering::Relaxed);
-            StateChangeResult::with_midfielder_state(MidfielderState::Standing)
-        };
-        result.start_tackle_cooldown = true;
-        result
-    }
 }

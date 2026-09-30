@@ -22,6 +22,7 @@ pub mod passing;
 pub mod pressure;
 pub mod shooting;
 pub mod skill_composites;
+pub mod tackle;
 pub mod traits_bias;
 pub mod xg;
 

@@ -1,31 +1,38 @@
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::defenders::states::common::{ActivityIntensity, DefenderCondition};
-use crate::r#match::events::Event;
-use crate::r#match::player::events::{FoulSeverity, PlayerEvent, ShootingEventContext};
 use crate::r#match::player::strategies::common::players::ops::defender_skill::DefenderSkillProfile;
 use crate::r#match::player::strategies::common::players::ops::defensive::DefensiveOperationsImpl;
-use crate::r#match::player::strategies::players::ops::skill_composites as sc;
+use crate::r#match::player::strategies::common::players::ops::tackle::{self, DuelAction, DuelSkills, TackleChoice};
 use crate::r#match::{
-    ConditionContext, MatchPlayerLite, PlayerSide, StateChangeResult, StateProcessingContext,
-    StateProcessingHandler, SteeringBehavior,
+    ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
+    SteeringBehavior,
 };
 use nalgebra::Vector3;
 #[cfg(feature = "match-logs")]
 use std::sync::atomic::Ordering;
 
-// 2026-08-30 (engine-audit Module 6): this file's own attempt-gate
-// distance is now `DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE`
-// (still 10.0 — ~1.25m — proper engagement range; previously 14u/~1.75m,
-// raised because attempts ran at 174/team/match, longer possessions in
-// attacking zones creating more chances to hit the gate; 10u forces
-// actual contact range). Centralized so the 7 outer defender states that
-// transition INTO this one can never drift out of sync with it again —
-// see that constant's own doc comment for the full history.
+// 2026-09-29: the tackle/contain/concede-out comparison and the
+// per-role attempt bodies were replaced by the shared unified tackle
+// system (`common/players/ops/tackle.rs`): hold / standing challenge /
+// slide chosen from the threat at the carrier's position, and every
+// ball outcome decided by one physical contact model. This state now
+// only owns the guards that make a challenge legal and the hand-off.
 const PRESSING_DISTANCE: f32 = 80.0;
 const RETURN_DISTANCE: f32 = 120.0;
 
 #[derive(Default, Clone)]
 pub struct DefenderTacklingState {}
+
+impl DefenderTacklingState {
+    fn duel_skills(ctx: &StateProcessingContext) -> DuelSkills {
+        let p = DefenderSkillProfile::from_ctx(ctx);
+        DuelSkills {
+            tackle: p.tackle_profile,
+            discipline: p.discipline,
+            condition: p.def_condition_mult,
+        }
+    }
+}
 
 impl StateProcessingHandler for DefenderTacklingState {
     fn process(&self, ctx: &StateProcessingContext) -> Option<StateChangeResult> {
@@ -39,43 +46,32 @@ impl StateProcessingHandler for DefenderTacklingState {
             ));
         }
 
-        // CRITICAL: Don't try to claim ball if it's in protected flight state
-        // Transition OUT of tackling to avoid clustering around the ball carrier
+        // Don't try to claim a ball that is in protected flight.
         if ctx.ball().is_in_flight() {
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Returning,
             ));
         }
 
-        // realism-bug (2026-07-28): Law 13 — an opponent inside the legal
-        // 9.15m free-kick retreat distance may not challenge for the ball
-        // at all until he's actually retreated. No roll, no contact —
-        // he's not even allowed to be this close yet, so `Pressing`
-        // (which itself now retreats him via the processor override)
-        // is the only legal state.
+        // Law 13: an opponent inside the free-kick retreat distance may
+        // not challenge at all.
         if ctx.ball().is_free_kick_encroaching() {
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Pressing,
             ));
         }
 
-        // realism-bug (2026-08-04): Law 12 — a goalkeeper in secure
-        // possession (or a live opponent goal kick) cannot be legally
-        // challenged for the ball at all; there is no duel to attempt.
-        // Covers a defender who has pushed forward (e.g. for a corner)
-        // and finds himself near the opponent GK after a claim. Mirrors
-        // the free-kick-encroachment guard above.
+        // Law 12: a goalkeeper holding the ball (or a live opponent goal
+        // kick) cannot be challenged.
         if ctx.ball().is_opponent_restart() {
             return Some(StateChangeResult::with_defender_state(
                 DefenderState::Pressing,
             ));
         }
 
-        // Check if there's an opponent with the ball
         if let Some(opponent) = ctx.players().opponents().with_ball().next() {
             let distance_to_opponent = opponent.distance(ctx);
 
-            // If opponent is too far for tackling, press instead
             if distance_to_opponent > PRESSING_DISTANCE {
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::DEF_GATE_TOO_FAR.fetch_add(1, Ordering::Relaxed);
@@ -84,7 +80,6 @@ impl StateProcessingHandler for DefenderTacklingState {
                 ));
             }
 
-            // If opponent is close but not in tackle range, keep pressing
             if distance_to_opponent > DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE {
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::DEF_GATE_NOT_IN_RANGE.fetch_add(1, Ordering::Relaxed);
@@ -93,13 +88,8 @@ impl StateProcessingHandler for DefenderTacklingState {
                 ));
             }
 
-            // Per-player tackle cooldown: a single per-state-machine gate
-            // (e.g. Pressing→Tackling cadence) never held because the
-            // Tackling state can be re-entered from Standing / Running /
-            // Covering / Guarding / HoldingLine, each with its own
-            // distance trigger and no shared cooldown. The cooldown lives
-            // on the player itself — whatever path routed us here, if we
-            // just tackled, we can't tackle again for ~1 s.
+            // Per-player tackle cooldown (a just-tackled player can't
+            // lunge again for ~1 s).
             if !ctx.player.can_attempt_tackle() {
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::DEF_GATE_COOLDOWN.fetch_add(1, Ordering::Relaxed);
@@ -108,13 +98,7 @@ impl StateProcessingHandler for DefenderTacklingState {
                 ));
             }
 
-            // Closest-teammate duel gate. Without this, 3-4 defenders
-            // within `TACKLE_DISTANCE_THRESHOLD` of the same ball carrier
-            // all enter Tackling in the same tick and each rolls their
-            // own attempt. Instrumentation showed this path was the
-            // primary driver of ~370 tackle events/team/match (real
-            // football: ~18). Only the best-positioned teammate
-            // engages; the rest fall back to Pressing to cover angles.
+            // Only the best-positioned teammate engages; the rest cover.
             if !ctx.team().is_best_player_to_chase_ball() {
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::DEF_GATE_NOT_BEST.fetch_add(1, Ordering::Relaxed);
@@ -123,132 +107,36 @@ impl StateProcessingHandler for DefenderTacklingState {
                 ));
             }
 
-            // We're close enough to tackle — but "close enough" no longer
-            // means "must attempt." D2 of docs/defensive-decision-logic-
-            // spec.md: compare tackle_value against contain_value/
-            // concede_out_value (D1, defensive_value.rs) before
-            // committing. `ctx.in_state_time` (ticks spent in this
-            // Tackling entry) stands in for `contain_duration_ticks` —
-            // deliberately reusing the existing state-time tracker
-            // instead of adding a new persistent per-player field, a
-            // smaller and lower-risk choice than D1 originally flagged.
-            // concede_out_value winning its own branch below (D3,
-            // 2026-08-21) dispatches a real deliberate poke toward the
-            // nearest boundary — see that branch's own comment.
-            //
-            // IMPORTANT: when holding off, return `None` (stay in THIS
-            // state) rather than transitioning to Pressing. A first cut
-            // returned to Pressing here — but that's a state CHANGE,
-            // which resets `ctx.in_state_time` back to 0 the moment
-            // Pressing routes back into Tackling next tick (it does,
-            // via the same distance/role gates above), so the urgency
-            // decay term in `contain_value` could never actually erode
-            // — exactly the "free stall" risk the spec explicitly
-            // flagged. Confirmed with real match-log data before fixing
-            // it: the pre-fix wiring showed wildly inconsistent hold-off
-            // rates across otherwise-similar matches (20.7%-94.3% of
-            // decision points), consistent with some duels getting stuck
-            // in a never-decaying contain loop. Staying in Tackling
-            // (this state's own velocity()/movement, not a lunge — the
-            // actual tackle roll only happens via the explicit
-            // `attempt_sliding_tackle` call below, which this branch
-            // skips) lets `in_state_time` genuinely accumulate and the
-            // urgency term genuinely decay tick over tick.
-            use crate::r#match::player::strategies::common::players::ops::defensive_value as dv;
-            // D5: these three take `tackle_profile` explicitly now so
-            // the same functions work for MidfielderTacklingState too —
-            // `def_profile.tackle_profile` is the identical value this
-            // used to derive internally, so behavior here is unchanged.
-            let def_profile = DefenderSkillProfile::from_ctx(ctx);
-            let tackle_val = dv::tackle_value(ctx, &opponent, def_profile.tackle_profile);
-            let contain_val = dv::contain_value(
-                ctx,
-                &opponent,
-                ctx.in_state_time as f32,
-                def_profile.tackle_profile,
-            );
-            let concede_val = dv::concede_out_value(ctx, &opponent, def_profile.tackle_profile);
-
-            // D3 (docs/defensive-decision-logic-spec.md, 2026-08-21):
-            // concede_out_value winning the comparison now actually
-            // executes — a deliberate poke toward the nearest boundary
-            // rather than a committed tackle. `> 0.0` guards against the
-            // degenerate case where BOTH concede_val and contain_val are
-            // gated to exactly 0.0 (not goal-side / not near a line) and
-            // tackle_val is merely very negative — without it, "0.0 is
-            // the max of three" would fire a concede-out that the
-            // function itself already said isn't a real opportunity
-            // (concede_out_value returns 0.0 explicitly when its own
-            // gates fail, same convention contain_value uses).
-            if concede_val > 0.0 && concede_val >= tackle_val && concede_val >= contain_val {
-                #[cfg(feature = "match-logs")]
-                crate::tackle_stats::DEF_CONCEDE_OUT.fetch_add(1, Ordering::Relaxed);
-                let shoot_ctx = ShootingEventContext::new()
-                    .with_player_id(ctx.player.id)
-                    // Discarded by handle_shoot_event's "DEF_CONCEDE_OUT"
-                    // branch, which recomputes the real target (nearest
-                    // boundary edge) fresh at dispatch time — same
-                    // convention FWD_RUN_SAFE_RESTART already uses and
-                    // documents (players.rs) for the identical reason: a
-                    // tick or two of drift between decision and dispatch
-                    // makes a stale target pointless to thread through.
-                    .with_target(ctx.tick_context.positions.ball.position)
-                    .with_reason("DEF_CONCEDE_OUT")
-                    .build(ctx);
-                let mut result = StateChangeResult::with_defender_state_and_event(
-                    DefenderState::Standing,
-                    Event::PlayerEvent(PlayerEvent::Shoot(shoot_ctx)),
-                );
-                result.start_tackle_cooldown = true;
-                return Some(result);
-            }
-
-            if tackle_val < contain_val {
-                #[cfg(feature = "match-logs")]
-                crate::tackle_stats::DEF_GATE_CONTAIN_OR_CONCEDE.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-
-            // Tackle wins the comparison. One shot per Tackling entry,
-            // enforced by the cooldown.
-            #[cfg(feature = "match-logs")]
-            crate::tackle_stats::DEF_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-            let (tackle_success, committed_foul, foul_severity) =
-                self.attempt_sliding_tackle(ctx, &opponent);
-
-            // Foul resolves before a clean win — a challenge that takes
-            // the man as well as the ball is a foul, same order the
-            // forward tackling state already uses. (§11.1: previously a
-            // successful roll silently discarded the foul roll.)
-            return if committed_foul {
-                let mut result = StateChangeResult::with_defender_state_and_event(
-                    DefenderState::Standing,
-                    Event::PlayerEvent(PlayerEvent::CommitFoul(ctx.player.id, foul_severity)),
-                );
-                result.start_tackle_cooldown = true;
-                Some(result)
-            } else if tackle_success {
-                #[cfg(feature = "match-logs")]
-                crate::tackle_stats::DEF_SUCCESSES.fetch_add(1, Ordering::Relaxed);
-                let mut result = StateChangeResult::with_defender_state_and_event(
-                    DefenderState::Standing,
-                    Event::PlayerEvent(PlayerEvent::TacklingBall(ctx.player.id)),
-                );
-                result.start_tackle_cooldown = true;
-                Some(result)
-            } else {
-                let mut result = StateChangeResult::with_defender_state(DefenderState::Pressing);
-                result.start_tackle_cooldown = true;
-                Some(result)
+            // The unified decision: hold (stay in THIS state so standoff
+            // time accumulates), challenge, or slide.
+            return match tackle::duel(ctx, &opponent, Self::duel_skills(ctx)) {
+                DuelAction::Hold => {
+                    #[cfg(feature = "match-logs")]
+                    crate::tackle_stats::DEF_GATE_CONTAIN_OR_CONCEDE.fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+                DuelAction::Act(events) => {
+                    #[cfg(feature = "match-logs")]
+                    crate::tackle_stats::DEF_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                    let next = if events.is_empty() {
+                        DefenderState::Pressing
+                    } else {
+                        DefenderState::Standing
+                    };
+                    let mut result = StateChangeResult::with_defender_state(next);
+                    result.events.add_range(events);
+                    result.start_tackle_cooldown = true;
+                    Some(result)
+                }
             };
         } else {
             // Ball is loose - check for interception
-            // Double-check not in flight before claiming
             if self.can_intercept_ball(ctx) && !ctx.ball().is_in_flight() {
-                // Ball is loose and we can intercept it
                 return Some(StateChangeResult::with_defender_state_and_event(
                     DefenderState::Running,
-                    Event::PlayerEvent(PlayerEvent::ClaimBall(ctx.player.id)),
+                    crate::r#match::events::Event::PlayerEvent(
+                        crate::r#match::player::events::PlayerEvent::ClaimBall(ctx.player.id),
+                    ),
                 ));
             }
 
@@ -261,16 +149,17 @@ impl StateProcessingHandler for DefenderTacklingState {
             }
 
             // Fallback: if ball is loose and very close, try to claim it
-            // Double-check not in flight before claiming
             if !ctx.tick_context.ball.is_owned && ball_distance < 5.0 && !ctx.ball().is_in_flight()
             {
                 return Some(StateChangeResult::with_defender_state_and_event(
                     DefenderState::Running,
-                    Event::PlayerEvent(PlayerEvent::ClaimBall(ctx.player.id)),
+                    crate::r#match::events::Event::PlayerEvent(
+                        crate::r#match::player::events::PlayerEvent::ClaimBall(ctx.player.id),
+                    ),
                 ));
             }
 
-            // If opponent is near the player but doesn't have the ball, maybe it's better to transition to pressing
+            // If an opponent is right next to the player but doesn't have the ball, press
             if let Some(close_opponent) = ctx.players().opponents().nearby(15.0).next() {
                 if close_opponent.distance(ctx) < 10.0 {
                     return Some(StateChangeResult::with_defender_state(
@@ -297,11 +186,20 @@ impl StateProcessingHandler for DefenderTacklingState {
     }
 
     fn velocity(&self, ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        // Holding: stand off goal-side and mirror the carrier instead of
+        // charging in. Acting or chasing: the normal explosive pursuit.
+        if let Some(opponent) = ctx.players().opponents().with_ball().next() {
+            if opponent.distance(ctx) <= DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE
+                && tackle::choose(ctx, &opponent, Self::duel_skills(ctx), ctx.in_state_time as f32)
+                    == TackleChoice::Hold
+            {
+                return Some(tackle::jockey_velocity(ctx, &opponent));
+            }
+        }
+
         let target = self.calculate_intelligent_target(ctx);
 
-        // Closing-speed boost driven by the unified defender profile —
-        // press_profile + tackle_profile already combine acceleration,
-        // anticipation, work_rate, tackling, balance with fatigue.
+        // Closing-speed boost driven by the unified defender profile.
         let def_profile = DefenderSkillProfile::from_ctx(ctx);
         let speed_boost = def_profile.tackle_speed_boost();
 
@@ -348,118 +246,6 @@ impl DefenderTacklingState {
             // Otherwise, pursue the ball directly
             ball_position
         }
-    }
-
-    fn attempt_sliding_tackle(
-        &self,
-        ctx: &StateProcessingContext,
-        opponent: &MatchPlayerLite,
-    ) -> (bool, bool, FoulSeverity) {
-        let rng = &ctx.context.rng;
-
-        // Unified defender profile drives the foul model below.
-        // tackle_profile blends tackling/positioning/anticipation/
-        // composure/strength/balance/agility; discipline is the
-        // composure/decisions/concentration blend that suppresses fouls.
-        let def_profile = DefenderSkillProfile::from_ctx(ctx);
-        let aggression01 = (ctx.player.skills.mental.aggression / 20.0).clamp(0.0, 1.0);
-
-        // Logistic success: tackle_profile vs attacker carry. Extracted
-        // to `defensive_value::tackle_win_probability` (2026-08-20, D1 of
-        // docs/defensive-decision-logic-spec.md) so it's queryable
-        // without re-deriving or re-tuning it — same formula, same
-        // constants, unchanged behavior here. See that function's own
-        // doc comment for the calibration history behind the 2.4
-        // steepness and 0.06-0.55 clamp (weak-team-competitiveness
-        // rationale: even an elite CB vs a poor forward leaves the
-        // attacker with 45% per-attempt survival — across 3 engagement
-        // sequences in the final third that's ~14% accumulated
-        // retention, enough to let weak teams complete the occasional
-        // shooting chain at extreme skill gaps).
-        let success_chance =
-            crate::r#match::player::strategies::common::players::ops::defensive_value::tackle_win_probability(
-                ctx, opponent, def_profile.tackle_profile,
-            );
-
-        let tackle_success = rng.random::<f32>() < success_chance;
-
-        // Foul chance driven by discipline (composure/decisions/
-        // concentration/tackling blend) instead of raw composure +
-        // aggression. Tired defenders foul more (low def_condition_mult
-        // adds to foul rate). Failed tackles roughly double the rate.
-        //
-        // Base 0.030 → 0.052 (2026-06 discipline recalibration): the
-        // engine whistled 6.3 fouls/team vs real ~12 — duel contact was
-        // committing too cleanly given the volume of attempts. Raising
-        // the contact-foul rate (paired with the referee Normal-band
-        // lift) brings whistled fouls, free kicks, and the
-        // persistent-infringement card pipeline toward real rates.
-        // Second lift 0.052 → 0.075: the first round's gain was eaten by
-        // the Reckless probability gate reclassifying card-fouls into
-        // normal contact (whistled at ~0.5 instead of ~0.85), netting
-        // only +10% whistles. Real per-duel foul rates are ~15-16%; the
-        // engine sat at ~10% after round one.
-        let mut base_foul = 0.075 + aggression01 * 0.12 - def_profile.discipline * 0.075;
-        if !tackle_success {
-            base_foul *= 1.80;
-        } else {
-            // Won-ball fouls exist ("got the ball but took the man")
-            // now that the caller resolves foul before success, but
-            // they must stay a minority outcome of clean wins.
-            base_foul *= 0.30;
-        }
-        base_foul += (1.0 - def_profile.def_condition_mult).max(0.0) * 0.08;
-        // Own-box restraint: real defenders stay on their feet inside
-        // their own penalty area — they jockey, contain and block
-        // rather than commit, because the downside is a spot kick.
-        // Without this, the foul-rate lift would inflate penalties
-        // (already over real rate before the lift). Uses the actual
-        // penalty-area RECTANGLE (the same one the restart award
-        // checks) — an earlier radius-from-goal proxy missed the box
-        // corners and let wide-channel box fouls escape the restraint.
-        let in_own_box = ctx
-            .context
-            .penalty_area(ctx.player.side == Some(PlayerSide::Left))
-            .contains(&ctx.tick_context.positions.ball.position);
-        if in_own_box {
-            base_foul *= 0.30;
-        }
-        // Self-preservation on a booking: a player carrying a yellow
-        // measurably tones the challenges down (and managers hook the
-        // ones who can't).
-        if ctx.player.yellow_cards > 0 {
-            base_foul *= 0.70;
-        }
-        // §11.1: scale the per-duel roll to the compressed match length
-        // (each duel event represents ~9 real duels — see the constant's
-        // doc comment) and lift the cap accordingly: an event-level foul
-        // probability near 1 is the honest per-90 rate, same reasoning
-        // as the goals-per-match calibration.
-        let foul_chance = (base_foul * sc::FOUL_TIME_COMPRESSION).clamp(0.006, 0.85);
-
-        let committed_foul = rng.random::<f32>() < foul_chance;
-
-        // Severity classification stays driven by aggression — discipline
-        // already gates whether a foul fires at all, so we don't need to
-        // double-dip here.
-        //
-        // Violent gate 0.12 → 0.02 and a 0.35 probability gate on
-        // Reckless (2026-06): the old shape classified most failed
-        // aggressive contact as Reckless and produced ~1.0 red
-        // cards/match (real ~0.15) — violent conduct is a
-        // once-in-ten-matches event, not an every-match one, and the
-        // typical failed tackle is just a normal foul.
-        let severity = if !committed_foul {
-            FoulSeverity::Normal
-        } else if aggression01 > 0.75 && !tackle_success && rng.random::<f32>() < 0.008 {
-            FoulSeverity::Violent
-        } else if !tackle_success && aggression01 > 0.55 && rng.random::<f32>() < 0.35 {
-            FoulSeverity::Reckless
-        } else {
-            FoulSeverity::Normal
-        };
-
-        (tackle_success, committed_foul, severity)
     }
 
     fn exists_nearby(&self, ctx: &StateProcessingContext) -> bool {
