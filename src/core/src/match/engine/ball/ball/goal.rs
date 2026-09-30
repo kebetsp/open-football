@@ -32,7 +32,12 @@ use nalgebra::Vector3;
 use std::cmp::Ordering;
 
 impl Ball {
-    pub(super) fn check_goal(&mut self, context: &MatchContext, result: &mut EventCollection) {
+    pub(super) fn check_goal(
+        &mut self,
+        context: &MatchContext,
+        players: &[MatchPlayer],
+        result: &mut EventCollection,
+    ) {
         // Guard: don't detect another goal if one was already scored this tick
         if self.goal_scored {
             return;
@@ -123,7 +128,17 @@ impl Ball {
                 let Some(player) = context.players.by_id(goalscorer) else {
                     return;
                 };
-                let is_auto_goal = match player.side {
+                // Side must come from the LIVE `players` slice: the
+                // `context.players` copy carries `side: None`, which made
+                // this always false (own goals were never recognised —
+                // a deflection into the defender's own net was credited
+                // as his team's goal). Verified 2026-09-30.
+                let live_side = players
+                    .iter()
+                    .find(|p| p.id == goalscorer)
+                    .and_then(|p| p.side)
+                    .or(player.side);
+                let is_auto_goal = match live_side {
                     Some(PlayerSide::Left) => goal_side == GoalSide::Home,
                     Some(PlayerSide::Right) => goal_side == GoalSide::Away,
                     _ => false,

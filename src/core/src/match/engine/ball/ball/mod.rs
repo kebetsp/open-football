@@ -923,7 +923,7 @@ impl Ball {
 
         // Move ball FIRST, then check goal/boundary on new position
         self.move_to(tick_context);
-        self.check_goal(context, events);
+        self.check_goal(context, players, events);
         self.check_over_goal(context, players, events);
         self.check_wide_of_goal(context, players, events);
         self.check_throw_in(context, players, events);
@@ -953,7 +953,7 @@ impl Ball {
 
         // Move ball: find owner position from players slice directly
         self.move_to_with_players(players);
-        self.check_goal(context, events);
+        self.check_goal(context, players, events);
         self.check_over_goal(context, players, events);
         self.check_wide_of_goal(context, players, events);
         self.check_throw_in(context, players, events);
