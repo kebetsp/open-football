@@ -188,23 +188,10 @@ pub struct Ball {
     /// ball is claimed/saved/out since those interaction checks already
     /// early-return in that case.
     pub direct_fk_shot_in_flight: bool,
-    /// D3 of docs/defensive-decision-logic-spec.md (2026-08-21): the
-    /// specific opponent this deliberate concede-out redirect was
-    /// dispossessed from — excluded from `try_intercept` for this one
-    /// flight only (see that function's own exclusion check). Without
-    /// this, raw-data verification found the redirect was intercepted
-    /// by that SAME adjacent opponent within one tick in 7/7 traced
-    /// real firings: a Tackling-range duel starts well inside
-    /// `try_intercept`'s ~5.5u reach, so the just-dispossessed attacker
-    /// — who the whole point of the action was to show OUTSIDE — could
-    /// otherwise reclaim it before the ball moves at all. Other,
-    /// genuinely better-positioned opponents remain fully eligible to
-    /// intercept; this narrows the candidate pool by exactly one
-    /// player, not the whole mechanism.
-    pub concede_out_shielded_opponent: Option<u32>,
     /// realism-bug (2026-08-26, corner/deflection investigation): tick
-    /// until which a `try_block_shot` corner-branch deflection is still
-    /// travelling toward the byline. Set by the corner branch; read by
+    /// until which a defender's touch (block, tackle, push-out, aerial
+    /// clearance) is still sending the ball over a boundary. Set by
+    /// `release_after_touch` and the aerial-contest resolver; read by
     /// `try_intercept`, which otherwise treats the deflection as an
     /// interceptable pass from the shooter's team (via `previous_owner`,
     /// untouched by the block) and lets the very defender who just
@@ -559,7 +546,6 @@ impl Ball {
             pending_corner_teleports: Vec::new(),
             pending_restart_teleports: Vec::new(),
             direct_fk_shot_in_flight: false,
-            concede_out_shielded_opponent: None,
             corner_deflection_guard_until_tick: 0,
             corner_contest_resolved: true,
             last_aerial_contest_tick: 0,
@@ -603,6 +589,75 @@ impl Ball {
             pending_error_to_shot_player_id: None,
             carry_owner: None,
             carry_start_position: Vector3::new(x, y, 0.0),
+        }
+    }
+
+    /// The ONE way a defender's touch (leg tackle, block, push-out)
+    /// turns a ball into a loose ball with a given velocity. Shared so
+    /// tackles and blocks cannot drift apart.
+    ///
+    /// * The toucher becomes `previous_owner`/last toucher; nobody owns
+    ///   the ball, all pass/shot bookkeeping is cleared.
+    /// * If the released ball heads at the toucher's OWN goal mouth it
+    ///   becomes a live deflected shot at that goal, so the normal
+    ///   keeper/save/goal logic resolves it — there is no own-goal dice.
+    /// * If it is leaving the pitch, instant re-claims (the toucher, the
+    ///   man he just dispossessed, a covering player) are held off so
+    ///   the ball actually crosses the line and produces the restart.
+    pub fn release_after_touch(
+        &mut self,
+        toucher_id: u32,
+        toucher_team: u32,
+        toucher_side: Option<PlayerSide>,
+        velocity: Vector3<f32>,
+        tick: u64,
+    ) {
+        let ball_pos = self.position;
+        self.velocity = velocity;
+        self.previous_owner = Some(toucher_id);
+        self.current_owner = None;
+        self.pass_target_player_id = None;
+        self.carry_owner = None;
+        self.ownership_duration = 0;
+        self.clear_pending_pass_metadata();
+        self.clear_pass_history();
+        self.flags.in_flight_state = 6;
+        self.cached_shot_target = None;
+        self.record_touch(toucher_id, toucher_team, tick, false);
+
+        if let Some(side) = toucher_side {
+            let own_goal_x = match side {
+                PlayerSide::Left => 0.0,
+                PlayerSide::Right => self.field_width,
+            };
+            let dx = own_goal_x - ball_pos.x;
+            let heading_at_goal = (dx > 0.0 && velocity.x > 0.1) || (dx < 0.0 && velocity.x < -0.1);
+            if heading_at_goal {
+                let ticks_to_goal = (dx / velocity.x).abs().max(1.0);
+                let goal_line_y = ball_pos.y + velocity.y * ticks_to_goal;
+                if (goal_line_y - self.field_height * 0.5).abs() < 60.0 {
+                    let g = crate::r#match::engine::physics::GRAVITY_PER_TICK;
+                    let goal_line_z = (ball_pos.z + velocity.z * ticks_to_goal
+                        - 0.5 * g * ticks_to_goal * ticks_to_goal)
+                        .max(0.0);
+                    self.cached_shot_target = Some(ShotTarget {
+                        goal_line_y,
+                        goal_line_z,
+                        defending_side: side,
+                        deflected: true,
+                        physics_save_rolled: false,
+                        is_direct_fk: false,
+                        total_flight_ticks: ticks_to_goal,
+                        dispatch_tick: tick,
+                        is_safe_restart: false,
+                    });
+                }
+            }
+        }
+
+        if self.cached_shot_target.is_none() && self.is_exiting_boundary_soon() {
+            self.flags.in_flight_state = 30;
+            self.corner_deflection_guard_until_tick = tick + 30;
         }
     }
 

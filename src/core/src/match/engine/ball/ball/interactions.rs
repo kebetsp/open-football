@@ -145,14 +145,6 @@ impl Ball {
                 continue;
             }
 
-            // D3 of docs/defensive-decision-logic-spec.md: the one
-            // opponent this concede-out redirect was dispossessed from
-            // can't reclaim it via this mechanism — see the field's own
-            // doc comment (ball/ball/mod.rs) for why.
-            if Some(player.id) == self.concede_out_shielded_opponent {
-                continue;
-            }
-
             // Distance from player to ball
             let dx = player.position.x - self.position.x;
             let dy = player.position.y - self.position.y;
@@ -279,10 +271,9 @@ impl Ball {
         events: &mut EventCollection,
     ) {
         // Only live shots — no cache means no shot in flight, no block.
-        let shot_target = match self.cached_shot_target {
-            Some(t) => t,
-            None => return,
-        };
+        if self.cached_shot_target.is_none() {
+            return;
+        }
         if self.current_owner.is_some() || self.flags.in_flight_state == 0 {
             return;
         }
@@ -362,7 +353,7 @@ impl Ball {
         // the outcome section below can discount clean-recovery
         // probability by how marginal the winning contact actually was
         // (2026-08-30, see the BLOCK_CORRIDOR comment above).
-        let mut best_perp_factor: f32 = 1.0;
+        let mut best_lat: f32 = 0.0;
 
         for player in players {
             // Only opposing outfielders block (GK save pipeline handles
@@ -459,7 +450,10 @@ impl Ball {
             if chance > best_chance {
                 best_chance = chance;
                 best_blocker = Some(player.id);
-                best_perp_factor = perp_factor;
+                // Signed offset of his centre from the shot line, along
+                // (-dir.y, dir.x): decides which way the surface turns
+                // the ball (see `tackle::block_contact`).
+                best_lat = dx * (-shot_dir_y) + dy * shot_dir_x;
             }
         }
 
@@ -487,11 +481,17 @@ impl Ball {
         #[cfg(feature = "match-logs")]
         block_diag::ROLL_PASSED.fetch_add(1, Ordering::Relaxed);
 
-        // Outcome distribution. Real blocks rarely produce clean
-        // possession — they produce loose balls, deflections wide for a
-        // corner, sideways skips, or (rarely) deflections back into
-        // danger. The previous deterministic ownership flow over-credited
-        // defenders.
+        // WHAT the touch does comes from contact geometry, not a table
+        // (block frequency above is unchanged — that roll is the
+        // skill/corridor model). The defender's body/leg is a blocking
+        // surface of radius `BLOCK_CORRIDOR`; the ball meets it at the
+        // offset `best_lat`. A square touch kills the ball and drops it
+        // back at his feet; an edge touch barely turns it, so it keeps
+        // going at goal, wide, or behind. A composed defender turns the
+        // surface a little toward "away from my goal, toward the
+        // touchline". Whether it ends up as a corner, a throw-in, an own
+        // goal or a rebound is decided by where the ball then goes and by
+        // last-touch — never by a dice table.
         let blocker = match players.iter().find(|p| p.id == blocker_id) {
             Some(p) => p,
             None => return,
@@ -501,218 +501,50 @@ impl Ball {
         let blocker_side = blocker.side;
         let composure = (blocker.skills.mental.composure / 20.0).clamp(0.0, 1.0);
         let technique = (blocker.skills.technical.technique / 20.0).clamp(0.0, 1.0);
-        let ball_speed_low_bonus = if ball_velocity_2d < 2.0 { 0.06 } else { 0.0 };
-        let controlled_block_prob =
-            (0.06 + composure * 0.05 + technique * 0.04 + ball_speed_low_bonus).clamp(0.06, 0.30);
-
-        // Deflection direction: away from the shot line, with a random ±45° spread.
-        let angle: f32 = (context.rng.unit_f32() - 0.5) * 1.56;
-        let rev_x = -shot_dir_x * angle.cos() - (-shot_dir_y) * angle.sin();
-        let rev_y = -shot_dir_x * angle.sin() + (-shot_dir_y) * angle.cos();
         let tick = self.current_tick_cached;
 
-        // realism-bug (2026-08, safe-restart plan, task 4): a player who
-        // deliberately struck this ball at the defender to concede a
-        // restart (`is_safe_restart`, not an on-goal attempt) is trying
-        // to send it out of play, not offer the defender a comfortable
-        // take. Small, additive nudge — shrink the clean-control share
-        // and hand the difference to the corner-style deflection-out
-        // branch; every other branch weight (and every non-safe-restart
-        // shot) is untouched. Reasoned, not sourced — this is the same
-        // genuinely niche behaviour the plan itself flags as having no
-        // findable real-world rate to calibrate against.
-        // 2026-08-30 (shot/cross-block investigation): a contact further
-        // from the exact shot line is a scrappier, less-controlled
-        // connection — a leg thrown out, not a clean body block — so it
-        // should skew toward a deflection outcome, not a comfortable
-        // recovery. Reuses `best_perp_factor` (1.0 dead on the line,
-        // down to 0.5 at the new corridor's outer edge) rather than
-        // inventing a second geometry term; the freed share goes to the
-        // corner-deflection branch specifically (the real-world
-        // "blocked shot squirts behind for a corner" case Pavel's
-        // framing is about), everything else in the split untouched.
-        let contact_quality = best_perp_factor.clamp(0.0, 1.0);
-        let marginal_corner_bump = (1.0 - contact_quality) * 0.15;
-        let p_controlled = if shot_target.is_safe_restart {
-            controlled_block_prob * 0.5
-        } else {
-            controlled_block_prob * (0.5 + 0.5 * contact_quality)
+        let centred = (1.0 - best_lat.abs() / BLOCK_CORRIDOR).clamp(0.0, 1.0);
+        let steer = centred * (0.15 + 0.35 * (0.5 * composure + 0.5 * technique));
+        let restitution = 0.25 - 0.10 * composure;
+        // Intent: away from his own goal, leaning to the nearer touchline.
+        let away_x = match blocker_side {
+            Some(PlayerSide::Left) => 1.0_f32,
+            Some(PlayerSide::Right) => -1.0,
+            None => {
+                if blocker_pos.x < self.field_width * 0.5 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            }
         };
-        let corner_bump = if shot_target.is_safe_restart {
-            0.12
-        } else {
-            marginal_corner_bump
-        };
-
-        let roll = context.rng.unit_f32();
-        let p_corner = p_controlled + 0.23 + corner_bump;
-        let p_safe = p_corner + 0.23;
-        let p_loose = p_safe + 0.40; // ~40% loose central rebound
-        // remainder ~14% → unlucky deflection toward goal (slows but stays live)
+        let lean_y = if blocker_pos.y < self.field_height * 0.5 { -0.5 } else { 0.5 };
+        let intent = Vector3::new(away_x, lean_y, 0.0);
+        let jitter = (context.rng.unit_f32() - 0.5) * 0.3;
+        let v_out = crate::r#match::player::strategies::players::ops::tackle::block_contact(
+            self.velocity,
+            best_lat,
+            BLOCK_CORRIDOR,
+            restitution,
+            intent,
+            steer,
+            jitter,
+            context.rng.unit_f32(),
+        );
 
         self.position = blocker_pos;
         self.position.z = 0.0;
-        self.previous_owner = self.current_owner.or(self.previous_owner);
-        self.pass_target_player_id = None;
-        self.cached_shot_target = None;
-        self.record_touch(blocker_id, blocker_team, tick, false);
         self.offside_snapshot = None;
         self.pass_origin_restart = PassOriginRestart::OpenPlay;
         // Dedicated Blocked event so the block credit can't leak into a
-        // separate Intercepted that happens to share the same tick — the
-        // ordering of events in `EventCollection` is no longer load-
-        // bearing for stat correctness.
-        let block_position = self.position;
-        events.add_ball_event(BallEvent::Blocked(blocker_id, block_position));
-
-        if roll < p_controlled {
-            // Clean block — defender gets the ball at his feet.
-            self.velocity = Vector3::zeros();
-            self.current_owner = Some(blocker_id);
-            self.flags.in_flight_state = 0;
-            self.claim_cooldown = 25;
-            events.add_ball_event(BallEvent::Intercepted(blocker_id, self.previous_owner));
-            return;
-        }
-
-        // Deflection branches below leave the ball loose (no owner) and
-        // do NOT emit `Intercepted` — block credit was already booked
-        // via the dedicated `Blocked` event above. Emitting `Intercepted`
-        // here would double-credit (interception + block), and worse,
-        // its `ClaimBall` follow-up would force ownership onto a
-        // defender who in physics terms hasn't actually picked the ball
-        // up. Possession is decided by whoever claims the loose ball
-        // next, not by the block itself.
-        if roll < p_corner {
-            #[cfg(feature = "match-logs")]
-            crate::mid_run_diag::BLOCK_CORNER_FIRED.fetch_add(1, Ordering::Relaxed);
-            // Deflection out for a corner — push the ball past the
-            // defender's OWN byline and WIDE OF THE POST (toward the corner
-            // flag) so the endline resolver awards a corner (defender = last
-            // toucher → corner for the attackers). Aiming merely at the
-            // byline (the old ±1.2 y nudge) left a central block crossing
-            // BETWEEN the posts → goal kick / own goal, so blocks almost
-            // never became corners (engine ran ~0.5 corners/match vs ~10
-            // real). The ball must finish outside `center ± GOAL_WIDTH`.
-            let endline_x = match blocker_side {
-                Some(PlayerSide::Left) => 0.0_f32,
-                Some(PlayerSide::Right) => self.field_width,
-                None => {
-                    if self.position.x < self.field_width * 0.5 {
-                        0.0
-                    } else {
-                        self.field_width
-                    }
-                }
-            };
-            let center_y = self.field_height * 0.5;
-            // Deflect toward the touchline the ball is already drifting to
-            // (sign of the reverse-deflection y), past the post.
-            let to_top = if rev_y.abs() > 0.01 {
-                rev_y < 0.0
-            } else {
-                self.position.y < center_y
-            };
-            let wide_y = if to_top {
-                (center_y - GOAL_WIDTH - self.field_height * 0.05).max(2.0)
-            } else {
-                (center_y + GOAL_WIDTH + self.field_height * 0.05).min(self.field_height - 2.0)
-            };
-            let dx = endline_x - self.position.x;
-            let dy = wide_y - self.position.y;
-            let dist = (dx * dx + dy * dy).sqrt().max(1.0);
-            let speed = (ball_velocity_2d * 0.6).clamp(3.0, 6.0);
-            self.velocity.x = (dx / dist) * speed;
-            self.velocity.y = (dy / dist) * speed;
-            self.velocity.z = 0.0;
-            self.current_owner = None;
-            self.flags.in_flight_state = 30;
-            // Hold off re-claims so the deflection crosses the byline before
-            // a covering defender grabs it back (else it never becomes a
-            // corner — the whole point of this branch).
-            self.claim_cooldown = 16;
-            // realism-bug (2026-08-26): the ball is unowned here
-            // (`current_owner = None`, above), so `claim_cooldown`'s own
-            // gate in `check_ball_ownership` (`claim_cooldown > 0 &&
-            // current_owner.is_some()`) never actually applies to this
-            // deflection — that check exists to stop ping-pong re-claims
-            // of an OWNED ball, not to protect a loose one. The real
-            // protection this branch depends on is `in_flight_state=30`
-            // routing the ball through `try_pass_target_claim` (which
-            // does nothing, since `pass_target_player_id` is also
-            // cleared) instead of `check_ball_ownership` — but
-            // `try_intercept` runs on EVERY tick regardless of
-            // `in_flight_state`, and reads `previous_owner` (still the
-            // ORIGINAL SHOOTER, untouched by this branch) to mean "the
-            // opposing team may intercept this pass" — so the very
-            // defender who just deflected the shot (or a nearby
-            // teammate) routinely re-claims their own deflection via
-            // `try_intercept` within 1-2 ticks, before it can travel
-            // anywhere near the byline. Measured with a raw diagnostic
-            // (temporary `CORNER_DEFLECTION_RECLAIMED` counter): 3 of 4
-            // corner-branch firings across 40 matches were reclaimed
-            // this way — this field is the real, permanent fix,
-            // exempting `try_intercept` for the deflection's own
-            // 30-tick window (matches `in_flight_state`'s duration).
-            self.corner_deflection_guard_until_tick = self.current_tick_cached + 30;
-            return;
-        }
-
-        if roll < p_safe {
-            // Safe sideways deflection — perpendicular skip away from
-            // both goals. Loose ball; either team can recover.
-            let safe_speed = (ball_velocity_2d * 0.35).clamp(1.5, 3.5);
-            // Rotate shot direction 90° (sign chosen by random) to skip sideways.
-            let sign = if context.rng.unit_f32() < 0.5 {
-                -1.0
-            } else {
-                1.0
-            };
-            self.velocity.x = -shot_dir_y * sign * safe_speed;
-            self.velocity.y = shot_dir_x * sign * safe_speed;
-            self.velocity.z = 0.0;
-            self.current_owner = None;
-            self.flags.in_flight_state = 25;
-            self.claim_cooldown = 0;
-            return;
-        }
-
-        if roll < p_loose {
-            // Loose central rebound — ball trickles in front of the
-            // defender, often producing a second-ball contest. Arms the
-            // rebound window (team shot-spacing exemption) so the
-            // second ball can actually be struck. The blocker is the
-            // last player the ball came off — recording him as previous
-            // owner makes the ATTACKERS the intercept-eligible side
-            // during the flight window (the spill is the defender's
-            // touch, not the shooter's pass), restoring the two-sided
-            // second-ball race.
+        // separate Intercepted that happens to share the same tick.
+        events.add_ball_event(BallEvent::Blocked(blocker_id, self.position));
+        // A slow ball dropping in front of the box is a live second ball:
+        // arm the rebound window (team shot-spacing exemption).
+        if (v_out.x * v_out.x + v_out.y * v_out.y).sqrt() < 3.0 {
             self.last_rebound_tick = tick;
-            self.previous_owner = Some(blocker_id);
-            let loose_speed = (ball_velocity_2d * 0.30).clamp(1.0, 2.8);
-            self.velocity.x = rev_x * loose_speed;
-            self.velocity.y = rev_y * loose_speed;
-            self.velocity.z = 0.0;
-            self.current_owner = None;
-            self.flags.in_flight_state = 20;
-            self.claim_cooldown = 0;
-            return;
         }
-
-        // Unlucky deflection: ball loses pace but keeps drifting toward
-        // goal. The shot flag is already cleared, so the keeper save
-        // pipeline won't credit a phantom save — but the ball is still
-        // live and can be a tap-in opportunity. Arms the rebound window;
-        // blocker booked as previous owner (see the loose branch above).
-        self.last_rebound_tick = tick;
-        self.previous_owner = Some(blocker_id);
-        let unlucky_speed = (ball_velocity_2d * 0.50).clamp(1.5, 3.5);
-        self.velocity.x = shot_dir_x * unlucky_speed * 0.7;
-        self.velocity.y = shot_dir_y * unlucky_speed * 0.7;
-        self.velocity.z = 0.0;
-        self.current_owner = None;
-        self.flags.in_flight_state = 25;
-        self.claim_cooldown = 0;
+        self.release_after_touch(blocker_id, blocker_team, blocker_side, v_out, tick);
     }
 
     /// Goalkeeper save check. Runs during shot flight: when the ball

@@ -1424,54 +1424,13 @@ impl PlayerEventDispatcher {
             }
         }
 
-        field.ball.velocity = velocity;
-        field.ball.previous_owner = Some(defender_id);
-        field.ball.current_owner = None;
-        field.ball.pass_target_player_id = None;
-        field.ball.carry_owner = None;
-        field.ball.ownership_duration = 0;
-        field.ball.clear_pending_pass_metadata();
-        field.ball.clear_pass_history();
-        field.ball.flags.in_flight_state = 6;
-        field.ball.cached_shot_target = None;
-        field
-            .ball
-            .record_touch(defender_id, defender_team, context.current_tick(), false);
-
-        // Own-goal geometry: only if the deflected ball is actually
-        // heading at the defender's own goal mouth.
-        if let Some(side) = defender_side {
-            let field_width = field.size.width as f32;
-            let field_height = field.size.height as f32;
-            let own_goal_x = match side {
-                PlayerSide::Left => 0.0,
-                PlayerSide::Right => field_width,
-            };
-            let dx = own_goal_x - ball_pos.x;
-            let heading_at_goal =
-                (dx > 0.0 && velocity.x > 0.1) || (dx < 0.0 && velocity.x < -0.1);
-            if heading_at_goal {
-                let ticks_to_goal = (dx / velocity.x).abs().max(1.0);
-                let goal_line_y = ball_pos.y + velocity.y * ticks_to_goal;
-                if (goal_line_y - field_height * 0.5).abs() < 60.0 {
-                    let g = crate::r#match::engine::physics::GRAVITY_PER_TICK;
-                    let goal_line_z = (ball_pos.z + velocity.z * ticks_to_goal
-                        - 0.5 * g * ticks_to_goal * ticks_to_goal)
-                        .max(0.0);
-                    field.ball.cached_shot_target = Some(ShotTarget {
-                        goal_line_y,
-                        goal_line_z,
-                        defending_side: side,
-                        deflected: true,
-                        physics_save_rolled: false,
-                        is_direct_fk: false,
-                        total_flight_ticks: ticks_to_goal,
-                        dispatch_tick: context.current_tick(),
-                        is_safe_restart: false,
-                    });
-                }
-            }
-        }
+        field.ball.release_after_touch(
+            defender_id,
+            defender_team,
+            defender_side,
+            velocity,
+            context.current_tick(),
+        );
     }
 
     fn handle_ball_owner_change_event(player_id: u32, field: &mut MatchField) {
@@ -3098,7 +3057,6 @@ impl PlayerEventDispatcher {
         field.ball.velocity = Vector3::zeros();
         field.ball.flags.in_flight_state = 0;
         field.ball.cached_shot_target = None;
-        field.ball.concede_out_shielded_opponent = None;
     }
 
     fn handle_shoot_event(

@@ -312,6 +312,12 @@ pub struct DuelSkills {
 pub enum TackleKind {
     Challenge,
     Slide,
+    /// A deliberate poke of the ball out of play (touchline or own
+    /// byline wide of the posts) to stop an attack at the cost of a
+    /// restart. Uses the same contact model as a challenge; only the
+    /// intent differs. Goes through `TackleContact`, NOT `ClearBall`
+    /// (which flips any clearance toward the own goal).
+    PushOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +344,113 @@ fn own_box_contains_ball(ctx: &StateProcessingContext) -> bool {
     ctx.context
         .penalty_area(ctx.player.side == Some(PlayerSide::Left))
         .contains(&ctx.tick_context.positions.ball.position)
+}
+
+/// A push-out is only considered when a boundary is this close (~9m).
+pub const PUSHOUT_RANGE: f32 = 72.0;
+/// Own-byline push-outs must be at least this far outside the posts so
+/// the ball does not end up in the goal (the goal half-width is 29u).
+const PUSHOUT_POST_MARGIN: f32 = 12.0;
+/// Value cost of the restart handed to the opponent (same units as
+/// `threat`, ~xG). A throw-in is nearly harmless; a corner is a small
+/// but real chance. Reasoned estimates, category (d).
+const THROW_IN_COST: f32 = 0.03;
+const CORNER_COST: f32 = 0.07;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExitOption {
+    /// Unit direction (xy) from the ball to the boundary.
+    pub dir: Vector3<f32>,
+    /// Distance from the ball to that boundary (u).
+    pub dist: f32,
+    /// Restart cost of using it.
+    pub cost: f32,
+}
+
+/// Nearest boundary the defender could push the ball over: a touchline,
+/// or his own byline wide of the posts. `None` when nothing is within
+/// [`PUSHOUT_RANGE`].
+pub fn nearest_exit(ctx: &StateProcessingContext, ball: Vector3<f32>) -> Option<ExitOption> {
+    let w = ctx.context.field_size.width as f32;
+    let h = ctx.context.field_size.height as f32;
+    let mut best: Option<ExitOption> = None;
+    let mut consider = |dir: Vector3<f32>, dist: f32, cost: f32| {
+        if dist <= PUSHOUT_RANGE && best.map_or(true, |b| dist < b.dist) {
+            best = Some(ExitOption { dir, dist, cost });
+        }
+    };
+    if ball.y < h * 0.5 {
+        consider(Vector3::new(0.0, -1.0, 0.0), ball.y.max(0.0), THROW_IN_COST);
+    } else {
+        consider(Vector3::new(0.0, 1.0, 0.0), (h - ball.y).max(0.0), THROW_IN_COST);
+    }
+    let own_x = if ctx.player.side == Some(PlayerSide::Left) { 0.0 } else { w };
+    let wide_of_posts =
+        (ball.y - h * 0.5).abs() > crate::r#match::engine::flow::goal::GOAL_WIDTH + PUSHOUT_POST_MARGIN;
+    if wide_of_posts {
+        let dir = Vector3::new(if own_x < 1.0 { -1.0 } else { 1.0 }, 0.0, 0.0);
+        consider(dir, (ball.x - own_x).abs(), CORNER_COST);
+    }
+    best
+}
+
+/// Restitution of a stretched leg / boot in a block (see `block_contact`).
+pub const BOOT_RESTITUTION: f32 = 0.65;
+
+/// Body/leg block contact for a shot or cross that reaches a defender
+/// standing near its line. `ball_vel` is the incoming xy velocity;
+/// `lateral` is the signed offset of the defender's centre from the
+/// ball's line (positive = to the ball's left, i.e. along
+/// `(-dir.y, dir.x)`); `radius` is the defender's effective blocking
+/// radius. A dead-centre block kills the ball and drops it back; an edge
+/// touch barely turns it, so it can keep going at goal, wide or behind.
+/// `steer` (0..1) is how much a composed defender turns the surface
+/// toward `intent_dir`. Returns the outgoing velocity (z in m/tick).
+pub fn block_contact(
+    ball_vel: Vector3<f32>,
+    lateral: f32,
+    radius: f32,
+    restitution: f32,
+    intent_dir: Vector3<f32>,
+    steer: f32,
+    jitter: f32,
+    loft_roll: f32,
+) -> Vector3<f32> {
+    let v = xy(ball_vel);
+    let speed_in = v.magnitude();
+    if speed_in < 1e-4 {
+        return ball_vel;
+    }
+    let dir = v / speed_in;
+    let perp = Vector3::new(-dir.y, dir.x, 0.0);
+    // The ball meets the defender's surface at offset -lateral from his
+    // centre; the surface normal there tilts away from -dir.
+    let sin_t = (-lateral / radius.max(1e-3)).clamp(-1.0, 1.0);
+    let cos_t = (1.0 - sin_t * sin_t).max(0.0).sqrt();
+    let n = norm_or(-dir * cos_t + perp * sin_t, -dir);
+    let intent = norm_or(xy(intent_dir), -dir);
+    let mut n_eff = norm_or(n * (1.0 - steer) + intent * steer, n);
+    n_eff = rotate(n_eff, jitter);
+    if v.x * n_eff.x + v.y * n_eff.y >= 0.0 {
+        n_eff = n;
+    }
+    let vn = v.x * n_eff.x + v.y * n_eff.y; // < 0
+    // A square touch is the torso: it soaks the ball up (`restitution`).
+    // Toward the edge of the corridor the contact is a stretched leg or
+    // foot, which is far more elastic (a ball off a boot keeps most of
+    // its speed). Blend between the two by how far off-centre it hit
+    // (reasoned estimate, category (d): body ~0.2, boot ~0.65).
+    let leg = ((lateral.abs() / radius.max(1e-3) - 0.25) / 0.45).clamp(0.0, 1.0);
+    let e = restitution + (BOOT_RESTITUTION - restitution).max(0.0) * leg;
+    let mut v_out = v - n_eff * ((1.0 + e) * vn);
+    let sp = v_out.magnitude();
+    if sp > MAX_DEFLECT_SPEED {
+        v_out = v_out * (MAX_DEFLECT_SPEED / sp);
+    }
+    // Low contact lifts the ball a little (same lift model as a leg touch).
+    let lift_angle = 0.17 + 0.45 * loft_roll;
+    let vz = ((-vn / 8.0) * lift_angle.tan()).clamp(0.0, launch_vz(MAX_DEFLECT_HEIGHT_M));
+    Vector3::new(v_out.x, v_out.y, vz)
 }
 
 /// Build the contact input for a tackle of `kind` against `opponent`
@@ -370,7 +483,7 @@ fn build_input(
         // Leg-tip speed RELATIVE to the body: a lunge/slide is far
         // quicker than a running stride (reasoned estimate, category d).
         TackleKind::Slide => (1.0 + max_speed, SLIDE_REACH),
-        TackleKind::Challenge => (0.7 + max_speed, LUNGE_REACH),
+        TackleKind::Challenge | TackleKind::PushOut => (0.7 + max_speed, LUNGE_REACH),
     };
 
     // Aim at the point where the leg tip can meet the ball (constant
@@ -402,6 +515,13 @@ fn build_input(
     let (intent, intent_speed, restitution) = match kind {
         TackleKind::Slide => (norm_or(away * 0.5 + lateral * 0.9, away), 1.3, 0.35),
         TackleKind::Challenge => (norm_or(away * 0.7 + lateral * 0.4, away), 0.55, 0.2),
+        // Aimed straight at the nearest boundary, hard enough to carry
+        // there (distance <= 72u needs ~1.4 u/tick against ground
+        // friction).
+        TackleKind::PushOut => match nearest_exit(ctx, ball) {
+            Some(e) => (e.dir, 1.8, 0.2),
+            None => (norm_or(away * 0.7 + lateral * 0.4, away), 0.55, 0.2),
+        },
     };
 
     ContactInput {
@@ -446,7 +566,7 @@ fn base_windup(kind: TackleKind, skills: DuelSkills) -> f32 {
     let slack = (1.0 - skills.tackle).clamp(0.0, 1.0);
     match kind {
         TackleKind::Slide => 2.0 + 6.0 * slack,
-        TackleKind::Challenge => 0.5 + 2.5 * slack,
+        TackleKind::Challenge | TackleKind::PushOut => 0.5 + 2.5 * slack,
     }
 }
 
@@ -487,6 +607,53 @@ fn slide_value(
             -threat - 0.1
         };
     }
+    total / 3.0
+}
+
+/// Deterministic prediction of a push-out: value of poking the ball over
+/// `exit` now, averaged over an early / expected / late wind-up. The
+/// attack ends in the best case (ball out, opponent gets the restart);
+/// a miss leaves him beaten, a foul is priced exactly like a slide's.
+fn pushout_value(
+    ctx: &StateProcessingContext,
+    opponent: &MatchPlayerLite,
+    skills: DuelSkills,
+    threat: f32,
+    exit: ExitOption,
+) -> f32 {
+    let ball = ctx.tick_context.positions.ball.position;
+    let in_box = own_box_contains_ball(ctx);
+    let w0 = base_windup(TackleKind::PushOut, skills);
+    let mut total = 0.0;
+    for w in [w0 - 1.0, w0, w0 + 2.0] {
+        let input = build_input(ctx, opponent, skills, TackleKind::PushOut, w.max(0.0), 0.0, Vector3::zeros(), 0.0, 0.5);
+        let o = resolve_contact(&input);
+        total += if o.foul {
+            if in_box {
+                -0.8
+            } else {
+                0.7 * threat - 0.25
+            }
+        } else if o.touched {
+            let v = xy(o.velocity);
+            let speed = v.magnitude();
+            // Does the ball actually get there? Friction stops a ball of
+            // speed s after ~s/0.015 units.
+            let heads_out = speed > 0.5
+                && v.dot(&exit.dir) > 0.6 * speed
+                && speed / 0.015 >= exit.dist;
+            if heads_out {
+                threat - exit.cost
+            } else {
+                // Touched but it stays in: no worse than a normal
+                // challenge that only half works.
+                threat * 0.25
+            }
+        } else {
+            -threat - 0.1
+        };
+    }
+    let _ = ball;
     total / 3.0
 }
 
@@ -549,6 +716,17 @@ pub fn choose(
             best = (sv, TackleChoice::Act(TackleKind::Slide));
         }
     }
+    // Push-out: a threatening attack next to a boundary can be ended by
+    // conceding a restart. Valued like the other options, from the
+    // predicted contact — no rule, no dice.
+    if d <= LUNGE_REACH && threat > 0.15 {
+        if let Some(exit) = nearest_exit(ctx, ctx.tick_context.positions.ball.position) {
+            let pv = pushout_value(ctx, opponent, skills, threat, exit);
+            if pv > best.0 {
+                best = (pv, TackleChoice::Act(TackleKind::PushOut));
+            }
+        }
+    }
     best.1
 }
 
@@ -600,7 +778,7 @@ pub fn duel(
     let windup_extra = tri(rng.unit_f32(), rng.unit_f32())
         * match kind {
             TackleKind::Slide => 4.0,
-            TackleKind::Challenge => 1.5,
+            TackleKind::Challenge | TackleKind::PushOut => 1.5,
         }
         * (1.0 - 0.5 * skills.tackle);
     let windup = (base_windup(kind, skills) + windup_extra + (1.0 - skills.condition) * 3.0).max(0.0);
@@ -644,7 +822,7 @@ pub fn duel(
     // hand): the calibrated discipline model, only when the geometry
     // itself was clean. Slides get their fouls purely from geometry.
     let mut foul = outcome.foul;
-    if !foul && kind == TackleKind::Challenge && (outcome.touched || outcome.body_contact) {
+    if !foul && kind != TackleKind::Slide && (outcome.touched || outcome.body_contact) {
         let mut base = 0.075 + aggression01 * 0.12 - skills.discipline * 0.075;
         base *= if outcome.touched { 0.30 } else { 1.80 };
         base += (1.0 - skills.condition).max(0.0) * 0.08;
@@ -766,6 +944,54 @@ mod tests {
                     o.leg_fraction
                 );
             }
+        }
+    }
+
+    fn block(lateral: f32, steer: f32) -> Vector3<f32> {
+        block_contact(
+            Vector3::new(2.5, 0.0, 0.0),
+            lateral,
+            14.0,
+            0.2,
+            Vector3::new(-1.0, -0.5, 0.0),
+            steer,
+            0.0,
+            0.5,
+        )
+    }
+
+    #[test]
+    fn centred_block_kills_the_ball_and_drops_it_back() {
+        let v = block(0.0, 0.0);
+        // Dead-centre: almost all speed lost, ball goes back the way it came.
+        assert!(v.x < 0.0, "should rebound backward, got {}", v.x);
+        assert!(v.x.abs() < 0.8, "energy should be mostly absorbed, got {}", v.x);
+        assert!(v.y.abs() < 1e-3);
+    }
+
+    #[test]
+    fn edge_touch_barely_turns_the_ball() {
+        let v = block(13.0, 0.0);
+        // Grazing the edge: the ball keeps going forward at goal, turned
+        // only a little.
+        assert!(v.x > 1.5, "graze should keep most forward speed, got {}", v.x);
+        let turn = angle_deg(Vector3::new(2.5, 0.0, 0.0), v).abs();
+        assert!(turn < 40.0, "graze turn should be small, got {turn}");
+    }
+
+    #[test]
+    fn block_side_decides_which_way_it_turns() {
+        let left = block(8.0, 0.0);
+        let right = block(-8.0, 0.0);
+        assert!(left.y * right.y < 0.0, "mirrored offsets must turn opposite ways");
+    }
+
+    #[test]
+    fn block_speed_capped_and_lift_non_negative() {
+        for l in [-14.0f32, -7.0, 0.0, 7.0, 14.0] {
+            let v = block(l, 0.4);
+            assert!(Vector3::new(v.x, v.y, 0.0).magnitude() <= MAX_DEFLECT_SPEED + 1e-3);
+            assert!(v.z >= 0.0);
         }
     }
 
