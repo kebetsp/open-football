@@ -1642,82 +1642,45 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             let def_id = defender.id;
             let composure = (defender.skills.mental.composure / 20.0).clamp(0.0, 1.0);
             let heading = (defender.skills.technical.heading / 20.0).clamp(0.0, 1.0);
-            // Clamp bounds mirror try_block_shot's own controlled_block_prob
-            // shape (calm, technically-sound defenders clear more cleanly).
-            let clean_prob = (0.85 + composure * 0.06 + heading * 0.06).clamp(0.85, 0.97);
-            let corner_prob = clean_prob + 0.019;
-            let throw_in_prob = corner_prob + 0.037;
-            // remainder (~2-3%): loose knockdown in the box - a genuine
-            // second-ball contest, matching the "other/noise" residual
-            // in the sourced data rather than assuming it away.
-            let roll = context.rng.unit_f32();
+            let def_team = defender.team_id;
+            let def_side = defender.side;
+            // ONE header contact (no outcome dice table). Intent: away
+            // from his own goal, leaning to the nearer touchline — how a
+            // centre-back is coached to clear a cross. Execution error
+            // (rotation of that direction) and power come from heading /
+            // composure: a good header goes where it is aimed, a poor one
+            // can go anywhere. Corner, throw-in, own goal or a clean
+            // clearance are decided by where the ball then goes and by
+            // last touch (`release_after_touch`), never by a roll.
+            // Error width and speeds are category-(d) estimates, tuned to
+            // the sourced uncompleted-cross outcomes (StatsBomb
+            // Bundesliga 2023/24, n=430: ~90% stays in play, ~3.7% throw-in,
+            // ~1.9% corner for the attackers).
             let own_goal_x_is_left = attacked_goal.x < context.field_size.width as f32 / 2.0;
-
-            if roll < clean_prob {
-                // Clean clearance - away from goal, upfield, a genuine
-                // loose ball either side can win (not an instant hand-back
-                // to the defender - a real header doesn't land at feet).
-                let clear_dir_x = if own_goal_x_is_left { 1.0 } else { -1.0 };
-                let angle: f32 = (context.rng.unit_f32() - 0.5) * 1.2;
-                field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
-                field.ball.velocity = Vector3::new(
-                    clear_dir_x * angle.cos() * 2.6,
-                    angle.sin() * 2.6,
-                    0.0,
-                );
-                field.ball.current_owner = None;
-                field.ball.previous_owner = Some(def_id);
-                field.ball.flags.in_flight_state = 20;
-                #[cfg(feature = "match-logs")]
-                aerial_def_diag::DEF_CLEAN.fetch_add(1, Ordering::Relaxed);
-            } else if roll < corner_prob {
-                // Deflected behind for a corner - mirrors try_block_shot's
-                // own corner-branch geometry (endline_x / wide of the
-                // post), but relative to the DEFENDING team's own goal
-                // (attacked_goal here IS the defending side's own goal).
-                let endline_x = if own_goal_x_is_left { 0.0_f32 } else { field.ball.field_width };
-                let center_y = field.ball.field_height * 0.5;
-                let to_top = def_pos.y < center_y;
-                let wide_y = if to_top {
-                    (center_y - GOAL_WIDTH - field.ball.field_height * 0.05).max(2.0)
-                } else {
-                    (center_y + GOAL_WIDTH + field.ball.field_height * 0.05).min(field.ball.field_height - 2.0)
-                };
-                let dx = endline_x - def_pos.x;
-                let dy = wide_y - def_pos.y;
-                let dist = (dx * dx + dy * dy).sqrt().max(1.0);
-                let speed = 3.5_f32;
-                field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
-                field.ball.velocity = Vector3::new((dx / dist) * speed, (dy / dist) * speed, 0.0);
-                field.ball.current_owner = None;
-                field.ball.previous_owner = Some(def_id);
-                field.ball.flags.in_flight_state = 30;
-                field.ball.claim_cooldown = 16;
-                field.ball.corner_deflection_guard_until_tick = tick + 30;
-                #[cfg(feature = "match-logs")]
-                aerial_def_diag::DEF_CORNER.fetch_add(1, Ordering::Relaxed);
-            } else if roll < throw_in_prob {
-                // Deflected out for a throw-in - sideways, toward the
-                // nearer touchline.
-                let to_top = def_pos.y < field.ball.field_height * 0.5;
-                let sign = if to_top { -1.0 } else { 1.0 };
-                field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
-                field.ball.velocity = Vector3::new(0.0, sign * 3.0, 0.0);
-                field.ball.current_owner = None;
-                field.ball.previous_owner = Some(def_id);
-                field.ball.flags.in_flight_state = 20;
-                #[cfg(feature = "match-logs")]
-                aerial_def_diag::DEF_THROW_IN.fetch_add(1, Ordering::Relaxed);
+            let skill = 0.5 * heading + 0.5 * composure;
+            let clear_dir_x = if own_goal_x_is_left { 1.0_f32 } else { -1.0 };
+            let lean_y = if def_pos.y < field.ball.field_height * 0.5 { -0.35_f32 } else { 0.35 };
+            let intent = lean_y.atan2(clear_dir_x.abs());
+            let intent = if clear_dir_x < 0.0 { std::f32::consts::PI - intent } else { intent };
+            let sigma = 0.25 + 0.55 * (1.0 - skill);
+            let err = (context.rng.unit_f32() + context.rng.unit_f32() + context.rng.unit_f32() - 1.5) * 2.0 * sigma / 1.5;
+            // A genuine mishit (skied, sliced, glanced behind): direction
+            // is unconstrained. Rarer for skilled headers.
+            let mishit_p = 0.05 + 0.10 * (1.0 - skill);
+            let ang = if context.rng.unit_f32() < mishit_p {
+                context.rng.unit_f32() * std::f32::consts::TAU
             } else {
-                // Loose knockdown - a real second-ball contest in the box.
-                let angle: f32 = context.rng.unit_f32() * std::f32::consts::TAU;
-                field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
-                field.ball.velocity = Vector3::new(angle.cos() * 1.5, angle.sin() * 1.5, 0.0);
-                field.ball.current_owner = None;
-                field.ball.previous_owner = Some(def_id);
-                field.ball.flags.in_flight_state = 25;
-                #[cfg(feature = "match-logs")]
-                aerial_def_diag::DEF_LOOSE.fetch_add(1, Ordering::Relaxed);
+                intent + err
+            };
+            let speed = 1.6 + 1.6 * skill * context.rng.unit_f32().max(0.3);
+            let v = Vector3::new(ang.cos() * speed, ang.sin() * speed, 0.03);
+            field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
+            field.ball.offside_snapshot = None;
+            field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
+            field.ball.release_after_touch(def_id, def_team, def_side, v, tick);
+            #[cfg(feature = "match-logs")]
+            {
+                aerial_def_diag::DEF_CLEAN.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
