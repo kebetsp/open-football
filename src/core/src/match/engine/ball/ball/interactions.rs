@@ -3,7 +3,7 @@
 //! unowned balls with `in_flight_state > 0` so routine possession
 //! play isn't disturbed.
 
-use super::Ball;
+use super::{Ball, PendingIntercept};
 use crate::PlayerFieldPositionGroup;
 use crate::r#match::ball::events::BallEvent;
 use crate::r#match::engine::goal::GOAL_WIDTH;
@@ -14,6 +14,7 @@ use crate::r#match::player::strategies::players::ops::effective_skill::{
     ActionContext as EffSkillCtx, effective_skill,
 };
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
+use crate::r#match::player::strategies::players::tackle::{ContactInput, resolve_contact};
 use crate::r#match::{MatchContext, MatchPlayer, PassOriginRestart, PlayerSide};
 use nalgebra::Vector3;
 #[cfg(feature = "match-logs")]
@@ -53,6 +54,9 @@ pub mod block_diag {
     }
 }
 
+/// Leg reach of an interception swing (~2.25m: a stretched leg).
+const INTERCEPT_REACH: f32 = 18.0;
+
 impl Ball {
     /// Opposing players near the ball's flight path can intercept passes.
     /// Interception chance depends on tackling, anticipation, positioning skills
@@ -70,6 +74,10 @@ impl Ball {
         let _ = context;
         // Only intercept unowned balls that are in flight (active pass)
         if self.current_owner.is_some() || self.flags.in_flight_state == 0 {
+            if !self.intercept_attempted.is_empty() {
+                self.intercept_attempted.clear();
+            }
+            self.pending_intercept = None;
             return;
         }
 
@@ -128,129 +136,169 @@ impl Ball {
         // a slightly higher base coefficient produces ~10
         // interceptions/team/match (real-football band) without the
         // intercept→snap→re-pass loops the previous 8u radius caused.
-        const INTERCEPT_RADIUS: f32 = 5.5;
-        const INTERCEPT_RADIUS_SQ: f32 = INTERCEPT_RADIUS * INTERCEPT_RADIUS;
+        // Contested interception (2026-10-01, Pavel's redesign). Every
+        // opponent near the ball's path gets ONE attempt per pass: each
+        // swings a leg (same contact geometry as a tackle), and the FIRST
+        // leg to meet the ball decides its fate. A well-timed, centred
+        // touch kills the ball and he controls it; a late or edge touch
+        // only deflects it (it goes where the contact sends it — a corner,
+        // a throw-in, an own goal, a loose ball); a miss lets it go
+        // through. A second defender arriving within a few ticks can
+        // spoil the first one's control. Nobody is "the best" by
+        // decree: a defender only stands down when a teammate is clearly
+        // better placed.
+        const TRIGGER_RADIUS: f32 = 10.0;
+        const TRIGGER_RADIUS_SQ: f32 = TRIGGER_RADIUS * TRIGGER_RADIUS;
+        // A candidate stands down if a teammate would reach the ball this
+        // many ticks sooner.
+        const STAND_DOWN_TICKS: f32 = 6.0;
+        // A second contact within this many ticks can spoil the first.
+        const SPOIL_WINDOW_TICKS: u32 = 4;
+        const SPOIL_PROB: f32 = 0.35;
+        // A touch that leaves the ball slower than this (shin, thigh or
+        // foot — whatever part met it) has killed it: a controlled
+        // interception (u/tick).
+        const CONTROL_MAX_SPEED: f32 = 1.5;
 
-        let mut best_interceptor: Option<u32> = None;
-        let mut best_chance: f32 = 0.0;
-
-        for player in players {
-            // Only opposing team players can intercept
-            if player.team_id == passer_team {
-                continue;
-            }
-
-            // Don't let the pass target's team intercept their own pass target
-            if Some(player.id) == self.pass_target_player_id {
-                continue;
-            }
-
-            // Distance from player to ball
-            let dx = player.position.x - self.position.x;
-            let dy = player.position.y - self.position.y;
-            let dist_sq = dx * dx + dy * dy;
-
-            if dist_sq > INTERCEPT_RADIUS_SQ {
-                continue;
-            }
-
-            // Base chance: dedicated `interception` composite — anticipation,
-            // positioning, concentration, marking, etc. routed through
-            // `effective_skill` so fatigue applies. Drop-in replacement for
-            // the legacy 4-skill average; magnitude lands in the same band
-            // (0..1). Minute derived from the cached tick (10ms ticks).
-            let minute = sc::minute_from_ticks(self.current_tick_cached);
-            let skill_factor = sc::interception(player, minute);
-
-            // Proximity factor: closer = higher chance (1.0 at 0m, 0.3 at max radius)
-            let dist = dist_sq.sqrt();
-            let proximity_factor = 1.0 - (dist / INTERCEPT_RADIUS) * 0.7;
-
-            // Fast passes are harder to intercept — penalty coefficient
-            // moderated from 0.10 (which made 7 u/tick passes 41% harder
-            // than slow ones) back toward a lighter slope.
-            let speed_penalty = 1.0 / (1.0 + ball_speed_sq.sqrt() * 0.06);
-
-            // Per-tick interception chance. The 0.13 coefficient with
-            // the 0.035 threshold mathematically excluded average
-            // defenders (skill 0.5 × proximity 0.65 × speed 0.6 ≈
-            // 0.025 per the old radius), so observed interceptions
-            // were ~0.1/team/match vs real ~10/team. 0.16 (with the
-            // bumped 5.5u radius and lowered 0.030 threshold) brings
-            // an average-positioned defender to ~0.038 (above
-            // threshold), and an elite defender at point-blank to
-            // ~0.07, while still leaving peripheral or off-the-pace
-            // defenders below the bar. Population per-team
-            // interceptions land near 12–13/match.
-            let chance = skill_factor * proximity_factor * speed_penalty * 0.16;
-
-            if chance > best_chance {
-                best_chance = chance;
-                best_interceptor = Some(player.id);
-            }
-        }
-
-        // Deterministic threshold. Avg defender (skill 0.5) at 60% of
-        // reach with a typical pass score ~0.040 — just above the bar —
-        // so most in-path defenders qualify, but peripheral ones don't.
-        //
-        // Stat-line note: population interceptions/team/match measures
-        // ~120 vs the ~10 real-football target. ~3× of that comes from
-        // the flight-protection extension (40→120 ticks) tripling the
-        // per-pass intercept window; the rest from pass-volume inflation
-        // (~1000 attempts/team vs real ~500). Raising the threshold to
-        // suppress this inflated goals/match dramatically (it acts as a
-        // population-wide pass-success governor), so the cosmetic stat
-        // inflation is accepted in favour of in-band goals + draws.
-        if best_chance > 0.030 {
-            if let Some(interceptor_id) = best_interceptor {
-                // Snap the ball to the interceptor and zero the
-                // velocity. Before this, velocity was just scaled to
-                // Zeroing velocity + handing ownership to the defender
-                // prevents the old "own-goal after intercept" bug without
-                // needing to teleport the ball. `move_to` will track the
-                // ball toward its new owner at 1.5 u/tick over the next
-                // 2-3 ticks, so visually the ball decelerates into the
-                // defender's feet instead of jumping instantly from its
-                // flight path onto the defender — which was visible to
-                // the user as "ball appearing on another player without
-                // moving".
-                //
-                // OG risk is fully handled by `self.velocity = zeros()`:
-                // a stationary ball can't roll past the 15u owner-drop
-                // threshold, so it can't cross the goal line unowned.
-                let _ = interceptor_id; // no teleport, keep position as-is
-                #[cfg(feature = "match-logs")]
-                {
-                    if self.current_tick_cached <= self.corner_deflection_guard_until_tick {
-                        block_diag::CORNER_DEFLECTION_RECLAIMED.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                self.current_owner = Some(interceptor_id);
-                self.pass_target_player_id = None;
-                self.flags.in_flight_state = 0;
-                self.claim_cooldown = 15;
-                self.velocity = Vector3::zeros();
-                self.position.z = 0.0;
-                // Interception ends any in-flight shot — a defender taking
-                // control downfield extinguishes the shot. Without this,
-                // the next time the keeper grabs a moving ball from an
-                // opponent (a long pass that loops to them), the stale
-                // shot flag credits a phantom save and inflates the
-                // saves/on-target ratio above 100%.
-                self.cached_shot_target = None;
-                let interceptor_team = players
-                    .iter()
-                    .find(|p| p.id == interceptor_id)
-                    .map(|p| p.team_id)
-                    .unwrap_or(0);
+        // Apply a contest resolved earlier once his leg reaches the ball.
+        if let Some(p) = self.pending_intercept {
+            if self.current_tick_cached >= p.apply_tick {
+                self.pending_intercept = None;
                 let tick = self.current_tick_cached;
-                self.record_touch(interceptor_id, interceptor_team, tick, true);
+                self.pass_target_player_id = None;
                 self.offside_snapshot = None;
                 self.pass_origin_restart = PassOriginRestart::OpenPlay;
-                events.add_ball_event(BallEvent::Intercepted(interceptor_id, self.previous_owner));
+                if p.controlled {
+                    self.current_owner = Some(p.defender_id);
+                    self.flags.in_flight_state = 0;
+                    self.claim_cooldown = 15;
+                    self.velocity = Vector3::zeros();
+                    self.position.z = 0.0;
+                    self.cached_shot_target = None;
+                    self.record_touch(p.defender_id, p.defender_team, tick, true);
+                    events.add_ball_event(BallEvent::Intercepted(p.defender_id, self.previous_owner));
+                } else {
+                    // A deflection is not an interception: no
+                    // `Intercepted` event (its ClaimBall follow-up would
+                    // hand him the ball he only touched).
+                    self.release_after_touch(p.defender_id, p.defender_team, p.defender_side, p.velocity, tick);
+                }
+            }
+            return;
+        }
+
+        let minute = sc::minute_from_ticks(self.current_tick_cached);
+        let mut cands: Vec<usize> = Vec::new();
+        for (i, player) in players.iter().enumerate() {
+            if player.team_id == passer_team
+                || Some(player.id) == self.pass_target_player_id
+                || self.intercept_attempted.contains(&player.id)
+            {
+                continue;
+            }
+            let dx = player.position.x - self.position.x;
+            let dy = player.position.y - self.position.y;
+            if dx * dx + dy * dy <= TRIGGER_RADIUS_SQ {
+                cands.push(i);
             }
         }
+        if cands.is_empty() {
+            return;
+        }
+
+        // Each candidate swings once; record the contact each would make.
+        struct Swing {
+            idx: usize,
+            tick: u32,
+            control: f32,
+            velocity: Vector3<f32>,
+        }
+        let mut swings: Vec<Swing> = Vec::new();
+        let ball_pos = Vector3::new(self.position.x, self.position.y, 0.0);
+        let ball_vel = Vector3::new(self.velocity.x, self.velocity.y, 0.0);
+        let rng = &context.rng;
+        for &i in &cands {
+            let p = &players[i];
+            self.intercept_attempted.push(p.id);
+            let skill = sc::interception(p, minute).clamp(0.0, 1.0);
+            let speed = p.skills.max_speed_with_condition(p.player_attributes.condition);
+            let leg_speed = 0.9 + speed;
+            let reach = INTERCEPT_REACH;
+            let def = Vector3::new(p.position.x, p.position.y, 0.0);
+            // Aim where the ball will be when the tip gets there.
+            let mut t = 5.0f32;
+            for _ in 0..30 {
+                let aim = ball_pos + ball_vel * t;
+                t = ((aim - def).magnitude() / leg_speed).min(60.0);
+            }
+            let aim = ball_pos + ball_vel * t;
+            let to = aim - def;
+            let axis = if to.magnitude() > 1e-3 { to / to.magnitude() } else { Vector3::new(1.0, 0.0, 0.0) };
+            // Reaction: sharper players start the leg sooner.
+            let tri = rng.unit_f32() - rng.unit_f32();
+            let windup = (0.3 + 2.5 * (1.0 - skill) + tri * 1.0).max(0.0);
+            // He wants to kill the ball; a clearance goes away from his goal.
+            let away_x = match p.side {
+                Some(PlayerSide::Left) => 1.0,
+                Some(PlayerSide::Right) => -1.0,
+                None => if p.position.x < self.field_width * 0.5 { 1.0 } else { -1.0 },
+            };
+            let lean_y = if p.position.y < self.field_height * 0.5 { -0.5 } else { 0.5 };
+            let intent = Vector3::new(away_x, lean_y, 0.0);
+            let input = ContactInput {
+                defender: def,
+                defender_vel: Vector3::new(p.velocity.x, p.velocity.y, 0.0),
+                ball: ball_pos,
+                ball_vel,
+                // No carrier: this is a pass in flight, nobody to foul.
+                carrier: ball_pos - ball_vel * 1000.0,
+                axis,
+                leg_speed,
+                reach,
+                windup_ticks: windup,
+                intent_dir: intent,
+                intent_speed: 0.4,
+                restitution: 0.10,
+                control_skill: (0.3 + 0.7 * skill).clamp(0.0, 1.0),
+                jitter: rng.unit_f32() - rng.unit_f32(),
+                jitter_sigma: 0.15 * (1.0 - 0.7 * skill),
+                loft_roll: rng.unit_f32(),
+            };
+            let o = resolve_contact(&input);
+            if o.touched {
+                swings.push(Swing { idx: i, tick: o.ball_tick.unwrap_or(0), control: o.control, velocity: o.velocity });
+            }
+        }
+        if swings.is_empty() {
+            return;
+        }
+        swings.sort_by_key(|s| s.tick);
+        let first = &swings[0];
+        // A defender clearly later than the first stands down: only a
+        // near-simultaneous contender can spoil.
+        let contender = swings
+            .iter()
+            .skip(1)
+            .any(|s| (s.tick as f32) <= first.tick as f32 + STAND_DOWN_TICKS.min(SPOIL_WINDOW_TICKS as f32));
+        let mut velocity = first.velocity;
+        let sp = (velocity.x * velocity.x + velocity.y * velocity.y).sqrt();
+        let mut controlled = sp <= CONTROL_MAX_SPEED;
+        if controlled && contender && rng.unit_f32() < SPOIL_PROB {
+            // Two legs at the ball: it squirts loose between them.
+            controlled = false;
+            let a = rng.unit_f32() * std::f32::consts::TAU;
+            velocity.x += a.cos() * 1.2;
+            velocity.y += a.sin() * 1.2;
+        }
+        let p = &players[first.idx];
+        self.pending_intercept = Some(PendingIntercept {
+            apply_tick: self.current_tick_cached + first.tick as u64,
+            defender_id: p.id,
+            defender_team: p.team_id,
+            defender_side: p.side,
+            velocity,
+            controlled,
+        });
     }
 
     /// Shot-block check. Runs only when the ball is a shot in flight

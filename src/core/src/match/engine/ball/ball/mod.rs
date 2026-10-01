@@ -198,6 +198,10 @@ pub struct Ball {
     /// deflected it re-claim it within 1-2 ticks — measured at 3/4
     /// corner-branch firings across 40 matches before this fix.
     pub corner_deflection_guard_until_tick: u64,
+    /// Defenders who already had their one attempt at the current pass.
+    pub intercept_attempted: Vec<u32>,
+    /// The resolved contest waiting for its contact tick.
+    pub pending_intercept: Option<PendingIntercept>,
     /// Fire-once guard for the discrete corner aerial contest. A played-out
     /// lofted corner can't thread the congested box to a specific runner, so
     /// once the cross is struck the engine resolves a single skill-weighted
@@ -416,6 +420,22 @@ pub struct Ball {
 /// will actually arrive rather than chasing its current position — a
 /// diving keeper commits to a spot on the line, they don't track the
 /// ball every frame.
+/// A contested interception resolved at first trigger and applied when
+/// the first defender's leg actually reaches the ball (so the ball keeps
+/// flying until then). See `Ball::try_intercept`.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingIntercept {
+    pub apply_tick: u64,
+    pub defender_id: u32,
+    pub defender_team: u32,
+    pub defender_side: Option<PlayerSide>,
+    /// Ball velocity after the touch (xy u/tick, z m/tick).
+    pub velocity: Vector3<f32>,
+    /// The touch kills the ball and he takes ownership; otherwise it is
+    /// a deflection and the ball is left loose.
+    pub controlled: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ShotTarget {
     /// y-coordinate at which the shot is projected to cross the goal
@@ -547,6 +567,8 @@ impl Ball {
             pending_restart_teleports: Vec::new(),
             direct_fk_shot_in_flight: false,
             corner_deflection_guard_until_tick: 0,
+            intercept_attempted: Vec::new(),
+            pending_intercept: None,
             corner_contest_resolved: true,
             last_aerial_contest_tick: 0,
             pending_corner_routine: None,
