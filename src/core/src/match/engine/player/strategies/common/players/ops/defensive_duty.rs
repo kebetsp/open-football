@@ -59,7 +59,11 @@ const THREAT_SCAN_RADIUS_UNITS: f32 = 280.0;
 /// Below this danger score, an opponent isn't worth pulling a defender
 /// out of shape to mark individually — real teams don't man-mark every
 /// opponent on the pitch, only the currently dangerous ones.
-const DANGER_FLOOR: f32 = 0.15;
+const DANGER_FLOOR: f32 = 0.30;
+
+/// Attacker value (xG, `box_attack::threat_value_at`) that counts as full
+/// danger: a central player ~10m from goal.
+const THREAT_FULL_VALUE: f32 = 0.10;
 
 /// Real defensive-zone doctrine: a centre-back or full-back stepping up
 /// to press is normal inside the defensive third plus a margin; a
@@ -218,6 +222,7 @@ const SCRAMBLE_SPREAD_STEP_UNITS: f32 = 56.0; // ~7.0m between neighbours
 /// box width (a real box is ~40m wide, so ~161u half-width at this
 /// project's scale) rather than sending a defender to stand outside
 /// the box chasing a phantom lane, however many responders there are.
+const SCRAMBLE_MAX_DEPTH_UNITS: f32 = 80.0; // 10m
 const SCRAMBLE_MAX_HALF_SPAN_UNITS: f32 = 140.0; // ~17.5m either side
 
 /// A tackle attempt is only live once the presser is genuinely this
@@ -813,14 +818,15 @@ fn assign_team(
         // See `MARK_MAX_DIST_UNITS`'s own doc comment.
         .filter(|c| (c.position - own_goal).magnitude() <= MARK_MAX_DIST_UNITS)
         .map(|c| {
-            let dist_to_goal = (c.position - own_goal).magnitude();
-            let proximity = 1.0 - (dist_to_goal / THREAT_SCAN_RADIUS_UNITS).clamp(0.0, 1.0);
-            let nearby_defenders = pool
-                .iter()
-                .filter(|d| (d.position - c.position).magnitude() <= 100.0)
-                .count();
-            let openness = 1.0 - (nearby_defenders as f32 / 3.0).clamp(0.0, 1.0);
-            let danger = (0.7 * proximity + 0.3 * openness).max(proximity * 0.7);
+            // Threat is what the attacker can PRODUCE from where he
+            // stands, in the attack's own xG currency (2026-10-03, wide
+            // play plan): a corner-flag winger (cross EV ~0.03) no longer
+            // outranks a central player at the box edge just because he
+            // is close to our goal in a straight line.
+            let danger = (crate::r#match::player::strategies::common::players::ops::box_attack::threat_value_at(
+                c.position, own_goal,
+            ) / THREAT_FULL_VALUE)
+                .clamp(0.0, 1.0);
             (*c, danger)
         })
         .filter(|(_, danger)| *danger >= DANGER_FLOOR)
@@ -1032,7 +1038,16 @@ fn assign_team(
     // counter so the fan-out spacing accounts for everyone converging,
     // not just the hold-shape half. ---
     if ball_dist_to_goal <= CRISIS_RADIUS_UNITS {
-        let danger_point = own_goal + (focal_pos - own_goal) * 0.6;
+        // Stand where a block stands: ~40% of the way to the ball, at most
+        // ~10m off the goal line (real back four sit ~9.9m from goal at a
+        // shot, StatsBomb 360), not 60% of the way out to the ball.
+        let to_ball = focal_pos - own_goal;
+        let ball_len = to_ball.magnitude();
+        let danger_point = if ball_len > 1.0 {
+            own_goal + to_ball / ball_len * (ball_len * 0.4).min(SCRAMBLE_MAX_DEPTH_UNITS)
+        } else {
+            own_goal
+        };
         // Full responder list gathered FIRST so the spread below can be
         // spaced evenly across the whole group in one pass, rather than
         // fanning outward one at a time from a fixed small step (the

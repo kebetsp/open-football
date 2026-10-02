@@ -380,6 +380,17 @@ pub(crate) fn chance_at(point: Vector3<f32>, goal: Vector3<f32>, opponents: &[Ma
     continuation(point, goal).max(shoot).max(cross)
 }
 
+/// Value of an attacker standing at `point` for the DEFENCE's threat
+/// ranking (domain 1): the same xG currency the attack uses (continuation,
+/// his own shot, a typical cross from a wide crossing position), without
+/// defender-dependent terms. A corner-flag winger is worth ~0.03, a
+/// central player 10m from goal ~0.10.
+pub(crate) fn threat_value_at(point: Vector3<f32>, goal: Vector3<f32>) -> f32 {
+    let shoot = RECV_SHOT_FACTOR * shot_xg(point, goal, &[]);
+    let cross = if in_crossing_area(point, goal) { CROSS_TYPICAL_EV } else { 0.0 };
+    continuation(point, goal).max(shoot).max(cross)
+}
+
 /// The final-third decision for the ball carrier. Always returns an
 /// action (domain 4 governs the whole final third).
 pub fn decide_final_third(

@@ -57,6 +57,8 @@ pub mod block_diag {
 /// Leg reach of an interception swing (~2.25m: a stretched leg).
 const INTERCEPT_REACH: f32 = 18.0;
 
+const LEG_REACH_HEIGHT_M: f32 = 1.2;
+
 impl Ball {
     /// Opposing players near the ball's flight path can intercept passes.
     /// Interception chance depends on tackling, anticipation, positioning skills
@@ -105,8 +107,12 @@ impl Ball {
             return;
         }
 
-        // Don't intercept aerial balls above player reach
-        if self.position.z > 2.5 {
+        // A leg swing cannot reach a ball above ~1.2m (knee-to-chest height
+        // of a standing player stretching); higher balls are headers and
+        // go through the aerial contest. Was 2.5m, which let an adjacent
+        // marker "intercept" a cross 0.2s after the kick at 1.3m height
+        // (22-36% of crosses; real blocked+intercepted ~5%).
+        if self.position.z > LEG_REACH_HEIGHT_M {
             return;
         }
 
