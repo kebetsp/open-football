@@ -199,6 +199,24 @@ const CARRY_STEP: f32 = 80.0;
 /// unchanged), 440 gave the same carry rate.
 const FAIR_CARRY_STEP: f32 = 320.0;
 const CARRY_HEADINGS: usize = 7;
+/// Defenders within this of a carry's end point (6m) each have to be beaten.
+const CARRY_CROWD_RADIUS: f32 = 48.0;
+/// Same-binary A/B toggle: set `CARRY_CROWD_ABLATE` (any value) to drop it.
+fn carry_crowd_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRY_CROWD_ABLATE").is_none())
+}
+/// Six-yard box half-width (9.2m) and the minimum goal-line depth of a carry's
+/// end point in front of goal (5.5m) / wide of it (3m), in units.
+const CARRY_GOALMOUTH_HALF_WIDTH: f32 = 74.0;
+const CARRY_FLOOR_CENTRAL: f32 = 44.0;
+const CARRY_FLOOR_WIDE: f32 = 24.0;
+/// Same-binary A/B toggle: set `CARRY_GOALLINE_ABLATE` (any value) to restore
+/// the old end-point clamp.
+fn carry_goalline_floor_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRY_GOALLINE_ABLATE").is_none())
+}
 const CARRY_FAN_HALF_DEG: f32 = 90.0;
 
 // ---- Runs.
@@ -464,6 +482,8 @@ pub fn decide_final_third(
         }
     }
 
+    #[cfg(feature = "match-logs")]
+    let (mut dbg_best, mut dbg_by) = ((0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32), (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32));
     // Carry.
     let to_goal = goal - from;
     let forward = if to_goal.magnitude() > 1.0 {
@@ -499,6 +519,22 @@ pub fn decide_final_third(
             let h = ctx.context.field_size.height as f32;
             target.x = target.x.clamp(4.0, w - 4.0);
             target.y = target.y.clamp(4.0, h - 4.0);
+            if carry_goalline_floor_on() {
+                // A carry does not run into the goalmouth: the shot model
+                // fitted on real shots says a point 0.7m from the goal line
+                // beside the post is worth 0.25+, so the old clamp (4u from
+                // the line) made "carry at the goal line" beat every real
+                // option. Real carries from the crossing zone end within
+                // 5.5m of the goal line 21% of the time but in the central
+                // box 1% (StatsBomb). Keep the end point out of the six-yard
+                // box (5.5m) when it is in front of goal, and 3m off the
+                // line elsewhere (a byline carry).
+                let lat = (target.y - goal.y).abs();
+                let floor = if lat < CARRY_GOALMOUTH_HALF_WIDTH { CARRY_FLOOR_CENTRAL } else { CARRY_FLOOR_WIDE };
+                if (goal.x - target.x).abs() < floor {
+                    target.x = goal.x - toward * floor;
+                }
+            }
             travel = (target - from).magnitude();
             if travel < 15.0 {
                 continue;
@@ -507,7 +543,22 @@ pub fn decide_final_third(
         // Ending the carry beside a defender is a take-on: success falls
         // from ~0.95 with room to the sourced 0.527 with none.
         let room = openness(target, opponents);
-        let p_keep = 0.95 * (open / CARRY_STEP).min(1.0) * (TAKE_ON_SUCCESS + (1.0 - TAKE_ON_SUCCESS) * room);
+        let mut p_keep = 0.95 * (open / CARRY_STEP).min(1.0) * (TAKE_ON_SUCCESS + (1.0 - TAKE_ON_SUCCESS) * room);
+        if carry_crowd_on() {
+            // `room` only sees the single nearest opponent. A run that ends
+            // among several defenders means beating each of them (real
+            // take-on success 0.527 per defender, StatsBomb); the engine's
+            // box is under-defended, so counting them is what stops a
+            // winger "carrying" through a crowded area to a central point.
+            let crowd = opponents
+                .iter()
+                .filter(|o| o.tactical_positions.position_group() != PlayerFieldPositionGroup::Goalkeeper)
+                .filter(|o| (o.position - target).magnitude() <= CARRY_CROWD_RADIUS)
+                .count();
+            if crowd > 1 {
+                p_keep *= TAKE_ON_SUCCESS.powi(crowd as i32 - 1);
+            }
+        }
         // Fair path: no flat delay discount. `p_keep` already prices the
         // take-on risk (0.527..0.95 by room), and a pass pays no equivalent
         // multiplier, so the old 0.9 double-counted risk against carries.
@@ -515,6 +566,14 @@ pub fn decide_final_third(
         let v = disc * p_keep * press_keep * (chance_at(target, goal, opponents) + RETAIN_BONUS)
             * carry_sticky_mult(ctx.player.velocity, heading);
         d_carry = d_carry.max(v);
+        #[cfg(feature = "match-logs")]
+        {
+            let tdep = (goal.x - target.x).abs() / UNITS_PER_METRE;
+            let tlat = (target.y - goal.y).abs() / UNITS_PER_METRE;
+            let ch = chance_at(target, goal, opponents);
+            if v > dbg_best.0 { dbg_best = (v, tdep, tlat, p_keep, ch, room); }
+            if tdep <= 8.0 && tlat >= 12.5 && v > dbg_by.0 { dbg_by = (v, tdep, tlat, p_keep, ch, room); }
+        }
         if v > best_value {
             best_value = v;
             best = Action::Carry(target);
@@ -535,6 +594,15 @@ pub fn decide_final_third(
         }
     }
 
+    #[cfg(feature = "match-logs")]
+    if (from.y - goal.y).abs() >= 100.0 && (goal.x - from.x).abs() <= 200.0 {
+        crate::match_log_info!(
+            "CARRYDIAG depth={:.1} lat={:.1} best_v={:.3} best_dep={:.1} best_lat={:.1} best_pk={:.2} best_ch={:.3} best_room={:.2} by_v={:.3} by_dep={:.1} by_lat={:.1} by_pk={:.2} by_ch={:.3} by_room={:.2} deliver={:.3} pass={:.3}",
+            (goal.x - from.x).abs() / UNITS_PER_METRE, (from.y - goal.y).abs() / UNITS_PER_METRE,
+            dbg_best.0, dbg_best.1, dbg_best.2, dbg_best.3, dbg_best.4, dbg_best.5,
+            dbg_by.0, dbg_by.1, dbg_by.2, dbg_by.3, dbg_by.4, dbg_by.5, d_deliver, d_pass
+        );
+    }
     #[cfg(feature = "match-logs")]
     crate::match_log_info!(
         "BOXDIAG id={} lat_m={:.1} depth_m={:.1} plan={} runners={} shoot={:.3} deliver={:.3} pass={:.3} carry={:.3} take={:.3} pf={:.3} pl={:.3} pb={:.3} opp_m={:.1} chose={}",
