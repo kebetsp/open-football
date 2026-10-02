@@ -190,6 +190,9 @@ impl Ball {
         let minute = sc::minute_from_ticks(self.current_tick_cached);
         let mut cands: Vec<usize> = Vec::new();
         for (i, player) in players.iter().enumerate() {
+            if self.is_claim_barred(player.id) {
+                continue;
+            }
             if player.team_id == passer_team
                 || Some(player.id) == self.pass_target_player_id
                 || self.intercept_attempted.contains(&player.id)

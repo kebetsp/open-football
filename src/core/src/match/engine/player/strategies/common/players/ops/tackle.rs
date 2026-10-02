@@ -39,6 +39,48 @@ use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::{MatchPlayerLite, PlayerSide, StateProcessingContext, SteeringBehavior};
 use nalgebra::Vector3;
 
+/// THE contest model (2026-10-03, docs/wide-play-holistic-design.md §3.1):
+/// probability that a ball carrier beats ONE defender in a duel. The
+/// physical resolution (`duel`), the defender's decision (`choose`) and
+/// every carry/dribble value (`box_attack`, `on_ball_decision`) read this
+/// one function, so what the player believes is what the physics does.
+/// Base = real take-on success (StatsBomb Bundesliga 2023/24: Dribble
+/// complete / attempted = 0.527). `CONTEST_SPREAD` is how much the skill
+/// gap (both 0..1 composites) moves it; 0 = every duel is the average.
+pub const TAKE_ON_BASE: f32 = 0.527;
+
+fn contest_spread() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("CONTEST_SPREAD").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0)
+    })
+}
+
+/// Carrier beats the defender, given each side's 0..1 duel composite.
+pub fn carrier_keep_probability(carrier_skill: f32, defender_skill: f32) -> f32 {
+    (TAKE_ON_BASE + contest_spread() * (carrier_skill - defender_skill)).clamp(0.15, 0.90)
+}
+
+/// Dribbling composite of any player by id (0.5 if unknown).
+pub fn carrier_skill_of(ctx: &StateProcessingContext, id: u32) -> f32 {
+    let minute = sc::minute_from_ms(ctx.context.total_match_time);
+    ctx.context
+        .players
+        .by_id(id)
+        .map(|p| sc::dribble_attack(p, minute))
+        .unwrap_or(0.5)
+}
+
+/// Defensive-duel composite of any player by id (0.5 if unknown).
+pub fn defender_skill_of(ctx: &StateProcessingContext, id: u32) -> f32 {
+    let minute = sc::minute_from_ms(ctx.context.total_match_time);
+    ctx.context
+        .players
+        .by_id(id)
+        .map(|p| sc::defensive_duel(p, minute))
+        .unwrap_or(0.5)
+}
+
 /// Half-thickness of the "leg + ball" capsule (leg ~0.10m + ball ~0.11m
 /// radius at 8u/m). Reasoned estimate, category (d).
 pub const LEG_CONTACT_RADIUS: f32 = 1.9;
@@ -670,7 +712,11 @@ pub fn choose(
     let margin = dv::is_goal_side(ctx.player.position, opponent.position, own_goal);
     let d = opponent.distance(ctx);
     let threat = dv::value_conceded_if_beaten(ctx, opponent);
-    let p_win = dv::tackle_win_probability(ctx, opponent, skills.tackle);
+    let p_win = 1.0
+        - carrier_keep_probability(
+            carrier_skill_of(ctx, opponent.id),
+            defender_skill_of(ctx, ctx.player.id),
+        );
     let covered = if dv::has_covering_teammate(ctx, opponent.position) {
         1.0
     } else {
@@ -757,8 +803,11 @@ pub fn duel(
         TackleChoice::Act(k) => k,
     };
     let rng = &ctx.context.rng;
-    let p_win = dv::tackle_win_probability(ctx, opponent, skills.tackle);
-    let evasion = (1.0 - p_win / 0.55).clamp(0.0, 1.0);
+    let p_keep = carrier_keep_probability(
+        carrier_skill_of(ctx, opponent.id),
+        defender_skill_of(ctx, ctx.player.id),
+    );
+    let carrier_wins = rng.unit_f32() < p_keep;
     let jitter = tri(rng.unit_f32(), rng.unit_f32());
     let loft = rng.unit_f32();
     let aim_sigma = 0.03 + 0.12 * (1.0 - skills.tackle);
@@ -766,7 +815,6 @@ pub fn duel(
     // The duel itself: the carrier sidesteps the lunge. How hard he can
     // is set by how much better he is than the tackler (1 - p_win),
     // scaled by his own speed; direction is a coin flip.
-    let _ = evasion;
     let to_ball = norm_or(
         xy(ctx.tick_context.positions.ball.position - ctx.player.position),
         Vector3::new(1.0, 0.0, 0.0),
@@ -774,7 +822,12 @@ pub fn duel(
     let perp = Vector3::new(-to_ball.y, to_ball.x, 0.0);
     let side = if rng.unit_f32() < 0.5 { 1.0 } else { -1.0 };
     let carrier_speed = xy(opponent.velocity(ctx)).magnitude().max(0.3);
-    let dodge = perp * (side * (1.0 - p_win) * 1.2 * carrier_speed * rng.unit_f32());
+    let dodge_roll = 0.6 + 0.4 * rng.unit_f32();
+    let dodge = if carrier_wins {
+        perp * (side * 1.2 * carrier_speed * dodge_roll)
+    } else {
+        Vector3::zeros()
+    };
     let windup_extra = tri(rng.unit_f32(), rng.unit_f32())
         * match kind {
             TackleKind::Slide => 4.0,
@@ -800,7 +853,9 @@ pub fn duel(
             0.0
         };
         crate::match_log_info!(
-            "TACKLE kind={:?} tick={} id={} d={:.1} touched={} bodyc={} foul={} ctrl={:.2} legfrac={:.2} turn={:.0} vin={:.2} vout={:.2} vz={:.3} box={}",
+            "TACKLE cw={} car={} kind={:?} tick={} id={} d={:.1} touched={} bodyc={} foul={} ctrl={:.2} legfrac={:.2} turn={:.0} vin={:.2} vout={:.2} vz={:.3} box={}",
+            carrier_wins,
+            opponent.id,
             kind,
             ctx.context.current_tick(),
             defender_id,
@@ -849,6 +904,7 @@ pub fn duel(
         events.push(Event::PlayerEvent(PlayerEvent::TackleContact(
             defender_id,
             outcome.velocity,
+            if carrier_wins { None } else { Some(opponent.id) },
         )));
     }
     DuelAction::Act(events)

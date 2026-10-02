@@ -133,6 +133,9 @@ pub struct Ball {
     pub unowned_stopped_ticks: u32,
     pub ownership_duration: u32,
     pub claim_cooldown: u32,
+    /// (player, until tick): a carrier who lost a duel cannot reclaim the
+    /// ball he was just dispossessed of until then (contest model).
+    pub claim_barred: Option<(u32, u64)>,
     pub pass_target_player_id: Option<u32>,
     /// Passer id of the most-recent live pass. Set on pass emit,
     /// cleared on any opponent touch or when the pass's natural
@@ -552,6 +555,7 @@ impl Ball {
             unowned_stopped_ticks: 0,
             ownership_duration: 0,
             claim_cooldown: 0,
+            claim_barred: None,
             pass_target_player_id: None,
             pending_pass_passer: None,
             pending_pass_set_tick: 0,
@@ -681,6 +685,11 @@ impl Ball {
             self.flags.in_flight_state = 30;
             self.corner_deflection_guard_until_tick = tick + 30;
         }
+    }
+
+    /// True while this player, having lost a duel, may not reclaim the ball.
+    pub fn is_claim_barred(&self, id: u32) -> bool {
+        matches!(self.claim_barred, Some((p, until)) if p == id && self.current_tick_cached <= until)
     }
 
     /// Record a meaningful touch. Drives restart resolution. `controlled`

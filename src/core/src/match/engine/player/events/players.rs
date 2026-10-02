@@ -482,6 +482,9 @@ pub enum FoulOutcome {
     Called(FoulRuling),
 }
 
+/// Ticks the carrier who lost a duel cannot reclaim his own dispossessed ball.
+pub const CONTEST_LOSER_BAR_TICKS: u64 = 30;
+
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
     Goal(u32, bool),
@@ -516,7 +519,7 @@ pub enum PlayerEvent {
     /// the ball. Carries the outgoing ball velocity (xy u/tick, z
     /// metres/tick) already computed by `tackle::resolve_contact` — the
     /// handler just applies it. Fouls are a separate `CommitFoul`.
-    TackleContact(u32, Vector3<f32>),
+    TackleContact(u32, Vector3<f32>, Option<u32>),
     BallOwnerChange(u32),
     PassTo(PassingEventContext),
     ClearBall(Vector3<f32>),
@@ -848,9 +851,14 @@ impl PlayerEventDispatcher {
                 Self::record_team_possession_if_switch(player_id, field, context);
                 Self::handle_tackling_ball_event(player_id, field, context);
             }
-            PlayerEvent::TackleContact(player_id, velocity) => {
+            PlayerEvent::TackleContact(player_id, velocity, barred) => {
                 Self::record_team_possession_if_switch(player_id, field, context);
                 Self::handle_tackle_contact_event(player_id, velocity, field, context);
+                // The carrier lost the contest: he cannot simply regather
+                // his own dispossessed ball (see Ball::claim_barred).
+                if let Some(c) = barred {
+                    field.ball.claim_barred = Some((c, context.current_tick() + CONTEST_LOSER_BAR_TICKS));
+                }
             }
             PlayerEvent::BallOwnerChange(player_id) => {
                 Self::handle_ball_owner_change_event(player_id, field);

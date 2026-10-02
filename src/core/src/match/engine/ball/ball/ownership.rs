@@ -269,7 +269,7 @@ impl Ball {
         }
         if let Some(target_id) = self
             .pass_target_player_id
-            .filter(|&id| self.restart_taker_lock != Some(id))
+            .filter(|&id| self.restart_taker_lock != Some(id) && !self.is_claim_barred(id))
         {
             if let Some(target_player) = players.iter().find(|p| p.id == target_id) {
                 // Use cached landing position for aerial balls, current position for ground balls
@@ -392,7 +392,7 @@ impl Ball {
         if self.flags.in_flight_state < 10 {
             if let Some(prev_id) = self
                 .previous_owner
-                .filter(|&id| self.restart_taker_lock != Some(id))
+                .filter(|&id| self.restart_taker_lock != Some(id) && !self.is_claim_barred(id))
             {
                 if let Some(prev_player) = players.iter().find(|p| p.id == prev_id) {
                     let dx = prev_player.position.x - self.position.x;
@@ -537,7 +537,7 @@ impl Ball {
             for notified_player_id in &self.take_ball_notified_players {
                 // §9.4.1: the restart taker may sit in the notified list
                 // from BEFORE his strike — he must not claim through it.
-                if self.restart_taker_lock == Some(*notified_player_id) {
+                if (self.restart_taker_lock == Some(*notified_player_id) || self.is_claim_barred(*notified_player_id)) {
                     continue;
                 }
                 if let Some(player) = players.iter().find(|p| p.id == *notified_player_id) {
@@ -736,7 +736,7 @@ impl Ball {
                 let nearest_attacker = defending_side.and_then(|def_side| {
                     players
                         .iter()
-                        .filter(|p| self.restart_taker_lock != Some(p.id))
+                        .filter(|p| self.restart_taker_lock != Some(p.id) && !self.is_claim_barred(p.id))
                         .filter(|p| p.side.is_some() && p.side != Some(def_side))
                         .filter_map(|p| {
                             let dx = p.position.x - self.position.x;
@@ -753,7 +753,7 @@ impl Ball {
                 let nearest_overall = players
                     .iter()
                     // §9.4.1: restart taker excluded from force-claims too.
-                    .filter(|p| self.restart_taker_lock != Some(p.id))
+                    .filter(|p| self.restart_taker_lock != Some(p.id) && !self.is_claim_barred(p.id))
                     .filter_map(|p| {
                         let dx = p.position.x - self.position.x;
                         let dy = p.position.y - self.position.y;
@@ -883,7 +883,7 @@ impl Ball {
         for player in players {
             // §9.4.1: don't send the restart taker chasing a ball he's
             // barred from touching.
-            if self.restart_taker_lock == Some(player.id) {
+            if (self.restart_taker_lock == Some(player.id) || self.is_claim_barred(player.id)) {
                 continue;
             }
             let dx = player.position.x - ball_position.x;
@@ -1095,7 +1095,7 @@ impl Ball {
         // where the target resolves back to the taker).
         if let Some(target_id) = self
             .pass_target_player_id
-            .filter(|&id| self.restart_taker_lock != Some(id))
+            .filter(|&id| self.restart_taker_lock != Some(id) && !self.is_claim_barred(id))
         {
             if let Some(target_player) = players.iter().find(|p| p.id == target_id) {
                 let dx = target_player.position.x - self.position.x;
@@ -1184,8 +1184,13 @@ impl Ball {
         for player in players.iter() {
             // §9.4.1 same-touch rule: the restart taker cannot claim
             // his own delivery until someone else touches it.
-            if self.restart_taker_lock == Some(player.id) {
+            if (self.restart_taker_lock == Some(player.id) || self.is_claim_barred(player.id)) {
                 continue;
+            }
+            if let Some((barred, until)) = self.claim_barred {
+                if barred == player.id && self.current_tick_cached <= until {
+                    continue;
+                }
             }
             let dx = player.position.x - self.position.x;
             let dy = player.position.y - self.position.y;

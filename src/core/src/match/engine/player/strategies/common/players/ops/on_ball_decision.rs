@@ -716,7 +716,17 @@ fn dribble_value(
     let beyond = blocker.position + forward * 30.0;
     let payoff_open = open_distance_in_heading(beyond, forward, opponents);
     let payoff = (payoff_open / CARRY_LOOKAHEAD).clamp(0.0, 1.0);
-    let skill = (ctx.player.skills.technical.dribbling / 20.0).clamp(0.0, 1.0);
+    // One contest model for the belief and the physics (tackle.rs). The
+    // old value scaled with the raw dribbling stat; now it scales with the
+    // chance of beating THIS blocker (equal to the old value for an
+    // average player, 0.5 at spread 0).
+    let p_keep = crate::r#match::player::strategies::common::players::ops::tackle::carrier_keep_probability(
+        crate::r#match::player::strategies::common::players::ops::tackle::carrier_skill_of(ctx, ctx.player.id),
+        crate::r#match::player::strategies::common::players::ops::tackle::defender_skill_of(ctx, blocker.id),
+    );
+    let skill = (0.5 * p_keep
+        / crate::r#match::player::strategies::common::players::ops::tackle::TAKE_ON_BASE)
+        .clamp(0.0, 1.0);
     let risk = turnover_cost(own_goal, from) * DRIBBLE_RISK_MULT;
     let base_priority = carry_priority_mult(group, (from - own_goal).magnitude());
     // The blocker himself is always one of the counted defenders ahead —

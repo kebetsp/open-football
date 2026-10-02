@@ -1550,7 +1550,7 @@ impl PassEvaluator {
                 // from the PRESSER's own multiplier (not the passer's —
                 // `MatchPlayerLite` doesn't carry it, so look up the
                 // full player by id, same pattern already used by
-                // `time_to_intercept`/`tackle_win_probability`).
+                // `time_to_intercept`).
                 if is_central_lane && is_goal_side(opponent.position, passer.position, own_goal) > 0.0
                 {
                     let press_trap_emphasis = ctx

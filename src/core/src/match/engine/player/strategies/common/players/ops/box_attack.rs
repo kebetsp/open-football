@@ -134,7 +134,7 @@ const P_SHOT_GIVEN_REACH: f32 = 0.6;
 /// Mean xG created per delivery (0.026-0.038 across origin depths).
 const CROSS_TYPICAL_EV: f32 = 0.03;
 /// Take-on success (StatsBomb Dribble complete / attempted).
-const TAKE_ON_SUCCESS: f32 = 0.527;
+const TAKE_ON_SUCCESS: f32 = crate::r#match::player::strategies::common::players::ops::tackle::TAKE_ON_BASE;
 /// A carry or take-on delays the chance and keeps the ball at some risk
 /// (estimate).
 const CARRY_DISCOUNT: f32 = 0.9;
@@ -583,8 +583,11 @@ pub fn decide_final_third(
     // Take-on.
     if let Some(blocker) = nearest_blocker(from, forward, opponents) {
         let beyond = blocker.position + forward * 30.0;
-        let skill = (ctx.player.skills.technical.dribbling / 20.0).clamp(0.0, 1.0);
-        let p_beat = TAKE_ON_SUCCESS * (0.7 + 0.6 * skill);
+        use crate::r#match::player::strategies::common::players::ops::tackle as contest;
+        let p_beat = contest::carrier_keep_probability(
+            contest::carrier_skill_of(ctx, ctx.player.id),
+            contest::defender_skill_of(ctx, blocker.id),
+        );
         let v = CARRY_DISCOUNT * p_beat * press_keep * (chance_at(beyond, goal, opponents) + RETAIN_BONUS);
         d_take = v;
         if v > best_value {
