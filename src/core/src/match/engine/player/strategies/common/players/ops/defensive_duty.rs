@@ -117,6 +117,24 @@ const MARK_LOOSE_UNITS: f32 = 40.0; // 5.0m
 /// second presser, leaving nobody behind).
 const COVER_STANDOFF_UNITS: f32 = 64.0; // 8.0m
 
+/// Wide-play plan (2026-10-04): the presser aims where the carrier will be
+/// this many ticks ahead (not where he is), so he can meet a cut-in instead
+/// of chasing a point 1.5 m goal-side of the carrier's current spot at the
+/// same top speed forever (measured: 7.6 m away at +0.3 s, still 4.9 m at
+/// +3 s). ~0.6 s at the engine's 100 ticks/s. Category (d) estimate.
+const PRESS_LEAD_TICKS: f32 = 60.0;
+/// How far the covering defender looks ahead along the carrier's path.
+/// ~1.0 s. Category (d) estimate.
+const COVER_LEAD_TICKS: f32 = 100.0;
+/// A carrier further than this from the centre line counts as "wide" for
+/// the presser's show-outside bias (100u = 12.5 m, the same wide-lane cut
+/// the measurement script uses), full effect 120u further out.
+const WIDE_START_UNITS: f32 = 100.0;
+const WIDE_RAMP_UNITS: f32 = 120.0;
+/// Share of the inward direction mixed into the presser's stand-off
+/// direction for a wide carrier (0 = straight goal-side as before).
+const SHOW_OUTSIDE_WEIGHT: f32 = 0.8;
+
 /// Defensive-line depth bounds and how much the ball's own distance
 /// from our goal pulls the line forward. Real doctrine: push up when
 /// the ball is contained and far away, sit deep when it's dangerously
@@ -900,13 +918,17 @@ fn assign_team(
     // where cover should stand) rather than falling through to an
     // unrelated "deepest overall" pick.
     let ball_dist_to_goal = (focal_pos - own_goal).magnitude();
-    let to_goal = own_goal - focal_pos;
+    // Cover stands on the carrier's projected path, goal-side of it, not
+    // 8 m behind the ball on the ball-to-goal line (a winger cutting in
+    // then meets someone).
+    let cover_from = focal_pos + focal_vel * COVER_LEAD_TICKS;
+    let to_goal = own_goal - cover_from;
     let dir = if to_goal.magnitude() > 1.0 {
         to_goal.normalize()
     } else {
         Vector3::new(1.0, 0.0, 0.0)
     };
-    let target = focal_pos + dir * COVER_STANDOFF_UNITS;
+    let target = cover_from + dir * COVER_STANDOFF_UNITS;
     // Forwards excluded from cover selection this pass, same reasoning
     // as Step D above — covering isn't a forward's off-ball job here.
     let cover = pool
@@ -940,13 +962,26 @@ fn assign_team(
         let dist_to_carrier = (presser.position - focal_pos).magnitude();
         let engage = (cover_arrived && dist_to_carrier <= ENGAGE_WITH_COVER_UNITS)
             || dist_to_carrier <= ENGAGE_WITHOUT_COVER_UNITS;
-        let to_goal = own_goal - focal_pos;
-        let dir = if to_goal.magnitude() > 1.0 {
+        // Stand at the carrier's anticipated position, goal-side AND (for a
+        // wide carrier) on the inside, so the carrier is shown toward the
+        // touchline instead of being allowed to cut in.
+        let predicted = focal_pos + focal_vel * PRESS_LEAD_TICKS;
+        let to_goal = own_goal - predicted;
+        let mut dir = if to_goal.magnitude() > 1.0 {
             to_goal.normalize()
         } else {
             Vector3::new(1.0, 0.0, 0.0)
         };
-        let target = focal_pos + dir * JOCKEY_DISTANCE_UNITS;
+        let lateral = predicted.y - own_goal.y; // goal centre y == pitch centre y
+        let wide = ((lateral.abs() - WIDE_START_UNITS) / WIDE_RAMP_UNITS).clamp(0.0, 1.0);
+        if wide > 0.0 {
+            let inward = Vector3::new(0.0, -lateral.signum(), 0.0);
+            let mixed = dir + inward * (SHOW_OUTSIDE_WEIGHT * wide);
+            if mixed.magnitude() > 0.01 {
+                dir = mixed.normalize();
+            }
+        }
+        let target = predicted + dir * JOCKEY_DISTANCE_UNITS;
         results.push(Assignment {
             id: presser.id,
             duty: DefensiveDuty::Press {

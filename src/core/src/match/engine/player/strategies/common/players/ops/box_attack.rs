@@ -126,6 +126,54 @@ fn continuation(point: Vector3<f32>, goal: Vector3<f32>) -> f32 {
     let w = ((dy / UNITS_PER_METRE - 10.0) / 10.0).clamp(0.0, 1.0);
     (1.0 - w) * central + w * CONT_WIDE
 }
+/// Value of the possession after a CARRY ends at `point`, fitted to where
+/// real wide-lane carries (>= 12.5m off the centre line, 8-32m from the goal
+/// line) end (StatsBomb Bundesliga 2023/24, 34 matches, future open-play xG
+/// in the possession after the carry; `scripts/attack-gap/statsbomb/
+/// carryend.py`): byline (<= 8m deep, >= 9.2m wide) 0.029 (n=159), box
+/// channel 0.040 (n=195), wide outside the box 0.0255 (n=296), central
+/// 16-25m 0.0226 (n=326), anything else 0.021 (n=1278); central box 0.145
+/// (n=12, too few: the all-action fit above is kept there). The all-action
+/// `continuation` (0.10*exp(-(d-10)/14)) is ~2x the real figure for a carry
+/// ending central 16-25m out, which made every cut-in outscore a byline run
+/// (real: 0.0226 vs 0.029).
+fn carry_continuation(point: Vector3<f32>, goal: Vector3<f32>) -> f32 {
+    let dep = (goal.x - point.x).abs() / UNITS_PER_METRE;
+    let lat = (point.y - goal.y).abs() / UNITS_PER_METRE;
+    let base = continuation(point, goal);
+    if dep <= 16.5 && lat < 9.2 {
+        return base;
+    }
+    let real = if dep <= 8.0 && lat >= 9.2 {
+        0.029
+    } else if dep <= 16.5 && lat < 20.2 {
+        0.040
+    } else if dep <= 16.5 {
+        0.0255
+    } else {
+        0.0226
+    };
+    base.min(real)
+}
+/// Same-binary A/B toggle: set `CARRY_ENDVAL_ABLATE` (any value) to use the
+/// all-action continuation for carry end points again.
+fn carry_endval_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRY_ENDVAL_ABLATE").is_none())
+}
+/// `chance_at` for the end point of a carry.
+fn carry_chance_at(point: Vector3<f32>, goal: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
+    if !carry_endval_on() {
+        return chance_at(point, goal, opponents);
+    }
+    let shoot = RECV_SHOT_FACTOR * shot_xg(point, goal, opponents);
+    let cross = if in_crossing_area(point, goal) {
+        CROSS_TYPICAL_EV * openness(point, opponents)
+    } else {
+        0.0
+    };
+    carry_continuation(point, goal).max(shoot).max(cross)
+}
 /// Open-play cross completion.
 const CROSS_COMPLETION: f32 = 0.35;
 /// Share of completed crosses that become a shot (a shot follows 20.5% of
@@ -201,6 +249,37 @@ const FAIR_CARRY_STEP: f32 = 320.0;
 const CARRY_HEADINGS: usize = 7;
 /// Defenders within this of a carry's end point (6m) each have to be beaten.
 const CARRY_CROWD_RADIUS: f32 = 48.0;
+/// Defenders within this of a carry's path (4m: a defender this close steps
+/// across and contests) each have to be beaten at the real take-on rate
+/// 0.527 (the same contest model the duel physics uses). Without it a cut-in
+/// "through" the gaps between standing defenders was free, since the lane
+/// test only sees defenders within 2.5m. Same-binary A/B toggle:
+/// `CARRY_PATH_ABLATE`.
+const CARRY_PATH_CONTEST_RADIUS: f32 = 32.0;
+fn carry_path_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRY_PATH_ABLATE").is_none())
+}
+fn dist_point_segment(p: Vector3<f32>, a: Vector3<f32>, b: Vector3<f32>) -> f32 {
+    let ab = b - a;
+    let l2 = ab.x * ab.x + ab.y * ab.y;
+    let t = if l2 > 0.0 { (((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / l2).clamp(0.0, 1.0) } else { 0.0 };
+    let q = Vector3::new(a.x + ab.x * t, a.y + ab.y * t, 0.0);
+    ((p.x - q.x).powi(2) + (p.y - q.y).powi(2)).sqrt()
+}
+/// Run commitment for a flank run (wide-lane plan, 2026-10-04): a carrier who
+/// is already moving along the flank toward the goal line keeps the run
+/// unless a pass/delivery is clearly better, instead of re-deciding every
+/// tick and giving the ball up after ~0.7s (measured: byline arrivals from
+/// the wide lane ~1.1/match vs real 4.7). Size is a calibration to that real
+/// arrival rate (swept via `BYLINE_STICKY`, default `BYLINE_STICKY_DEFAULT`).
+const BYLINE_STICKY_DEFAULT: f32 = 0.5;
+fn byline_sticky() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        std::env::var("BYLINE_STICKY").ok().and_then(|v| v.parse().ok()).unwrap_or(BYLINE_STICKY_DEFAULT)
+    })
+}
 /// Same-binary A/B toggle: set `CARRY_CROWD_ABLATE` (any value) to drop it.
 fn carry_crowd_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -570,12 +649,40 @@ pub fn decide_final_third(
                 p_keep *= TAKE_ON_SUCCESS.powi(crowd as i32 - 1);
             }
         }
+        if carry_path_on() && fair {
+            let on_path = opponents
+                .iter()
+                .filter(|o| o.tactical_positions.position_group() != PlayerFieldPositionGroup::Goalkeeper)
+                .filter(|o| (o.position - target).magnitude() > CARRY_CROWD_RADIUS)
+                .filter(|o| dist_point_segment(o.position, from, target) <= CARRY_PATH_CONTEST_RADIUS)
+                .count();
+            if on_path > 0 {
+                p_keep *= TAKE_ON_SUCCESS.powi(on_path as i32);
+            }
+        }
         // Fair path: no flat delay discount. `p_keep` already prices the
         // take-on risk (0.527..0.95 by room), and a pass pays no equivalent
         // multiplier, so the old 0.9 double-counted risk against carries.
         let disc = if fair { 1.0 } else { CARRY_DISCOUNT };
-        let v = disc * p_keep * press_keep * (chance_at(target, goal, opponents) + RETAIN_BONUS)
-            * carry_sticky_mult(ctx.player.velocity, heading);
+        // Flank run in progress: the carrier is wide and the candidate
+        // heading runs mostly toward the goal line (within ~37 degrees of
+        // it) without cutting in by more than ~0.4 of its length. The end
+        // points are 320u away, so a lateral-distance test on the end
+        // point (the first version) almost never matched.
+        let from_lat = (from.y - goal.y).abs();
+        let inward_comp = -(from.y - goal.y).signum() * heading.y;
+        let flank_run = fair
+            && from_lat >= CROSS_MIN_LATERAL
+            && heading.x * toward >= 0.80
+            && inward_comp <= 0.40;
+        let flank_mult = if flank_run && carry_sticky_mult(ctx.player.velocity, heading) > 1.0 {
+            1.0 + byline_sticky()
+        } else {
+            1.0
+        };
+        let v = disc * p_keep * press_keep * (carry_chance_at(target, goal, opponents) + RETAIN_BONUS)
+            * carry_sticky_mult(ctx.player.velocity, heading)
+            * flank_mult;
         d_carry = d_carry.max(v);
         #[cfg(feature = "match-logs")]
         {
@@ -611,10 +718,13 @@ pub fn decide_final_third(
     #[cfg(feature = "match-logs")]
     if (from.y - goal.y).abs() >= 100.0 && (goal.x - from.x).abs() <= 200.0 {
         crate::match_log_info!(
-            "CARRYDIAG depth={:.1} lat={:.1} best_v={:.3} best_dep={:.1} best_lat={:.1} best_pk={:.2} best_ch={:.3} best_room={:.2} by_v={:.3} by_dep={:.1} by_lat={:.1} by_pk={:.2} by_ch={:.3} by_room={:.2} deliver={:.3} pass={:.3}",
-            (goal.x - from.x).abs() / UNITS_PER_METRE, (from.y - goal.y).abs() / UNITS_PER_METRE,
+            "CARRYDIAG id={} depth={:.1} lat={:.1} best_v={:.3} best_dep={:.1} best_lat={:.1} best_pk={:.2} best_ch={:.3} best_room={:.2} by_v={:.3} by_dep={:.1} by_lat={:.1} by_pk={:.2} by_ch={:.3} by_room={:.2} deliver={:.3} pass={:.3} chosen={} tdep={:.1} tlat={:.1}",
+            ctx.player.id, (goal.x - from.x).abs() / UNITS_PER_METRE, (from.y - goal.y).abs() / UNITS_PER_METRE,
             dbg_best.0, dbg_best.1, dbg_best.2, dbg_best.3, dbg_best.4, dbg_best.5,
-            dbg_by.0, dbg_by.1, dbg_by.2, dbg_by.3, dbg_by.4, dbg_by.5, d_deliver, d_pass
+            dbg_by.0, dbg_by.1, dbg_by.2, dbg_by.3, dbg_by.4, dbg_by.5, d_deliver, d_pass,
+            match best { Action::Shoot => "shoot", Action::Deliver { .. } => "deliver", Action::Through { .. } => "through", Action::Pass(_) => "pass", Action::Carry(_) => "carry", Action::Dribble(_) => "take", _ => "hold" },
+            match best { Action::Carry(t) => (goal.x - t.x).abs() / UNITS_PER_METRE, _ => -1.0 },
+            match best { Action::Carry(t) => (t.y - goal.y).abs() / UNITS_PER_METRE, _ => -1.0 }
         );
     }
     #[cfg(feature = "match-logs")]
