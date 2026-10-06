@@ -535,6 +535,12 @@ pub fn decide_final_third(
     goal: Vector3<f32>,
     opponents: &[MatchPlayerLite],
 ) -> Action {
+    #[cfg(feature = "match-logs")]
+    let mut bl = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    // (best byline-heading value, max open m, travel m, p_keep, end chance, end depth m, end lat m, n candidates)
+    #[cfg(feature = "match-logs")]
+    let mut pw = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    // (best pass value, p_c, tm lat m, tm depth m, chance_at, distance m)
     let mut best = Action::Hold;
     let mut best_value = HOLD_VALUE;
     let (mut d_shoot, mut d_deliver, mut d_pass, mut d_carry, mut d_take) =
@@ -605,6 +611,11 @@ pub fn decide_final_third(
             v *= BACK_TO_PASSER_MULT;
         }
         d_pass = d_pass.max(v);
+        #[cfg(feature = "match-logs")]
+        if v > pw.0 {
+            pw = (v, p_c, (tm.position.y - goal.y).abs() / UNITS_PER_METRE, (goal.x - tm.position.x).abs() / UNITS_PER_METRE,
+                  chance_at(tm.position, goal, opponents), (tm.position - from).magnitude() / UNITS_PER_METRE);
+        }
         let dxg = (tm.position.x - from.x) * toward;
         if dxg > 24.0 { d_pf = d_pf.max(v) } else if dxg < -24.0 { d_pb = d_pb.max(v) } else { d_pl = d_pl.max(v) }
         if v > best_value {
@@ -653,6 +664,15 @@ pub fn decide_final_third(
             open_distance_in_heading(from, heading, opponents)
         };
         let travel = open.min(step_len);
+        #[cfg(feature = "match-logs")]
+        {
+            let fl = (from.y - goal.y).abs();
+            let inw = -(from.y - goal.y).signum() * heading.y;
+            if fl >= CROSS_MIN_LATERAL && heading.x * toward >= 0.80 && inw <= 0.40 {
+                bl.1 = bl.1.max(open / UNITS_PER_METRE);
+                bl.7 += 1.0;
+            }
+        }
         if travel < 15.0 {
             continue;
         }
@@ -742,6 +762,11 @@ pub fn decide_final_third(
             * flank_mult;
         d_carry = d_carry.max(v);
         #[cfg(feature = "match-logs")]
+        if flank_run && v > bl.0 {
+            bl = (v, bl.1, travel / UNITS_PER_METRE, p_keep, carry_chance_at(ctx, target, goal, opponents),
+                  (goal.x - target.x).abs() / UNITS_PER_METRE, (target.y - goal.y).abs() / UNITS_PER_METRE, bl.7);
+        }
+        #[cfg(feature = "match-logs")]
         {
             let tdep = (goal.x - target.x).abs() / UNITS_PER_METRE;
             let tlat = (target.y - goal.y).abs() / UNITS_PER_METRE;
@@ -786,7 +811,7 @@ pub fn decide_final_third(
     }
     #[cfg(feature = "match-logs")]
     crate::match_log_info!(
-        "BOXDIAG id={} lat_m={:.1} depth_m={:.1} plan={} runners={} shoot={:.3} deliver={:.3} pass={:.3} carry={:.3} take={:.3} pf={:.3} pl={:.3} pb={:.3} opp_m={:.1} chose={}",
+        "BOXDIAG id={} lat_m={:.1} depth_m={:.1} plan={} runners={} shoot={:.3} deliver={:.3} pass={:.3} carry={:.3} take={:.3} pf={:.3} pl={:.3} pb={:.3} opp_m={:.1} bl_v={:.3} bl_open_m={:.1} bl_trav_m={:.1} bl_pkeep={:.2} bl_end={:.3} bl_edep={:.1} bl_elat={:.1} bl_n={} pw_v={:.3} pw_pc={:.2} pw_lat={:.1} pw_dep={:.1} pw_ch={:.3} pw_dist={:.1} bc_dep={:.1} bc_lat={:.1} bc_pk={:.2} bc_ch={:.3} chose={}",
         ctx.player.id,
         (from.y - goal.y).abs() / UNITS_PER_METRE,
         (goal.x - from.x).abs() / UNITS_PER_METRE,
@@ -801,6 +826,9 @@ pub fn decide_final_third(
         d_pl,
         d_pb,
         nearest_opponent_dist(from, opponents) / UNITS_PER_METRE,
+        bl.0, bl.1, bl.2, bl.3, bl.4, bl.5, bl.6, bl.7 as u32,
+        pw.0, pw.1, pw.2, pw.3, pw.4, pw.5,
+        dbg_best.1, dbg_best.2, dbg_best.3, dbg_best.4,
         match best {
             Action::Shoot => "shoot",
             Action::Deliver { .. } => "deliver",
