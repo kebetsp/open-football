@@ -31,7 +31,7 @@
 use crate::PlayerFieldPositionGroup;
 use crate::r#match::engine::goal::GOAL_WIDTH;
 use crate::r#match::player::strategies::common::players::ops::on_ball_decision::{
-    Action, FINAL_THIRD_BOUNDARY, intercept_risk, nearest_blocker, nearest_opponent_dist,
+    Action, FINAL_THIRD_BOUNDARY, intercept_risk, nearest_blocker, nearest_opponent_dist, real_max_speed,
     open_distance_in_heading, open_distance_capped, carry_fair_scoring, carry_sticky_mult, openness, rotate_xy,
 };
 use crate::r#match::{
@@ -206,6 +206,110 @@ fn best_pass_from(
     }
     best
 }
+
+// ---- Carry contest by time (2026-10-06). A carry is not valued as if no
+// defender were there: each opponent either can reach the carry path before
+// the carrier passes (a contest, beaten at the real take-on rate) or cannot.
+/// Ticks a defender needs to react before moving (same as `intercept_risk`).
+const REACT_TICKS: f32 = 15.0;
+/// A carrier with the ball runs slower than his top speed (estimate).
+const CARRY_SPEED_FRAC: f32 = 0.9;
+/// Contest probability ramps 0 -> 1 as a defender's arrival at the path goes
+/// from this many ticks AFTER the carrier to this many BEFORE him (1.5s each
+/// side; estimate — the ramp width is not sourced).
+const CONTEST_RAMP_TICKS: f32 = 150.0;
+/// Same-binary A/B toggle: set `CARRY_CONTEST_ABLATE` (any value) to use the
+/// old snapshot model (end-point room/crowd/path counts, static shot value).
+fn carry_contest_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRY_CONTEST_ABLATE").is_none())
+}
+/// Chance of keeping the ball on a carry with no contest at all. Calibrated,
+/// not measured: with the contest model the old 0.95 made every carry far
+/// cheaper than before and strikers shot after 46% of final-third receptions
+/// (real centre-forwards: 13%, StatsBomb), so it is fitted to those real
+/// terminal-action shares (swept via `CARRY_BASE_KEEP`).
+const CARRY_BASE_KEEP_DEFAULT: f32 = 0.72;
+fn carry_base_keep() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("CARRY_BASE_KEEP").ok().and_then(|v| v.parse().ok()).unwrap_or(CARRY_BASE_KEEP_DEFAULT))
+}
+struct CarryContest {
+    /// Where the run is stopped by the first likely contest, if any.
+    stop: Option<Vector3<f32>>,
+    /// Chance of keeping the ball up to that point (the stopping defender
+    /// himself is NOT included: what happens there is valued separately).
+    keep: f32,
+    /// Ticks the carrier needs to reach the end (or stop) point.
+    arrive_ticks: f32,
+}
+fn carry_contest(
+    ctx: &StateProcessingContext,
+    from: Vector3<f32>,
+    target: Vector3<f32>,
+    opponents: &[MatchPlayerLite],
+) -> CarryContest {
+    let seg = target - from;
+    let len = seg.magnitude();
+    if len < 1.0 {
+        return CarryContest { stop: None, keep: carry_base_keep(), arrive_ticks: 0.0 };
+    }
+    let dir = seg / len;
+    let v_c = (real_max_speed(ctx, ctx.player.id) * CARRY_SPEED_FRAC).max(0.05);
+    let mut cs: Vec<(f32, f32)> = Vec::new();
+    for o in opponents {
+        if o.tactical_positions.position_group() == PlayerFieldPositionGroup::Goalkeeper {
+            continue;
+        }
+        let along = (o.position - from).dot(&dir).clamp(0.0, len);
+        let q = from + dir * along;
+        let d = (o.position - q).magnitude();
+        let t_opp = REACT_TICKS + d / real_max_speed(ctx, o.id).max(0.05);
+        let t_car = along / v_c;
+        let c = (0.5 + (t_car - t_opp) / (2.0 * CONTEST_RAMP_TICKS)).clamp(0.0, 1.0);
+        if c > 0.02 {
+            cs.push((along, c));
+        }
+    }
+    cs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut keep = carry_base_keep();
+    let mut stop = None;
+    let mut s_end = len;
+    for &(a, c) in &cs {
+        if c >= 0.5 {
+            s_end = a.max(15.0);
+            stop = Some(from + dir * s_end);
+            break;
+        }
+        keep *= 1.0 - c * (1.0 - TAKE_ON_SUCCESS);
+    }
+    CarryContest { stop, keep, arrive_ticks: s_end / v_c }
+}
+/// Opponents moved toward `point` by what they can cover in `ticks` (the
+/// keeper stays put). The shot/pass value at a carry's end is judged against
+/// where the defence will be on arrival, not where it stands now.
+fn predict_opponents(
+    ctx: &StateProcessingContext,
+    opponents: &[MatchPlayerLite],
+    point: Vector3<f32>,
+    ticks: f32,
+) -> Vec<MatchPlayerLite> {
+    opponents
+        .iter()
+        .map(|o| {
+            let mut c = o.clone();
+            if o.tactical_positions.position_group() != PlayerFieldPositionGroup::Goalkeeper {
+                let to = point - o.position;
+                let d = to.magnitude();
+                if d > 1.0 {
+                    let travel = (real_max_speed(ctx, o.id) * (ticks - REACT_TICKS).max(0.0)).min(d);
+                    c.position = o.position + to / d * travel;
+                }
+            }
+            c
+        })
+        .collect()
+}
 /// `chance_at` for the end point of a carry.
 fn carry_chance_at(
     ctx: &StateProcessingContext,
@@ -226,6 +330,10 @@ fn carry_chance_at(
     let lat = (point.y - goal.y).abs() / UNITS_PER_METRE;
     let cont = if carry_options_on() && dep <= 16.5 && lat < 9.2 {
         best_pass_from(ctx, point, goal, opponents)
+    } else if carry_contest_on() && dep <= 8.0 && lat >= 9.2 {
+        // Byline end point: what the carrier can do from there includes a
+        // pass or cut-back to a teammate, valued by where the teammate is.
+        carry_continuation(point, goal).max(best_pass_from(ctx, point, goal, opponents))
     } else {
         carry_continuation(point, goal)
     };
@@ -658,7 +766,9 @@ pub fn decide_final_third(
         let heading = rotate_xy(forward, -half + 2.0 * half * t);
         let fair = carry_fair_scoring();
         let step_len = if fair { FAIR_CARRY_STEP } else { CARRY_STEP };
-        let open = if fair {
+        let open = if fair && carry_contest_on() {
+            step_len
+        } else if fair {
             open_distance_capped(from, heading, opponents, step_len)
         } else {
             open_distance_in_heading(from, heading, opponents)
@@ -707,16 +817,34 @@ pub fn decide_final_third(
                 continue;
             }
         }
-        // Ending the carry beside a defender is a take-on: success falls
-        // from ~0.95 with room to the sourced 0.527 with none.
+        let contest_on = fair && carry_contest_on();
         let room = openness(target, opponents);
-        let mut p_keep = 0.95 * (open / CARRY_STEP).min(1.0) * (TAKE_ON_SUCCESS + (1.0 - TAKE_ON_SUCCESS) * room);
-        if carry_crowd_on() {
-            // `room` only sees the single nearest opponent. A run that ends
-            // among several defenders means beating each of them (real
-            // take-on success 0.527 per defender, StatsBomb); the engine's
-            // box is under-defended, so counting them is what stops a
-            // winger "carrying" through a crowded area to a central point.
+        let mut end_value: Option<f32> = None;
+        let mut p_keep;
+        if contest_on {
+            let cc = carry_contest(ctx, from, target, opponents);
+            p_keep = cc.keep;
+            if let Some(st) = cc.stop {
+                // The first likely contest: decide there — pass, take him
+                // on, or the shot/cross from that spot — against where the
+                // defence will be on arrival.
+                target = st;
+                travel = (target - from).magnitude();
+                let opps = predict_opponents(ctx, opponents, st, cc.arrive_ticks);
+                let pass_here = (best_pass_from(ctx, st, goal, &opps) - RETAIN_BONUS).max(0.0);
+                let beyond = st + (st - from).normalize() * 30.0;
+                let take_here = TAKE_ON_SUCCESS * chance_at(beyond, goal, &opps);
+                end_value = Some(pass_here.max(take_here).max(chance_at(st, goal, &opps)));
+            } else {
+                let opps = predict_opponents(ctx, opponents, target, cc.arrive_ticks);
+                end_value = Some(carry_chance_at(ctx, target, goal, &opps));
+            }
+        } else {
+            // Ending the carry beside a defender is a take-on: success falls
+            // from ~0.95 with room to the sourced 0.527 with none.
+            p_keep = 0.95 * (open / CARRY_STEP).min(1.0) * (TAKE_ON_SUCCESS + (1.0 - TAKE_ON_SUCCESS) * room);
+        }
+        if !contest_on && carry_crowd_on() {
             let crowd = opponents
                 .iter()
                 .filter(|o| o.tactical_positions.position_group() != PlayerFieldPositionGroup::Goalkeeper)
@@ -726,7 +854,7 @@ pub fn decide_final_third(
                 p_keep *= TAKE_ON_SUCCESS.powi(crowd as i32 - 1);
             }
         }
-        if carry_path_on() && fair {
+        if !contest_on && carry_path_on() && fair {
             let on_path = opponents
                 .iter()
                 .filter(|o| o.tactical_positions.position_group() != PlayerFieldPositionGroup::Goalkeeper)
@@ -757,7 +885,7 @@ pub fn decide_final_third(
         } else {
             1.0
         };
-        let v = disc * p_keep * press_keep * (carry_chance_at(ctx, target, goal, opponents) + RETAIN_BONUS)
+        let v = disc * p_keep * press_keep * (end_value.unwrap_or_else(|| carry_chance_at(ctx, target, goal, opponents)) + RETAIN_BONUS)
             * carry_sticky_mult(ctx.player.velocity, heading)
             * flank_mult;
         d_carry = d_carry.max(v);
