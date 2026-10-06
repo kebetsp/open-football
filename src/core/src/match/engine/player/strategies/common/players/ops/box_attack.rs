@@ -161,8 +161,58 @@ fn carry_endval_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CARRY_ENDVAL_ABLATE").is_none())
 }
+/// OPT-IN (default off): set `CARRY_OPTIONS` (any value) to value a carry that
+/// ends in the central box by the best pass from that spot instead of the
+/// fixed 0.10 continuation. Measured 2026-10-06 (40 matches each, same
+/// binary): no effect on winger cut-in ratio (slots 5/8 ~4:1 either way) and
+/// byline arrivals 1.25 vs 1.65/match without it — so not enabled.
+fn carry_options_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CARRY_OPTIONS").is_some())
+}
+/// Floor for the continuation of a carry that ends in the central box with no
+/// teammate worth passing to: the real value of the least valuable zones
+/// (StatsBomb carry-end table above: 0.021-0.029). Estimate (rounded).
+const CARRY_OPTIONS_FLOOR: f32 = 0.02;
+/// What the carrier could do from `point` besides shooting: the best pass to
+/// a teammate (completion against defenders from `point`, box cap included,
+/// teammate valued by `chance_at` where he stands), never below the floor.
+/// Empty box or covered lanes -> the floor, so a cut-in into nothing is no
+/// longer worth the fixed 0.10.
+fn best_pass_from(
+    ctx: &StateProcessingContext,
+    point: Vector3<f32>,
+    goal: Vector3<f32>,
+    opponents: &[MatchPlayerLite],
+) -> f32 {
+    let mut best = CARRY_OPTIONS_FLOOR;
+    for tm in ctx.players().teammates().nearby(PASS_MAX_RANGE) {
+        if tm.tactical_positions.position_group() == PlayerFieldPositionGroup::Goalkeeper {
+            continue;
+        }
+        if (tm.position - point).magnitude() < 5.0 {
+            continue;
+        }
+        let mut p_c = 1.0 - intercept_risk(ctx, point, tm.position, opponents);
+        if in_box(tm.position, goal) {
+            let cap = if in_box(point, goal) {
+                BOX_PASS_COMPLETION_FROM_INSIDE
+            } else {
+                BOX_PASS_COMPLETION_FROM_OUTSIDE
+            };
+            p_c = p_c.min(cap);
+        }
+        best = best.max(p_c * (chance_at(tm.position, goal, opponents) + RETAIN_BONUS));
+    }
+    best
+}
 /// `chance_at` for the end point of a carry.
-fn carry_chance_at(point: Vector3<f32>, goal: Vector3<f32>, opponents: &[MatchPlayerLite]) -> f32 {
+fn carry_chance_at(
+    ctx: &StateProcessingContext,
+    point: Vector3<f32>,
+    goal: Vector3<f32>,
+    opponents: &[MatchPlayerLite],
+) -> f32 {
     if !carry_endval_on() {
         return chance_at(point, goal, opponents);
     }
@@ -172,7 +222,14 @@ fn carry_chance_at(point: Vector3<f32>, goal: Vector3<f32>, opponents: &[MatchPl
     } else {
         0.0
     };
-    carry_continuation(point, goal).max(shoot).max(cross)
+    let dep = (goal.x - point.x).abs() / UNITS_PER_METRE;
+    let lat = (point.y - goal.y).abs() / UNITS_PER_METRE;
+    let cont = if carry_options_on() && dep <= 16.5 && lat < 9.2 {
+        best_pass_from(ctx, point, goal, opponents)
+    } else {
+        carry_continuation(point, goal)
+    };
+    cont.max(shoot).max(cross)
 }
 /// Open-play cross completion.
 const CROSS_COMPLETION: f32 = 0.35;
@@ -680,7 +737,7 @@ pub fn decide_final_third(
         } else {
             1.0
         };
-        let v = disc * p_keep * press_keep * (carry_chance_at(target, goal, opponents) + RETAIN_BONUS)
+        let v = disc * p_keep * press_keep * (carry_chance_at(ctx, target, goal, opponents) + RETAIN_BONUS)
             * carry_sticky_mult(ctx.player.velocity, heading)
             * flank_mult;
         d_carry = d_carry.max(v);
