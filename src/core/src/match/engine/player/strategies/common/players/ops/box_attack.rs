@@ -367,6 +367,16 @@ const RETAIN_BONUS: f32 = 0.03;
 /// (fading out by 3m). Calibrated, not measured.
 const CARRY_PRESSURE_LOSS: f32 = 0.35;
 const CARRY_PRESSURE_RANGE_M: f32 = 3.0;
+/// Share of `RETAIN_BONUS` a PASS keeps when the passer is in the crossing
+/// area (wide, within 25m of the goal line). There the chance a pass creates
+/// should count more than keeping the ball: a cross spends the possession and
+/// gets no bonus, so a safe pass to anyone nearby beat it by construction
+/// (0.06 vs 0.035). Swept 1.0/0.5/0.25/0 (30-40 matches each): 0.5 gives crosses 8.5/match (real ~8.3, was 4.8), shots after a cross 1.13 (was 0.45), forward shoot share 15% (real 13%); 0.25 and 0 push the forward shoot share to 18-19%. Calibration, not measured. `CROSSZONE_RETAIN=1` = old behaviour.
+const CROSSZONE_RETAIN_DEFAULT: f32 = 0.5;
+fn crosszone_retain() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("CROSSZONE_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(CROSSZONE_RETAIN_DEFAULT))
+}
 /// Standing still with the ball is worth almost nothing (estimate).
 const HOLD_VALUE: f32 = 0.004;
 /// A passer who just received from a teammate rarely returns it at once
@@ -714,7 +724,8 @@ pub fn decide_final_third(
             };
             p_c = p_c.min(cap);
         }
-        let mut v = p_c * (chance_at(tm.position, goal, opponents) + RETAIN_BONUS);
+        let retain = if in_crossing_area(from, goal) { RETAIN_BONUS * crosszone_retain() } else { RETAIN_BONUS };
+        let mut v = p_c * (chance_at(tm.position, goal, opponents) + retain);
         if ctx.tick_context.ball.last_owner == Some(tm.id) {
             v *= BACK_TO_PASSER_MULT;
         }
