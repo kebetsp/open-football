@@ -448,7 +448,8 @@ fn dist_point_segment(p: Vector3<f32>, a: Vector3<f32>, b: Vector3<f32>) -> f32 
 /// tick and giving the ball up after ~0.7s (measured: byline arrivals from
 /// the wide lane ~1.1/match vs real 4.7). Size is a calibration to that real
 /// arrival rate (swept via `BYLINE_STICKY`, default `BYLINE_STICKY_DEFAULT`).
-const BYLINE_STICKY_DEFAULT: f32 = 0.5;
+/// 2026-10-07 re-sweep on the contest model (30 matches each): 0.8 -> ~7 arrivals/match (0.5: 5.7), crosses flat (8.2-8.7), crosses from <=5.5m 8% -> 13%; 1.2/1.6 not better (sweep is noisy).
+const BYLINE_STICKY_DEFAULT: f32 = 0.8;
 fn byline_sticky() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
