@@ -377,6 +377,14 @@ fn crosszone_retain() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("CROSSZONE_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(CROSSZONE_RETAIN_DEFAULT))
 }
+fn cross_open_neutral() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CROSS_OPEN_NEUTRAL").is_some())
+}
+fn cross_xg_noblock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CROSS_XG_NOBLOCK").is_some())
+}
 /// Standing still with the ball is worth almost nothing (estimate).
 const HOLD_VALUE: f32 = 0.004;
 
@@ -871,7 +879,20 @@ pub fn decide_final_third(
                 continue;
             };
             let d_zone = nearest_opponent_dist(r.point, &outfield);
-            let open_mod = 0.55 + 0.9 * (d_zone.min(ZONE_OPEN_REF) / ZONE_OPEN_REF);
+            // Experiment switches (2026-10-08): the sourced completion (0.35) and
+            // shot-after rate (0.6) already average over real, crowded boxes, so
+            // a crowd factor and shot blockers on top may double-count.
+            let open_mod = if cross_open_neutral() { 1.0 } else { 0.55 + 0.9 * (d_zone.min(ZONE_OPEN_REF) / ZONE_OPEN_REF) };
+            let xg_zone_all = if cross_xg_noblock() {
+                let gk_only: Vec<MatchPlayerLite> = opponents
+                    .iter()
+                    .filter(|o| o.tactical_positions.position_group() == PlayerFieldPositionGroup::Goalkeeper)
+                    .cloned()
+                    .collect();
+                shot_xg(r.point, goal, &gk_only)
+            } else {
+                shot_xg(r.point, goal, opponents)
+            };
             let arrive =
                 (1.0 - (runner.position - r.point).magnitude() / ARRIVE_REF).clamp(0.35, 1.0);
             // From the byline zone the six-yard box is played low: the lofted
@@ -882,7 +903,7 @@ pub fn decide_final_third(
                 if wide_play_on("latemid") && (goal.x - from.x).abs() <= BYLINE_CTX_DEPTH {
                     let lane = 0.7 + 0.3 * (1.0 - intercept_risk(ctx, from, r.point, opponents));
                     let p_reach = CUTBACK_BASE_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive * lane;
-                    let v = p_reach * CUTBACK_P_SHOT * shot_xg(r.point, goal, opponents);
+                    let v = p_reach * CUTBACK_P_SHOT * xg_zone_all;
                     d_deliver = d_deliver.max(v);
                     if v > best_value {
                         best_value = v;
@@ -895,7 +916,7 @@ pub fn decide_final_third(
             if wide_play_on("cutback") && six_yard && (goal.x - from.x).abs() <= CUTBACK_MAX_DEPTH {
                 let lane = 0.7 + 0.3 * (1.0 - intercept_risk(ctx, from, r.point, opponents));
                 let p_reach = CUTBACK_BASE_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive * lane;
-                let v = p_reach * CUTBACK_P_SHOT * shot_xg(r.point, goal, opponents);
+                let v = p_reach * CUTBACK_P_SHOT * xg_zone_all;
                 d_deliver = d_deliver.max(v);
                 if v > best_value {
                     best_value = v;
@@ -904,10 +925,10 @@ pub fn decide_final_third(
                 continue;
             }
             let p_reach = CROSS_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive;
-            let xg_zone = shot_xg(r.point, goal, opponents);
+            let xg_zone = xg_zone_all;
             let byline_here = wide_play_on("lowcross") && (goal.x - from.x).abs() <= BYLINE_CTX_DEPTH;
             let crowd = outfield.iter().filter(|o| (o.position - r.point).magnitude() <= 48.0).count();
-            let loft_mult = if byline_here && crowd >= 2 { LOFT_CROWD_MULT } else { 1.0 };
+            let loft_mult = if byline_here && crowd >= 2 && !cross_open_neutral() { LOFT_CROWD_MULT } else { 1.0 };
             let v = p_reach * P_SHOT_GIVEN_REACH * xg_zone * loft_mult;
             #[cfg(feature = "match-logs")]
             if v > dz.0 {
