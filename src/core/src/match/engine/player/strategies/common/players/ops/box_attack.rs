@@ -381,10 +381,11 @@ fn crosszone_retain() -> f32 {
 const HOLD_VALUE: f32 = 0.004;
 
 // ---- Wide-play plan, 2026-10-08 (docs/wide-play-holistic-design.md §17).
-/// A carrier this close to the goal line (12.5m) plays the six-yard box with
-/// a LOW ball, not a lofted cross; `WIDE_PLAY_ABLATE` restores the old
+/// A carrier this close to the goal line (5.5m) plays the six-yard box with
+/// a LOW ball, not a lofted cross (StatsBomb: flagged cut-backs exist only
+/// from <=5.5m, n=35 vs 52 crosses; 5.5-11m has 81 crosses and no cut-backs); `WIDE_PLAY_ABLATE` restores the old
 /// behaviour (same-binary A/B).
-const CUTBACK_MAX_DEPTH: f32 = 100.0;
+const CUTBACK_MAX_DEPTH: f32 = 44.0;
 /// Value parity with the cross it replaces: StatsBomb Bundesliga 2023/24
 /// gives the same xG per delivery from <=5.5m (cut-back 0.032, n=35;
 /// cross 0.038, n=52) and a similar completion (0.34 vs 0.27), so the
