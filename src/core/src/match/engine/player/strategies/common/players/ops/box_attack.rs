@@ -573,6 +573,15 @@ fn zone_point(zone: BoxZone, goal: Vector3<f32>, inward: f32, near_sign: f32) ->
 /// is beyond 29m (hysteresis so the plan does not flicker at the line).
 const RUN_TRIGGER_DEPTH: f32 = 200.0;
 const RUN_RELEASE_DEPTH: f32 = 232.0;
+/// Extra trigger/release depth (units) so runners start earlier and have
+/// arrived when the delivery is played (`RUN_EARLY` env, default
+/// `RUN_EARLY_DEFAULT`; measured: only 1.9 attackers in the box at a
+/// delivery vs 2.9 in StatsBomb 360).
+const RUN_EARLY_DEFAULT: f32 = 80.0;
+fn run_early_extra() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("RUN_EARLY").ok().and_then(|v| v.parse().ok()).unwrap_or(RUN_EARLY_DEFAULT))
+}
 /// Runs also need the carrier to be in a crossing position — wide enough
 /// that a delivery is a live option (>= 12.5m off the centre line to
 /// start, released below 8.75m). With a central carrier the strikers stay
@@ -587,6 +596,12 @@ const STICKY_BONUS: f32 = 60.0;
 /// A runner nudges his point to the local gap: candidate offsets.
 const NUDGE_LATERAL: f32 = 16.0;
 const NUDGE_DEPTH: f32 = 12.0;
+/// Gap search (2026-10-08): a runner looks for the free space around his
+/// zone (+-5m lateral, +-3m deep) and prefers it over the nominal zone point
+/// (displacement penalty 0.15 per unit instead of 0.3). `WIDE_PLAY_OFF=gaps`.
+const GAP_LATERAL: [f32; 7] = [-40.0, -24.0, -12.0, 0.0, 12.0, 24.0, 40.0];
+const GAP_HYSTERESIS: f32 = 12.0;
+const GAP_DEPTH: [f32; 5] = [-24.0, -12.0, 0.0, 12.0, 24.0];
 
 /// Assigns up to four attackers to box zones for the side attacking
 /// `goal`, and records the plan on the context. Returns (id, point).
@@ -602,7 +617,8 @@ pub fn plan_box_runs(
     let carrier_depth = (goal.x - carrier_pos.x).abs();
     let carrier_lateral = (carrier_pos.y - goal.y).abs();
     let was_active = context.box_plan[side_index].active;
-    let threshold = if was_active { RUN_RELEASE_DEPTH } else { RUN_TRIGGER_DEPTH };
+    let extra = run_early_extra();
+    let threshold = if was_active { RUN_RELEASE_DEPTH + extra } else { RUN_TRIGGER_DEPTH + extra };
     let lat_threshold = if was_active { RUN_RELEASE_LATERAL } else { RUN_TRIGGER_LATERAL };
     if carrier_depth > threshold || carrier_lateral < lat_threshold {
         context.box_plan[side_index] = BoxPlan::default();
@@ -648,9 +664,24 @@ pub fn plan_box_runs(
         // points already given to teammates.
         let mut best_pt = base;
         let mut best_score = f32::MIN;
-        for dl in [-NUDGE_LATERAL, 0.0, NUDGE_LATERAL] {
-            for dd in [-NUDGE_DEPTH, 0.0, NUDGE_DEPTH] {
+        let gaps = wide_play_on("gaps");
+        let (dls, dds, pen): (Vec<f32>, Vec<f32>, f32) = if gaps {
+            (GAP_LATERAL.to_vec(), GAP_DEPTH.to_vec(), 0.2)
+        } else {
+            (vec![-NUDGE_LATERAL, 0.0, NUDGE_LATERAL], vec![-NUDGE_DEPTH, 0.0, NUDGE_DEPTH], 0.3)
+        };
+        for &dl in &dls {
+            for &dd in &dds {
                 let pt = Vector3::new(base.x + inward * dd, base.y + dl, 0.0);
+                if gaps {
+                    // Stay in the box (the edge zone may sit just outside it).
+                    let dep = (goal.x - pt.x).abs();
+                    let lat = (pt.y - goal.y).abs();
+                    let max_dep = if zone == BoxZone::Edge { BOX_DEPTH + 16.0 } else { BOX_DEPTH - 8.0 };
+                    if dep < 24.0 || dep > max_dep || lat > BOX_HALF_WIDTH - 20.0 {
+                        continue;
+                    }
+                }
                 let opp_d = opponents_outfield
                     .iter()
                     .map(|o| (o - pt).magnitude())
@@ -659,10 +690,30 @@ pub fn plan_box_runs(
                     .iter()
                     .map(|r| (r.point - pt).magnitude())
                     .fold(60.0f32, f32::min);
-                let score = opp_d.min(80.0) + mate_d.min(60.0) - 0.3 * (dl.abs() + dd.abs());
+                // Separation from defenders and teammates, as before (the
+                // zone point's own chance is NOT re-scored: moving points
+                // toward the goalmouth inflated the value of delivering and
+                // made crosses fire early, before the runners had arrived).
+                let score = opp_d.min(80.0) + mate_d.min(60.0) - pen * (dl.abs() + dd.abs());
                 if score > best_score {
                     best_score = score;
                     best_pt = pt;
+                }
+            }
+        }
+        // Hysteresis: keep last tick's point for this runner and zone unless
+        // the new one is clearly better, so the target does not jitter as the
+        // defenders move (a jittering target means he never arrives).
+        if gaps {
+            if let Some(prev) = previous.iter().find(|r| r.id == cand.id && r.zone == zone) {
+                let opp_d = opponents_outfield.iter().map(|o| (o - prev.point).magnitude()).fold(80.0f32, f32::min);
+                let mate_d = assigned.iter().map(|r| (r.point - prev.point).magnitude()).fold(60.0f32, f32::min);
+                let dl = prev.point.y - base.y;
+                let dd = (prev.point.x - base.x) * inward;
+                let prev_score = opp_d.min(80.0) + mate_d.min(60.0) - 0.2 * (dl.abs() + dd.abs());
+                let in_range = (prev.point - base).magnitude() <= 60.0;
+                if in_range && prev_score + GAP_HYSTERESIS >= best_score {
+                    best_pt = prev.point;
                 }
             }
         }
@@ -741,6 +792,9 @@ pub fn decide_final_third(
         }
     }
 
+    #[cfg(feature = "match-logs")]
+    let mut dz = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+    // (best lofted value, p_reach, zone xG, arrive, open_mod, runner-to-zone m, defenders within 6m of zone, zone idx)
     // Deliver into a planned run zone (wide carriers).
     let side_index = match ctx.player.side {
         Some(crate::r#match::player::PlayerSide::Left) => 0,
@@ -782,6 +836,11 @@ pub fn decide_final_third(
             let crowd = outfield.iter().filter(|o| (o.position - r.point).magnitude() <= 48.0).count();
             let loft_mult = if byline_here && crowd >= 2 { LOFT_CROWD_MULT } else { 1.0 };
             let v = p_reach * P_SHOT_GIVEN_REACH * xg_zone * loft_mult;
+            #[cfg(feature = "match-logs")]
+            if v > dz.0 {
+                dz = (v, p_reach, xg_zone, arrive, open_mod, (runner.position - r.point).magnitude() / UNITS_PER_METRE, crowd as f32,
+                      match r.zone { BoxZone::PenaltySpot => 0.0, BoxZone::FarPost => 1.0, BoxZone::Edge => 2.0, BoxZone::NearPost => 3.0 });
+            }
             d_deliver = d_deliver.max(v);
             if v > best_value {
                 best_value = v;
@@ -1048,6 +1107,16 @@ pub fn decide_final_third(
             match best { Action::Shoot => "shoot", Action::Deliver { .. } => "deliver", Action::Through { .. } => "through", Action::Pass(_) => "pass", Action::Carry(_) => "carry", Action::Dribble(_) => "take", _ => "hold" },
             match best { Action::Carry(t) => (goal.x - t.x).abs() / UNITS_PER_METRE, _ => -1.0 },
             match best { Action::Carry(t) => (t.y - goal.y).abs() / UNITS_PER_METRE, _ => -1.0 }
+        );
+    }
+    #[cfg(feature = "match-logs")]
+    if (goal.x - from.x).abs() <= BYLINE_CTX_DEPTH && in_crossing_area(from, goal) && !matches!(best, Action::Carry(_)) {
+        crate::match_log_info!(
+            "BYLDIAG chose={} dep_m={:.1} lat_m={:.1} plan={} runners={} dz_v={:.4} dz_preach={:.3} dz_xg={:.3} dz_arrive={:.2} dz_open={:.2} dz_runner_m={:.1} dz_crowd={:.0} dz_zone={:.0} d_cross_best={:.4} d_pass={:.4} d_pb={:.4} d_pl={:.4} d_pf={:.4} d_carry={:.4} d_shoot={:.4} pw_v={:.4} pw_pc={:.2} pw_ch={:.3} pw_dist={:.1} opp_m={:.1}",
+            match best { Action::Shoot => "shoot", Action::Deliver { .. } => "deliver", Action::Cutback { .. } => "cutback", Action::LowCross { .. } => "lowcross", Action::Through { .. } => "through", Action::Pass(_) => "pass", Action::Dribble(_) => "take", _ => "hold" },
+            (goal.x - from.x).abs() / UNITS_PER_METRE, (from.y - goal.y).abs() / UNITS_PER_METRE, plan.active, plan.runners.len(),
+            dz.0, dz.1, dz.2, dz.3, dz.4, dz.5, dz.6, dz.7, d_deliver, d_pass, d_pb, d_pl, d_pf, d_carry, d_shoot,
+            pw.0, pw.1, pw.4, pw.5, nearest_opponent_dist(from, opponents) / UNITS_PER_METRE
         );
     }
     #[cfg(feature = "match-logs")]

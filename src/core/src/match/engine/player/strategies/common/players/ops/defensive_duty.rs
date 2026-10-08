@@ -243,6 +243,29 @@ const SCRAMBLE_SPREAD_STEP_UNITS: f32 = 56.0; // ~7.0m between neighbours
 const SCRAMBLE_MAX_DEPTH_UNITS: f32 = 80.0; // 10m
 const SCRAMBLE_MAX_HALF_SPAN_UNITS: f32 = 140.0; // ~17.5m either side
 
+/// Box defence (2026-10-08): when the ball is wide in the crossing area of
+/// OUR goal (>= 12.5m off the centre line, within 25m of the goal line), the
+/// players on hold-shape duty take positions that cover the box instead of
+/// holding the line outside it: near-post guard, penalty spot, far post,
+/// box edge, and two back-side cover positions. Measured at the moment of a
+/// cross (StatsBomb 360, 221 crosses vs 60 engine matches): defenders in
+/// the box 5.43 vs 3.30, their lateral spread 6.6m vs 4.8m, and 2.8 hold-
+/// shape players per delivery stood a median 5m outside the box.
+/// Slot geometry mirrors `box_attack::zone_geometry` (units: depth from the
+/// goal line, lateral toward the carrier's side). `BOX_DEFENCE_OFF` (any
+/// value) disables (same-binary A/B).
+const BOX_DEF_MIN_LATERAL: f32 = 100.0;
+const BOX_DEF_MAX_DEPTH: f32 = 200.0;
+const BOX_DEF_SLOTS: [(f32, f32); 6] =
+    [(40.0, 30.0), (88.0, 0.0), (48.0, -37.0), (140.0, 0.0), (112.0, 72.0), (112.0, -72.0)];
+const BOX_MARK_DEPTH: f32 = 132.0;
+const BOX_MARK_HALF_WIDTH: f32 = 161.0;
+const BOX_MARK_MIN_UNITS: f32 = 20.0; // 2.5m
+fn box_defence_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BOX_DEFENCE_OFF").is_none())
+}
+
 /// A tackle attempt is only live once the presser is genuinely this
 /// close AND cover has arrived (missing is no longer fatal) — or, if
 /// no cover exists this tick, only once much closer still (a real
@@ -879,7 +902,16 @@ fn assign_team(
         let Some(marker) = marker else {
             break;
         };
-        let tightness = MARK_LOOSE_UNITS - (MARK_LOOSE_UNITS - MARK_TIGHT_UNITS) * danger.min(1.0);
+        let mut tightness = MARK_LOOSE_UNITS - (MARK_LOOSE_UNITS - MARK_TIGHT_UNITS) * danger.min(1.0);
+        // Inside our own box a marker keeps the real typical distance, not
+        // touch-tight: StatsBomb 360 at a cross, attacker to nearest defender
+        // mean 3.05m, median ~2.4m (engine with box defence: 1.8m).
+        if box_defence_on()
+            && (opponent.position.x - own_goal.x).abs() <= BOX_MARK_DEPTH
+            && (opponent.position.y - own_goal.y).abs() <= BOX_MARK_HALF_WIDTH
+        {
+            tightness = tightness.max(BOX_MARK_MIN_UNITS);
+        }
         let to_goal = own_goal - opponent.position;
         let dir = if to_goal.magnitude() > 1.0 {
             to_goal.normalize()
@@ -1062,6 +1094,35 @@ fn assign_team(
             engage: false,
         });
         hold_shape_ids.push(c.id);
+    }
+
+    // --- Box defence: hold-shape players cover the box when the ball is
+    // wide in the crossing area (see BOX_DEF_SLOTS). ---
+    if box_defence_on()
+        && (focal_pos.y - own_goal.y).abs() >= BOX_DEF_MIN_LATERAL
+        && (focal_pos.x - own_goal.x).abs() <= BOX_DEF_MAX_DEPTH
+    {
+        let side = (focal_pos.y - own_goal.y).signum();
+        let mut free: Vec<u32> = hold_shape_ids.clone();
+        for (depth, lat) in BOX_DEF_SLOTS {
+            if free.is_empty() {
+                break;
+            }
+            let pt = Vector3::new(own_goal.x + attack_dir * depth, own_goal.y + side * lat, 0.0);
+            let (fi, _) = free
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let pos = pool.iter().find(|c| c.id == *id).map(|c| c.position).unwrap_or(pt);
+                    (i, (pos - pt).magnitude())
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap();
+            let id = free.remove(fi);
+            if let Some(a) = results.iter_mut().find(|a| a.id == id) {
+                a.target = pt;
+            }
+        }
     }
 
     // --- Step G: crisis override. Relabels the hold-shape pool
