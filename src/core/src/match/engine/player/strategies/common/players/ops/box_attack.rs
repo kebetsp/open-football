@@ -408,6 +408,18 @@ fn wide_play_on(feature: &str) -> bool {
 /// heading (he gets the ball instead, or moves out of the lane).
 const MATE_LANE_RADIUS: f32 = 24.0;
 const MATE_LANE_LENGTH: f32 = 160.0;
+/// Byline context (2026-10-08, Pavel): a wide carrier within 12.5m of the
+/// goal line plays the box only with a delivery (lofted cross, low driven
+/// cross, cut-back); an ordinary pass INTO the box is not available. Back
+/// passes (recycle) and the carry fan (cut inside, run on) stay.
+const BYLINE_CTX_DEPTH: f32 = 100.0;
+/// Estimate (no source splits lofted from driven crosses): a lofted ball is
+/// contested in the air when the target zone is crowded (x0.85 with 2+
+/// defenders within 6m); a low driven ball needs a clear lane
+/// (x0.75 blocked .. x1.10 clear).
+const LOFT_CROWD_MULT: f32 = 0.85;
+const LOWCROSS_LANE_LO: f32 = 0.75;
+const LOWCROSS_LANE_SPAN: f32 = 0.35;
 fn teammate_in_lane(ctx: &StateProcessingContext, from: Vector3<f32>, dir: Vector3<f32>) -> bool {
     ctx.players().teammates().all().any(|t| {
         if t.tactical_positions.position_group() == PlayerFieldPositionGroup::Goalkeeper {
@@ -765,11 +777,24 @@ pub fn decide_final_third(
                 continue;
             }
             let p_reach = CROSS_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive;
-            let v = p_reach * P_SHOT_GIVEN_REACH * shot_xg(r.point, goal, opponents);
+            let xg_zone = shot_xg(r.point, goal, opponents);
+            let byline_here = wide_play_on("lowcross") && (goal.x - from.x).abs() <= BYLINE_CTX_DEPTH;
+            let crowd = outfield.iter().filter(|o| (o.position - r.point).magnitude() <= 48.0).count();
+            let loft_mult = if byline_here && crowd >= 2 { LOFT_CROWD_MULT } else { 1.0 };
+            let v = p_reach * P_SHOT_GIVEN_REACH * xg_zone * loft_mult;
             d_deliver = d_deliver.max(v);
             if v > best_value {
                 best_value = v;
                 best = Action::Deliver { to: r.id, target: r.point };
+            }
+            if byline_here {
+                let lane = 1.0 - intercept_risk(ctx, from, r.point, opponents);
+                let vl = p_reach * P_SHOT_GIVEN_REACH * xg_zone * (LOWCROSS_LANE_LO + LOWCROSS_LANE_SPAN * lane);
+                d_deliver = d_deliver.max(vl);
+                if vl > best_value {
+                    best_value = vl;
+                    best = Action::LowCross { to: r.id, target: r.point };
+                }
             }
         }
     }
@@ -780,6 +805,9 @@ pub fn decide_final_third(
             continue;
         }
         if (tm.position - from).magnitude() < 5.0 {
+            continue;
+        }
+        if wide_play_on("nopass") && in_crossing_area(from, goal) && (goal.x - from.x).abs() <= BYLINE_CTX_DEPTH && in_box(tm.position, goal) {
             continue;
         }
         let mut p_c = 1.0 - intercept_risk(ctx, from, tm.position, opponents);

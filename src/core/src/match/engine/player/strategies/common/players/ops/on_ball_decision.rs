@@ -223,6 +223,9 @@ pub enum Action {
     /// not how it is played; `players.rs` keys the ground trajectory on
     /// the `BOX_CUTBACK` reason.
     Cutback { to: u32, target: Vector3<f32> },
+    /// A low DRIVEN cross (struck hard and flat, not lofted) from the
+    /// byline zone into the box (`BOX_LOWCROSS`).
+    LowCross { to: u32, target: Vector3<f32> },
 }
 
 /// Step A's gate: true when a manager-issued directive already governs
@@ -899,6 +902,7 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
             Action::Deliver { to, .. } => ("Deliver", to as f32, 0.0),
             Action::Through { to, .. } => ("Through", to as f32, 0.0),
             Action::Cutback { to, .. } => ("Cutback", to as f32, 0.0),
+            Action::LowCross { to, .. } => ("LowCross", to as f32, 0.0),
         };
         crate::match_log_info!(
             "ONBALLACT t={} id={} group={:?} action={} value={:.3} own_goal_dist={:.1} tx={:.1} ty={:.1} fx={:.2} fy={:.2}",

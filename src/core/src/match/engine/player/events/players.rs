@@ -2190,7 +2190,10 @@ impl PlayerEventDispatcher {
         // low pass (ground, driven only when it has to travel), whatever the
         // lane obstacles would otherwise have chosen.
         let is_cutback = event_model.reason == "BOX_CUTBACK";
-        let trajectory_type = if is_cutback {
+        let is_lowcross = event_model.reason == "BOX_LOWCROSS";
+        let trajectory_type = if is_lowcross {
+            TrajectoryType::LowDriven
+        } else if is_cutback {
             if actual_horizontal_distance <= 60.0 { TrajectoryType::Ground } else { TrajectoryType::LowDriven }
         } else if is_gk_long_kick {
             TrajectoryType::HighArc
