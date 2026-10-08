@@ -84,6 +84,9 @@ pub enum BoxZone {
     FarPost,
     Edge,
     NearPost,
+    /// Cut-back receiver inside the box, ahead of the penalty spot, taken by
+    /// a midfielder arriving late (2026-10-08).
+    LateRun,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -257,7 +257,7 @@ const SCRAMBLE_MAX_HALF_SPAN_UNITS: f32 = 140.0; // ~17.5m either side
 const BOX_DEF_MIN_LATERAL: f32 = 100.0;
 const BOX_DEF_MAX_DEPTH: f32 = 200.0;
 const BOX_DEF_SLOTS: [(f32, f32); 6] =
-    [(40.0, 30.0), (88.0, 0.0), (48.0, -37.0), (140.0, 0.0), (112.0, 72.0), (112.0, -72.0)];
+    [(40.0, 36.0), (88.0, 0.0), (48.0, -44.0), (140.0, 0.0), (112.0, 96.0), (112.0, -96.0)];
 const BOX_MARK_DEPTH: f32 = 132.0;
 const BOX_MARK_HALF_WIDTH: f32 = 161.0;
 const BOX_MARK_MIN_UNITS: f32 = 20.0; // 2.5m

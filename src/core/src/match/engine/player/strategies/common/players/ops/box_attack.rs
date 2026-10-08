@@ -561,6 +561,9 @@ fn zone_geometry(zone: BoxZone) -> (f32, f32) {
         BoxZone::FarPost => (48.0, -37.0),
         BoxZone::Edge => (136.0, 0.0),
         BoxZone::NearPost => (44.0, 30.0),
+        // Cut-back spot: top of the penalty-spot area, a little to the far
+        // side so it is not on top of the spot runner (5m apart).
+        BoxZone::LateRun => (112.0, -24.0),
     }
 }
 
@@ -601,6 +604,12 @@ const NUDGE_DEPTH: f32 = 12.0;
 /// (displacement penalty 0.15 per unit instead of 0.3). `WIDE_PLAY_OFF=gaps`.
 const GAP_LATERAL: [f32; 7] = [-40.0, -24.0, -12.0, 0.0, 12.0, 24.0, 40.0];
 const GAP_HYSTERESIS: f32 = 12.0;
+const ROLE_MISMATCH_COST: f32 = 240.0;
+/// Dart when the carrier is within 27.5m of the goal line (most deliveries start ~20m out; 17.5m left the runners staged outside the box at the delivery: attackers in box 2.65 -> 1.92); until then the
+/// runner waits 6m back and 3m wide of his zone (estimates).
+const DART_DEPTH: f32 = 220.0;
+const STAGE_BACK: f32 = 48.0;
+const STAGE_LATERAL: f32 = 24.0;
 const GAP_DEPTH: [f32; 5] = [-24.0, -12.0, 0.0, 12.0, 24.0];
 
 /// Assigns up to four attackers to box zones for the side attacking
@@ -646,11 +655,29 @@ pub fn plan_box_runs(
     let previous = context.box_plan[side_index].runners.clone();
     let mut used: Vec<u32> = Vec::new();
     let mut assigned: Vec<BoxRunner> = Vec::new();
-    for zone in [BoxZone::PenaltySpot, BoxZone::FarPost, BoxZone::Edge, BoxZone::NearPost] {
+    let late_mid = wide_play_on("latemid");
+    let zones: &[BoxZone] = if late_mid {
+        &[BoxZone::PenaltySpot, BoxZone::FarPost, BoxZone::NearPost, BoxZone::LateRun, BoxZone::Edge]
+    } else {
+        &[BoxZone::PenaltySpot, BoxZone::FarPost, BoxZone::Edge, BoxZone::NearPost]
+    };
+    for &zone in zones {
         let base = zone_point(zone, goal, inward, near_sign);
         let mut best: Option<(f32, &RunCandidate)> = None;
         for c in eligible.iter().filter(|c| !used.contains(&c.id)) {
             let mut cost = (c.position - base).magnitude();
+            if late_mid {
+                // Strikers take the crossing targets (near post, spot, far
+                // post); midfielders arrive late for the cut-back and the
+                // edge. Soft: a mismatch costs 30m of distance, so a
+                // midfielder still fills a striker zone if no striker is
+                // anywhere near it.
+                let striker_zone = matches!(zone, BoxZone::PenaltySpot | BoxZone::FarPost | BoxZone::NearPost);
+                let is_forward = c.group == PlayerFieldPositionGroup::Forward;
+                if striker_zone != is_forward {
+                    cost += ROLE_MISMATCH_COST;
+                }
+            }
             if previous.iter().any(|r| r.id == c.id && r.zone == zone) {
                 cost -= STICKY_BONUS;
             }
@@ -719,7 +746,26 @@ pub fn plan_box_runs(
         }
         assigned.push(BoxRunner { id: cand.id, zone, point: best_pt });
     }
-    let out = assigned.iter().map(|r| (r.id, r.point)).collect();
+    // Timed runs (2026-10-08): until the carrier is close to the goal line
+    // the runner waits at a staging point a few metres back and wide of his
+    // zone; when the carrier reaches the dart depth he runs to the zone, so
+    // he arrives as the delivery is played instead of standing in it for
+    // seconds under a marker. The plan keeps the ZONE point (what a delivery
+    // aims at); only the movement target is staged. `WIDE_PLAY_OFF=dart`.
+    let darting = !wide_play_on("dart") || carrier_depth <= DART_DEPTH;
+    let out: Vec<(u32, Vector3<f32>)> = assigned
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if darting {
+                (r.id, r.point)
+            } else {
+                let side = if i % 2 == 0 { 1.0 } else { -1.0 };
+                let (back, lat) = if r.zone == BoxZone::Edge { (0.0, 0.0) } else { (STAGE_BACK, STAGE_LATERAL * side) };
+                (r.id, Vector3::new(r.point.x + inward * back, r.point.y + lat, 0.0))
+            }
+        })
+        .collect();
     context.box_plan[side_index] = BoxPlan { active: true, runners: assigned };
     out
 }
@@ -818,6 +864,21 @@ pub fn decide_final_third(
                 (1.0 - (runner.position - r.point).magnitude() / ARRIVE_REF).clamp(0.35, 1.0);
             // From the byline zone the six-yard box is played low: the lofted
             // delivery to those two zones is replaced by a cut-back.
+            if r.zone == BoxZone::LateRun {
+                // The late runner is a cut-back target: a low ball from the
+                // byline zone, nothing lofted to the penalty arc.
+                if wide_play_on("latemid") && (goal.x - from.x).abs() <= BYLINE_CTX_DEPTH {
+                    let lane = 0.7 + 0.3 * (1.0 - intercept_risk(ctx, from, r.point, opponents));
+                    let p_reach = CUTBACK_BASE_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive * lane;
+                    let v = p_reach * CUTBACK_P_SHOT * shot_xg(r.point, goal, opponents);
+                    d_deliver = d_deliver.max(v);
+                    if v > best_value {
+                        best_value = v;
+                        best = Action::Cutback { to: r.id, target: r.point };
+                    }
+                }
+                continue;
+            }
             let six_yard = matches!(r.zone, BoxZone::NearPost | BoxZone::FarPost);
             if wide_play_on("cutback") && six_yard && (goal.x - from.x).abs() <= CUTBACK_MAX_DEPTH {
                 let lane = 0.7 + 0.3 * (1.0 - intercept_risk(ctx, from, r.point, opponents));
@@ -839,7 +900,7 @@ pub fn decide_final_third(
             #[cfg(feature = "match-logs")]
             if v > dz.0 {
                 dz = (v, p_reach, xg_zone, arrive, open_mod, (runner.position - r.point).magnitude() / UNITS_PER_METRE, crowd as f32,
-                      match r.zone { BoxZone::PenaltySpot => 0.0, BoxZone::FarPost => 1.0, BoxZone::Edge => 2.0, BoxZone::NearPost => 3.0 });
+                      match r.zone { BoxZone::PenaltySpot => 0.0, BoxZone::FarPost => 1.0, BoxZone::Edge => 2.0, BoxZone::NearPost => 3.0, BoxZone::LateRun => 4.0 });
             }
             d_deliver = d_deliver.max(v);
             if v > best_value {
