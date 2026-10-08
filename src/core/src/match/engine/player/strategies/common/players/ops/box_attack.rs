@@ -594,6 +594,17 @@ fn run_early_extra() -> f32 {
 /// sideways 15% / pass forward 19%.
 const RUN_TRIGGER_LATERAL: f32 = 100.0;
 const RUN_RELEASE_LATERAL: f32 = 70.0;
+/// Lateral width (units off the centre line) at which the box runs start
+/// (`RUN_LAT` env, default `RUN_LAT_DEFAULT`; release keeps the 0.7 ratio).
+/// Measured (2026-10-08): the strikers missing from the box at a delivery
+/// had been on the box-run duty a median 0.8s (83% under 1.5s) vs 4.3s for
+/// those in the box: a switch of play or quick wide reception starts the
+/// run and the delivery follows at once.
+const RUN_LAT_DEFAULT: f32 = 40.0;
+fn run_lat_trigger() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("RUN_LAT").ok().and_then(|v| v.parse().ok()).unwrap_or(RUN_LAT_DEFAULT))
+}
 /// Bonus (units) for keeping a runner in the zone he already had.
 const STICKY_BONUS: f32 = 60.0;
 /// A runner nudges his point to the local gap: candidate offsets.
@@ -628,7 +639,8 @@ pub fn plan_box_runs(
     let was_active = context.box_plan[side_index].active;
     let extra = run_early_extra();
     let threshold = if was_active { RUN_RELEASE_DEPTH + extra } else { RUN_TRIGGER_DEPTH + extra };
-    let lat_threshold = if was_active { RUN_RELEASE_LATERAL } else { RUN_TRIGGER_LATERAL };
+    let lat_trigger = run_lat_trigger();
+    let lat_threshold = if was_active { lat_trigger * (RUN_RELEASE_LATERAL / RUN_TRIGGER_LATERAL) } else { lat_trigger };
     if carrier_depth > threshold || carrier_lateral < lat_threshold {
         context.box_plan[side_index] = BoxPlan::default();
         return Vec::new();
