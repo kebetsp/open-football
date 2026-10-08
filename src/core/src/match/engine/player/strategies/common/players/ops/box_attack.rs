@@ -367,12 +367,13 @@ const RETAIN_BONUS: f32 = 0.03;
 /// (fading out by 3m). Calibrated, not measured.
 const CARRY_PRESSURE_LOSS: f32 = 0.35;
 const CARRY_PRESSURE_RANGE_M: f32 = 3.0;
+/// 2026-10-08: default 0.5 -> 0 (see docs/wide-play-holistic-design.md §22): with a realistically crowded box the best delivery (0.044) tied the back pass (0.0445) and the pass won 51% of byline decisions; at 0 crossing-type deliveries return to 8.2/match (real ~8.3) and the forward shot-rate guards do not move.
 /// Share of `RETAIN_BONUS` a PASS keeps when the passer is in the crossing
 /// area (wide, within 25m of the goal line). There the chance a pass creates
 /// should count more than keeping the ball: a cross spends the possession and
 /// gets no bonus, so a safe pass to anyone nearby beat it by construction
 /// (0.06 vs 0.035). Swept 1.0/0.5/0.25/0 (30-40 matches each): 0.5 gives crosses 8.5/match (real ~8.3, was 4.8), shots after a cross 1.13 (was 0.45), forward shoot share 15% (real 13%); 0.25 and 0 push the forward shoot share to 18-19%. Calibration, not measured. `CROSSZONE_RETAIN=1` = old behaviour.
-const CROSSZONE_RETAIN_DEFAULT: f32 = 0.5;
+const CROSSZONE_RETAIN_DEFAULT: f32 = 0.0;
 fn crosszone_retain() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("CROSSZONE_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(CROSSZONE_RETAIN_DEFAULT))
