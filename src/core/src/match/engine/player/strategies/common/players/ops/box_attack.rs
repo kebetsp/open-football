@@ -378,6 +378,21 @@ fn crosszone_retain() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *K.get_or_init(|| std::env::var("CROSSZONE_RETAIN").ok().and_then(|v| v.parse().ok()).unwrap_or(CROSSZONE_RETAIN_DEFAULT))
 }
+/// Cut-back share (2026-10-08): real play from within 12.5m of the goal line
+/// has 4.4 crosses (2.4 lofted, 1.5 ground, 0.5 low) and 0.9 cut-backs per
+/// match; the engine played 2.4 cut-backs and 0.9 lofted. `CUTBACK_MULT`
+/// scales the cut-back value (default `CUTBACK_MULT_DEFAULT`);
+/// `CUTBACK_REPLACES=1` restores the old rule that the cut-back REPLACES the
+/// lofted ball to the six-yard zones within 5.5m.
+const CUTBACK_MULT_DEFAULT: f32 = 1.3;
+fn cutback_mult() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("CUTBACK_MULT").ok().and_then(|v| v.parse().ok()).unwrap_or(CUTBACK_MULT_DEFAULT))
+}
+fn cutback_replaces_lofted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CUTBACK_REPLACES").is_some())
+}
 fn cross_open_neutral() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CROSS_OPEN_NEUTRAL").is_some())
@@ -904,7 +919,7 @@ pub fn decide_final_third(
                 if wide_play_on("latemid") && (goal.x - from.x).abs() <= BYLINE_CTX_DEPTH {
                     let lane = 0.7 + 0.3 * (1.0 - intercept_risk(ctx, from, r.point, opponents));
                     let p_reach = CUTBACK_BASE_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive * lane;
-                    let v = p_reach * CUTBACK_P_SHOT * xg_zone_all;
+                    let v = p_reach * CUTBACK_P_SHOT * xg_zone_all * cutback_mult();
                     d_deliver = d_deliver.max(v);
                     if v > best_value {
                         best_value = v;
@@ -917,13 +932,17 @@ pub fn decide_final_third(
             if wide_play_on("cutback") && six_yard && (goal.x - from.x).abs() <= CUTBACK_MAX_DEPTH {
                 let lane = 0.7 + 0.3 * (1.0 - intercept_risk(ctx, from, r.point, opponents));
                 let p_reach = CUTBACK_BASE_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive * lane;
-                let v = p_reach * CUTBACK_P_SHOT * xg_zone_all;
+                let v = p_reach * CUTBACK_P_SHOT * xg_zone_all * cutback_mult();
                 d_deliver = d_deliver.max(v);
                 if v > best_value {
                     best_value = v;
                     best = Action::Cutback { to: r.id, target: r.point };
                 }
-                continue;
+                if !cutback_replaces_lofted() {
+                    // fall through: the lofted ball stays an option
+                } else {
+                    continue;
+                }
             }
             let p_reach = CROSS_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive;
             let xg_zone = xg_zone_all;
