@@ -184,6 +184,26 @@ fn advance_depth(group: PlayerFieldPositionGroup, phase: Phase) -> f32 {
 /// who'd otherwise get the literal identical target from `width_depth`
 /// don't collapse onto the same point. Reasoned estimate (category d).
 const WIDTH_SAME_GROUP_STAGGER: f32 = 60.0;
+/// Wide-play plan (2026-10-08): two wide players do not share one lane. A
+/// wide player standing AHEAD of a teammate who has the ball on the same
+/// flank steps inside (to the half-space) and leaves the running line to the
+/// carrier; once the carrier has passed him he widens again. Lane sharing =
+/// the carrier within 12m of the touchline line (full shift inside 3m);
+/// the player is 4-40m ahead of him along the attack; shift 9m. `WIDE_PLAY_ABLATE` switches it off (same-binary A/B).
+const VACATE_AHEAD_MIN: f32 = 32.0;
+const VACATE_AHEAD_MAX: f32 = 320.0;
+const VACATE_LANE_FULL: f32 = 24.0;
+const VACATE_LANE_NONE: f32 = 96.0;
+const VACATE_SHIFT: f32 = 72.0;
+/// `WIDE_PLAY_ABLATE` (any value) switches the whole plan off; `WIDE_PLAY_OFF`
+/// = comma list of `cutback`, `mate`, `trigger`, `vacate` switches single parts.
+fn wide_play_on(feature: &str) -> bool {
+    static OFF: std::sync::OnceLock<(bool, String)> = std::sync::OnceLock::new();
+    let (all, list) = OFF.get_or_init(|| {
+        (std::env::var_os("WIDE_PLAY_ABLATE").is_some(), std::env::var("WIDE_PLAY_OFF").unwrap_or_default())
+    });
+    !*all && !list.split(',').any(|f| f == feature)
+}
 
 /// A central forward in the Progression phase pins the shoulder of the
 /// opponent's last outfield defender: he stands this far short of that
@@ -728,6 +748,15 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
             width_depth(c.position_group, phase) - stagger_index as f32 * WIDTH_SAME_GROUP_STAGGER;
         let y = if is_left { WIDTH_MARGIN } else { field_height - WIDTH_MARGIN };
         let mut target = Vector3::new(target_x_from_depth(depth), y, 0.0);
+        if wide_play_on("vacate") && c.id != reference_id {
+            let ball = carrier.position;
+            let carrier_gap = (ball.y - y).abs();
+            let ahead = (c.position.x - ball.x) * attack_dir;
+            if carrier_gap < VACATE_LANE_NONE && ahead >= VACATE_AHEAD_MIN && ahead <= VACATE_AHEAD_MAX {
+                let f = ((VACATE_LANE_NONE - carrier_gap) / (VACATE_LANE_NONE - VACATE_LANE_FULL)).clamp(0.0, 1.0);
+                target.y += if is_left { VACATE_SHIFT * f } else { -VACATE_SHIFT * f };
+            }
+        }
         let mut duty = AttackDuty::Width;
         // Step E: push into genuinely open space -- only once the team
         // has genuinely progressed (Progression/Final); build-up doesn't

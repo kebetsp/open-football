@@ -2186,7 +2186,13 @@ impl PlayerEventDispatcher {
         // before that fix, landing short of even their own penalty box in
         // 100% of a 324-kick sample).
         let is_gk_long_kick = passer_is_goalkeeper && actual_horizontal_distance > 60.0;
-        let trajectory_type = if is_gk_long_kick {
+        // Wide-play plan (2026-10-08): a cut-back from the byline zone is a
+        // low pass (ground, driven only when it has to travel), whatever the
+        // lane obstacles would otherwise have chosen.
+        let is_cutback = event_model.reason == "BOX_CUTBACK";
+        let trajectory_type = if is_cutback {
+            if actual_horizontal_distance <= 60.0 { TrajectoryType::Ground } else { TrajectoryType::LowDriven }
+        } else if is_gk_long_kick {
             TrajectoryType::HighArc
         } else if (is_corner_delivery || is_fk_delivery) && actual_horizontal_distance > 25.0 {
             TrajectoryType::HighArc

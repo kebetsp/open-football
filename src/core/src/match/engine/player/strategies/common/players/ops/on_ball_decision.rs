@@ -217,6 +217,12 @@ pub enum Action {
     /// space he is running into rather than at his feet. The conflict
     /// check's own item 5: "a run pays off only if he can play it."
     Through { to: u32, target: Vector3<f32> },
+    /// Wide-play plan (2026-10-08): a LOW pass from the byline zone into
+    /// the six-yard box (a cut-back), struck on the ground. A lofted cross
+    /// from a few metres off the goal line to a point a few metres away is
+    /// not how it is played; `players.rs` keys the ground trajectory on
+    /// the `BOX_CUTBACK` reason.
+    Cutback { to: u32, target: Vector3<f32> },
 }
 
 /// Step A's gate: true when a manager-issued directive already governs
@@ -892,6 +898,7 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
             Action::Hold => ("Hold", 0.0, 0.0),
             Action::Deliver { to, .. } => ("Deliver", to as f32, 0.0),
             Action::Through { to, .. } => ("Through", to as f32, 0.0),
+            Action::Cutback { to, .. } => ("Cutback", to as f32, 0.0),
         };
         crate::match_log_info!(
             "ONBALLACT t={} id={} group={:?} action={} value={:.3} own_goal_dist={:.1} tx={:.1} ty={:.1} fx={:.2} fy={:.2}",

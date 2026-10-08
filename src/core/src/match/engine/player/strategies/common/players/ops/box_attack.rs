@@ -379,6 +379,57 @@ fn crosszone_retain() -> f32 {
 }
 /// Standing still with the ball is worth almost nothing (estimate).
 const HOLD_VALUE: f32 = 0.004;
+
+// ---- Wide-play plan, 2026-10-08 (docs/wide-play-holistic-design.md §17).
+/// A carrier this close to the goal line (12.5m) plays the six-yard box with
+/// a LOW ball, not a lofted cross; `WIDE_PLAY_ABLATE` restores the old
+/// behaviour (same-binary A/B).
+const CUTBACK_MAX_DEPTH: f32 = 100.0;
+/// Value parity with the cross it replaces: StatsBomb Bundesliga 2023/24
+/// gives the same xG per delivery from <=5.5m (cut-back 0.032, n=35;
+/// cross 0.038, n=52) and a similar completion (0.34 vs 0.27), so the
+/// cross parameters (completion 0.35, shot-after 0.6) are reused and the
+/// only difference is the lane: a ground ball is exposed to the six-yard
+/// box crowd, a lofted one is not (factor 0.7-1.0 by how clear the lane is).
+const CUTBACK_BASE_COMPLETION: f32 = CROSS_COMPLETION;
+const CUTBACK_P_SHOT: f32 = P_SHOT_GIVEN_REACH;
+/// `WIDE_PLAY_ABLATE` (any value) switches the whole plan off; `WIDE_PLAY_OFF`
+/// = comma list of `cutback`, `mate`, `trigger`, `vacate` switches single parts.
+fn wide_play_on(feature: &str) -> bool {
+    static OFF: std::sync::OnceLock<(bool, String)> = std::sync::OnceLock::new();
+    let (all, list) = OFF.get_or_init(|| {
+        (std::env::var_os("WIDE_PLAY_ABLATE").is_some(), std::env::var("WIDE_PLAY_OFF").unwrap_or_default())
+    });
+    !*all && !list.split(',').any(|f| f == feature)
+}
+/// A carry does not run through a teammate: any same-team outfield player
+/// within 3m of the first 20m of the run, ahead of the carrier, blocks that
+/// heading (he gets the ball instead, or moves out of the lane).
+const MATE_LANE_RADIUS: f32 = 24.0;
+const MATE_LANE_LENGTH: f32 = 160.0;
+fn teammate_in_lane(ctx: &StateProcessingContext, from: Vector3<f32>, dir: Vector3<f32>) -> bool {
+    ctx.players().teammates().all().any(|t| {
+        if t.tactical_positions.position_group() == PlayerFieldPositionGroup::Goalkeeper {
+            return false;
+        }
+        let rel = t.position - from;
+        let along = rel.x * dir.x + rel.y * dir.y;
+        if along < MATE_LANE_RADIUS || along > MATE_LANE_LENGTH {
+            return false;
+        }
+        let perp = (rel.x * dir.y - rel.y * dir.x).abs();
+        perp <= MATE_LANE_RADIUS
+    })
+}
+/// A wide carrier with an open flank run (no likely contest before the run
+/// ends) prefers it from the first touch, not only once already moving along
+/// the line: position as the trigger. Multiplier on the run's value;
+/// `WIDE_RUN_TRIGGER` overrides (0 = off).
+const WIDE_RUN_TRIGGER_DEFAULT: f32 = 0.3;
+fn wide_run_trigger() -> f32 {
+    static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("WIDE_RUN_TRIGGER").ok().and_then(|v| v.parse().ok()).unwrap_or(WIDE_RUN_TRIGGER_DEFAULT))
+}
 /// A passer who just received from a teammate rarely returns it at once
 /// (estimate; multiplier on the pass value).
 const BACK_TO_PASSER_MULT: f32 = 0.6;
@@ -698,6 +749,20 @@ pub fn decide_final_third(
             let open_mod = 0.55 + 0.9 * (d_zone.min(ZONE_OPEN_REF) / ZONE_OPEN_REF);
             let arrive =
                 (1.0 - (runner.position - r.point).magnitude() / ARRIVE_REF).clamp(0.35, 1.0);
+            // From the byline zone the six-yard box is played low: the lofted
+            // delivery to those two zones is replaced by a cut-back.
+            let six_yard = matches!(r.zone, BoxZone::NearPost | BoxZone::FarPost);
+            if wide_play_on("cutback") && six_yard && (goal.x - from.x).abs() <= CUTBACK_MAX_DEPTH {
+                let lane = 0.7 + 0.3 * (1.0 - intercept_risk(ctx, from, r.point, opponents));
+                let p_reach = CUTBACK_BASE_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive * lane;
+                let v = p_reach * CUTBACK_P_SHOT * shot_xg(r.point, goal, opponents);
+                d_deliver = d_deliver.max(v);
+                if v > best_value {
+                    best_value = v;
+                    best = Action::Cutback { to: r.id, target: r.point };
+                }
+                continue;
+            }
             let p_reach = CROSS_COMPLETION * (0.8 + 0.4 * crossing) * open_mod * arrive;
             let v = p_reach * P_SHOT_GIVEN_REACH * shot_xg(r.point, goal, opponents);
             d_deliver = d_deliver.max(v);
@@ -798,6 +863,9 @@ pub fn decide_final_third(
         if travel < 15.0 {
             continue;
         }
+        if fair && wide_play_on("mate") && teammate_in_lane(ctx, from, heading) {
+            continue;
+        }
         let mut target = from + heading * travel;
         let mut travel = travel;
         if fair {
@@ -833,9 +901,11 @@ pub fn decide_final_third(
         let room = openness(target, opponents);
         let mut end_value: Option<f32> = None;
         let mut p_keep;
+        let mut run_open = false;
         if contest_on {
             let cc = carry_contest(ctx, from, target, opponents);
             p_keep = cc.keep;
+            run_open = cc.stop.is_none();
             if let Some(st) = cc.stop {
                 // The first likely contest: decide there — pass, take him
                 // on, or the shot/cross from that spot — against where the
@@ -894,6 +964,8 @@ pub fn decide_final_third(
             && inward_comp <= 0.40;
         let flank_mult = if flank_run && carry_sticky_mult(ctx.player.velocity, heading) > 1.0 {
             1.0 + byline_sticky()
+        } else if flank_run && run_open && inward_comp.abs() <= 0.25 && wide_play_on("trigger") {
+            1.0 + wide_run_trigger()
         } else {
             1.0
         };
@@ -973,6 +1045,7 @@ pub fn decide_final_third(
             Action::Shoot => "shoot",
             Action::Deliver { .. } => "deliver",
             Action::Through { .. } => "through",
+            Action::Cutback { .. } => "cutback",
             Action::Pass(_) => "pass",
             Action::Carry(_) => "carry",
             Action::Dribble(_) => "take",

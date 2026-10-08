@@ -2201,6 +2201,7 @@ impl<'p> StateProcessor<'p> {
             | Action::Pass(_)
             | Action::Clear
             | Action::Deliver { .. }
+            | Action::Cutback { .. }
             | Action::Through { .. } => Some(Vector3::zeros()),
         }
     }
@@ -2283,6 +2284,27 @@ impl<'p> StateProcessor<'p> {
                     .with_to_player_id(to)
                     .with_pass_target(target)
                     .with_reason("BOX_DELIVER")
+                    .build(ctx);
+                let event = Event::PlayerEvent(PlayerEvent::PassTo(pass_ctx));
+                match role {
+                    Role::Defender => {
+                        StateChangeResult::with_defender_state_and_event(DefenderState::Running, event)
+                    }
+                    Role::Midfielder => StateChangeResult::with_midfielder_state_and_event(
+                        MidfielderState::Running,
+                        event,
+                    ),
+                    Role::Forward => {
+                        StateChangeResult::with_forward_state_and_event(ForwardState::Running, event)
+                    }
+                }
+            }
+            Action::Cutback { to, target } => {
+                let pass_ctx = PassingEventContext::new()
+                    .with_from_player_id(ctx.player.id)
+                    .with_to_player_id(to)
+                    .with_pass_target(target)
+                    .with_reason("BOX_CUTBACK")
                     .build(ctx);
                 let event = Event::PlayerEvent(PlayerEvent::PassTo(pass_ctx));
                 match role {
