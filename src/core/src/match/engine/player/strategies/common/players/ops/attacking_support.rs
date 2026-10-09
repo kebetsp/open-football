@@ -81,6 +81,9 @@ use crate::r#match::player::strategies::common::players::ops::box_attack::{
     RunCandidate, plan_box_runs,
 };
 use crate::r#match::player::strategies::common::players::ops::off_ball_runs::{RunnerInput, plan_runs};
+use crate::r#match::player::strategies::common::players::ops::off_ball_support::{
+    choose_spot, SupportPlayer, SupportWorld, HELP_AFTER_MS,
+};
 use crate::r#match::player::strategies::common::spacing::is_front_two_tactic;
 use crate::r#match::{MatchContext, MatchField, MatchPlayerLite, PlayerSide};
 use crate::MatchTacticType;
@@ -203,6 +206,13 @@ fn wide_play_on(feature: &str) -> bool {
         (std::env::var_os("WIDE_PLAY_ABLATE").is_some(), std::env::var("WIDE_PLAY_OFF").unwrap_or_default())
     });
     !*all && !list.split(',').any(|f| f == feature)
+}
+
+/// `OFFBALL_SUPPORT_ABLATE` (any value) switches the off-ball support-spot
+/// selection (`off_ball_support.rs`) off, for same-binary A/B runs.
+fn support_spots_on() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var_os("OFFBALL_SUPPORT_ABLATE").is_some())
 }
 
 /// A central forward in the Progression phase pins the shoulder of the
@@ -896,6 +906,99 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         });
     }
 
+    // --- Off-ball support spots (`off_ball_support.rs`): the fixed role/
+    // phase targets above are only the starting point. Each Width/Advance/
+    // Penetrate player picks the best nearby spot for the carrier (clear
+    // lane, space, support distance, not on a teammate, offside-safe), and
+    // never keeps one spot for long, so the off-ball team is always
+    // adjusting. When the possession has not progressed for a while the
+    // nearest forward and the nearest wide player come close to help.
+    let mut refined: Vec<(u32, Vector3<f32>)> = Vec::new();
+    let now_ms = context.total_match_time;
+    let stagnant_ms = context.support_stagnation[side_index].update(now_ms, ball_dist_to_own_goal);
+    if support_spots_on() {
+        let teammates: Vec<(u32, Vector3<f32>)> = cands
+            .iter()
+            .filter(|c| c.team_id == carrier.team_id && c.position_group != PlayerFieldPositionGroup::Goalkeeper)
+            .map(|c| (c.id, c.position))
+            .collect();
+        let opp_last_line_x = cands
+            .iter()
+            .filter(|c| c.team_id != carrier.team_id && c.position_group != PlayerFieldPositionGroup::Goalkeeper)
+            .map(|c| c.position.x)
+            .fold(None, |acc: Option<f32>, x| {
+                Some(match acc {
+                    None => x,
+                    Some(a) => if attack_dir > 0.0 { a.max(x) } else { a.min(x) },
+                })
+            });
+        let eligible = |a: &Assignment| -> bool {
+            matches!(a.duty, AttackDuty::Width | AttackDuty::Advance | AttackDuty::Penetrate)
+                && !a.redirected
+                && !(matches!(phase, Phase::Final)
+                    && pool
+                        .iter()
+                        .find(|c| c.id == a.id)
+                        .is_some_and(|c| c.position_group == PlayerFieldPositionGroup::Forward))
+        };
+        // Helpers: when stuck, the nearest forward and the nearest wide non-forward.
+        let mut helpers: Vec<u32> = Vec::new();
+        if stagnant_ms >= HELP_AFTER_MS && !matches!(phase, Phase::Final) {
+            let near = |c: &Cand| (c.position - carrier.position).magnitude();
+            let mut fwd: Option<&Cand> = None;
+            let mut wide: Option<&Cand> = None;
+            for a in results.iter().filter(|a| eligible(a)) {
+                if let Some(c) = pool.iter().find(|c| c.id == a.id) {
+                    if c.position_group == PlayerFieldPositionGroup::Forward {
+                        if fwd.map_or(true, |f| near(c) < near(f)) { fwd = Some(c); }
+                    } else if is_wide(c.position_type, front_two_early)
+                        && c.position_group != PlayerFieldPositionGroup::Defender
+                        && wide.map_or(true, |f| near(c) < near(f))
+                    {
+                        wide = Some(c);
+                    }
+                }
+            }
+            helpers.extend(fwd.map(|c| c.id));
+            helpers.extend(wide.map(|c| c.id));
+        }
+        let opp_positions: Vec<Vector3<f32>> = cands
+            .iter()
+            .filter(|c| c.team_id != carrier.team_id)
+            .map(|c| c.position)
+            .collect();
+        let world = SupportWorld {
+            carrier: carrier.position,
+            attack_dir,
+            opponents: &opp_positions,
+            teammates: &teammates,
+            opp_last_line_x,
+            width: context.field_size.width as f32,
+            height: field_height,
+            now_ms,
+        };
+        let mut taken: Vec<Vector3<f32>> = Vec::new();
+        for a in results.iter_mut() {
+            if !eligible(a) {
+                continue;
+            }
+            let Some(pl) = field.get_player(a.id) else { continue };
+            let sp = SupportPlayer {
+                id: a.id,
+                position: pl.position,
+                base: a.target,
+                prev_spot: pl.support_spot,
+                anchor: pl.support_anchor,
+                anchor_since_ms: pl.support_anchor_since_ms,
+                helper: helpers.contains(&a.id),
+            };
+            let spot = choose_spot(&world, &sp, &taken);
+            taken.push(spot);
+            a.target = spot;
+            refined.push((a.id, spot));
+        }
+    }
+
     // Diagnostic (kept feature-gated at zero cost otherwise): the
     // resolved phase + ball depth once per tick -- lets a raw trace
     // directly check for boundary flicker (open question #1 in the
@@ -932,6 +1035,19 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         if let Some(idx) = field.player_index(a.id) {
             field.players[idx].ai_attack_duty = a.duty;
             field.players[idx].ai_attack_target = a.target;
+        }
+    }
+    for (id, spot) in refined {
+        if let Some(idx) = field.player_index(id) {
+            let p = &mut field.players[idx];
+            p.support_spot = Some(spot);
+            let moved = ((p.position.x - p.support_anchor.x).powi(2)
+                + (p.position.y - p.support_anchor.y).powi(2))
+            .sqrt();
+            if moved >= 40.0 {
+                p.support_anchor = p.position;
+                p.support_anchor_since_ms = now_ms;
+            }
         }
     }
 }

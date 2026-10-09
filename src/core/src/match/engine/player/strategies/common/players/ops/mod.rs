@@ -15,6 +15,7 @@ pub mod goalkeeper_skill;
 pub mod midfielder_skill;
 pub mod movement;
 pub mod off_ball_runs;
+pub mod off_ball_support;
 pub mod on_ball_decision;
 pub mod on_ball_value;
 pub mod panic;

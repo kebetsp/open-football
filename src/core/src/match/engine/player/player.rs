@@ -432,6 +432,13 @@ pub struct MatchPlayer {
     /// byline, back) instead of freezing on one spot forever. Resets to
     /// 0 the instant he receives the ball.
     pub run_stale_ticks: u16,
+    /// Off-ball support spot (`off_ball_support.rs`): the spot this player
+    /// last chose as his support position, where he has been standing
+    /// (`support_anchor`) and since when — the dwell timer that forces a
+    /// relocation instead of freezing on one spot.
+    pub support_spot: Option<Vector3<f32>>,
+    pub support_anchor: Vector3<f32>,
+    pub support_anchor_since_ms: u64,
     /// Cross-player attacking trigger: when teammate `.0` has the ball,
     /// this player's effective directive becomes `.1` (evaluated per
     /// possession change in the engine loop).
@@ -992,6 +999,9 @@ impl MatchPlayer {
             run_commit_target: Vector3::zeros(),
             run_commit_duty: AttackDuty::None,
             run_stale_ticks: 0,
+            support_spot: None,
+            support_anchor: Vector3::zeros(),
+            support_anchor_since_ms: 0,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
@@ -1113,6 +1123,9 @@ impl MatchPlayer {
             run_commit_target: Vector3::zeros(),
             run_commit_duty: AttackDuty::None,
             run_stale_ticks: 0,
+            support_spot: None,
+            support_anchor: Vector3::zeros(),
+            support_anchor_since_ms: 0,
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,

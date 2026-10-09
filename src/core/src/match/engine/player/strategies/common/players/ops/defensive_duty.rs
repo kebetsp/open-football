@@ -27,6 +27,9 @@
 //! pre-existing decision-function dependencies.
 
 use crate::PlayerFieldPositionGroup;
+use crate::r#match::player::strategies::common::players::ops::off_ball_support::{
+    choose_defensive_spot, DefWorld, SupportPlayer,
+};
 use crate::r#match::defenders::states::DefenderState;
 use crate::r#match::forwarders::states::ForwardState;
 use crate::r#match::midfielders::states::MidfielderState;
@@ -50,6 +53,40 @@ const JOCKEY_DISTANCE_UNITS: f32 = 12.0;
 /// defender will chase before giving up") — a verification target for
 /// the raw-trace pass, not treated as final.
 const MAX_PRESS_CLOSING_TICKS: f32 = 220.0;
+
+/// Off-ball pressure plan (2026-10-08): a presser steps up even when he
+/// cannot win a race to the carrier, because a mid-block press is an
+/// approach, not a sprint to win the ball. 520 ticks (~5s, about 25-30m) so
+/// the nearest midfielder closes a carrier in the middle third. Real
+/// passers in the middle third have the nearest opponent a median 3.4m away
+/// (StatsBomb 360, Bundesliga 2023/24); the engine had 4.5m with only 16-21%
+/// of moments having any presser at all. `PRESS_REACH_ABLATE` restores 220.
+const PRESS_REACH_TICKS: f32 = 520.0;
+fn press_reach_ticks() -> f32 {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("PRESS_REACH_ABLATE").is_some()) {
+        MAX_PRESS_CLOSING_TICKS
+    } else {
+        PRESS_REACH_TICKS
+    }
+}
+/// `FWD_SCREEN_ABLATE` removes the forward screening job (forwards then get
+/// no duty out of possession unless pressing, as before).
+fn fwd_screen_on() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var_os("FWD_SCREEN_ABLATE").is_some())
+}
+/// `DEF_SPOT_ABLATE` removes the hold-shape spot selection (lane cover and
+/// dwell) and leaves the fixed shape targets.
+fn def_spots_on() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var_os("DEF_SPOT_ABLATE").is_some())
+}
+/// Forwards out of possession stand high, screening the opponent's build-up:
+/// 15m ahead of the midfield line, never deeper into the opponent's half than
+/// 58% of the pitch length.
+const FORWARD_SCREEN_GAP_UNITS: f32 = 120.0;
+const FORWARD_SCREEN_MAX_FRACTION: f32 = 0.58;
 
 /// Opponents beyond this distance from the ball aren't ranked as
 /// current threats at all — real marking doesn't extend to the far
@@ -313,6 +350,10 @@ struct Cand {
     /// system's own loose-ball assignments below, so the two mechanisms
     /// never fight over the same player.
     is_taking_ball: bool,
+    /// Off-ball support spot memory (`off_ball_support.rs`).
+    support_spot: Option<Vector3<f32>>,
+    support_anchor: Vector3<f32>,
+    support_anchor_since_ms: u64,
 }
 
 /// One player's resolved assignment for this tick.
@@ -387,6 +428,9 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                     | PlayerState::Midfielder(MidfielderState::TakeBall)
                     | PlayerState::Forward(ForwardState::TakeBall)
             ),
+            support_spot: p.support_spot,
+            support_anchor: p.support_anchor,
+            support_anchor_since_ms: p.support_anchor_since_ms,
         })
         .collect();
 
@@ -438,6 +482,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             goal_for_side(defending_side),
             goal_for_side(opposite_side(defending_side)),
             defending_side,
+            true,
         )
     } else if let Some(passer_id) = field.ball.pending_pass_passer {
         // Case 2a (added 2026-09-23, folded in from domain 2's carry-over
@@ -474,16 +519,19 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             reset_all(field);
             return;
         };
+        let (focus_id, focus_pos, focus_vel) =
+            pressure_focus(&cands, field, passer.team_id, Some(passer.id));
         assign_team(
             &cands,
             defending_team,
             passer.team_id,
-            field.ball.position,
-            field.ball.velocity,
-            None,
+            focus_pos,
+            focus_vel,
+            focus_id,
             goal_for_side(defending_side),
             goal_for_side(opposite_side(defending_side)),
             defending_side,
+            false,
         )
     } else if let Some(prev_owner_id) = field
         .ball
@@ -531,16 +579,19 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             reset_all(field);
             return;
         };
+        let (focus_id, focus_pos, focus_vel) =
+            pressure_focus(&cands, field, prev_owner.team_id, Some(prev_owner.id));
         assign_team(
             &cands,
             defending_team,
             prev_owner.team_id,
-            field.ball.position,
-            field.ball.velocity,
-            None,
+            focus_pos,
+            focus_vel,
+            focus_id,
             goal_for_side(defending_side),
             goal_for_side(opposite_side(defending_side)),
             defending_side,
+            false,
         )
     } else {
         // Case 2b: a genuine loose ball — both teams organise around
@@ -599,6 +650,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                 goal_for_side(side),
                 goal_for_side(opposite_side(side)),
                 side,
+                false,
             ));
         }
         all
@@ -714,6 +766,78 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
         }
     }
 
+    // --- Hold-shape spot selection (`off_ball_support.rs`): a defending
+    // player who is only holding shape keeps adjusting inside it — standing
+    // on the line between the carrier and his options, never on a teammate,
+    // never on one spot for long. Skipped in the box-defence and crisis
+    // zones, which have their own fixed slots.
+    let mut assignments = assignments;
+    let mut refined: Vec<(u32, Vector3<f32>)> = Vec::new();
+    let now_ms = context.total_match_time;
+    if def_spots_on() {
+        let ball_pos = field.ball.position;
+        let width = context.field_size.width as f32;
+        let height = context.field_size.height as f32;
+        let mut taken_by_team: Vec<(u32, Vec<Vector3<f32>>)> = Vec::new();
+        for a in assignments.iter_mut() {
+            if !matches!(a.duty, DefensiveDuty::HoldShape) {
+                continue;
+            }
+            let Some(me) = cands.iter().find(|c| c.id == a.id) else { continue };
+            let Some(side) = me.side else { continue };
+            let own_goal = goal_for_side(side);
+            let to_ball = ball_pos - own_goal;
+            if to_ball.magnitude() <= CRISIS_RADIUS_UNITS {
+                continue;
+            }
+            if box_defence_on()
+                && (ball_pos.y - own_goal.y).abs() >= BOX_DEF_MIN_LATERAL
+                && (ball_pos.x - own_goal.x).abs() <= BOX_DEF_MAX_DEPTH
+            {
+                continue;
+            }
+            let options: Vec<Vector3<f32>> = cands
+                .iter()
+                .filter(|c| c.team_id != me.team_id && c.position_group != PlayerFieldPositionGroup::Goalkeeper)
+                .map(|c| c.position)
+                .collect();
+            let teammates: Vec<(u32, Vector3<f32>)> = cands
+                .iter()
+                .filter(|c| c.team_id == me.team_id && c.position_group != PlayerFieldPositionGroup::Goalkeeper)
+                .map(|c| (c.id, c.position))
+                .collect();
+            let world = DefWorld {
+                carrier: ball_pos,
+                own_goal,
+                options: &options,
+                teammates: &teammates,
+                width,
+                height,
+                now_ms,
+            };
+            let sp = SupportPlayer {
+                id: me.id,
+                position: me.position,
+                base: a.target,
+                prev_spot: me.support_spot,
+                anchor: me.support_anchor,
+                anchor_since_ms: me.support_anchor_since_ms,
+                helper: false,
+            };
+            let slot = match taken_by_team.iter().position(|(t, _)| *t == me.team_id) {
+                Some(i) => i,
+                None => {
+                    taken_by_team.push((me.team_id, Vec::new()));
+                    taken_by_team.len() - 1
+                }
+            };
+            let spot = choose_defensive_spot(&world, &sp, &taken_by_team[slot].1);
+            taken_by_team[slot].1.push(spot);
+            a.target = spot;
+            refined.push((a.id, spot));
+        }
+    }
+
     for a in assignments {
         if let Some(idx) = field.player_index(a.id) {
             field.players[idx].ai_defensive_duty = a.duty;
@@ -721,6 +845,48 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             field.players[idx].ai_defensive_engage = a.engage;
         }
     }
+    for (id, spot) in refined {
+        if let Some(idx) = field.player_index(id) {
+            let p = &mut field.players[idx];
+            p.support_spot = Some(spot);
+            let moved = ((p.position.x - p.support_anchor.x).powi(2) + (p.position.y - p.support_anchor.y).powi(2)).sqrt();
+            if moved >= 40.0 {
+                p.support_anchor = p.position;
+                p.support_anchor_since_ms = now_ms;
+            }
+        }
+    }
+}
+
+/// `PRESS_FOCUS_ABLATE` restores the old behaviour: with no registered ball
+/// owner (pass in flight, recent touch) nobody is assigned to press.
+fn press_focus_on() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var_os("PRESS_FOCUS_ABLATE").is_some())
+}
+
+/// Who the defending team should press while the ball has no registered
+/// owner: the intended receiver of a pass in flight, else the last owner.
+/// Before this the press step was skipped for those cases, so a presser
+/// existed only in the few ticks where `current_owner` was set (measured:
+/// a presser in 21% of middle-third moments, median 5.4m from the ball).
+fn pressure_focus(
+    cands: &[Cand],
+    field: &MatchField,
+    owner_team: u32,
+    fallback_id: Option<u32>,
+) -> (Option<u32>, Vector3<f32>, Vector3<f32>) {
+    if press_focus_on() {
+        if let Some(rid) = field.ball.pass_target_player_id {
+            if let Some(r) = cands.iter().find(|c| c.id == rid && c.team_id == owner_team) {
+                return (Some(rid), r.position, r.velocity);
+            }
+        }
+        if let Some(o) = fallback_id.and_then(|id| cands.iter().find(|c| c.id == id)) {
+            return (Some(o.id), o.position, o.velocity);
+        }
+    }
+    (None, field.ball.position, field.ball.velocity)
 }
 
 /// Steps C-H of the design doc's spec, for one defending team against
@@ -739,6 +905,7 @@ fn assign_team(
     own_goal: Vector3<f32>,
     opponent_goal: Vector3<f32>,
     defending_side: PlayerSide,
+    ball_owned: bool,
 ) -> Vec<Assignment> {
     // Forwards are included in the pool (needed so they're eligible for
     // Step C's press-trigger race and Step G's crisis scramble, both
@@ -841,7 +1008,7 @@ fn assign_team(
             }
         }
         if let Some((candidate, closing_ticks, _)) = best {
-            if closing_ticks <= MAX_PRESS_CLOSING_TICKS {
+            if closing_ticks <= press_reach_ticks() {
                 presser = Some(candidate);
                 assigned.push(candidate.id);
             }
@@ -992,8 +1159,9 @@ fn assign_team(
     // never `Some` for a loose ball. ---
     if let (Some(presser), Some(carrier_id)) = (presser, carrier_id) {
         let dist_to_carrier = (presser.position - focal_pos).magnitude();
-        let engage = (cover_arrived && dist_to_carrier <= ENGAGE_WITH_COVER_UNITS)
-            || dist_to_carrier <= ENGAGE_WITHOUT_COVER_UNITS;
+        let engage = ball_owned
+            && ((cover_arrived && dist_to_carrier <= ENGAGE_WITH_COVER_UNITS)
+                || dist_to_carrier <= ENGAGE_WITHOUT_COVER_UNITS);
         // Stand at the carrier's anticipated position, goal-side AND (for a
         // wide carrier) on the inside, so the carrier is shown toward the
         // touchline instead of being allowed to cut in.
@@ -1094,6 +1262,30 @@ fn assign_team(
             engage: false,
         });
         hold_shape_ids.push(c.id);
+    }
+
+    // --- Forward screen: a forward who is not pressing stands high on the
+    // opponent's build-up (ball-side lean) instead of having no job.
+    if fwd_screen_on() {
+        let pitch_len = (opponent_goal.x - own_goal.x).abs();
+        let fwd_depth = (mid_line_depth + FORWARD_SCREEN_GAP_UNITS).min(pitch_len * FORWARD_SCREEN_MAX_FRACTION);
+        let screeners: Vec<(u32, f32)> = pool
+            .iter()
+            .filter(|c| {
+                c.position_group == PlayerFieldPositionGroup::Forward
+                    && !assigned.contains(&c.id)
+                    && !results.iter().any(|a| a.id == c.id)
+            })
+            .map(|c| (c.id, c.start_position.y))
+            .collect();
+        for (id, start_y) in screeners {
+            let target = Vector3::new(
+                own_goal.x + attack_dir * fwd_depth,
+                start_y * 0.6 + predicted_carrier_pos.y * 0.4,
+                0.0,
+            );
+            results.push(Assignment { id, duty: DefensiveDuty::HoldShape, target, engage: false });
+        }
     }
 
     // --- Box defence: hold-shape players cover the box when the ball is

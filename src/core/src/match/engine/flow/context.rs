@@ -102,6 +102,36 @@ pub struct BoxPlan {
     pub runners: Vec<BoxRunner>,
 }
 
+/// Off-ball support (`off_ball_support.rs`): per attacking side, how long
+/// the possession has gone without progressing. Progress means the ball got
+/// 8m deeper (64 units) than the best so far in this possession.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Stagnation {
+    pub since_ms: u64,
+    pub best_depth: f32,
+    pub last_seen_ms: u64,
+}
+
+impl Stagnation {
+    const PROGRESS_UNITS: f32 = 64.0;
+
+    /// Update from the ball's current depth (distance from own goal along
+    /// the attack). Returns how long (ms) the side has held the ball
+    /// without getting deeper. A gap of over 1.5s means the possession
+    /// changed hands, so it starts again.
+    pub fn update(&mut self, now_ms: u64, depth: f32) -> u64 {
+        if now_ms.saturating_sub(self.last_seen_ms) > 1500 || self.last_seen_ms == 0 {
+            self.since_ms = now_ms;
+            self.best_depth = depth;
+        } else if depth > self.best_depth + Self::PROGRESS_UNITS {
+            self.since_ms = now_ms;
+            self.best_depth = depth;
+        }
+        self.last_seen_ms = now_ms;
+        now_ms.saturating_sub(self.since_ms)
+    }
+}
+
 pub struct MatchContext {
     pub state: GameState,
     pub time: MatchTime,
@@ -264,6 +294,10 @@ pub struct MatchContext {
     /// tick by `assign_attacking_support`, read by the on-ball decision
     /// so the carrier knows where the runners are going.
     pub box_plan: [BoxPlan; 2],
+
+    /// Off-ball support (`off_ball_support.rs`): per attacking side, how
+    /// long this side's possession has gone without progressing.
+    pub support_stagnation: [Stagnation; 2],
 
     /// Per-team skill composite aggregates, cached between refresh
     /// passes. The raw recompute walks every active player and
@@ -472,6 +506,7 @@ impl MatchContext {
             starting_home_tactic: None,
             starting_away_tactic: None,
             box_plan: Default::default(),
+            support_stagnation: Default::default(),
             home_skill_aggregates: TeamSkillAggregates::neutral(),
             away_skill_aggregates: TeamSkillAggregates::neutral(),
             second_half_start_ms: 0,
