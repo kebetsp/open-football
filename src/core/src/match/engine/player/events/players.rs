@@ -2417,6 +2417,8 @@ impl PlayerEventDispatcher {
             .map(|p| p.team_id);
         field.ball.pass_origin_position = Some(field.ball.position);
         field.ball.pass_origin_team = passer_team;
+        field.ball.last_pass_tick = field.ball.current_tick_cached;
+        field.ball.last_pass_to = Some(event_model.to_player_id);
 
         // §9.4.1 same-touch rule: if this pass IS the staged restart
         // delivery (struck by the pending taker), the taker is locked

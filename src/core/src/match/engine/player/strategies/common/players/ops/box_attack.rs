@@ -420,6 +420,54 @@ const CUTBACK_BASE_COMPLETION: f32 = CROSS_COMPLETION;
 const CUTBACK_P_SHOT: f32 = P_SHOT_GIVEN_REACH;
 /// `WIDE_PLAY_ABLATE` (any value) switches the whole plan off; `WIDE_PLAY_OFF`
 /// = comma list of `cutback`, `mate`, `trigger`, `vacate` switches single parts.
+/// Shoot-after-reception table (StatsBomb Bundesliga 2023/24, 34 matches,
+/// `scripts/attack-gap/statsbomb/shoottable.py`): share of open-play
+/// receptions within 36m of goal followed by a foot shot within 2.5s, by the
+/// blocker-free shot xG at the reception point. Midfielders and defenders:
+/// <0.02 0.6-1.1%, 0.02-0.03 2.5-4.4%, 0.03-0.04 5-9%, 0.04-0.06 13-23%,
+/// 0.06-0.09 28-40%, 0.09-0.15 17-45%, >0.15 47%. Pooled and smoothed below.
+/// The value comparison (a maximum) never takes the 0.02-0.06 xG shots real
+/// players take 3-20% of the time: edge-of-box receivers shot after 2% of
+/// receptions (real 15%) and beyond 22m after 0% (real 5%).
+const LONG_SHOT_TABLE: [(f32, f32); 7] =
+    [(0.02, 0.007), (0.03, 0.03), (0.04, 0.07), (0.06, 0.15), (0.09, 0.28), (0.15, 0.40), (1.0, 0.47)];
+const LONG_SHOT_WINDOW_TICKS: u64 = 250;
+fn long_shot_off() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("LONGSHOT_OFF").is_some())
+}
+/// One draw per possession (keyed on the player and the tick he got the
+/// ball), compared with the table probability at the current position: a
+/// personal xG threshold per reception, not a per-tick roll that would
+/// compound. Real players shoot on information the model cannot see.
+fn long_shot_intent(ctx: &StateProcessingContext, from: Vector3<f32>, goal: Vector3<f32>) -> bool {
+    if long_shot_off() {
+        return false;
+    }
+    let xg = shot_xg(from, goal, &[]);
+    // Forwards' shoot shares at good chances (>= 0.06) are already calibrated
+    // through the value maximum (RETAIN_BONUS); the draw only covers the low
+    // tiers where the maximum never shoots.
+    if ctx.player.tactical_position.current_position.is_forward() && xg >= 0.06 {
+        return false;
+    }
+    let p = LONG_SHOT_TABLE.iter().find(|(hi, _)| xg < *hi).map(|(_, p)| *p).unwrap_or(0.47);
+    // Only the receiver of a recent pass (flight + about a second on the
+    // ball): the table is "share of receptions followed by a shot".
+    let b = &ctx.tick_context.ball;
+    if b.last_pass_to != Some(ctx.player.id) || ctx.current_tick().saturating_sub(b.last_pass_tick) > LONG_SHOT_WINDOW_TICKS {
+        return false;
+    }
+    let start = b.last_pass_tick;
+    let mut z = (ctx.player.id as u64).wrapping_mul(0x9E3779B97F4A7C15) ^ start.wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^= z >> 31;
+    let u = (z >> 11) as f64 / (1u64 << 53) as f64;
+    #[cfg(feature = "match-logs")]
+    crate::match_log_info!("LSI id={} xg={:.3} p={:.3} u={:.3} start={} fire={}", ctx.player.id, xg, p, u, start, u < p as f64);
+    u < p as f64
+}
 fn wide_play_on(feature: &str) -> bool {
     static OFF: std::sync::OnceLock<(bool, String)> = std::sync::OnceLock::new();
     let (all, list) = OFF.get_or_init(|| {
@@ -1233,6 +1281,13 @@ pub fn decide_final_third(
             pw.0, pw.1, pw.4, pw.5, nearest_opponent_dist(from, opponents) / UNITS_PER_METRE
         );
     }
+    // Shoot-after-reception draw (see `LONG_SHOT_TABLE`): applied last, after
+    // every other option has been valued, so the carry/pass maximum cannot
+    // override it.
+    if !matches!(best, Action::Shoot) && (goal - from).magnitude() <= SHOT_MAX_RANGE && long_shot_intent(ctx, from, goal) {
+        best = Action::Shoot;
+    }
+
     #[cfg(feature = "match-logs")]
     crate::match_log_info!(
         "BOXDIAG id={} lat_m={:.1} depth_m={:.1} plan={} runners={} shoot={:.3} deliver={:.3} pass={:.3} carry={:.3} take={:.3} pf={:.3} pl={:.3} pb={:.3} opp_m={:.1} bl_v={:.3} bl_open_m={:.1} bl_trav_m={:.1} bl_pkeep={:.2} bl_end={:.3} bl_edep={:.1} bl_elat={:.1} bl_n={} pw_v={:.3} pw_pc={:.2} pw_lat={:.1} pw_dep={:.1} pw_ch={:.3} pw_dist={:.1} bc_dep={:.1} bc_lat={:.1} bc_pk={:.2} bc_ch={:.3} chose={}",

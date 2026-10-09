@@ -100,6 +100,8 @@ pub struct BallMetadata {
     /// lay_off_on_long_ball directive gate (`BallOps::is_long_reception`).
     pub pass_origin_position: Option<Vector3<f32>>,
     pub pass_origin_team: Option<u32>,
+    pub last_pass_tick: u64,
+    pub last_pass_to: Option<u32>,
 
     notified_buf: [u32; 4],
     notified_len: u8,
@@ -152,6 +154,8 @@ impl BallMetadata {
         self.last_owner = field.ball.previous_owner;
         self.pass_origin_position = field.ball.pass_origin_position;
         self.pass_origin_team = field.ball.pass_origin_team;
+        self.last_pass_tick = field.ball.last_pass_tick;
+        self.last_pass_to = field.ball.last_pass_to;
         self.ownership_duration = field.ball.ownership_duration;
 
         self.notified_len = field.ball.take_ball_notified_players.len().min(4) as u8;
@@ -187,6 +191,8 @@ impl From<&MatchField> for BallMetadata {
             last_owner: None,
             pass_origin_position: None,
             pass_origin_team: None,
+            last_pass_tick: 0,
+            last_pass_to: None,
             notified_buf: [0; 4],
             notified_len: 0,
             ownership_duration: 0,

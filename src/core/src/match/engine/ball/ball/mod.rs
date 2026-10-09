@@ -354,6 +354,11 @@ pub struct Ball {
     /// survive until the next pass or reset, so a receiver can gate
     /// behaviour on how far the ball travelled (lay_off_on_long_ball).
     pub pass_origin_position: Option<Vector3<f32>>,
+    /// Tick the last pass was struck and who it was aimed at (survives the
+    /// claim, unlike `pass_target_player_id`): gives a receiver's decisions a
+    /// stable per-reception key (long-shot draw, box_attack.rs).
+    pub last_pass_tick: u64,
+    pub last_pass_to: Option<u32>,
     pub pass_origin_team: Option<u32>,
     pub last_completed_pass_receiver_id: Option<u32>,
     pub last_completed_pass_tick: u64,
@@ -599,6 +604,8 @@ impl Ball {
             pending_pass_was_cross: false,
             last_completed_pass_passer_id: None,
             pass_origin_position: None,
+            last_pass_tick: 0,
+            last_pass_to: None,
             pass_origin_team: None,
             last_completed_pass_receiver_id: None,
             last_completed_pass_tick: 0,
