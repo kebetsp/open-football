@@ -1285,6 +1285,12 @@ pub fn decide_final_third(
     // every other option has been valued, so the carry/pass maximum cannot
     // override it.
     if !matches!(best, Action::Shoot) && (goal - from).magnitude() <= SHOT_MAX_RANGE && long_shot_intent(ctx, from, goal) {
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!(
+            "LSOVR replaced={} dep_m={:.1} lat_m={:.1} crossing_area={}",
+            match &best { Action::Deliver { .. } => "deliver", Action::Cutback { .. } => "cutback", Action::LowCross { .. } => "lowcross", Action::Through { .. } => "through", Action::Pass(_) => "pass", Action::Dribble(_) => "take", Action::Carry(_) => "carry", _ => "hold" },
+            (goal.x - from.x).abs() / UNITS_PER_METRE, (from.y - goal.y).abs() / UNITS_PER_METRE, in_crossing_area(from, goal)
+        );
         best = Action::Shoot;
     }
 
