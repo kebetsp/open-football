@@ -87,6 +87,31 @@ impl StateProcessingHandler for GoalkeeperHoldingState {
             base_duration
         };
         if ctx.in_state_time >= holding_duration {
+            // realism-bug (2026-10-11, keeper distribution): the timer used
+            // to release regardless of who stood next to him. A real keeper
+            // with an attacker closing him down and no clean lane waits —
+            // the Law gives him 6s with the ball in his hands and the
+            // attacker may not challenge it — rather than throwing it at
+            // the nearest opponent. Only waits while an opponent is within
+            // PRESSED_RADIUS AND no lane is currently clear; the moment a
+            // lane opens (the standoff pushes the presser back, a teammate
+            // moves) or the 6s budget is spent he releases as before.
+            const PRESSED_RADIUS: f32 = 40.0; // 5m at 8u/m
+            const MAX_HOLD_TICKS: u64 = 600; // IFAB Law 12: 6 seconds
+            if ctx.in_state_time < MAX_HOLD_TICKS {
+                let pressed = ctx
+                    .players()
+                    .opponents()
+                    .all()
+                    .any(|o| (o.position - ctx.player.position).magnitude() < PRESSED_RADIUS);
+                if pressed
+                    && super::distributing::GoalkeeperDistributingState::default()
+                        .find_best_pass_option(ctx)
+                        .is_none()
+                {
+                    return None;
+                }
+            }
             return Some(StateChangeResult::with_goalkeeper_state(
                 GoalkeeperState::Distributing,
             ));

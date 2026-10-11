@@ -78,12 +78,18 @@ impl GoalkeeperDistributingState {
     /// Unit scale: 1u = 0.125m, field 840u = 105m. The halfway line
     /// sits at x = field_width/2. A GK at x ≈ 20u kicks towards x ≈ 420u
     /// (~50m), matching a real goal kick.
-    fn find_best_pass_option<'a>(
+    pub(crate) fn find_best_pass_option<'a>(
         &'a self,
         ctx: &'a StateProcessingContext<'a>,
     ) -> Option<MatchPlayerLite> {
         const MIN_RECEIVE_DISTANCE: f32 = 30.0; // no back-passes / tap-outs
         const BLOCK_CORRIDOR: f32 = 8.0; // lane width for interception check
+        /// An opponent this close (3m at 8u/m) reaches a ball leaving the
+        /// keeper's hand within a few ticks, wherever the lane points.
+        const RELEASE_REACH: f32 = 24.0;
+        /// Corridor used for such a close opponent (~2.5m) — wider than
+        /// the 1m mid-lane corridor because he is already at the release.
+        const RELEASE_CORRIDOR: f32 = 20.0;
 
         // Maximum search range scales with distribution skill: weak
         // keepers can't reliably hit a 70m punt, so they shouldn't even
@@ -135,14 +141,27 @@ impl GoalkeeperDistributingState {
 
             // Pass lane blocked by an opponent — skip.
             let pass_dir = (teammate.position - ctx.player.position).normalize();
+            // realism-bug (2026-10-11, keeper distribution): the old test
+            // skipped any opponent whose projection onto the lane was
+            // under 10u — i.e. exactly the attacker standing at the
+            // keeper's feet — and measured 8.4% of after-save releases
+            // claimed by an opponent within 0.3s (nearest opponent a
+            // median 1.8m away). The lane is now the segment from the
+            // keeper to the receiver (clamped, so an opponent beside or
+            // just behind the release point still counts), and anyone
+            // within RELEASE_REACH of the keeper gets a wider corridor
+            // because he reaches the ball in the first ticks of flight.
             let blocked = ctx.players().opponents().all().any(|opp| {
                 let to_opp = opp.position - ctx.player.position;
-                let proj = to_opp.dot(&pass_dir);
-                if proj < 10.0 || proj > distance {
-                    return false;
-                }
-                let proj_pt = ctx.player.position + pass_dir * proj;
-                (opp.position - proj_pt).norm() < BLOCK_CORRIDOR
+                let proj = to_opp.dot(&pass_dir).clamp(0.0, distance);
+                let seg_pt = ctx.player.position + pass_dir * proj;
+                let lateral = (opp.position - seg_pt).norm();
+                let corridor = if to_opp.norm() < RELEASE_REACH {
+                    RELEASE_CORRIDOR
+                } else {
+                    BLOCK_CORRIDOR
+                };
+                lateral < corridor
             });
             if blocked {
                 continue;

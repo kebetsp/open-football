@@ -984,6 +984,63 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     {
                         context.dead_ball_until_ms = context.total_match_time;
                     }
+
+                    // realism-bug (2026-10-11, keeper distribution): IFAB
+                    // Law 16 — opponents must be OUTSIDE the penalty area
+                    // until the goal kick is in play. Measured before this
+                    // fix: 53% of goal kicks were released with at least one
+                    // opponent still inside the canonical box, because the
+                    // walk-out is a gradual §13.4 retreat that the early-
+                    // exit roll or the natural window could end first. The
+                    // kick now waits (bounded) until the box is clear, and
+                    // anyone still inside gets a walk-out target just
+                    // outside it — covers every opponent, not just pressers.
+                    if field.ball.pass_origin_restart == crate::r#match::PassOriginRestart::GoalKick {
+                        if let Some(taker_side) = field
+                            .ball
+                            .restart_pending_taker
+                            .and_then(|id| field.players.iter().find(|p| p.id == id))
+                            .and_then(|p| p.side)
+                        {
+                            const GOAL_KICK_CLEAR_MAX_WAIT_MS: u64 = 6000;
+                            let taker_is_left = taker_side == PlayerSide::Left;
+                            let area = context.penalty_area(taker_is_left);
+                            let scale = context.field_size.width as f32 / 105.0;
+                            // Just outside the box edge (goal-line-relative depth).
+                            let exit_x = if taker_is_left {
+                                area.max.x + 1.5 * scale
+                            } else {
+                                area.min.x - 1.5 * scale
+                            };
+                            let mut anyone_inside = false;
+                            for p in field.players.iter_mut() {
+                                if p.side == Some(taker_side)
+                                    || p.is_sent_off
+                                    || p.tactical_position.current_position.is_goalkeeper()
+                                    || !area.contains(&p.position)
+                                {
+                                    continue;
+                                }
+                                anyone_inside = true;
+                                let needs_target = match p.restart_retreat_target {
+                                    Some(t) => area.contains(&t),
+                                    None => true,
+                                };
+                                if needs_target {
+                                    p.restart_retreat_target =
+                                        Some(Vector3::new(exit_x, p.position.y, 0.0));
+                                }
+                            }
+                            if anyone_inside
+                                && context.total_match_time
+                                    < context.dead_ball_min_ms + GOAL_KICK_CLEAR_MAX_WAIT_MS
+                            {
+                                context.dead_ball_until_ms = context
+                                    .dead_ball_until_ms
+                                    .max(context.total_match_time + 20);
+                            }
+                        }
+                    }
                 }
                 continue;
             }

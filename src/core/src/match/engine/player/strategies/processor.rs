@@ -590,6 +590,14 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
+        // realism-bug (2026-10-11, keeper distribution): opponents keep a
+        // standoff from a keeper holding the ball. Applied after the
+        // assignment overrides so pressing/marking can't walk through it;
+        // it only removes the inward component, so lateral jockeying stays.
+        if let Some(velocity) = Self::keeper_standoff_velocity(&processing_ctx, result.velocity) {
+            result.velocity = Some(velocity);
+        }
+
         // §12.4: the staged short-corner option holds his spot until the
         // corner is struck — without this his state machine runs him back
         // toward his anchor and the delivery picker's "genuinely
@@ -3002,6 +3010,98 @@ impl<'p> StateProcessor<'p> {
             .skills
             .max_speed_with_condition(player.player_attributes.condition);
         Some(dir * speed)
+    }
+
+    /// realism-bug (2026-10-11, keeper distribution): standoff from a
+    /// goalkeeper who has the ball in his hands. IFAB Law 12 already
+    /// forbids challenging him (the Tackling/Pressing/Intercepting exits
+    /// via `is_opponent_restart`), but nothing kept opponents away, so a
+    /// median opponent stood 1.8m from the keeper at release and 8.4% of
+    /// after-save distributions were claimed within 0.3s. Pressing high is
+    /// still real doctrine (domain 1 wants it), so this is a standoff,
+    /// not a retreat: within `KEEPER_STANDOFF` (4m, matching the 3-5m
+    /// jockeying distance used elsewhere) the inward component of the
+    /// proposed velocity is removed and a push outward added in
+    /// proportion to how far inside the radius he is; lateral movement
+    /// is untouched. No effect on the keeper's own team or his own GK.
+    fn keeper_standoff_velocity(
+        ctx: &StateProcessingContext,
+        proposed: Option<Vector3<f32>>,
+    ) -> Option<Vector3<f32>> {
+        const KEEPER_STANDOFF: f32 = 32.0; // 4m at 8u/m
+        let player = ctx.player;
+        if player.tactical_position.current_position.is_goalkeeper() {
+            return None;
+        }
+        if !ctx.ball().is_held_by_opponent_goalkeeper() {
+            return None;
+        }
+        let keeper_pos = ctx.tick_context.positions.ball.position;
+
+        // Goal kick (IFAB Law 16): opponents stay OUTSIDE the penalty
+        // area until the ball is in play. The restart window already
+        // waits for the box to clear (run.rs), but the keeper then holds
+        // 0.8-1.6s before kicking and a 4m standoff alone lets a presser
+        // walk straight back into the box. Keep the box closed until the
+        // kick: inside → walk out; at the edge → no movement into it.
+        if ctx.tick_context.ball.pass_origin_restart == crate::r#match::PassOriginRestart::GoalKick {
+            let fw = ctx.context.field_size.width as f32;
+            let fh = ctx.context.field_size.height as f32;
+            let scale = fw / 105.0;
+            let depth = 16.5 * scale;
+            let half_w = 20.16 * scale;
+            let own_x = if keeper_pos.x < fw * 0.5 { 0.0 } else { fw };
+            let out = if own_x == 0.0 { 1.0_f32 } else { -1.0 }; // direction away from the goal line
+            let dx = (player.position.x - own_x).abs();
+            let dy = (player.position.y - fh * 0.5).abs();
+            let speed = player
+                .skills
+                .max_speed_with_condition(player.player_attributes.condition);
+            let mut v = proposed.unwrap_or_else(Vector3::zeros);
+            if dx < depth && dy < half_w {
+                // Inside: walk out the short way (toward the halfway side).
+                v = Vector3::new(out * speed, 0.0, 0.0);
+                return Some(v);
+            }
+            let margin = 2.0;
+            let mut changed = false;
+            if dx < depth + margin && dy < half_w + margin && v.x * out < 0.0 {
+                v.x = 0.0; // would step toward the goal line into the box
+                changed = true;
+            }
+            if dx < depth && dy < half_w + margin {
+                let toward_centre = if player.position.y < fh * 0.5 { 1.0_f32 } else { -1.0 };
+                if v.y * toward_centre > 0.0 {
+                    v.y = 0.0; // would step sideways into the box
+                    changed = true;
+                }
+            }
+            if changed {
+                return Some(v);
+            }
+        }
+
+        let away = player.position - keeper_pos;
+        let dist = away.magnitude();
+        if dist >= KEEPER_STANDOFF {
+            return None;
+        }
+        let radial = if dist > 0.5 {
+            away / dist
+        } else {
+            (ctx.ball().direction_to_own_goal() - player.position).normalize()
+        };
+        let speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition);
+        let mut v = proposed.unwrap_or_else(Vector3::zeros);
+        let inward = -v.dot(&radial);
+        if inward > 0.0 {
+            v += radial * inward;
+        }
+        let deficit = (KEEPER_STANDOFF - dist) / KEEPER_STANDOFF;
+        v += radial * speed * deficit;
+        Some(v)
     }
 
     /// Universal offside-line hold — engine audit Module 3 (2026-08-29),
