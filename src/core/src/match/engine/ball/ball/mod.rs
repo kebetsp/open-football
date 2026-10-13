@@ -201,6 +201,16 @@ pub struct Ball {
     /// deflected it re-claim it within 1-2 ticks — measured at 3/4
     /// corner-branch firings across 40 matches before this fix.
     pub corner_deflection_guard_until_tick: u64,
+    /// Defenders who already had their one block attempt at the current
+    /// shot (same idiom as `intercept_attempted` for passes). Without it
+    /// `try_block_shot` re-rolled every tick a defender stayed near the
+    /// shot line: measured median 4 rolls per shot, which stacked a
+    /// 10-15% per-event chance into a 47-61% block rate (real 26%).
+    pub block_rolled: Vec<u32>,
+    /// `ShotTarget::dispatch_tick` of the shot `block_rolled` belongs to;
+    /// a different value means a new shot (or a deflection) and the list
+    /// is cleared.
+    pub block_roll_shot_tick: u64,
     /// Defenders who already had their one attempt at the current pass.
     pub intercept_attempted: Vec<u32>,
     /// The resolved contest waiting for its contact tick.
@@ -576,6 +586,8 @@ impl Ball {
             pending_restart_teleports: Vec::new(),
             direct_fk_shot_in_flight: false,
             corner_deflection_guard_until_tick: 0,
+            block_rolled: Vec::new(),
+            block_roll_shot_tick: 0,
             intercept_attempted: Vec::new(),
             pending_intercept: None,
             corner_contest_resolved: true,

@@ -21,6 +21,25 @@ use nalgebra::Vector3;
 #[cfg(feature = "match-logs")]
 use std::sync::atomic::Ordering;
 
+/// Multiplier on the per-defender block chance now that each defender gets
+/// ONE roll per shot (see `Ball::block_rolled`). The old per-tick re-rolling
+/// stacked the chance to a 47-61% block rate (real 26%); one roll per
+/// defender gives ~15%, which would collapse deflections (6 `Blocked`
+/// events/match, close to real) and own goals, so the chance is scaled up
+/// to ease the block rate in steps instead. Tunable on one binary with
+/// `BLOCK_ONCE_SCALE` while calibrating; the baked default is the chosen
+/// value.
+fn block_once_scale() -> f32 {
+    use std::sync::OnceLock;
+    static SCALE: OnceLock<f32> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("BLOCK_ONCE_SCALE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(2.5)
+    })
+}
+
 /// TEMPORARY realism-bug diagnostic (2026-08-26, corner/deflection
 /// investigation) — measures whether the block corridor's geometric
 /// gate (BLOCK_LOOKAHEAD/BLOCK_CORRIDOR) or the post-gate RNG chance is
@@ -352,6 +371,14 @@ impl Ball {
             return;
         }
 
+        // One block attempt per defender per shot: a new shot (or a
+        // deflection, which gets a new dispatch tick) starts a fresh list.
+        if let Some(t) = self.cached_shot_target.as_ref() {
+            if self.block_roll_shot_tick != t.dispatch_tick {
+                self.block_rolled.clear();
+                self.block_roll_shot_tick = t.dispatch_tick;
+            }
+        }
         let shooter_team = match self.previous_owner {
             Some(prev_id) => players.iter().find(|p| p.id == prev_id).map(|p| p.team_id),
             None => return,
@@ -423,6 +450,10 @@ impl Ball {
             if player.tactical_position.current_position.position_group()
                 == PlayerFieldPositionGroup::Goalkeeper
             {
+                continue;
+            }
+
+            if self.block_rolled.contains(&player.id) {
                 continue;
             }
 
@@ -532,9 +563,19 @@ impl Ball {
         // RNG threshold instead of deterministic cutoff: a 30% block
         // chance still allows the shot through 70% of the time, which
         // is what we want — defenders block but don't always block.
+        // The chance is scaled (see `block_once_scale`) and each defender
+        // gets exactly one roll for this shot, win or lose.
+        let chance = (best_chance * block_once_scale()).clamp(0.03, 0.5);
         let blocker_id = match best_blocker {
-            Some(id) if context.rng.unit_f32() < best_chance.clamp(0.03, 0.38) => id,
-            _ => return,
+            Some(id) => {
+                self.block_rolled.push(id);
+                if context.rng.unit_f32() < chance {
+                    id
+                } else {
+                    return;
+                }
+            }
+            None => return,
         };
         #[cfg(feature = "match-logs")]
         block_diag::ROLL_PASSED.fetch_add(1, Ordering::Relaxed);
