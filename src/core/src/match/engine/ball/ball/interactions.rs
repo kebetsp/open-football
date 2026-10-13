@@ -13,6 +13,7 @@ use crate::r#match::events::EventCollection;
 use crate::r#match::player::strategies::players::ops::effective_skill::{
     ActionContext as EffSkillCtx, effective_skill,
 };
+use crate::r#match::player::strategies::players::ops::goalkeeper_skill::shot_limited_reach;
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 use crate::r#match::player::strategies::players::tackle::{ContactInput, resolve_contact};
 use crate::r#match::{MatchContext, MatchPlayer, PassOriginRestart, PlayerSide};
@@ -815,7 +816,11 @@ impl Ball {
         //   skills 1   → 20u (2.5m, standing dive — can touch the post)
         //   skills 10  → 26u (3.25m, covers most of the goal)
         //   skills 20  → 32u (4.0m, elite full-stretch — beyond the post)
-        let reach = 20.0 + scaled_agility * 8.0 + scaled_reflexes * 4.0;
+        let max_reach = 20.0 + scaled_agility * 8.0 + scaled_reflexes * 4.0;
+        // 2026-10-13: the time the shot gives him limits that reach (same
+        // shared function as the keeper state machine's two checks, so the
+        // layers agree; see `shot_limited_reach` for what is exempt).
+        let reach = shot_limited_reach(max_reach, &shot_target);
         let lateral_error = (keeper.position.y - shot_target.goal_line_y).abs();
         if lateral_error > reach {
             // realism-bug (2026-07-31) diagnostic, scratch-only: confirm

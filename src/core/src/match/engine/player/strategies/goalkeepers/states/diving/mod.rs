@@ -2,7 +2,9 @@ use crate::r#match::events::Event;
 use crate::r#match::goalkeepers::states::common::{ActivityIntensity, GoalkeeperCondition};
 use crate::r#match::goalkeepers::states::state::GoalkeeperState;
 use crate::r#match::player::events::PlayerEvent;
-use crate::r#match::player::strategies::players::ops::goalkeeper_skill::GoalkeeperSkillProfile;
+use crate::r#match::player::strategies::players::ops::goalkeeper_skill::{
+    GoalkeeperSkillProfile, shot_limited_reach,
+};
 use crate::r#match::{
     ConditionContext, StateChangeResult, StateProcessingContext, StateProcessingHandler,
 };
@@ -148,8 +150,17 @@ impl GoalkeeperDivingState {
 
         // Effective dive radius scales with skill: weak ~12u, elite
         // ~30u. Beyond that the keeper cannot get a hand on the ball.
-        let catch_distance =
+        let max_catch_distance =
             6.0 + prof.dive_reach * 10.0 + prof.handling_profile * 4.0 + prof.shot_stopping * 4.0;
+        // 2026-10-13: a shot in flight limits how far he can get in the
+        // time it gives him (shared with the physics roll and the Catching
+        // state; see `shot_limited_reach` for what is exempt). Non-shot
+        // balls (crosses, loose balls) have no cached target and are
+        // untouched.
+        let catch_distance = match &ctx.tick_context.ball.cached_shot_target {
+            Some(t) => shot_limited_reach(max_catch_distance, t),
+            None => max_catch_distance,
+        };
         if ball_distance > catch_distance {
             return false;
         }

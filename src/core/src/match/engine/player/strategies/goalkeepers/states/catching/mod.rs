@@ -2,7 +2,9 @@ use crate::r#match::events::Event;
 use crate::r#match::goalkeepers::states::common::{ActivityIntensity, GoalkeeperCondition};
 use crate::r#match::goalkeepers::states::state::GoalkeeperState;
 use crate::r#match::player::events::PlayerEvent;
-use crate::r#match::player::strategies::players::ops::goalkeeper_skill::GoalkeeperSkillProfile;
+use crate::r#match::player::strategies::players::ops::goalkeeper_skill::{
+    GoalkeeperSkillProfile, shot_limited_reach,
+};
 use crate::r#match::{
     ConditionContext, PlayerDistanceFromStartPosition, StateChangeResult, StateProcessingContext,
     StateProcessingHandler, SteeringBehavior,
@@ -185,7 +187,10 @@ impl GoalkeeperCatchingState {
                 return false;
             }
             // Effective reach in game units: weak ~14u, elite ~30u.
-            let reach = 10.0 + prof.dive_reach * 12.0 + prof.shot_stopping * 4.0;
+            let max_reach = 10.0 + prof.dive_reach * 12.0 + prof.shot_stopping * 4.0;
+            // 2026-10-13: reach is limited by the time the shot gives him
+            // (see `shot_limited_reach` for what is exempt and why).
+            let reach = shot_limited_reach(max_reach, target);
             let lateral_error = (ctx.player.position.y - target.goal_line_y).abs();
             if lateral_error > reach {
                 return false;

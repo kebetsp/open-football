@@ -6,6 +6,61 @@ use crate::r#match::player::strategies::players::ops::effective_skill::{
 use crate::r#match::player::strategies::players::ops::skill_composites as sc;
 
 // ---------------------------------------------------------------------------
+// Time-limited save reach — shared by BOTH save layers (the physics roll in
+// `Ball::try_save_shot` and the keeper state machine's `is_catch_successful`)
+// so they cannot drift apart.
+// ---------------------------------------------------------------------------
+//
+// 2026-10-13 (shot-conversion vs real, `docs/shot-conversion-vs-real.md`).
+// Both layers used a FIXED sideways reach (physics 20-32u, state machine
+// 10-26u = 1.25-4 m) that ignored how long the shot takes to arrive. A shot
+// from under 11 m is in the air ~0.2 s (median), far too short for a real
+// keeper to cover that: measured against StatsBomb, real shots needing >= ~1.9 m
+// of movement almost always score and real saves sit within ~1 m, while the
+// engine saved shots up to ~3.6 m away (close-range save rate 76% vs real 50%).
+//
+// Reach now grows with the time available: a standing body/arm cover, plus
+// dive distance after a human reaction delay, never above the skill-based
+// maximum the caller already computed. Long shots (flight >= ~60 ticks) hit
+// the maximum and are unchanged. All three constants are category-(d)
+// estimates (no dataset gives keeper dive speed per shot), chosen so a
+// 0.2 s shot gives ~1.4 m, matching the real ~1-1.9 m save/goal boundary.
+const KEEPER_BODY_REACH_U: f32 = 9.0; // ~1.1 m: body width + arm span each side
+const KEEPER_REACTION_TICKS: f32 = 15.0; // 0.15 s human reaction floor
+const KEEPER_DIVE_U_PER_TICK: f32 = 0.48; // ~6 m/s sideways dive
+
+/// `max_reach` is the caller's skill-based maximum (game units);
+/// `total_flight_ticks` is the shot's flight time from the strike
+/// (`ShotTarget::total_flight_ticks`). A value <= 0 means "unknown" (e.g.
+/// penalties) and leaves the reach untouched.
+pub fn time_limited_reach(max_reach: f32, total_flight_ticks: f32) -> f32 {
+    if total_flight_ticks <= 0.0 {
+        return max_reach;
+    }
+    let dive = (total_flight_ticks - KEEPER_REACTION_TICKS).max(0.0) * KEEPER_DIVE_U_PER_TICK;
+    max_reach.min(KEEPER_BODY_REACH_U + dive)
+}
+
+/// The one rule all three save layers use for a shot in flight.
+///
+/// The time limit applies to a clean shot, where the keeper reacts to the
+/// strike. It does NOT apply to:
+/// - a deflected shot: its `total_flight_ticks` restarts at the deflection
+///   (a handful of ticks), and deflections already carry their own
+///   calibrated keeper penalty (save chance x0.5, from real deflected-shot
+///   conversion). Applying the cap too double-penalised him: measured
+///   own goals/match rose 0.43 -> 1.2 (real ~0.09), almost all outfield
+///   deflections into the net.
+/// - a direct free kick: long flights, conversion tuned separately.
+pub fn shot_limited_reach(max_reach: f32, target: &crate::r#match::ShotTarget) -> f32 {
+    if target.deflected || target.is_direct_fk {
+        max_reach
+    } else {
+        time_limited_reach(max_reach, target.total_flight_ticks)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GoalkeeperSkillProfile — unified skill model for goalkeepers.
 // ---------------------------------------------------------------------------
 //
