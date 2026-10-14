@@ -4604,6 +4604,15 @@ impl PlayerEventDispatcher {
         // way `secure_ball_for` already does for every other grant.
         if let Some(gk) = field.players.iter().find(|p| p.id == player_id) {
             crate::snap_tag!("gk_catch_event");
+            #[cfg(feature = "match-logs")]
+            crate::match_log_info!(
+                "GKCATCH state={} dist={:.1} shot={} speed={:.2} z={:.2}",
+                gk.state,
+                (gk.position - field.ball.position).norm(),
+                field.ball.cached_shot_target.is_some(),
+                field.ball.velocity.norm(),
+                field.ball.position.z
+            );
             field.ball.position = gk.position;
             field.ball.position.z = 0.0;
         }
