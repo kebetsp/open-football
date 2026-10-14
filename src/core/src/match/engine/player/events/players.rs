@@ -3065,6 +3065,7 @@ impl PlayerEventDispatcher {
     // matching its own `CLAIM_COOLDOWN_TICKS`, not a new value).
     fn secure_ball_for(player_id: u32, field: &mut MatchField) {
         if let Some(player) = field.players.iter().find(|p| p.id == player_id) {
+            crate::snap_tag!("secure_ball_for");
             field.ball.position = player.position;
             field.ball.position.z = 0.0;
         }
@@ -4602,6 +4603,7 @@ impl PlayerEventDispatcher {
         // snap the ball to the goalkeeper's real position here, the same
         // way `secure_ball_for` already does for every other grant.
         if let Some(gk) = field.players.iter().find(|p| p.id == player_id) {
+            crate::snap_tag!("gk_catch_event");
             field.ball.position = gk.position;
             field.ball.position.z = 0.0;
         }
@@ -5279,6 +5281,7 @@ impl PlayerEventDispatcher {
             .unwrap_or(0);
 
         let ball = &mut field.ball;
+        crate::snap_tag!("restart_5282");
         ball.position = restart_pos;
         ball.velocity = Vector3::zeros();
         ball.previous_owner = ball.current_owner;
@@ -5714,6 +5717,7 @@ impl PlayerEventDispatcher {
 
         // Tell the engine to teleport the taker onto the ball next tick.
         let ball = &mut field.ball;
+        crate::snap_tag!("restart_5717");
         ball.position = restart_pos;
         ball.velocity = Vector3::zeros();
         ball.previous_owner = ball.current_owner;

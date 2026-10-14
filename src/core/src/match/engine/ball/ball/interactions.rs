@@ -631,6 +631,7 @@ impl Ball {
             context.rng.unit_f32(),
         );
 
+        crate::snap_tag!("block_to_blocker");
         self.position = blocker_pos;
         self.position.z = 0.0;
         self.offside_snapshot = None;
@@ -1025,6 +1026,7 @@ impl Ball {
 
         if outcome_roll < p_catch {
             // Clean catch — keeper holds.
+            crate::snap_tag!("gk_catch_phys");
             self.position = keeper_pos;
             self.position.z = 0.0;
             self.velocity = Vector3::zeros();

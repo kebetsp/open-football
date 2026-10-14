@@ -559,6 +559,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 (ball_pos.y + aim.y) * 0.5,
                 0.0,
             );
+            crate::snap_tag!("tick562_mid");
             field.ball.position = mid;
             field.ball.velocity = Vector3::new(dir.x * 4.0, dir.y * 4.0, 0.0);
             // Mark the ball as a live shot. `check_goal` only credits a
@@ -610,6 +611,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     .find(|p| p.id == gk_id)
                     .map(|p| p.team_id)
                     .unwrap_or(0);
+                crate::snap_tag!("fk_saved_gk");
                 field.ball.position = Vector3::new(gk_pos.x, gk_pos.y, 0.0);
                 field.ball.velocity = Vector3::zeros();
                 field.ball.previous_owner = Some(taker_id);
@@ -1365,6 +1367,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     }
                     PlayerFieldPositionGroup::Goalkeeper => {
                         winner.state = PlayerState::Goalkeeper(GoalkeeperState::Shooting);
+                        crate::snap_tag!("corner_contest");
                         field.ball.position =
                             Vector3::new(winner_pos.x, winner_pos.y, 0.3);
                         field.ball.velocity = Vector3::zeros();
@@ -1626,6 +1629,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             if gk_claims {
                 let idx = gk_idx.unwrap();
                 let gk = &field.players[idx];
+                crate::snap_tag!("aerial_gk_claim");
                 field.ball.position = Vector3::new(gk.position.x, gk.position.y, 0.0);
                 field.ball.velocity = Vector3::zeros();
                 field.ball.current_owner = Some(gk.id);
@@ -1674,6 +1678,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             };
             let speed = 1.6 + 1.6 * skill * context.rng.unit_f32().max(0.3);
             let v = Vector3::new(ang.cos() * speed, ang.sin() * speed, 0.03);
+            crate::snap_tag!("aerial_def_clear");
             field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
             field.ball.offside_snapshot = None;
             field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
@@ -1701,6 +1706,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         match group {
             PlayerFieldPositionGroup::Goalkeeper => {
                 field.players[att_idx].state = PlayerState::Goalkeeper(GoalkeeperState::Shooting);
+                crate::snap_tag!("aerial_gk_att");
                 field.ball.position = Vector3::new(winner_pos.x, winner_pos.y, 0.3);
                 field.ball.velocity = Vector3::zeros();
                 field.ball.current_owner = Some(winner_id);
@@ -1714,6 +1720,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 // See the identical corner-resolver comment above for why
                 // the descent velocity dropped from -0.35 to -0.004 in
                 // this 2026-08 height-physics rewrite.
+                crate::snap_tag!("aerial_att_drop");
                 field.ball.position =
                     Vector3::new(winner_pos.x - dir.x * 2.0, winner_pos.y - dir.y * 2.0, 2.55);
                 field.ball.velocity = Vector3::new(dir.x * 1.8, dir.y * 1.8, -0.004);

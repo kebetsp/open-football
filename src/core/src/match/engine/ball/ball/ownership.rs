@@ -225,6 +225,7 @@ impl Ball {
             }
         };
 
+        crate::snap_tag!("failed_first_touch");
         self.position = receiver_position;
         self.position.z = 0.0;
         self.velocity = out_dir * out_speed;

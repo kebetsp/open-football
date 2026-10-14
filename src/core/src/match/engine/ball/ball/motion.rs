@@ -274,6 +274,7 @@ impl Ball {
             if distance_squared <= MAX_OWNER_TELEPORT_DISTANCE_SQUARED {
                 if distance_squared <= SNAP_DISTANCE_SQUARED {
                     // Close enough - snap to owner
+                    crate::snap_tag!("owner_follow_a");
                     self.position = owner_position;
                     self.position.z = 0.0;
                     self.velocity = Vector3::zeros();
@@ -328,6 +329,7 @@ impl Ball {
 
                 if dist_sq <= MAX_OWNER_TELEPORT_DISTANCE_SQUARED {
                     if dist_sq <= SNAP_DISTANCE_SQUARED {
+                        crate::snap_tag!("owner_follow_b");
                         self.position = owner.position;
                         self.position.z = 0.0;
                         self.velocity = Vector3::zeros();

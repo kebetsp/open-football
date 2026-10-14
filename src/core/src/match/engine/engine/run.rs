@@ -2940,10 +2940,33 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
 
             // Full tick: ball + player AI + events
             // Light tick: ball + player movement only (no AI re-evaluation)
+            #[cfg(feature = "match-logs")]
+            let snapdiag_before = (field.ball.position, field.ball.current_owner);
             if tick_parity & 1 == 0 {
                 Self::game_tick_light(field, context, match_data, &mut tick_ctx, &mut events);
             } else {
                 Self::game_tick_inner(field, context, match_data, &mut tick_ctx, &mut events);
+            }
+            #[cfg(feature = "match-logs")]
+            {
+                let tags = crate::r#match::logs::snapdiag::take();
+                let dx = field.ball.position.x - snapdiag_before.0.x;
+                let dy = field.ball.position.y - snapdiag_before.0.y;
+                let d = (dx * dx + dy * dy).sqrt();
+                if d > 8.0 {
+                    log::info!(
+                        "SNAPDIAG t={} d={:.1} from=({:.0},{:.0}) to=({:.0},{:.0}) owner={:?}->{:?} tags={}",
+                        context.total_match_time,
+                        d,
+                        snapdiag_before.0.x,
+                        snapdiag_before.0.y,
+                        field.ball.position.x,
+                        field.ball.position.y,
+                        snapdiag_before.1,
+                        field.ball.current_owner,
+                        if tags.is_empty() { "UNTAGGED".to_string() } else { tags.join(",") }
+                    );
+                }
             }
 
             // Replay-position recording, gated by a cursor instead of
