@@ -3199,6 +3199,7 @@ impl PlayerEventDispatcher {
                         total_flight_ticks: (dist / speed).max(1.0),
                         dispatch_tick: shoot_event_model.tick,
                         is_safe_restart: true,
+                        shot_distance: field.ball.distance_to_goal(defending_side),
                     });
                 }
             } else {
@@ -4448,6 +4449,7 @@ impl PlayerEventDispatcher {
                     total_flight_ticks: ticks_to_goal.max(1.0),
                     dispatch_tick: shoot_event_model.tick,
                     is_safe_restart: false,
+                    shot_distance: field.ball.distance_to_goal(defending_side),
                 });
             } else {
                 field.ball.cached_shot_target = None;

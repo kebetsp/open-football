@@ -16,6 +16,7 @@ pub mod interactions;
 mod motion;
 mod ownership;
 mod restart;
+mod save;
 mod stall;
 
 use crate::r#match::engine::ball::events::BallEvent;
@@ -533,6 +534,11 @@ pub struct ShotTarget {
     /// at goal. Unused (defaults to `false`, inert) for every other
     /// shot type.
     pub is_safe_restart: bool,
+    /// Distance (game units) from where the shot was struck to the centre of
+    /// the goal it is heading for. Anchors the keeper's single save
+    /// probability on the real save-rate-by-distance curve
+    /// (`ball/ball/save.rs`).
+    pub shot_distance: f32,
 }
 
 #[derive(Default, Clone)]
@@ -637,6 +643,18 @@ impl Ball {
         }
     }
 
+    /// Straight-line distance (game units) from the ball to the centre of
+    /// the goal defended by `defending_side`.
+    pub fn distance_to_goal(&self, defending_side: PlayerSide) -> f32 {
+        let gx = match defending_side {
+            PlayerSide::Left => 0.0,
+            PlayerSide::Right => self.field_width,
+        };
+        let dx = self.position.x - gx;
+        let dy = self.position.y - self.field_height * 0.5;
+        (dx * dx + dy * dy).sqrt()
+    }
+
     /// The ONE way a defender's touch (leg tackle, block, push-out)
     /// turns a ball into a loose ball with a given velocity. Shared so
     /// tackles and blocks cannot drift apart.
@@ -695,6 +713,7 @@ impl Ball {
                         total_flight_ticks: ticks_to_goal,
                         dispatch_tick: tick,
                         is_safe_restart: false,
+                        shot_distance: (ball_pos.x - own_goal_x).abs(),
                     });
                 }
             }
@@ -953,7 +972,7 @@ impl Ball {
 
         self.try_intercept(context, players, events);
         self.try_block_shot(context, players, events);
-        self.try_save_shot(context, players, events);
+        self.resolve_shot_at_keeper(context, players, events);
         self.try_notify_standing_ball(players, events);
 
         // NUCLEAR OPTION: Force claiming if ball unowned and stopped for too long
@@ -997,7 +1016,7 @@ impl Ball {
         self.update_velocity();
         self.try_intercept(context, players, events);
         self.try_block_shot(context, players, events);
-        self.try_save_shot(context, players, events);
+        self.resolve_shot_at_keeper(context, players, events);
         self.process_ownership(context, players, events);
         self.tick_carry_tracker(events);
 

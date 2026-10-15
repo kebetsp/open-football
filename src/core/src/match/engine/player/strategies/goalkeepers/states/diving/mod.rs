@@ -139,6 +139,12 @@ impl GoalkeeperDivingState {
     }
 
     fn is_ball_caught(&self, ctx: &StateProcessingContext) -> bool {
+        // A live shot is resolved once by `Ball::resolve_shot_at_keeper`
+        // (docs/goalkeeper-shot-stopping-from-null.md); this state never
+        // decides a save for it.
+        if ctx.tick_context.ball.cached_shot_target.is_some() {
+            return false;
+        }
         let ball_distance = ctx.ball().distance();
         // Must be flying toward the GK or very close.
         if ball_distance > 5.0 && !ctx.ball().is_towards_player_with_angle(0.6) {
@@ -190,6 +196,9 @@ impl GoalkeeperDivingState {
     }
 
     fn is_ball_nearby(&self, ctx: &StateProcessingContext) -> bool {
+        if ctx.tick_context.ball.cached_shot_target.is_some() {
+            return false;
+        }
         ctx.ball().distance() < BALL_CLAIM_DISTANCE
     }
 }

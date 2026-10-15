@@ -3,7 +3,7 @@ use crate::r#match::goalkeepers::states::common::{ActivityIntensity, GoalkeeperC
 use crate::r#match::goalkeepers::states::state::GoalkeeperState;
 use crate::r#match::player::events::PlayerEvent;
 use crate::r#match::player::strategies::players::ops::goalkeeper_skill::{
-    GoalkeeperSkillProfile, shot_limited_reach,
+    GoalkeeperSkillProfile,
 };
 use crate::r#match::{
     ConditionContext, PlayerDistanceFromStartPosition, StateChangeResult, StateProcessingContext,
@@ -175,114 +175,14 @@ impl GoalkeeperCatchingState {
     fn is_catch_successful(&self, ctx: &StateProcessingContext) -> bool {
         let prof = GoalkeeperSkillProfile::from_ctx(ctx);
 
-        // Shot-in-flight: judge the save from the *intercept line*, not
-        // from current ball distance. A ball aimed into the corner
-        // passes the GK 8-15 units wide of their current position —
-        // real keepers reach 3-4 m (6-8 u) diving, so the relevant
-        // metric is "how far off the line am I?", not "am I touching
-        // the ball right now?".
-        if let Some(target) = &ctx.tick_context.ball.cached_shot_target {
-            // Ball over the bar — no save attempt worth making.
-            if target.goal_line_z > 2.44 {
-                return false;
-            }
-            // Effective reach in game units: weak ~14u, elite ~30u.
-            let max_reach = 10.0 + prof.dive_reach * 12.0 + prof.shot_stopping * 4.0;
-            // 2026-10-13: reach is limited by the time the shot gives him
-            // (see `shot_limited_reach` for what is exempt and why).
-            let reach = shot_limited_reach(max_reach, target);
-            let lateral_error = (ctx.player.position.y - target.goal_line_y).abs();
-            if lateral_error > reach {
-                return false;
-            }
-
-            // Build shot difficulty in 0..1 from placement, power,
-            // reaction-window, and keeper-offline factors.
-            let placement = (lateral_error / reach).clamp(0.0, 1.0);
-            let ball_speed = ctx.tick_context.positions.ball.velocity.norm();
-            let power = ((ball_speed - 2.0) / 6.0).clamp(0.0, 1.0);
-            let lateral_factor = placement; // already a 0..1 lateral error.
-            let height_factor = (target.goal_line_z / 2.44).clamp(0.0, 1.0);
-            let reaction = (1.0 - prof.shot_stopping).clamp(0.0, 1.0) * 0.4;
-
-            let shot_difficulty = (power * 0.28
-                + placement * 0.24
-                + lateral_factor * 0.18
-                + height_factor * 0.10
-                + reaction * 0.10
-                + (1.0 - prof.condition_mult) * 0.10)
-                .clamp(0.0, 1.0);
-
-            // Per-shot save probability, then converted to per-tick.
-            // Calibrated for ~3 ticks of approach during a save.
-            let mut save_prob = prof.save_probability(shot_difficulty);
-            // Deflection damping: the GK was set for the original
-            // trajectory. A redirected shot arrives on a line they
-            // haven't committed to, so reaction window is shorter.
-            // Real PL data: deflected on-target shots produce ~30% goals
-            // vs ~10% for clean on-target shots — a ~3× boost to
-            // goal-per-shot, which we model as a ~0.50 multiplier to
-            // save_prob (keepers save the rest by reflex or blocked
-            // shot recovery).
-            if target.deflected {
-                save_prob *= 0.50;
-            }
-            // realism-bug (2026-07-30, revised 2026-07-31 twice): `per_tick_save(p, n)`
-            // derives a per-tick rate such that `n` REPEATED rolls compound
-            // back to the intended per-shot probability `p` — but this
-            // state never exits while `cached_shot_target` is live, so the
-            // ACTUAL number of ticks this roll fires is however long the
-            // keeper stays within `reach`, not a fixed constant. A hardcoded
-            // `expected_ticks=40.0` for direct FKs was wrong: measured
-            // actual evaluation counts per shot ranged 24-255 (median ~90),
-            // so the same per-tick rate still compounded well past
-            // `save_prob` for shots that ran longer than 40 ticks (measured:
-            // state-machine saves fired on ~90% of direct FK shots even
-            // after separately fixing the physics-layer height gate). A
-            // second attempt recomputed "ticks remaining" fresh on every
-            // evaluation instead — this was ALSO wrong, in the opposite
-            // direction: recomputing a brand-new n-roll decomposition every
-            // tick means the per-tick rate climbs sharply as the remaining
-            // count shrinks near arrival, so the last few ticks each carry
-            // a large chunk of `save_prob` on their own, stacked on top of
-            // everything already rolled earlier — net over-counting again.
-            // The fix that actually works: `total_flight_ticks`, a FIXED
-            // per-shot constant computed once at dispatch (the same
-            // `ticks_to_goal` already used for the goal_line_y/z
-            // projection) and stored on `ShotTarget`. Using the same
-            // constant for every evaluation of this shot means however
-            // many times the function actually fires, the cumulative
-            // probability tracks the intended per-shot value instead of
-            // compounding past it in either direction. Every other shot
-            // type keeps the untouched fixed 3.0 calibration.
-            let expected_ticks = if target.is_direct_fk {
-                target.total_flight_ticks.max(1.0)
-            } else {
-                3.0
-            };
-            let per_tick = prof.per_tick_save(save_prob, expected_ticks);
-            let roll = ctx.context.rng.unit_f32();
-            // realism-bug (2026-07-31) diagnostic, scratch-only: every
-            // per-tick evaluation of the state-machine save for a direct
-            // FK — lateral error, shot_difficulty, save_prob, per_tick
-            // rate, and the roll outcome. Grouping these by shot (the
-            // count of consecutive lines) reveals the REAL in-reach
-            // window length vs. the assumed expected_ticks=40. Remove
-            // once the investigation concludes.
-            #[cfg(feature = "match-logs")]
-            if target.is_direct_fk {
-                log::info!(
-                    "FKCONV_CATCH lat_err={:.2} reach={:.2} shot_diff={:.3} save_prob={:.3} per_tick={:.4} roll={:.4} saved={}",
-                    lateral_error,
-                    reach,
-                    shot_difficulty,
-                    save_prob,
-                    per_tick,
-                    roll,
-                    roll < per_tick
-                );
-            }
-            return roll < per_tick;
+        // Shot in flight: the save is decided ONCE, at the moment the ball
+        // reaches the keeper, by `Ball::resolve_shot_at_keeper`
+        // (ball/ball/save.rs; design: docs/goalkeeper-shot-stopping-from-null.md).
+        // This state only steers toward the intercept line. It used to roll
+        // a save every tick of the flight and snap the ball to the keeper
+        // from any distance (up to 85 m) -- removed 2026-10-14.
+        if ctx.tick_context.ball.cached_shot_target.is_some() {
+            return false;
         }
 
         let distance_to_ball = ctx.ball().distance();
