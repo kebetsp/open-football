@@ -319,7 +319,8 @@ impl Ball {
                 let bdy = target_player.position.y - self.position.y;
                 let reach = super::contact::contact_reach(target_player);
                 let within_reach = bdx * bdx + bdy * bdy <= reach * reach;
-                if dist_sq < RECEIVER_CLAIM_DISTANCE_SQ && self.position.z <= RECEIVER_MAX_HEIGHT {
+                if dist_sq < RECEIVER_CLAIM_DISTANCE_SQ && self.position.z <= RECEIVER_MAX_HEIGHT
+                    && !header_instead_of_claim(target_player, self.position) {
                     // Receiver is becoming active. If we have an offside
                     // snapshot for this receiver and it's offside per the
                     // kick-time geometry, fire offside instead of a clean
@@ -1140,6 +1141,7 @@ impl Ball {
                 let reach = super::contact::contact_reach(target_player);
                 let within_reach = dist_sq <= reach * reach;
                 if dist_sq < RECEIVER_PRIORITY_DISTANCE_SQ && self.position.z <= RECEIVER_MAX_HEIGHT
+                    && !header_instead_of_claim(target_player, self.position)
                 {
                     let passer_id = self.current_owner.or(self.previous_owner);
                     // First-touch resolution on the post-flight priority
@@ -1211,7 +1213,6 @@ impl Ball {
         let mut nearby_ids: [u32; MAX_NEARBY] = [0; MAX_NEARBY];
         let mut nearby_count: usize = 0;
 
-        let ball_height_reachable = self.position.z <= PLAYER_JUMP_REACH;
 
         for player in players.iter() {
             // §9.4.1 same-touch rule: the restart taker cannot claim
@@ -1231,6 +1232,8 @@ impl Ball {
             if dist_sq > BALL_DISTANCE_THRESHOLD_SQUARED {
                 continue;
             }
+            let ball_height_reachable = self.position.z <= PLAYER_JUMP_REACH
+                && !header_instead_of_claim(player, self.position);
 
             if ball_speed_sq <= SLOW_BALL_VELOCITY_SQ {
                 if !ball_height_reachable {
@@ -1478,4 +1481,16 @@ impl Ball {
         // takeover-advantage threshold continues to work.
         composite * 20.0
     }
+}
+
+/// An outfield player who can physically HEAD the ball right now (ball in
+/// the heading band and inside his reach) does not take an ordinary claim:
+/// the aerial contest (`resolve_aerial_contest` / `resolve_corner_contest`,
+/// which run later in the same tick) decides the header. Before this, the
+/// claim took the ball out of the air (observed `ClaimBall` at z≈2.76 m)
+/// and no header could ever happen (2026-10-16). Players not yet within
+/// header reach keep the old early claim, which is pass-tempo bookkeeping.
+fn header_instead_of_claim(p: &crate::r#match::MatchPlayer, ball: nalgebra::Vector3<f32>) -> bool {
+    !p.tactical_position.current_position.is_goalkeeper()
+        && super::contact::can_header(p, ball)
 }

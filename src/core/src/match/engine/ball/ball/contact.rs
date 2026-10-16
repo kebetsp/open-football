@@ -45,6 +45,12 @@ pub fn header_height_cap(p: &MatchPlayer) -> f32 {
 /// is ordinary ground/low play).
 pub const AERIAL_MIN_Z: f32 = 1.6;
 
+/// A header contest is decided only once the ball has dropped to this
+/// height: below every outfielder's jump cap (2.5 m+), so nobody is
+/// excluded just because he jumps a few centimetres lower and a defender
+/// cannot win a contest the attacker could not yet reach (2026-10-17).
+pub const CONTEST_MAX_Z: f32 = 2.4;
+
 /// Can this OUTFIELD player physically meet the ball with his head right
 /// now? Horizontal reach is his skill-scaled lunge/jump stride; vertical
 /// is his jump height. No teleport anywhere: if true, HE steps to the ball.
