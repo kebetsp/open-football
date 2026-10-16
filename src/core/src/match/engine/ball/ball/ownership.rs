@@ -353,6 +353,10 @@ impl Ball {
                     // First-touch resolution before control is granted.
                     // Only a genuine teammate pass rolls — self-passes
                     // and passer-less claims keep the legacy flow.
+                    if let Some(pid) = passer_id.filter(|&id| id != target_id && !within_reach) {
+                        // Ball still out of reach: the touch is owed, rolled when he gets to it.
+                        self.first_touch_owed = Some((target_id, pid, self.current_tick_cached));
+                    }
                     if let Some(pid) = passer_id.filter(|&id| id != target_id && within_reach) {
                         let outcome = self.roll_first_touch(context, target_player, players);
                         if outcome != FirstTouchOutcome::Clean {
@@ -1141,6 +1145,10 @@ impl Ball {
                     // First-touch resolution on the post-flight priority
                     // claim as well — same roll as the in-flight site so
                     // a slow arriving pass isn't a free clean control.
+                    if let Some(pid) = passer_id.filter(|&id| id != target_id && !within_reach) {
+                        // Ball still out of reach: the touch is owed, rolled when he gets to it.
+                        self.first_touch_owed = Some((target_id, pid, self.current_tick_cached));
+                    }
                     if let Some(pid) = passer_id.filter(|&id| id != target_id && within_reach) {
                         let outcome = self.roll_first_touch(context, target_player, players);
                         if outcome != FirstTouchOutcome::Clean {
@@ -1377,6 +1385,33 @@ impl Ball {
                                 }
                             }
                         }
+                    }
+                }
+
+                // A first touch owed from an early (out-of-reach) pass-target
+                // claim is rolled now, when the receiver actually reaches the
+                // ball (<= 5u). A failed touch leaves the ball where it is.
+                if let Some((owed_id, pid, owed_tick)) = self.first_touch_owed {
+                    if owed_id == player.id
+                        && self.current_tick_cached.saturating_sub(owed_tick) <= 400
+                    {
+                        self.first_touch_owed = None;
+                        let outcome = self.roll_first_touch(context, player, players);
+                        if outcome != FirstTouchOutcome::Clean {
+                            self.apply_failed_first_touch(
+                                context,
+                                player.id,
+                                player.team_id,
+                                player.position,
+                                pid,
+                                outcome,
+                                events,
+                            );
+                            return;
+                        }
+                    } else {
+                        // Someone else got the ball, or the debt expired.
+                        self.first_touch_owed = None;
                     }
                 }
 

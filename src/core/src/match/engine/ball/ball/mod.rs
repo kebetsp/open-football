@@ -402,6 +402,11 @@ pub struct Ball {
     /// caught/parried (it is placed out of his reach) and a decided SAVE
     /// is aimed at him and always saved. Cleared by any new shot.
     pub penalty_decided: Option<(u32, bool)>,
+    /// A first-touch roll still owed by a receiver whose pass-target claim
+    /// happened while the ball was out of his reach: (receiver, passer,
+    /// tick). The roll is made when he actually gets to the ball (ordinary
+    /// nearby claim); a failed touch then happens where the ball is.
+    pub first_touch_owed: Option<(u32, u32, u64)>,
     /// Qualified assister of the most recent shot — the passer whose
     /// completed pass the shooter received inside the key-pass window
     /// (~3 s) before shooting. None for solo runs / long carries, so a
@@ -645,6 +650,7 @@ impl Ball {
             last_shot_xg: 0.0,
             last_shot_shooter_id: None,
             penalty_decided: None,
+            first_touch_owed: None,
             last_shot_assister_id: None,
             last_rebound_tick: 0,
             last_giveaway_player_id: None,
