@@ -3064,9 +3064,19 @@ impl PlayerEventDispatcher {
     // sibling function already uses (same 15-tick/~150ms cooldown,
     // matching its own `CLAIM_COOLDOWN_TICKS`, not a new value).
     fn secure_ball_for(player_id: u32, field: &mut MatchField) {
-        if let Some(player) = field.players.iter().find(|p| p.id == player_id) {
-            crate::snap_tag!("secure_ball_for");
-            field.ball.position = player.position;
+        // No-teleport rule (2026-10-16): securing the ball is a contact.
+        // The player must be within his physical reach of the ball and
+        // he steps onto it; the ball is never moved to him. Out of
+        // reach: no contact, the ball keeps its real motion.
+        let ball_ground = Vector3::new(field.ball.position.x, field.ball.position.y, 0.0);
+        if let Some(player) = field.players.iter_mut().find(|p| p.id == player_id) {
+            let dx = player.position.x - ball_ground.x;
+            let dy = player.position.y - ball_ground.y;
+            let reach = crate::r#match::engine::ball::contact::contact_reach(player);
+            if (dx * dx + dy * dy).sqrt() > reach {
+                return;
+            }
+            crate::r#match::engine::ball::contact::jump_to_ball(player, ball_ground);
             field.ball.position.z = 0.0;
         }
         field.ball.previous_owner = field.ball.current_owner;
@@ -3098,6 +3108,7 @@ impl PlayerEventDispatcher {
         // arrive in ~18 ticks instead of ~9, matching the ~3.75× shot/player
         // speed ratio observed in real football (vs. the engine's prior ~10×).
         const MAX_SHOT_VELOCITY: f32 = 3.2;
+        field.ball.penalty_decided = None;
         const MIN_SHOT_DISTANCE: f32 = 1.0; // Minimum distance to prevent NaN from normalization
 
         // realism-bug (2026-08, dribble/pass/shot decision plan —
@@ -4481,6 +4492,11 @@ impl PlayerEventDispatcher {
     }
 
     fn handle_parried_ball_event(player_id: u32, field: &mut MatchField) {
+        if let Some((taker, true)) = field.ball.penalty_decided {
+            if field.ball.cached_shot_target.is_some() && field.ball.previous_owner == Some(taker) {
+                return;
+            }
+        }
         // Only credit when the ball was a real shot — guards against
         // the diving state calling this when the GK gave up on a long
         // pass. The state-machine emitters are gated on the same flag,
@@ -4516,6 +4532,24 @@ impl PlayerEventDispatcher {
     }
 
     fn handle_caught_ball_event(player_id: u32, field: &mut MatchField) {
+        if let Some((taker, true)) = field.ball.penalty_decided {
+            if field.ball.cached_shot_target.is_some() && field.ball.previous_owner == Some(taker) {
+                return;
+            }
+        }
+        // No-teleport rule (2026-10-16): a catch is a contact, so the ball
+        // must be within the keeper's reach (dive + step, max 32u = 4m).
+        // Before, this handler accepted any distance and moved the ball
+        // to the keeper (worst case 85m). Out of reach: the event is
+        // dropped and the ball keeps its real trajectory.
+        const GK_CATCH_REACH: f32 = 32.0;
+        if let Some(gk) = field.players.iter().find(|p| p.id == player_id) {
+            let dx = gk.position.x - field.ball.position.x;
+            let dy = gk.position.y - field.ball.position.y;
+            if (dx * dx + dy * dy).sqrt() > GK_CATCH_REACH {
+                return;
+            }
+        }
         // Detect saves: ball was moving and came from an opponent
         let ball_was_moving = field.ball.velocity.norm_squared() > 0.25;
         let last_owner_team = field.ball.previous_owner.and_then(|prev_id| {
@@ -4604,20 +4638,12 @@ impl PlayerEventDispatcher {
         // hypothesis and pointing squarely at this position gap. Fix:
         // snap the ball to the goalkeeper's real position here, the same
         // way `secure_ball_for` already does for every other grant.
-        if let Some(gk) = field.players.iter().find(|p| p.id == player_id) {
-            crate::snap_tag!("gk_catch_event");
-            #[cfg(feature = "match-logs")]
-            crate::match_log_info!(
-                "GKCATCH state={} dist={:.1} shot={} speed={:.2} z={:.2}",
-                gk.state,
-                (gk.position - field.ball.position).norm(),
-                field.ball.cached_shot_target.is_some(),
-                field.ball.velocity.norm(),
-                field.ball.position.z
-            );
-            field.ball.position = gk.position;
-            field.ball.position.z = 0.0;
+        // The keeper steps/dives onto the ball; the ball stays put.
+        let ball_ground = Vector3::new(field.ball.position.x, field.ball.position.y, 0.0);
+        if let Some(gk) = field.players.iter_mut().find(|p| p.id == player_id) {
+            crate::r#match::engine::ball::contact::jump_to_ball(gk, ball_ground);
         }
+        field.ball.position.z = 0.0;
         // Ball must stop when caught — prevent it from continuing into the goal
         field.ball.velocity = Vector3::zeros();
         field.ball.flags.in_flight_state = 0;
@@ -5494,7 +5520,7 @@ impl PlayerEventDispatcher {
         // hoof needs ~5 u/tick each of horizontal and vertical to
         // travel 30-40m before landing. 7.0 total covers that with a
         // little slack. Still well below the global MAX_VELOCITY safety.
-        const MAX_CLEAR_VELOCITY: f32 = 7.0;
+        const MAX_CLEAR_VELOCITY: f32 = 3.2; // physical ceiling (was 7.0 = 87 m/s)
         let speed = velocity.norm();
         let mut capped_velocity = if speed > MAX_CLEAR_VELOCITY {
             velocity * (MAX_CLEAR_VELOCITY / speed)

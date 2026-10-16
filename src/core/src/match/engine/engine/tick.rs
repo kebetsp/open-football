@@ -175,6 +175,19 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
     /// to a player 30-200 units away, and `move_to`'s 15-unit distance check
     /// nulls ownership on the very next tick — ball stalls for seconds.
     pub(super) fn apply_pending_set_piece_teleport(field: &mut MatchField) {
+        // Contact lunges: the player steps onto the ball, never the
+        // reverse (see `ball/ball/contact.rs`).
+        if !field.ball.pending_player_jumps.is_empty() {
+            let jumps = std::mem::take(&mut field.ball.pending_player_jumps);
+            for (player_id, ball_pos) in jumps {
+                if let Some(idx) = field.player_index(player_id) {
+                    crate::r#match::engine::ball::contact::jump_to_ball(
+                        &mut field.players[idx],
+                        ball_pos,
+                    );
+                }
+            }
+        }
         if let Some((player_id, ball_pos)) = field.ball.pending_set_piece_teleport.take() {
             // Handing the ball to a staged taker starts a NEW restart —
             // any live same-touch lock belongs to a dead delivery chain
@@ -543,25 +556,18 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // and the claim cooldown plus the absent `cached_shot_target`
             // keep the physics save & GK state machine out of it — the
             // outcome was already decided by the conversion model.
-            let corner_y = if context.rng.bernoulli(0.5) { 18.0 } else { -18.0 };
+            // Real strike from the spot at the shot-speed cap (3.2 u/tick,
+            // ~40 m/s); the ball is NOT moved. The decided goal is aimed
+            // inside the post, far from the keeper, and flagged so a
+            // catch/parry event cannot undo it (`penalty_decided`).
+            let corner_y = if context.rng.bernoulli(0.5) { 24.0 } else { -24.0 };
             let aim = Vector3::new(goal.x, goal.y + corner_y, 0.0);
             let dir = {
                 let v = Vector3::new(aim.x - ball_pos.x, aim.y - ball_pos.y, 0.0);
                 v.normalize()
             };
-            // Launch from the trajectory midpoint: the full 88u flight
-            // at 4 u/tick gives the keeper ~22 ticks (~25u of lateral
-            // cover — he eats the decided goal). From ~44u he gets ~12
-            // ticks (~13u), inside the 18u corner offset, so the model's
-            // verdict stands. Reads as an unstoppable strike in replay.
-            let mid = Vector3::new(
-                (ball_pos.x + aim.x) * 0.5,
-                (ball_pos.y + aim.y) * 0.5,
-                0.0,
-            );
-            crate::snap_tag!("tick562_mid");
-            field.ball.position = mid;
-            field.ball.velocity = Vector3::new(dir.x * 4.0, dir.y * 4.0, 0.0);
+            field.ball.velocity = Vector3::new(dir.x * 3.2, dir.y * 3.2, 0.0);
+            field.ball.penalty_decided = Some((taker_id, true));
             // Mark the ball as a live shot. `check_goal` only credits a
             // crossing when the scorer has recent shot MEMORY (invisible
             // here — it reads `context.players`, a copy that never sees
@@ -598,7 +604,9 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 p.memory.record_shot(tick, true);
             }
         } else if context.rng.bernoulli(0.60) {
-            // SAVED (60% of non-goals) — keeper holds it.
+            // SAVED (60% of non-goals): a real strike aimed at the keeper;
+            // `penalty_decided` makes his contact (the one save decision)
+            // always succeed. Nothing is placed in his hands.
             if let Some((gk_id, _)) = gk {
                 let gk_pos = field
                     .players
@@ -606,22 +614,37 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     .find(|p| p.id == gk_id)
                     .map(|p| p.position)
                     .unwrap_or(Vector3::new(goal.x, goal.y, 0.0));
-                let gk_team = field
-                    .players
-                    .iter()
-                    .find(|p| p.id == gk_id)
-                    .map(|p| p.team_id)
-                    .unwrap_or(0);
-                crate::snap_tag!("fk_saved_gk");
-                field.ball.position = Vector3::new(gk_pos.x, gk_pos.y, 0.0);
-                field.ball.velocity = Vector3::zeros();
+                let aim = Vector3::new(goal.x, gk_pos.y.clamp(goal.y - 26.0, goal.y + 26.0), 0.0);
+                let dir = {
+                    let v = Vector3::new(aim.x - ball_pos.x, aim.y - ball_pos.y, 0.0);
+                    v.normalize()
+                };
+                field.ball.velocity = Vector3::new(dir.x * 3.2, dir.y * 3.2, 0.0);
+                field.ball.penalty_decided = Some((taker_id, false));
+                {
+                    use crate::r#match::engine::ball::ball::ShotTarget;
+                    let defending_side = if goal.x < ball_pos.x {
+                        PlayerSide::Left
+                    } else {
+                        PlayerSide::Right
+                    };
+                    field.ball.cached_shot_target = Some(ShotTarget {
+                        goal_line_y: aim.y,
+                        goal_line_z: 0.5,
+                        defending_side,
+                        deflected: false,
+                        physics_save_rolled: false,
+                        is_direct_fk: false,
+                        total_flight_ticks: 28.0,
+                        dispatch_tick: tick,
+                        is_safe_restart: false,
+                        shot_distance: field.ball.distance_to_goal(defending_side),
+                    });
+                }
                 field.ball.previous_owner = Some(taker_id);
-                field.ball.current_owner = Some(gk_id);
-                field.ball.ownership_duration = 0;
-                field.ball.claim_cooldown = 60;
-                field.ball.flags.in_flight_state = 60;
-                field.ball.pending_save_credit = Some((gk_id, taker_id));
-                field.ball.record_touch(gk_id, gk_team, tick, true);
+                field.ball.current_owner = None;
+                field.ball.claim_cooldown = 80;
+                field.ball.flags.in_flight_state = 80;
                 if let Some(p) = field.get_player_mut(taker_id) {
                     p.memory.record_shot(tick, true);
                 }
@@ -1233,7 +1256,14 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         if (ball_pos - attacked_goal).magnitude() > 160.0 {
             return;
         }
-        if ball.position.z < 2.0 {
+        // No-teleport rule (2026-10-16): the contest only exists while the
+        // ball is in the heading band (1.6–3.0m) AND at least one
+        // attacker is physically within reach of it; candidates are the
+        // players who can actually meet the ball where it IS. The winner
+        // steps to the ball — the ball is never moved to a player.
+        if ball.position.z < crate::r#match::engine::ball::contact::AERIAL_MIN_Z
+            || ball.position.z > 3.0
+        {
             return;
         }
 
@@ -1258,10 +1288,15 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         let mut best_def_score = 0.40_f32;
         let mut gk_command = 0.35_f32;
         for (i, p) in field.players.iter().enumerate() {
-            if (p.position - attacked_goal).magnitude() > 135.0 {
+            let is_gk = p.tactical_position.current_position.is_goalkeeper();
+            let in_reach = if is_gk {
+                crate::r#match::engine::ball::contact::can_keeper_claim(p, ball_pos)
+            } else {
+                crate::r#match::engine::ball::contact::can_header(p, ball_pos)
+            };
+            if !in_reach {
                 continue;
             }
-            let is_gk = p.tactical_position.current_position.is_goalkeeper();
             if p.team_id == att_team {
                 // Realism-bug 2026-07-26: a GK genuinely pushed forward
                 // for a late corner (gk_up_after_minute) is a real, if
@@ -1285,12 +1320,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             }
         }
 
+        // No attacker can meet the ball where it is yet: the contest has
+        // not started. The ball keeps flying; we look again next tick.
         let (att_idx, att_score) = match best_att {
             Some(v) => v,
-            None => {
-                field.ball.corner_contest_resolved = true;
-                return;
-            }
+            None => return,
         };
 
         let att_win =
@@ -1368,9 +1402,12 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     }
                     PlayerFieldPositionGroup::Goalkeeper => {
                         winner.state = PlayerState::Goalkeeper(GoalkeeperState::Shooting);
-                        crate::snap_tag!("corner_contest");
-                        field.ball.position =
-                            Vector3::new(winner_pos.x, winner_pos.y, 0.3);
+                        // The keeper steps to the ball; the ball stays.
+                        let bp = field.ball.position;
+                        crate::r#match::engine::ball::contact::jump_to_ball(
+                            &mut field.players[att_idx],
+                            bp,
+                        );
                         field.ball.velocity = Vector3::zeros();
                         field.ball.current_owner = Some(winner_id);
                         field.ball.flags.in_flight_state = 0;
@@ -1419,12 +1456,19 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // down through that band in a physically correct ~0.4-0.5s —
             // matching real header hang time without needing a large
             // artificial descent push.
-            b.position =
-                Vector3::new(winner_pos.x - dir.x * 2.0, winner_pos.y - dir.y * 2.0, 2.55);
+            // 2026-10-16: the winner steps to the ball (a header is a
+            // touch where the ball is) and flicks it goalward with a
+            // gentle real impulse; the ball's position is NOT changed.
+            let _ = winner_pos;
+            let ball_now = b.position;
             b.velocity = Vector3::new(dir.x * 1.8, dir.y * 1.8, -0.004);
             b.current_owner = None;
             b.previous_owner = taker;
             b.flags.in_flight_state = 1;
+            crate::r#match::engine::ball::contact::jump_to_ball(
+                &mut field.players[att_idx],
+                ball_now,
+            );
         }
         // Otherwise the cross plays out — the keeper claims or a defender
         // clears (the realistic majority outcome).
@@ -1511,7 +1555,10 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // excluding any live cached_shot_target here is correct for
         // headers too, not just driven shots -- there's nothing left to
         // "contest" once a shot exists.
-        if ball.current_owner.is_some() || ball.position.z < 2.0 || ball.cached_shot_target.is_some()
+        if ball.current_owner.is_some()
+            || ball.position.z < crate::r#match::engine::ball::contact::AERIAL_MIN_Z
+            || ball.position.z > 3.0
+            || ball.cached_shot_target.is_some()
         {
             return;
         }
@@ -1568,10 +1615,17 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         let mut gk_command = 0.35_f32;
         let mut gk_idx: Option<usize> = None;
         for (i, p) in field.players.iter().enumerate() {
-            if (p.position - attacked_goal).magnitude() > CONTEST_RADIUS {
+            let is_gk = p.tactical_position.current_position.is_goalkeeper();
+            // No-teleport rule (2026-10-16): only players who can
+            // physically meet the ball where it is take part.
+            let in_reach = if is_gk {
+                crate::r#match::engine::ball::contact::can_keeper_claim(p, ball_pos)
+            } else {
+                crate::r#match::engine::ball::contact::can_header(p, ball_pos)
+            };
+            if !in_reach {
                 continue;
             }
-            let is_gk = p.tactical_position.current_position.is_goalkeeper();
             if p.team_id == att_team {
                 let s = sc::aerial_outfield_attacker(p, minute);
                 if best_att.map_or(true, |(_, bs)| s > bs) {
@@ -1591,12 +1645,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             }
         }
 
-        field.ball.last_aerial_contest_tick = tick;
-
+        // Nobody can meet the ball yet: no contest, the ball keeps flying
+        // (checked again next tick; the cooldown is NOT consumed).
         let (att_idx, att_score) = match best_att {
             Some(v) => v,
             None => return,
         };
+        field.ball.last_aerial_contest_tick = tick;
 
         let att_win =
             (0.36 + (att_score - best_def_score) * 0.50 - gk_command * 0.18).clamp(0.10, 0.62);
@@ -1629,9 +1684,9 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             };
             if gk_claims {
                 let idx = gk_idx.unwrap();
+                let bp = field.ball.position;
+                crate::r#match::engine::ball::contact::jump_to_ball(&mut field.players[idx], bp);
                 let gk = &field.players[idx];
-                crate::snap_tag!("aerial_gk_claim");
-                field.ball.position = Vector3::new(gk.position.x, gk.position.y, 0.0);
                 field.ball.velocity = Vector3::zeros();
                 field.ball.current_owner = Some(gk.id);
                 field.ball.previous_owner = Some(gk.id);
@@ -1679,8 +1734,10 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             };
             let speed = 1.6 + 1.6 * skill * context.rng.unit_f32().max(0.3);
             let v = Vector3::new(ang.cos() * speed, ang.sin() * speed, 0.03);
-            crate::snap_tag!("aerial_def_clear");
-            field.ball.position = Vector3::new(def_pos.x, def_pos.y, 0.3);
+            // The defender steps to the ball; the ball is not moved.
+            let _ = def_pos;
+            let bp = field.ball.position;
+            crate::r#match::engine::ball::contact::jump_to_ball(&mut field.players[def_idx], bp);
             field.ball.offside_snapshot = None;
             field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
             field.ball.release_after_touch(def_id, def_team, def_side, v, tick);
@@ -1707,8 +1764,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         match group {
             PlayerFieldPositionGroup::Goalkeeper => {
                 field.players[att_idx].state = PlayerState::Goalkeeper(GoalkeeperState::Shooting);
-                crate::snap_tag!("aerial_gk_att");
-                field.ball.position = Vector3::new(winner_pos.x, winner_pos.y, 0.3);
+                let bp = field.ball.position;
+                crate::r#match::engine::ball::contact::jump_to_ball(
+                    &mut field.players[att_idx],
+                    bp,
+                );
                 field.ball.velocity = Vector3::zeros();
                 field.ball.current_owner = Some(winner_id);
                 field.ball.flags.in_flight_state = 0;
@@ -1721,9 +1781,14 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 // See the identical corner-resolver comment above for why
                 // the descent velocity dropped from -0.35 to -0.004 in
                 // this 2026-08 height-physics rewrite.
-                crate::snap_tag!("aerial_att_drop");
-                field.ball.position =
-                    Vector3::new(winner_pos.x - dir.x * 2.0, winner_pos.y - dir.y * 2.0, 2.55);
+                // The winner steps to the ball and flicks it goalward;
+                // the ball's position is unchanged (no teleport).
+                let _ = winner_pos;
+                let bp = field.ball.position;
+                crate::r#match::engine::ball::contact::jump_to_ball(
+                    &mut field.players[att_idx],
+                    bp,
+                );
                 field.ball.velocity = Vector3::new(dir.x * 1.8, dir.y * 1.8, -0.004);
                 field.ball.current_owner = None;
                 field.ball.previous_owner = Some(winner_id);

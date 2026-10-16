@@ -488,6 +488,16 @@ impl Ball {
             if perp_dist > BLOCK_CORRIDOR {
                 continue;
             }
+            // No-teleport rule (2026-10-16): a block is a contact, so the
+            // ball must be within the defender's physical reach NOW (he
+            // steps onto it; the ball is never moved to him). A defender
+            // further up the line gets his chance on a later tick, when
+            // the ball has really travelled to him.
+            if (projection * projection + perp_dist * perp_dist).sqrt()
+                > super::contact::contact_reach(player)
+            {
+                continue;
+            }
 
             // Skill mix: bravery (willingness to step into shot),
             // positioning (read the angle), anticipation (read the
@@ -629,8 +639,11 @@ impl Ball {
             context.rng.unit_f32(),
         );
 
-        crate::snap_tag!("block_to_blocker");
-        self.position = blocker_pos;
+        // The blocker steps into the ball's path (within BLOCK_CORRIDOR);
+        // the ball is not moved to him.
+        let _ = blocker_pos;
+        self.pending_player_jumps
+            .push((blocker_id, Vector3::new(self.position.x, self.position.y, 0.0)));
         self.position.z = 0.0;
         self.offside_snapshot = None;
         self.pass_origin_restart = PassOriginRestart::OpenPlay;

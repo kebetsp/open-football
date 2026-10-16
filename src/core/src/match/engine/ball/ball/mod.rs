@@ -11,6 +11,7 @@
 //! | [`motion`]      | Velocity integration, owner tracking, boundary inset         |
 //! | [`stall`]       | Position-anchor stall detector + snapshot diagnostics        |
 
+pub mod contact;
 mod goal;
 pub mod interactions;
 mod motion;
@@ -167,6 +168,11 @@ pub struct Ball {
     /// after `ball.update` returns, so the owner is on the ball before
     /// the next `move_to` distance check can null their ownership.
     pub pending_set_piece_teleport: Option<(u32, Vector3<f32>)>,
+    /// Players that must step/lunge onto the ball after a contact
+    /// resolved inside `Ball::update` (which only sees `&[MatchPlayer]`).
+    /// Drained by `apply_pending_set_piece_teleport`. The BALL never
+    /// moves for a contact; the player does (see `contact.rs`).
+    pub pending_player_jumps: Vec<(u32, Vector3<f32>)>,
     /// Attacking centre-backs to teleport into the box when a corner is
     /// awarded — the dead-ball set-up (in real football the big men walk
     /// up during the stoppage). Populated in the corner branch of
@@ -390,6 +396,12 @@ pub struct Ball {
     /// ownership change.
     pub last_shot_xg: f32,
     pub last_shot_shooter_id: Option<u32>,
+    /// A penalty whose outcome the conversion model already decided:
+    /// (taker id, is_goal). The ball is a real strike from the spot; this
+    /// only tells the keeper-contact code that a decided GOAL cannot be
+    /// caught/parried (it is placed out of his reach) and a decided SAVE
+    /// is aimed at him and always saved. Cleared by any new shot.
+    pub penalty_decided: Option<(u32, bool)>,
     /// Qualified assister of the most recent shot — the passer whose
     /// completed pass the shooter received inside the key-pass window
     /// (~3 s) before shooting. None for solo runs / long carries, so a
@@ -588,6 +600,7 @@ impl Ball {
             kickoff_team_side: None,
             cached_landing_position: Vector3::new(x, y, 0.0),
             pending_set_piece_teleport: None,
+            pending_player_jumps: Vec::new(),
             pending_corner_teleports: Vec::new(),
             pending_restart_teleports: Vec::new(),
             direct_fk_shot_in_flight: false,
@@ -631,6 +644,7 @@ impl Ball {
             pressers_at_pass_count: 0,
             last_shot_xg: 0.0,
             last_shot_shooter_id: None,
+            penalty_decided: None,
             last_shot_assister_id: None,
             last_rebound_tick: 0,
             last_giveaway_player_id: None,
@@ -1119,6 +1133,7 @@ impl Ball {
         self.unowned_ticks = 0;
         self.cached_landing_position = self.position;
         self.pending_set_piece_teleport = None;
+        self.pending_player_jumps.clear();
         self.pending_corner_teleports.clear();
         self.pending_restart_teleports.clear();
         self.owned_stuck_ticks = 0;

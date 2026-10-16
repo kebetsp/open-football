@@ -18,12 +18,12 @@ impl Ball {
         // for 3-5 cycles before a defender could claim. 0.3 keeps the
         // second bounce low enough to reach on the return trip.
         const BOUNCE_COEFFICIENT: f32 = 0.3;
-        // Global ball velocity safety cap. Sits above every action-specific
-        // cap (shot 3.2, pass 3.2, clearance 7.0) so it never clamps real
-        // physics but still catches runaway bug velocities. Clearances are
-        // the highest-magnitude legitimate action because they stack
-        // meaningful horizontal AND vertical velocity for lofted hoofs.
-        const MAX_VELOCITY: f32 = 8.0;
+        // Physical speed ceiling (2026-10-16 no-teleport/no-unphysical-
+        // motion rule): 3.2 u/tick = 40 m/s, the shot/pass cap and about
+        // the fastest real kick. Nothing — clearance, deflection, tackle
+        // contact — may exceed it. (Was 8.0 with clearances at 7.0 =
+        // 87 m/s.) 3.3 leaves float slack above the 3.2 action caps.
+        const MAX_VELOCITY: f32 = 3.3;
 
         // Physics constants for realistic ball behavior
         // Air drag: affects aerial balls (proportional to v²)

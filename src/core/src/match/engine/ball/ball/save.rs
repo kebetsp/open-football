@@ -189,6 +189,17 @@ impl Ball {
             );
             return; // Out of reach: nothing to decide, the shot goes on.
         }
+        // No-teleport rule (2026-10-16): the save is only a contact if the
+        // BALL is physically within the keeper's reach (dive + step,
+        // skill-scaled, shot-time-limited). Otherwise the shot goes on and
+        // the check repeats next tick as the ball closes.
+        {
+            let gx = keeper.position.x - self.position.x;
+            let gy = keeper.position.y - self.position.y;
+            if (gx * gx + gy * gy).sqrt() > reach {
+                return;
+            }
+        }
         let rho = (lateral_error / reach.max(1.0)).clamp(0.0, 1.0);
 
         let skill = sc::gk_shot_stopping(keeper, minute);
@@ -207,6 +218,13 @@ impl Ball {
             logit += DIRECT_FK_LOGIT_OFFSET;
         }
         let p_save = (1.0 / (1.0 + (-logit).exp())).clamp(0.03, 0.97);
+        // A penalty the conversion model decided as SAVED is aimed at the
+        // keeper and is always saved (the outcome mix is still picked
+        // below). A decided GOAL never reaches this code (latch consumed).
+        let p_save = match self.penalty_decided {
+            Some((taker, false)) if self.previous_owner == Some(taker) => 1.0,
+            _ => p_save,
+        };
 
         // The one decision.
         if let Some(t) = self.cached_shot_target.as_mut() {
@@ -264,8 +282,11 @@ impl Ball {
 
         match outcome {
             SaveOutcome::Held => {
-                crate::snap_tag!("gk_catch_phys");
-                self.position = keeper_pos;
+                // The keeper dives/steps onto the ball; the ball stays.
+                self.pending_player_jumps.push((
+                    keeper_id,
+                    Vector3::new(self.position.x, self.position.y, 0.0),
+                ));
                 self.position.z = 0.0;
                 self.velocity = Vector3::zeros();
                 self.current_owner = Some(keeper_id);

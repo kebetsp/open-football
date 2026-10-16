@@ -225,9 +225,14 @@ impl Ball {
             }
         };
 
-        crate::snap_tag!("failed_first_touch");
-        self.position = receiver_position;
-        self.position.z = 0.0;
+        // 2026-10-16: the ball is NOT relocated to the receiver. The
+        // touch happens where the ball is; the receiver steps/lunges to
+        // it (`pending_player_jumps`, capped by `contact_reach` — the
+        // caller only reaches here when the ball is within that reach).
+        let _ = receiver_position;
+        self.pending_player_jumps
+            .push((receiver_id, Vector3::new(self.position.x, self.position.y, 0.0)));
+        self.position.z = self.position.z.min(0.5);
         self.velocity = out_dir * out_speed;
         self.velocity.z = 0.0;
         self.previous_owner = Some(receiver_id);
@@ -301,6 +306,19 @@ impl Ball {
                 const RECEIVER_CLAIM_DISTANCE_SQ: f32 = 100.0 * 100.0;
                 const RECEIVER_MAX_HEIGHT: f32 = 2.8;
 
+                // 2026-10-16 (no-teleport rule): the early pass-target claim
+                // is bookkeeping only (ownership is dropped again next tick
+                // if the ball is >15u away) and it is load-bearing for pass
+                // tempo — gating it by reach halved pass volume (measured),
+                // so the 100u radius stays. What must not happen is a first
+                // touch that moves the ball: the first-touch ROLL only
+                // happens when the BALL itself is within the receiver's
+                // physical reach (skill-scaled, max 24u), and a failed
+                // touch leaves the ball where it is.
+                let bdx = target_player.position.x - self.position.x;
+                let bdy = target_player.position.y - self.position.y;
+                let reach = super::contact::contact_reach(target_player);
+                let within_reach = bdx * bdx + bdy * bdy <= reach * reach;
                 if dist_sq < RECEIVER_CLAIM_DISTANCE_SQ && self.position.z <= RECEIVER_MAX_HEIGHT {
                     // Receiver is becoming active. If we have an offside
                     // snapshot for this receiver and it's offside per the
@@ -335,7 +353,7 @@ impl Ball {
                     // First-touch resolution before control is granted.
                     // Only a genuine teammate pass rolls — self-passes
                     // and passer-less claims keep the legacy flow.
-                    if let Some(pid) = passer_id.filter(|&id| id != target_id) {
+                    if let Some(pid) = passer_id.filter(|&id| id != target_id && within_reach) {
                         let outcome = self.roll_first_touch(context, target_player, players);
                         if outcome != FirstTouchOutcome::Clean {
                             let receiver_position = target_player.position;
@@ -1112,13 +1130,18 @@ impl Ball {
                 const RECEIVER_PRIORITY_DISTANCE_SQ: f32 = 100.0 * 100.0;
                 const RECEIVER_MAX_HEIGHT: f32 = 2.8;
 
+                // Same rule as the in-flight site: the claim radius stays (it
+                // is tempo bookkeeping), only the first-touch roll needs the
+                // ball inside the receiver's physical reach.
+                let reach = super::contact::contact_reach(target_player);
+                let within_reach = dist_sq <= reach * reach;
                 if dist_sq < RECEIVER_PRIORITY_DISTANCE_SQ && self.position.z <= RECEIVER_MAX_HEIGHT
                 {
                     let passer_id = self.current_owner.or(self.previous_owner);
                     // First-touch resolution on the post-flight priority
                     // claim as well — same roll as the in-flight site so
                     // a slow arriving pass isn't a free clean control.
-                    if let Some(pid) = passer_id.filter(|&id| id != target_id) {
+                    if let Some(pid) = passer_id.filter(|&id| id != target_id && within_reach) {
                         let outcome = self.roll_first_touch(context, target_player, players);
                         if outcome != FirstTouchOutcome::Clean {
                             let receiver_position = target_player.position;
