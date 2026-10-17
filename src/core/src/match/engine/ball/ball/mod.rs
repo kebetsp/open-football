@@ -1085,61 +1085,6 @@ impl Ball {
         Vector3::new(clamped_x, clamped_y, 0.0)
     }
 
-    /// Where (and in how many ticks) an unowned, lofted ball next passes
-    /// through head height (`HEAD_Z`) on its way down. Uses the same drag
-    /// and gravity as `update_velocity`. `None` when the ball is not a
-    /// real lofted delivery (never rises above 2.6 m, is owned, or does
-    /// not come down to head height within `MAX_TICKS`). A ball that is
-    /// already inside the heading band and descending returns its current
-    /// position at tick 0.
-    pub fn predict_head_point(&self) -> Option<(Vector3<f32>, u32)> {
-        if self.current_owner.is_some() {
-            return None;
-        }
-        Self::predict_head_point_from(self.position, self.velocity)
-    }
-
-    /// Same as [`Ball::predict_head_point`] from a raw position/velocity
-    /// (the per-tick ball snapshot players read).
-    pub fn predict_head_point_from(
-        start_pos: Vector3<f32>,
-        start_vel: Vector3<f32>,
-    ) -> Option<(Vector3<f32>, u32)> {
-        const HEAD_Z: f32 = 2.0;
-        const MAX_TICKS: u32 = 220;
-        const AIR_DRAG: f32 = 0.04;
-        const BALL_MASS: f32 = 0.43;
-        if start_pos.z < 1.6 {
-            return None;
-        }
-        let g = crate::r#match::engine::physics::GRAVITY_PER_TICK;
-        let mut pos = start_pos;
-        let mut vel = start_vel;
-        let mut peak = pos.z;
-        if pos.z <= HEAD_Z && vel.z < 0.0 {
-            return Some((pos, 0));
-        }
-        for t in 1..=MAX_TICKS {
-            let n = vel.norm();
-            if n > 0.1 {
-                let a = -AIR_DRAG * n / BALL_MASS * 0.016;
-                vel.x += vel.x * a;
-                vel.y += vel.y * a;
-                vel.z += vel.z * a;
-            }
-            vel.z -= g;
-            pos += vel;
-            peak = peak.max(pos.z);
-            if pos.z < 0.2 {
-                return None;
-            }
-            if vel.z < 0.0 && pos.z <= HEAD_Z && peak >= 2.3 {
-                return Some((pos, t));
-            }
-        }
-        None
-    }
-
     /// Check if the ball is aerial (in the air above player reach)
     pub fn is_aerial(&self) -> bool {
         const PLAYER_REACH_HEIGHT: f32 = 2.3;

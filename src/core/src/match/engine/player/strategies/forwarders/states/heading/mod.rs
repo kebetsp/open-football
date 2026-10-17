@@ -26,12 +26,6 @@ impl StateProcessingHandler for ForwardHeadingState {
             FWD_HEADING_STATE_ENTRIES.fetch_add(1, Ordering::Relaxed);
         }
         let ball_position = ctx.tick_context.positions.ball.position;
-        #[cfg(feature = "match-logs")]
-        crate::match_log_info!(
-            "HEADSTATE id={} dist={:.1} z={:.2} won={} corner={} t={}",
-            ctx.player.id, ctx.ball().distance(), ball_position.z, ctx.player.aerial_contest_won,
-            ctx.ball().is_team_attacking_corner(), ctx.context.total_match_time
-        );
 
         // Ball too far — transition back to running
         if ctx.ball().distance() > HEADING_DISTANCE_THRESHOLD {
