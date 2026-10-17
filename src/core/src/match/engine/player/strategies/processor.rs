@@ -3037,14 +3037,7 @@ impl<'p> StateProcessor<'p> {
                 better += 1;
             }
         }
-        // Near a goal (box and goal-kick zone) two players per team attack
-        // the ball; elsewhere an aerial duel is one against one, so a
-        // lofted switch or long ball does not drag half the defence in.
-        let goal_l = ctx.context.goal_positions.left;
-        let goal_r = ctx.context.goal_positions.right;
-        let near_goal = ((target.x - goal_l.x).powi(2) + (target.y - goal_l.y).powi(2)).sqrt() < 200.0
-            || ((target.x - goal_r.x).powi(2) + (target.y - goal_r.y).powi(2)).sqrt() < 200.0;
-        if better >= if near_goal { 2 } else { 1 } {
+        if better >= 2 {
             return None;
         }
         let to = Vector3::new(target.x - player.position.x, target.y - player.position.y, 0.0);

@@ -320,7 +320,7 @@ impl Ball {
                 let reach = super::contact::contact_reach(target_player);
                 let within_reach = bdx * bdx + bdy * bdy <= reach * reach;
                 if dist_sq < RECEIVER_CLAIM_DISTANCE_SQ && self.position.z <= RECEIVER_MAX_HEIGHT
-                    && !self.header_instead_of_claim(target_player, players) {
+                    && !header_instead_of_claim(target_player, self.position) {
                     // Receiver is becoming active. If we have an offside
                     // snapshot for this receiver and it's offside per the
                     // kick-time geometry, fire offside instead of a clean
@@ -1141,7 +1141,7 @@ impl Ball {
                 let reach = super::contact::contact_reach(target_player);
                 let within_reach = dist_sq <= reach * reach;
                 if dist_sq < RECEIVER_PRIORITY_DISTANCE_SQ && self.position.z <= RECEIVER_MAX_HEIGHT
-                    && !self.header_instead_of_claim(target_player, players)
+                    && !header_instead_of_claim(target_player, self.position)
                 {
                     let passer_id = self.current_owner.or(self.previous_owner);
                     // First-touch resolution on the post-flight priority
@@ -1233,7 +1233,7 @@ impl Ball {
                 continue;
             }
             let ball_height_reachable = self.position.z <= PLAYER_JUMP_REACH
-                && !self.header_instead_of_claim(player, players);
+                && !header_instead_of_claim(player, self.position);
 
             if ball_speed_sq <= SLOW_BALL_VELOCITY_SQ {
                 if !ball_height_reachable {
@@ -1483,35 +1483,14 @@ impl Ball {
     }
 }
 
-impl Ball {
-    /// An outfield player who can physically HEAD the ball right now (ball
-    /// in the heading band, inside his reach) does not take an ordinary
-    /// claim where a header contest will actually be held: near a goal
-    /// (the box contest, `resolve_aerial_contest` / `resolve_corner_contest`,
-    /// runs later in the same tick) or when an opponent can also reach the
-    /// ball. Before this, the claim took the ball out of the air (observed
-    /// `ClaimBall` at z=2.76 m) and no header could happen (2026-10-16).
-    /// A lone receiver away from goal keeps the ordinary early claim:
-    /// nobody contests it, and removing it delayed wing receptions
-    /// (byline runs halved, measured). Players not yet within header reach
-    /// keep the old early claim, which is pass-tempo bookkeeping.
-    fn header_instead_of_claim(&self, p: &crate::r#match::MatchPlayer, players: &[MatchPlayer]) -> bool {
-        use super::contact::can_header;
-        if p.tactical_position.current_position.is_goalkeeper() || !can_header(p, self.position) {
-            return false;
-        }
-        let mid_y = self.field_height * 0.5;
-        let dy = self.position.y - mid_y;
-        let near_goal = [0.0_f32, self.field_width].iter().any(|gx| {
-            let dx = self.position.x - gx;
-            (dx * dx + dy * dy).sqrt() <= 160.0
-        });
-        near_goal
-            || players.iter().any(|o| {
-                o.team_id != p.team_id
-                    && !o.is_sent_off
-                    && !o.tactical_position.current_position.is_goalkeeper()
-                    && can_header(o, self.position)
-            })
-    }
+/// An outfield player who can physically HEAD the ball right now (ball in
+/// the heading band and inside his reach) does not take an ordinary claim:
+/// the aerial contest (`resolve_aerial_contest` / `resolve_corner_contest`,
+/// which run later in the same tick) decides the header. Before this, the
+/// claim took the ball out of the air (observed `ClaimBall` at z≈2.76 m)
+/// and no header could ever happen (2026-10-16). Players not yet within
+/// header reach keep the old early claim, which is pass-tempo bookkeeping.
+fn header_instead_of_claim(p: &crate::r#match::MatchPlayer, ball: nalgebra::Vector3<f32>) -> bool {
+    !p.tactical_position.current_position.is_goalkeeper()
+        && super::contact::can_header(p, ball)
 }
