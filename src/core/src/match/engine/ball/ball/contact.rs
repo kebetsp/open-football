@@ -45,6 +45,49 @@ pub fn header_height_cap(p: &MatchPlayer) -> f32 {
 /// is ordinary ground/low play).
 pub const AERIAL_MIN_Z: f32 = 1.6;
 
+/// A header contest is decided only once the ball has dropped to this
+/// height: below every outfielder's jump cap (2.5 m+), so nobody is
+/// excluded just because he jumps a few centimetres lower and a defender
+/// cannot win a contest the attacker could not yet reach (2026-10-17).
+pub const CONTEST_MAX_Z: f32 = 2.4;
+
+/// Header-work switches (2026-10-17). Each part of the lofted-ball header
+/// work has its own environment variable so every part can be
+/// measured alone against baseline (the first attempt shipped them
+/// together and could not tell which one hurt byline runs and crosses).
+/// Validated parts are on by default; `HDR_X=0` turns one off.
+pub mod hdr {
+    use std::sync::OnceLock;
+    pub const RUN: usize = 0; // runners go to the head-height point
+    pub const CLAIM: usize = 1; // a player who can head it skips the early claim
+    pub const SHOT: usize = 2; // a won box header fires its own shot
+    pub const Z: usize = 3; // contests resolve at z <= CONTEST_MAX_Z
+    pub const OPEN: usize = 4; // lofted balls away from the box too
+    pub const GK: usize = 6; // the keeper runs onto a high ball in his own box
+    pub const DEF: usize = 5; // a defender in reach clears even when no attacker can reach
+    static FLAGS: OnceLock<[bool; 7]> = OnceLock::new();
+    pub fn on(i: usize) -> bool {
+        FLAGS.get_or_init(|| {
+            // Default on for the validated parts; "HDR_X=0" turns one off,
+            // "HDR_X=1" turns an off-by-default part on.
+            let e = |n: &str, d: bool| match std::env::var(n).ok().as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => d,
+            };
+            [
+                e("HDR_RUN", true),
+                e("HDR_CLAIM", true),
+                e("HDR_SHOT", true),
+                e("HDR_Z", true),
+                e("HDR_OPEN", true),
+                e("HDR_DEF", false),
+                e("HDR_GK", true),
+            ]
+        })[i]
+    }
+}
+
 /// Can this OUTFIELD player physically meet the ball with his head right
 /// now? Horizontal reach is his skill-scaled lunge/jump stride; vertical
 /// is his jump height. No teleport anywhere: if true, HE steps to the ball.

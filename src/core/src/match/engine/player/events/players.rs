@@ -2417,6 +2417,19 @@ impl PlayerEventDispatcher {
             .map(|p| p.team_id);
         field.ball.pass_origin_position = Some(field.ball.position);
         field.ball.pass_origin_team = passer_team;
+        field.ball.set_piece_lofted = field
+            .players
+            .iter()
+            .find(|p| p.id == event_model.from_player_id)
+            .map(|p| p.tactical_position.current_position.is_goalkeeper())
+            .unwrap_or(false)
+            || matches!(
+                field.ball.pass_origin_restart,
+                PassOriginRestart::GoalKick
+                    | PassOriginRestart::FreeKick
+                    | PassOriginRestart::DirectFreeKick
+                    | PassOriginRestart::IndirectFreeKick
+            );
         field.ball.last_pass_tick = field.ball.current_tick_cached;
         field.ball.last_pass_to = Some(event_model.to_player_id);
 

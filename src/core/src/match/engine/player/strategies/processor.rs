@@ -579,6 +579,18 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity * tempo);
         }
 
+        // Aerial attack (2026-10-16, Pavel: headers anywhere a lofted ball
+        // can be reached). Applied after every positional/reactive
+        // override above so the two best-placed players of each team run
+        // under the ball's flight path, to the point where it passes head
+        // height — not to its ground landing spot, which is ~40u further
+        // on and out of header reach.
+        if crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::RUN) {
+            if let Some(velocity) = Self::aerial_attack_velocity(&processing_ctx) {
+                result.velocity = Some(velocity);
+            }
+        }
+
         // realism-bug (2026-07-28): mandatory free-kick retreat (Law 13).
         // Applied AFTER the assignment override so an encroaching
         // defender retreats even if a manager has explicitly told him to
@@ -2966,6 +2978,116 @@ impl<'p> StateProcessor<'p> {
             return None;
         }
         Some(to_ball.normalize() * player.skills.physical.pace)
+    }
+
+    /// Aerial attack: for a lofted, unowned ball, the (up to) two
+    /// players of each team who can reach the point where it passes head
+    /// height soonest run there at full pace. Attackers and defenders
+    /// use the same rule so the duel is real. Everyone else keeps their
+    /// duty. See `Ball::predict_head_point_from`.
+    fn aerial_attack_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        if crate::r#match::player::strategies::common::kicker_mode::is_active() {
+            return None;
+        }
+        let player = ctx.player;
+        let is_gk = player.tactical_position.current_position.is_goalkeeper();
+        let hdr = crate::r#match::engine::ball::contact::hdr::on;
+        if player.is_sent_off
+            || (is_gk && !hdr(crate::r#match::engine::ball::contact::hdr::GK))
+        {
+            return None;
+        }
+        if player.restart_retreat_target.is_some()
+            || ctx.tick_context.ball.cached_shot_target.is_some()
+        {
+            return None;
+        }
+        if ctx.tick_context.ball.current_owner.is_some()
+            || ctx.tick_context.ball.last_owner == Some(player.id)
+        {
+            return None;
+        }
+        match player.state {
+            Defender(DefenderState::Tackling)
+            | Midfielder(MidfielderState::Tackling)
+            | Forward(ForwardState::Tackling) => return None,
+            _ => {}
+        }
+        let b = &ctx.tick_context.positions.ball;
+        let (target, ticks) = crate::r#match::engine::ball::Ball::predict_head_point_from(
+            b.position, b.velocity,
+        )?;
+        let (w, h) = (ctx.context.field_size.width as f32, ctx.context.field_size.height as f32);
+        if target.x < -20.0 || target.x > w + 20.0 || target.y < -20.0 || target.y > h + 20.0 {
+            return None;
+        }
+        let reach = crate::r#match::engine::ball::contact::contact_reach(player) * 0.7;
+        let speed = player
+            .skills
+            .max_speed_with_condition(player.player_attributes.condition)
+            .max(0.05);
+        let eta = |d: f32, sp: f32| ((d - reach).max(0.0)) / sp;
+        let my_d = ((player.position.x - target.x).powi(2) + (player.position.y - target.y).powi(2)).sqrt();
+        let my_eta = eta(my_d, speed);
+        if my_d > 260.0 || my_eta > ticks as f32 + 10.0 {
+            return None;
+        }
+        if is_gk {
+            // Keeper: only a high ball dropping into his own box. He is
+            // the first choice there (no ranking against outfielders).
+            let own_goal = if player.position.x < w * 0.5 { ctx.context.goal_positions.left } else { ctx.context.goal_positions.right };
+            let td = ((target.x - own_goal.x).powi(2) + (target.y - own_goal.y).powi(2)).sqrt();
+            if td > 150.0 || my_d > 150.0 {
+                return None;
+            }
+            // He only comes for it if he gets there first.
+            for op in ctx.players().opponents().all() {
+                if op.tactical_positions.is_goalkeeper() {
+                    continue;
+                }
+                let d = ((op.position.x - target.x).powi(2) + (op.position.y - target.y).powi(2)).sqrt();
+                if eta(d, 0.45) < my_eta {
+                    return None;
+                }
+            }
+            let to = Vector3::new(target.x - player.position.x, target.y - player.position.y, 0.0);
+            let dist = to.magnitude();
+            if dist < 1.0 {
+                return Some(Vector3::zeros());
+            }
+            return Some(to / dist * speed.min(dist));
+        }
+        // Rank among teammates (assumed typical running speed).
+        let mut better = 0;
+        for tm in ctx.players().teammates().all() {
+            if tm.tactical_positions.is_goalkeeper() || tm.id == player.id {
+                continue;
+            }
+            let d = ((tm.position.x - target.x).powi(2) + (tm.position.y - target.y).powi(2)).sqrt();
+            if eta(d, 0.45) < my_eta {
+                better += 1;
+            }
+        }
+        // Near a goal (box and goal-kick zone) two players per team attack
+        // the ball; elsewhere an aerial duel is one against one, so a
+        // lofted switch or long ball does not drag half the defence in.
+        let goal_l = ctx.context.goal_positions.left;
+        let goal_r = ctx.context.goal_positions.right;
+        let near_goal = ((target.x - goal_l.x).powi(2) + (target.y - goal_l.y).powi(2)).sqrt() < 200.0
+            || ((target.x - goal_r.x).powi(2) + (target.y - goal_r.y).powi(2)).sqrt() < 200.0;
+        if better >= if near_goal { 2 } else { 1 } {
+            return None;
+        }
+        // Away from the goals only when the open-field part is on.
+        if !near_goal && !(crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::OPEN) && ctx.tick_context.ball.set_piece_lofted) {
+            return None;
+        }
+        let to = Vector3::new(target.x - player.position.x, target.y - player.position.y, 0.0);
+        let dist = to.magnitude();
+        if dist < 1.0 {
+            return Some(Vector3::zeros());
+        }
+        Some(to / dist * speed.min(dist))
     }
 
     /// realism-bug (2026-07-28): mandatory free-kick retreat. §13.4's

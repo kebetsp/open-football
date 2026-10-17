@@ -117,8 +117,10 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         Self::apply_pending_save_credit(field);
         Self::resolve_penalty_kick(field, context);
         Self::resolve_free_kick(field, context, match_data);
-        Self::resolve_corner_contest(field, context);
-        Self::resolve_aerial_contest(field, context);
+        Self::resolve_corner_contest(field, context, match_data);
+        Self::resolve_aerial_contest(field, context, match_data);
+        #[cfg(feature = "match-logs")]
+        Self::aerial_band_diag(field, context);
         // Resolve any deferred-foul / advantage state. Cheap (one
         // Option read in the dominant no-advantage case) so we run it
         // every full tick rather than waiting for the next event.
@@ -1199,7 +1201,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         }
     }
 
-    pub(super) fn resolve_corner_contest(field: &mut MatchField, context: &mut MatchContext) {
+    pub(super) fn resolve_corner_contest(
+        field: &mut MatchField,
+        context: &mut MatchContext,
+        match_data: &mut ResultMatchPositionData,
+    ) {
         use crate::r#match::PassOriginRestart;
         use nalgebra::Vector3;
 
@@ -1262,7 +1268,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // players who can actually meet the ball where it IS. The winner
         // steps to the ball — the ball is never moved to a player.
         if ball.position.z < crate::r#match::engine::ball::contact::AERIAL_MIN_Z
-            || ball.position.z > 3.0
+            || ball.position.z > (if crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::Z) { crate::r#match::engine::ball::contact::CONTEST_MAX_Z } else { 3.0 })
         {
             return;
         }
@@ -1330,6 +1336,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         let att_win =
             (0.36 + (att_score - best_def_score) * 0.50 - gk_command * 0.18).clamp(0.10, 0.62);
 
+        let mut header_shooter: Option<usize> = None;
         if context.rng.bernoulli(att_win) {
             #[cfg(feature = "match-logs")]
             crate::mid_run_diag::CORNER_CONTEST_WON.fetch_add(1, Ordering::Relaxed);
@@ -1414,6 +1421,9 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     }
                 }
             }
+            #[cfg(feature = "match-logs")]
+            crate::match_log_info!("CORNERWIN t={} id={}", context.total_match_time, field.players[att_idx].id);
+            header_shooter = Some(att_idx);
             // Attacker wins: drop the ball just behind them at head height,
             // moving goalward, so it reads as an incoming header to their
             // state (the CB's AttackingCorner, or a forward's run→heading).
@@ -1482,6 +1492,9 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // attacking CB instead of playing out as GK claims/clearances.
         field.ball.pass_target_player_id = None;
         field.ball.clear_pending_pass_metadata();
+        if let Some(idx) = header_shooter.filter(|_| crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::SHOT)) {
+            Self::fire_header(field, context, match_data, idx, attacked_goal);
+        }
 
         // Persist this corner's routine + estimated xG into the team's
         // history so `pick_corner_routine` can vary future deliveries.
@@ -1501,6 +1514,193 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         field.ball.corner_contest_resolved = true;
     }
 
+    /// Diagnostic (header investigation 2026-10-16, match-logs only): per tick,
+    /// while an unowned ball is in the heading band near a goal, how far
+    /// is the nearest attacker / defender and can anyone head it.
+    #[cfg(feature = "match-logs")]
+    fn aerial_band_diag(field: &MatchField, context: &MatchContext) {
+        use crate::r#match::PassOriginRestart;
+        let b = &field.ball;
+        if b.current_owner.is_some() || b.position.z < 1.0 || b.position.z > 3.6 {
+            return;
+        }
+        let gl = context.goal_positions.left;
+        let gr = context.goal_positions.right;
+        let dg = (b.position - gl).magnitude().min((b.position - gr).magnitude());
+        if dg > 200.0 {
+            return;
+        }
+        let att_team = b
+            .pass_origin_team
+            .or_else(|| {
+                b.previous_owner
+                    .and_then(|id| field.players.iter().find(|p| p.id == id))
+                    .map(|p| p.team_id)
+            });
+        let Some(att_team) = att_team else { return };
+        let (mut na, mut nd) = (f32::MAX, f32::MAX);
+        let (mut ha, mut hd, mut n40) = (0, 0, 0);
+        for p in field.players.iter().filter(|p| !p.is_sent_off) {
+            let d = ((p.position.x - b.position.x).powi(2) + (p.position.y - b.position.y).powi(2)).sqrt();
+            let gk = p.tactical_position.current_position.is_goalkeeper();
+            if p.team_id == att_team {
+                if d < na { na = d; }
+                if d < 40.0 { n40 += 1; }
+                if !gk && crate::r#match::engine::ball::contact::can_header(p, b.position) { ha += 1; }
+            } else if !gk {
+                if d < nd { nd = d; }
+                if crate::r#match::engine::ball::contact::can_header(p, b.position) { hd += 1; }
+            }
+        }
+        let kind = match b.pass_origin_restart {
+            PassOriginRestart::Corner => "corner",
+            PassOriginRestart::DirectFreeKick | PassOriginRestart::IndirectFreeKick => "fk",
+            _ => "open",
+        };
+        crate::match_log_info!(
+            "AERDIAG t={} kind={} z={:.2} vz={:.4} dg={:.0} natt={:.0} ndef={:.0} att40={} canh_a={} canh_d={} shot={}",
+            context.total_match_time, kind, b.position.z, b.velocity.z, dg, na, nd, n40, ha, hd,
+            b.cached_shot_target.is_some()
+        );
+    }
+
+    /// A header won in the box: the contest has decided who got there, so
+    /// the header itself is dispatched right here instead of waiting for
+    /// the winner's state machine — which `should_force_takeball` and the
+    /// duty overrides replace before it ever runs (measured: 9 contest
+    /// wins, 1 Heading-state entry in 10 matches). Contact quality
+    /// (heading + jumping) decides whether it is a real attempt on goal;
+    /// accuracy is then graded by the shot pipeline's header model.
+    fn fire_header(
+        field: &mut MatchField,
+        context: &mut MatchContext,
+        match_data: &mut ResultMatchPositionData,
+        idx: usize,
+        attacked_goal: nalgebra::Vector3<f32>,
+    ) {
+        use crate::club::player::ability::position::PlayerFieldPositionGroup;
+        use crate::r#match::engine::events::dispatcher::Event;
+        use crate::r#match::player::events::{PlayerEvent, ShootingEventContext};
+        use crate::r#match::player::strategies::players::ShotType;
+
+        let p = &field.players[idx];
+        let reason = match p.tactical_position.current_position.position_group() {
+            PlayerFieldPositionGroup::Forward => "FWD_HEADING_ON_GOAL",
+            PlayerFieldPositionGroup::Midfielder => "MID_HEADING_ON_GOAL",
+            PlayerFieldPositionGroup::Defender => "DEF_CORNER_HEADER",
+            PlayerFieldPositionGroup::Goalkeeper => return,
+        };
+        let heading = (p.skills.technical.heading / 20.0).clamp(0.0, 1.0);
+        let jumping = (p.skills.physical.jumping / 20.0).clamp(0.0, 1.0);
+        let contact = (0.62 + (heading + jumping) * 0.5 * 0.30).clamp(0.55, 0.95);
+        if context.rng.unit_f32() >= contact {
+            return; // glanced it: the flick-on drift from the contest stands
+        }
+        let id = p.id;
+        let force = 1.8 + 0.6 * heading;
+        let mut evs = EventCollection::with_event(Event::PlayerEvent(PlayerEvent::Shoot(
+            ShootingEventContext {
+                from_player_id: id,
+                target: nalgebra::Vector3::new(attacked_goal.x, attacked_goal.y, 0.0),
+                force: force as f64,
+                reason,
+                tick: context.current_tick(),
+                shot_type: ShotType::Header,
+            },
+        )));
+        EventDispatcher::dispatch(&mut evs, field, context, match_data, true);
+        // The header is taken: don't let the Heading state fire a second one.
+        {
+            use crate::r#match::defenders::states::DefenderState;
+            use crate::r#match::forwarders::states::ForwardState;
+            use crate::r#match::midfielders::states::MidfielderState;
+            use crate::r#match::player::state::PlayerState;
+            let pl = &mut field.players[idx];
+            pl.aerial_contest_won = 0;
+            pl.state = match pl.tactical_position.current_position.position_group() {
+                PlayerFieldPositionGroup::Forward => PlayerState::Forward(ForwardState::Running),
+                PlayerFieldPositionGroup::Midfielder => {
+                    PlayerState::Midfielder(MidfielderState::Running)
+                }
+                _ => PlayerState::Defender(DefenderState::Running),
+            };
+        }
+    }
+
+    /// A header won away from the box (goal-kick reception, long ball,
+    /// switch of play): the winner steps to the ball and nods it on to the
+    /// best-placed teammate (ahead of him and open), or forward if there is
+    /// none. One contact through `release_after_touch`; accuracy and pace
+    /// come from heading / composure.
+    fn open_field_header(field: &mut MatchField, context: &mut MatchContext, idx: usize) {
+        use crate::r#match::PassOriginRestart;
+        use crate::r#match::PlayerSide;
+        use nalgebra::Vector3;
+
+        let tick = context.current_tick();
+        let (id, team, side, pos, heading, composure) = {
+            let w = &field.players[idx];
+            (
+                w.id,
+                w.team_id,
+                w.side,
+                w.position,
+                (w.skills.technical.heading / 20.0).clamp(0.0, 1.0),
+                (w.skills.mental.composure / 20.0).clamp(0.0, 1.0),
+            )
+        };
+        let attack_x = match side {
+            Some(PlayerSide::Left) => 1.0_f32,
+            Some(PlayerSide::Right) => -1.0,
+            None => return,
+        };
+        let mut best: Option<(Vector3<f32>, f32)> = None;
+        for p in field.players.iter() {
+            if p.team_id != team
+                || p.id == id
+                || p.is_sent_off
+                || p.tactical_position.current_position.is_goalkeeper()
+            {
+                continue;
+            }
+            let d = ((p.position.x - pos.x).powi(2) + (p.position.y - pos.y).powi(2)).sqrt();
+            if !(25.0..=240.0).contains(&d) {
+                continue;
+            }
+            let mut near_opp = 60.0_f32;
+            for o in field.players.iter().filter(|o| o.team_id != team && !o.is_sent_off) {
+                let od = ((o.position.x - p.position.x).powi(2)
+                    + (o.position.y - p.position.y).powi(2))
+                .sqrt();
+                near_opp = near_opp.min(od);
+            }
+            let fwd = ((p.position.x - pos.x) * attack_x / 240.0).clamp(-0.5, 1.0);
+            let score = 0.6 * fwd + 0.5 * (near_opp / 60.0) - d / 600.0;
+            if best.map_or(true, |(_, bs)| score > bs) {
+                best = Some((p.position, score));
+            }
+        }
+        let aim = best
+            .map(|(a, _)| a)
+            .unwrap_or_else(|| Vector3::new(pos.x + attack_x * 100.0, pos.y, 0.0));
+        let to = Vector3::new(aim.x - pos.x, aim.y - pos.y, 0.0);
+        let dist = to.magnitude().max(1.0);
+        let skill = 0.6 * heading + 0.4 * composure;
+        let sigma = 0.06 + 0.30 * (1.0 - skill);
+        let err = (context.rng.unit_f32() + context.rng.unit_f32() + context.rng.unit_f32() - 1.5)
+            * 2.0
+            * sigma
+            / 1.5;
+        let base = to.y.atan2(to.x) + err;
+        let speed = (dist * 0.0173).clamp(0.8, 2.6);
+        let v = Vector3::new(base.cos() * speed, base.sin() * speed, 0.03);
+        let bp = field.ball.position;
+        crate::r#match::engine::ball::contact::jump_to_ball(&mut field.players[idx], bp);
+        field.ball.offside_snapshot = None;
+        field.ball.pass_origin_restart = PassOriginRestart::OpenPlay;
+        field.ball.release_after_touch(id, team, side, v, tick);
+    }
+
     /// Realism-bug 2026-07-26 follow-up: generalizes `resolve_corner_contest`
     /// to every OTHER airborne delivery into a box — open-play crosses,
     /// free-kick crosses, long high passes, goal-kick punts. Corners keep
@@ -1512,7 +1712,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
     /// receiver's ambient state never notices a dropped aerial ball) is
     /// not corner-specific machinery, it's true of every position's
     /// state machine for any aerial delivery.
-    pub(super) fn resolve_aerial_contest(field: &mut MatchField, context: &mut MatchContext) {
+    pub(super) fn resolve_aerial_contest(
+        field: &mut MatchField,
+        context: &mut MatchContext,
+        match_data: &mut ResultMatchPositionData,
+    ) {
         use crate::club::player::ability::position::PlayerFieldPositionGroup;
         use crate::r#match::PassOriginRestart;
         use crate::r#match::defenders::states::DefenderState;
@@ -1557,7 +1761,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // "contest" once a shot exists.
         if ball.current_owner.is_some()
             || ball.position.z < crate::r#match::engine::ball::contact::AERIAL_MIN_Z
-            || ball.position.z > 3.0
+            || ball.position.z > (if crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::Z) { crate::r#match::engine::ball::contact::CONTEST_MAX_Z } else { 3.0 })
             || ball.cached_shot_target.is_some()
         {
             return;
@@ -1604,8 +1808,24 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // Only contest deliveries genuinely near the goal being attacked
         // — a routine long pass at midfield, or a goal kick played out of
         // the kicker's own box, isn't a heading duel.
-        if (ball_pos - attacked_goal).magnitude() > CONTEST_RADIUS {
-            return;
+        // 2026-10-16 (Pavel: headers anywhere a lofted ball is reachable,
+        // goal kicks included): outside the box the contest still exists,
+        // but a won header is a knock-on / clearance to a teammate, not a
+        // shot (see `open_field_header`).
+        let in_box = (ball_pos - attacked_goal).magnitude() <= CONTEST_RADIUS;
+        if !in_box && !(crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::OPEN) && ball.set_piece_lofted) {
+            return; // baseline: only deliveries into the box are contested
+        }
+        // A cross still travelling toward the box is not an open-field
+        // duel: wait until it is inside, so the contest is the box one
+        // (a header on goal), not a knock-on from outside it.
+        if !in_box {
+            let to_goal = attacked_goal - ball_pos;
+            if to_goal.magnitude() < CONTEST_RADIUS + 70.0
+                && (to_goal.x * ball.velocity.x + to_goal.y * ball.velocity.y) > 0.0
+            {
+                return;
+            }
         }
 
         let minute = (context.total_match_time / 60_000) as u32;
@@ -1647,15 +1867,59 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
 
         // Nobody can meet the ball yet: no contest, the ball keeps flying
         // (checked again next tick; the cooldown is NOT consumed).
-        let (att_idx, att_score) = match best_att {
-            Some(v) => v,
-            None => return,
+        let no_att = best_att.is_none();
+        if no_att && best_def_idx.is_none() && gk_idx.is_none() {
+            return;
+        }
+        // Baseline: the contest does not start until an attacker can meet
+        // the ball. A defender/keeper reaching it alone is HDR_DEF.
+        if no_att && !crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::DEF) {
+            return;
+        }
+        let (att_idx, att_score) = best_att.unwrap_or((0, 0.0));
+        let nobody_against = best_def_idx.is_none() && gk_idx.is_none();
+        // The intended receiver of a lofted pass has read the flight and
+        // is running onto it: a small edge over a defender who has to react.
+        let target_edge = if field.ball.pass_target_player_id == Some(field.players[att_idx].id) {
+            0.30
+        } else {
+            0.0
         };
+        // Whoever is nearer the contact point gets there first.
+        let closer_edge = match (best_att, best_def_idx) {
+            (Some((ai, _)), Some(di)) => {
+                let d = |i: usize| {
+                    let p = &field.players[i].position;
+                    ((p.x - ball_pos.x).powi(2) + (p.y - ball_pos.y).powi(2)).sqrt()
+                };
+                ((d(di) - d(ai)) / 80.0).clamp(-0.25, 0.25)
+            }
+            _ => 0.0,
+        };
+        // Away from the box a header is only a real DUEL: one side alone
+        // under a lofted ball just controls it as an ordinary reception.
+        if !in_box && (no_att || nobody_against) {
+            return;
+        }
         field.ball.last_aerial_contest_tick = tick;
+        let att_win = if no_att {
+            0.0
+        } else if !in_box {
+            if nobody_against {
+                1.0
+            } else {
+                (0.50 + target_edge + closer_edge + (att_score - best_def_score) * 0.50).clamp(0.15, 0.80)
+            }
+        } else {
+            (0.36 + (att_score - best_def_score) * 0.50 - gk_command * 0.18).clamp(0.10, 0.62)
+        };
 
-        let att_win =
-            (0.36 + (att_score - best_def_score) * 0.50 - gk_command * 0.18).clamp(0.10, 0.62);
-
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!(
+            "AERRES t={} in_box={} no_att={} att_win={:.2} att_score={:.2} def_score={:.2} def={} gk={} restart={:?}",
+            context.total_match_time, in_box, no_att, att_win, att_score, best_def_score,
+            best_def_idx.is_some(), gk_idx.is_some(), field.ball.pass_origin_restart
+        );
         if !context.rng.bernoulli(att_win) {
             // realism-bug (2026-08-27): the defending side winning this
             // roll — "the realistic majority" per the comment this
@@ -1697,6 +1961,10 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 return;
             }
             let Some(def_idx) = best_def_idx else { return };
+            if !in_box {
+                Self::open_field_header(field, context, def_idx);
+                return;
+            }
             let defender = &field.players[def_idx];
             let def_pos = defender.position;
             let def_id = defender.id;
@@ -1748,6 +2016,12 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             return;
         }
 
+        if !in_box {
+            Self::open_field_header(field, context, att_idx);
+            return;
+        }
+        #[cfg(feature = "match-logs")]
+        crate::match_log_info!("AERWIN t={} id={} z={:.2}", context.total_match_time, field.players[att_idx].id, field.ball.position.z);
         let winner_pos = field.players[att_idx].position;
         let winner_id = field.players[att_idx].id;
         let to_goal = attacked_goal - winner_pos;
@@ -1811,6 +2085,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         }
         field.ball.pass_target_player_id = None;
         field.ball.clear_pending_pass_metadata();
+        if !matches!(group, PlayerFieldPositionGroup::Goalkeeper)
+            && crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::SHOT)
+        {
+            Self::fire_header(field, context, match_data, att_idx, attacked_goal);
+        }
     }
 
     /// Consume `Ball::pending_save_credit` left behind by the physics

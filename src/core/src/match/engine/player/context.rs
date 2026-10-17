@@ -99,6 +99,7 @@ pub struct BallMetadata {
     /// in-flight `previous_owner` clearing. Read by the
     /// lay_off_on_long_ball directive gate (`BallOps::is_long_reception`).
     pub pass_origin_position: Option<Vector3<f32>>,
+    pub set_piece_lofted: bool,
     pub pass_origin_team: Option<u32>,
     pub last_pass_tick: u64,
     pub last_pass_to: Option<u32>,
@@ -152,6 +153,7 @@ impl BallMetadata {
         self.is_in_flight_state = field.ball.flags.in_flight_state;
         self.current_owner = field.ball.current_owner;
         self.last_owner = field.ball.previous_owner;
+        self.set_piece_lofted = field.ball.set_piece_lofted;
         self.pass_origin_position = field.ball.pass_origin_position;
         self.pass_origin_team = field.ball.pass_origin_team;
         self.last_pass_tick = field.ball.last_pass_tick;
@@ -189,6 +191,7 @@ impl From<&MatchField> for BallMetadata {
             is_in_flight_state: 0,
             current_owner: None,
             last_owner: None,
+            set_piece_lofted: false,
             pass_origin_position: None,
             pass_origin_team: None,
             last_pass_tick: 0,
