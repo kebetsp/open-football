@@ -1500,7 +1500,7 @@ impl Ball {
         if !super::contact::hdr::on(super::contact::hdr::CLAIM) {
             return false;
         }
-        if p.tactical_position.current_position.is_goalkeeper() || !can_header(p, self.position) {
+        if p.tactical_position.current_position.is_goalkeeper() || !super::contact::can_header_in(p, self.position, players) {
             return false;
         }
         let mid_y = self.field_height * 0.5;

@@ -1293,15 +1293,19 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         let mut best_att: Option<(usize, f32)> = None;
         let mut best_def_score = 0.40_f32;
         let mut gk_command = 0.35_f32;
+        let mut against_seen = false;
         for (i, p) in field.players.iter().enumerate() {
             let is_gk = p.tactical_position.current_position.is_goalkeeper();
             let in_reach = if is_gk {
                 crate::r#match::engine::ball::contact::can_keeper_claim(p, ball_pos)
             } else {
-                crate::r#match::engine::ball::contact::can_header(p, ball_pos)
+                crate::r#match::engine::ball::contact::can_header_in(p, ball_pos, &field.players)
             };
             if !in_reach {
                 continue;
+            }
+            if p.team_id != att_team {
+                against_seen = true;
             }
             if p.team_id == att_team {
                 // Realism-bug 2026-07-26: a GK genuinely pushed forward
@@ -1333,8 +1337,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             None => return,
         };
 
-        let att_win =
-            (0.36 + (att_score - best_def_score) * 0.50 - gk_command * 0.18).clamp(0.10, 0.62);
+        let att_win = if !against_seen
+            && crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::FREE)
+        {
+            1.0 // nobody can challenge him: an unchallenged header is taken
+        } else {
+            (0.36 + (att_score - best_def_score) * 0.50 - gk_command * 0.18).clamp(0.10, 0.62)
+        };
 
         let mut header_shooter: Option<usize> = None;
         if context.rng.bernoulli(att_win) {
@@ -1557,6 +1566,21 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             PassOriginRestart::DirectFreeKick | PassOriginRestart::IndirectFreeKick => "fk",
             _ => "open",
         };
+        if b.velocity.z < 0.0 && b.position.z <= 2.0 && b.position.z - b.velocity.z > 2.0 {
+            let tick = context.current_tick();
+            let att_near = field.players.iter().filter(|p| {
+                p.team_id == att_team && !p.tactical_position.current_position.is_goalkeeper()
+                    && crate::r#match::engine::ball::contact::can_header_in(p, b.position, &field.players)
+            }).count();
+            crate::match_log_info!(
+                "AERGATE t={} owner={} cooldown_ok={} shot={} att_can={} opp_near={} restart={:?} corner_resolved={} z={:.2}",
+                context.total_match_time, b.current_owner.is_some(),
+                tick.saturating_sub(b.last_aerial_contest_tick) >= 60,
+                b.cached_shot_target.is_some(), att_near,
+                crate::r#match::engine::ball::contact::opponent_near_ball(&field.players, att_team, b.position),
+                b.pass_origin_restart, b.corner_contest_resolved, b.position.z
+            );
+        }
         crate::match_log_info!(
             "AERDIAG t={} kind={} z={:.2} vz={:.4} dg={:.0} natt={:.0} ndef={:.0} att40={} canh_a={} canh_d={} shot={}",
             context.total_match_time, kind, b.position.z, b.velocity.z, dg, na, nd, n40, ha, hd,
@@ -1593,15 +1617,26 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         let heading = (p.skills.technical.heading / 20.0).clamp(0.0, 1.0);
         let jumping = (p.skills.physical.jumping / 20.0).clamp(0.0, 1.0);
         let contact = (0.62 + (heading + jumping) * 0.5 * 0.30).clamp(0.55, 0.95);
-        if context.rng.unit_f32() >= contact {
+        let glanced = context.rng.unit_f32() >= contact;
+        let risky = crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::CLUMSY)
+            && crate::r#match::engine::ball::contact::opponent_near_ball(&field.players, p.team_id, field.ball.position);
+        if glanced && !risky {
             return; // glanced it: the flick-on drift from the contest stands
         }
         let id = p.id;
-        let force = 1.8 + 0.6 * heading;
+        let mut force = 1.8 + 0.6 * heading;
+        let mut aim_y = attacked_goal.y;
+        if glanced {
+            // Clumsy header: still a header on the ball's way, aimed well
+            // off target, instead of a foot control with a man nearby.
+            let off = 70.0 + context.rng.unit_f32() * 70.0;
+            aim_y += if context.rng.unit_f32() < 0.5 { off } else { -off };
+            force *= 0.7;
+        }
         let mut evs = EventCollection::with_event(Event::PlayerEvent(PlayerEvent::Shoot(
             ShootingEventContext {
                 from_player_id: id,
-                target: nalgebra::Vector3::new(attacked_goal.x, attacked_goal.y, 0.0),
+                target: nalgebra::Vector3::new(attacked_goal.x, aim_y, 0.0),
                 force: force as f64,
                 reason,
                 tick: context.current_tick(),
@@ -1841,7 +1876,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             let in_reach = if is_gk {
                 crate::r#match::engine::ball::contact::can_keeper_claim(p, ball_pos)
             } else {
-                crate::r#match::engine::ball::contact::can_header(p, ball_pos)
+                crate::r#match::engine::ball::contact::can_header_in(p, ball_pos, &field.players)
             };
             if !in_reach {
                 continue;
@@ -1873,7 +1908,14 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         }
         // Baseline: the contest does not start until an attacker can meet
         // the ball. A defender/keeper reaching it alone is HDR_DEF.
-        if no_att && !crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::DEF) {
+        if no_att
+            && !(crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::DEF)
+                && crate::r#match::engine::ball::contact::opponent_near_ball(
+                    &field.players,
+                    field.players[best_def_idx.or(gk_idx).unwrap_or(0)].team_id,
+                    ball_pos,
+                ))
+        {
             return;
         }
         let (att_idx, att_score) = best_att.unwrap_or((0, 0.0));
@@ -1910,6 +1952,10 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             } else {
                 (0.50 + target_edge + closer_edge + (att_score - best_def_score) * 0.50).clamp(0.15, 0.80)
             }
+        } else if nobody_against
+            && crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::FREE)
+        {
+            1.0 // nobody can challenge him: an unchallenged header is taken
         } else {
             (0.36 + (att_score - best_def_score) * 0.50 - gk_command * 0.18).clamp(0.10, 0.62)
         };

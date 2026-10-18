@@ -63,9 +63,11 @@ pub mod hdr {
     pub const SHOT: usize = 2; // a won box header fires its own shot
     pub const Z: usize = 3; // contests resolve at z <= CONTEST_MAX_Z
     pub const OPEN: usize = 4; // lofted balls away from the box too
+    pub const FREE: usize = 7; // unchallenged attacker at the ball takes the header
+    pub const CLUMSY: usize = 8; // opponent within ~5 m: a glanced header is a mishit, not a foot touch
     pub const GK: usize = 6; // the keeper runs onto a high ball in his own box
     pub const DEF: usize = 5; // a defender in reach clears even when no attacker can reach
-    static FLAGS: OnceLock<[bool; 7]> = OnceLock::new();
+    static FLAGS: OnceLock<[bool; 9]> = OnceLock::new();
     pub fn on(i: usize) -> bool {
         FLAGS.get_or_init(|| {
             // Default on for the validated parts; "HDR_X=0" turns one off,
@@ -83,6 +85,8 @@ pub mod hdr {
                 e("HDR_OPEN", true),
                 e("HDR_DEF", false),
                 e("HDR_GK", true),
+                e("HDR_FREE", true),
+                e("HDR_CLUMSY", false),
             ]
         })[i]
     }
@@ -91,6 +95,33 @@ pub mod hdr {
 /// Can this OUTFIELD player physically meet the ball with his head right
 /// now? Horizontal reach is his skill-scaled lunge/jump stride; vertical
 /// is his jump height. No teleport anywhere: if true, HE steps to the ball.
+/// Any player of the other team within ~5 m (40u) of the ball, keepers
+/// included: the situation where a foot touch risks losing the ball.
+pub fn opponent_near_ball(players: &[crate::r#match::MatchPlayer], team: u32, ball: Vector3<f32>) -> bool {
+    players.iter().any(|o| {
+        o.team_id != team && !o.is_sent_off && {
+            let dx = o.position.x - ball.x;
+            let dy = o.position.y - ball.y;
+            dx * dx + dy * dy <= 40.0 * 40.0
+        }
+    })
+}
+
+/// `can_header` with a lunge: when the CLUMSY switch is on and an opponent
+/// is within ~5 m of the ball, a foot touch risks losing it, so any player
+/// whose full stride (`MAX_REACH`) gets him there may go for the header.
+pub fn can_header_in(p: &MatchPlayer, ball: Vector3<f32>, players: &[MatchPlayer]) -> bool {
+    if can_header(p, ball) {
+        return true;
+    }
+    if !hdr::on(hdr::CLUMSY) || ball.z < AERIAL_MIN_Z || ball.z > header_height_cap(p) {
+        return false;
+    }
+    let dx = p.position.x - ball.x;
+    let dy = p.position.y - ball.y;
+    (dx * dx + dy * dy).sqrt() <= MAX_REACH && opponent_near_ball(players, p.team_id, ball)
+}
+
 pub fn can_header(p: &MatchPlayer, ball: Vector3<f32>) -> bool {
     if ball.z < AERIAL_MIN_Z || ball.z > header_height_cap(p) {
         return false;
