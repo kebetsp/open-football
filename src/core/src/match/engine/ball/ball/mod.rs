@@ -1012,7 +1012,9 @@ impl Ball {
         // it. That's a real stall.
         self.detect_position_stall(players);
 
+        let diag_prev = (self.current_owner, self.pass_target_player_id);
         self.process_ownership(context, players, events);
+        self.cross_touch_diag(context, players, diag_prev);
         self.tick_carry_tracker(events);
 
         // Move ball FIRST, then check goal/boundary on new position
@@ -1023,6 +1025,32 @@ impl Ball {
         self.check_throw_in(context, players, events);
         self.expire_offside_snapshot(context);
         self.update_landing_cache();
+    }
+
+    /// TEMP diagnostic (match-logs): a player gains the ball while it is in the air.
+    #[allow(unused_variables)]
+    fn cross_touch_diag(&self, context: &MatchContext, players: &[MatchPlayer], prev: (Option<u32>, Option<u32>)) {
+        #[cfg(feature = "match-logs")]
+        {
+            if self.current_owner != prev.0 && self.position.z >= 0.7 {
+                if let Some(id) = self.current_owner {
+                    if let Some(p) = players.iter().find(|p| p.id == id) {
+                        let dg = [0.0_f32, self.field_width].iter().map(|gx| {
+                            let dx = self.position.x - gx; let dy = self.position.y - self.field_height * 0.5;
+                            (dx * dx + dy * dy).sqrt()
+                        }).fold(f32::MAX, f32::min);
+                        let hd = super::contact::can_header_in(p, self.position, players);
+                        let opp = super::contact::opponent_near_ball(players, p.team_id, self.position);
+                        crate::match_log_info!(
+                            "CROSSTOUCH t={} id={} intended={} z={:.2} dg={:.0} canhead={} opp_near={} restart={:?} gk={} cooldown_ok={}",
+                            context.total_match_time, id, prev.1 == Some(id), self.position.z, dg, hd, opp,
+                            self.pass_origin_restart, p.tactical_position.current_position.is_goalkeeper(),
+                            self.current_tick_cached.saturating_sub(self.last_aerial_contest_tick) >= 60
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Light update: full ball logic but reads owner position from players slice directly.
@@ -1042,7 +1070,9 @@ impl Ball {
         self.try_intercept(context, players, events);
         self.try_block_shot(context, players, events);
         self.resolve_shot_at_keeper(context, players, events);
+        let diag_prev = (self.current_owner, self.pass_target_player_id);
         self.process_ownership(context, players, events);
+        self.cross_touch_diag(context, players, diag_prev);
         self.tick_carry_tracker(events);
 
         // Move ball: find owner position from players slice directly
