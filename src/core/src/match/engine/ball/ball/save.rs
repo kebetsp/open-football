@@ -418,15 +418,12 @@ impl Ball {
     }
 }
 
-/// Ground friction per tick on a rolling ball (`motion.rs`,
-/// `GROUND_FRICTION_COEFFICIENT`).
-const GROUND_FRICTION_PER_TICK: f32 = 0.015;
-
 /// Launch velocity for a keeper's tip round the post: the ball must cross
 /// the byline OUTSIDE the posts (so the last-toucher rule awards the
-/// corner). The launch is friction-exact: a ball launched with speed `v`
-/// covers `v * (1 - (1-f)^T) / f` in `T` ticks, so the velocity is scaled
-/// to cover the whole planned displacement in exactly `T` ticks.
+/// corner). The ball travels a straight line along the planned
+/// displacement, so it only has to be launched with enough speed to cover
+/// it (ground-roll model, `engine::physics`) and still be moving at the
+/// end.
 fn tipped_out_velocity(
     ball_x: f32,
     ball_y: f32,
@@ -446,11 +443,10 @@ fn tipped_out_velocity(
     let line_beyond = if left_goal { -0.1 } else { field_width + 0.1 };
     let dy = wide_y - ball_y;
     let dx = line_beyond - ball_x;
-    let t = (dy.abs() / 1.5).max(2.0);
-    let f = GROUND_FRICTION_PER_TICK;
-    // Total distance factor over t ticks of friction decay.
-    let reach = (1.0 - (1.0 - f).powf(t)) / f;
-    Vector3::new(dx / reach, dy / reach, 0.0)
+    let len = (dx * dx + dy * dy).sqrt().max(1e-3);
+    // Still rolling at 0.3 u/tick (~3.75 m/s) when it reaches the line.
+    let speed = crate::r#match::engine::physics::roll_launch_speed(len, 0.3).min(3.2);
+    Vector3::new(dx / len * speed, dy / len * speed, 0.0)
 }
 
 #[cfg(test)]
@@ -475,8 +471,12 @@ mod tests {
                     for _ in 0..200 {
                         x += vx;
                         y += vy;
-                        vx *= 1.0 - GROUND_FRICTION_PER_TICK;
-                        vy *= 1.0 - GROUND_FRICTION_PER_TICK;
+                        let sp = (vx * vx + vy * vy).sqrt();
+                        if sp > 0.0 {
+                            let r = crate::r#match::engine::physics::roll_step(sp) / sp;
+                            vx *= r;
+                            vy *= r;
+                        }
                         let beyond = if left { x < 0.0 } else { x > field_w };
                         if beyond {
                             crossed = Some(y);

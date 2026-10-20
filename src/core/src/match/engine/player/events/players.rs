@@ -1936,17 +1936,14 @@ impl PlayerEventDispatcher {
         //     flank while a midfielder passes across got a target 100+ units
         //     off to the side — beyond any teammate, often out of bounds.
         //
-        // Fix 1: physics-correct flight time.
-        //   Ball kinematics: D = V0*(1-(1-F)^T)/F  →  T = ln(1-D*F/V0)/ln(1-F)
-        //   V0=MAX_PASS_VELOCITY=3.2, F=GROUND_FRICTION=0.015 (both from this file)
+        // Fix 1: physics-correct flight time, from the same ground-roll
+        // model the ball uses (`engine::physics`): launch speed is the one
+        // `calculate_horizontal_velocity` would pick for this distance,
+        // time is the ticks to slow from it to the arrival speed.
         let pass_distance_est = (receiver_pos - passer_position).magnitude();
-        const LEAD_BALL_SPEED: f32 = 3.2;   // matches MAX_PASS_VELOCITY below
-        const LEAD_FRICTION: f32 = 0.015;    // matches GROUND_FRICTION below
-        let clamped_dist = pass_distance_est.min(LEAD_BALL_SPEED / LEAD_FRICTION * 0.90);
-        let range_fraction = (clamped_dist * LEAD_FRICTION / LEAD_BALL_SPEED).clamp(0.0, 0.999);
-        let flight_time_est = ((1.0_f32 - range_fraction).ln()
-            / (1.0_f32 - LEAD_FRICTION).ln())
-            .clamp(8.0, 80.0);
+        let (lead_v0, lead_va) = Self::ground_pass_speeds(pass_distance_est);
+        let flight_time_est =
+            crate::r#match::engine::physics::roll_ticks(lead_v0, lead_va).clamp(8.0, 80.0);
         let anticipation = (skills.vision * 0.6 + skills.passing * 0.4).clamp(0.0, 1.0);
         let lead_fraction = 0.60 + anticipation * 0.35;
         let lead_ticks = flight_time_est * lead_fraction;
@@ -2485,6 +2482,29 @@ impl PlayerEventDispatcher {
         (ball_pass_vector.x * ball_pass_vector.x + ball_pass_vector.y * ball_pass_vector.y).sqrt()
     }
 
+    /// (launch speed, arrival speed) in u/tick for a ground pass over
+    /// `distance` units. Arrival speed is how firmly the pass is weighted
+    /// at the target: unchanged from the old formula (the ball used to be
+    /// launched at distance*0.015*overshoot with friction 0.015*v, so it
+    /// reached the target still moving at 0.015*distance*(overshoot-1));
+    /// only the way it gets there is new. Longer passes keep arriving
+    /// faster (air drag/bounce losses on lofted balls are compensated by
+    /// the ballistic re-solve elsewhere for HighArc/MediumArc).
+    fn ground_pass_speeds(distance: f32) -> (f32, f32) {
+        let overshoot = if distance < 50.0 {
+            1.15
+        } else if distance < 100.0 {
+            1.25
+        } else if distance < 200.0 {
+            1.45
+        } else {
+            1.65
+        };
+        let arrive = (distance * 0.015 * (overshoot - 1.0)).clamp(0.05, 2.5);
+        let launch = crate::r#match::engine::physics::roll_launch_speed(distance, arrive);
+        (launch, arrive)
+    }
+
     fn calculate_horizontal_velocity(
         ball_pass_vector: &Vector3<f32>,
         pass_force: f32,
@@ -2495,26 +2515,10 @@ impl PlayerEventDispatcher {
             + ball_pass_vector.y * ball_pass_vector.y)
             .sqrt();
 
-        // Calculate velocity needed to reach target accounting for friction and air drag
-        // With ground friction factor 0.985/tick, total roll distance = v0 / 0.015
-        // So v0 = distance * 0.015 for ground passes
-        // Lofted passes experience air drag (proportional to v²) which bleeds much more speed,
-        // plus 5% horizontal loss on each bounce — so longer passes need more overshoot
-        const GROUND_FRICTION: f32 = 0.015;
-
-        // Distance-dependent overshoot: short passes need little extra,
-        // long passes need significantly more to compensate for air drag and bounce losses
-        let overshoot = if distance < 50.0 {
-            1.15 // Short: ground friction only
-        } else if distance < 100.0 {
-            1.25 // Medium: slight air drag on lofted balls
-        } else if distance < 200.0 {
-            1.45 // Long: significant air drag compensation
-        } else {
-            1.65 // Very long: heavy air drag + multiple bounces
-        };
-
-        let needed_velocity = distance * GROUND_FRICTION * overshoot;
+        // Launch speed so the ball reaches the target rolling on the grass
+        // (`engine::physics` ground-roll model: constant deceleration plus
+        // v^2 drag) with the arrival speed the old weighting produced.
+        let (needed_velocity, _) = Self::ground_pass_speeds(distance);
 
         // pass_force (0.3-2.0) modulates: skilled players weight the pass better
         // Normalize to 0.90-1.1 range so it fine-tunes rather than drives the physics

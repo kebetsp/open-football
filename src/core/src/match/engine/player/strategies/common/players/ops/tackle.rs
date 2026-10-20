@@ -558,8 +558,7 @@ fn build_input(
         TackleKind::Slide => (norm_or(away * 0.5 + lateral * 0.9, away), 1.3, 0.35),
         TackleKind::Challenge => (norm_or(away * 0.7 + lateral * 0.4, away), 0.55, 0.2),
         // Aimed straight at the nearest boundary, hard enough to carry
-        // there (distance <= 72u needs ~1.4 u/tick against ground
-        // friction).
+        // there (distance <= 72u).
         TackleKind::PushOut => match nearest_exit(ctx, ball) {
             Some(e) => (e.dir, 1.8, 0.2),
             None => (norm_or(away * 0.7 + lateral * 0.4, away), 0.55, 0.2),
@@ -679,11 +678,11 @@ fn pushout_value(
         } else if o.touched {
             let v = xy(o.velocity);
             let speed = v.magnitude();
-            // Does the ball actually get there? Friction stops a ball of
-            // speed s after ~s/0.015 units.
+            // Does the ball actually get there? Ground-roll model
+            // (`engine::physics`): how far a ball of this speed rolls.
             let heads_out = speed > 0.5
                 && v.dot(&exit.dir) > 0.6 * speed
-                && speed / 0.015 >= exit.dist;
+                && crate::r#match::engine::physics::roll_stop_distance(speed) >= exit.dist;
             if heads_out {
                 threat - exit.cost
             } else {
