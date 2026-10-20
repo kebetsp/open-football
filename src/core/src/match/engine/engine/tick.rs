@@ -1616,10 +1616,21 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         };
         let heading = (p.skills.technical.heading / 20.0).clamp(0.0, 1.0);
         let jumping = (p.skills.physical.jumping / 20.0).clamp(0.0, 1.0);
-        let contact = (0.62 + (heading + jumping) * 0.5 * 0.30).clamp(0.55, 0.95);
+        let mut contact = (0.62 + (heading + jumping) * 0.5 * 0.30).clamp(0.55, 0.95);
+        // HDR_QUALITY (2026-10-20, Pavel): control and marking set how GOOD
+        // the header is, never WHETHER it is taken. A man within ~5 m lowers
+        // contact quality; a poor contact is a weak, off-target header, not
+        // a cancelled shot.
+        let quality_only = crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::QUALITY);
+        if quality_only
+            && crate::r#match::engine::ball::contact::opponent_near_ball(&field.players, p.team_id, field.ball.position)
+        {
+            contact -= 0.15;
+        }
         let glanced = context.rng.unit_f32() >= contact;
-        let risky = crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::CLUMSY)
-            && crate::r#match::engine::ball::contact::opponent_near_ball(&field.players, p.team_id, field.ball.position);
+        let risky = quality_only
+            || (crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::CLUMSY)
+                && crate::r#match::engine::ball::contact::opponent_near_ball(&field.players, p.team_id, field.ball.position));
         if glanced && !risky {
             return; // glanced it: the flick-on drift from the contest stands
         }
