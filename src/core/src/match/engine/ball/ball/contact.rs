@@ -66,8 +66,9 @@ pub mod hdr {
     pub const FREE: usize = 7; // unchallenged attacker at the ball takes the header
     pub const CLUMSY: usize = 8; // opponent within ~5 m: a glanced header is a mishit, not a foot touch
     pub const GK: usize = 6; // the keeper runs onto a high ball in his own box
+    pub const RECV: usize = 9; // the intended receiver of a lofted ball always runs to the head-height point
     pub const DEF: usize = 5; // a defender in reach clears even when no attacker can reach
-    static FLAGS: OnceLock<[bool; 9]> = OnceLock::new();
+    static FLAGS: OnceLock<[bool; 10]> = OnceLock::new();
     pub fn on(i: usize) -> bool {
         FLAGS.get_or_init(|| {
             // Default on for the validated parts; "HDR_X=0" turns one off,
@@ -87,6 +88,7 @@ pub mod hdr {
                 e("HDR_GK", true),
                 e("HDR_FREE", true),
                 e("HDR_CLUMSY", false),
+                e("HDR_RECV", true),
             ]
         })[i]
     }

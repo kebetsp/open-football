@@ -3014,6 +3014,40 @@ impl<'p> StateProcessor<'p> {
             _ => {}
         }
         let b = &ctx.tick_context.positions.ball;
+        // Intended receiver of a live lofted pass from his own team near a
+        // goal (2026-10-20, HDR_RECV): he always attacks the ball, from the
+        // moment it leaves the passer's foot. The ETA and rank tests below
+        // only choose WHO runs among competing players; a receiver whose
+        // run was "too late" used to fall back to his BoxRun and jog
+        // (measured: blocked on 49% of in-flight ticks, and the head point
+        // did not exist for 66%: ball below 1.6 m or a low cross).
+        if !is_gk
+            && crate::r#match::engine::ball::contact::hdr::on(crate::r#match::engine::ball::contact::hdr::RECV)
+            && ctx.tick_context.ball.last_pass_to == Some(player.id)
+            && ctx.tick_context.ball.pass_origin_team == Some(player.team_id)
+            && ctx.context.current_tick().saturating_sub(ctx.tick_context.ball.last_pass_tick) <= 400
+            && ctx.tick_context.ball.pass_origin_restart == crate::r#match::PassOriginRestart::OpenPlay
+        {
+            if let Some((target, _ticks)) = crate::r#match::engine::ball::Ball::predict_header_point_recv_from(b.position, b.velocity) {
+                let goal_l = ctx.context.goal_positions.left;
+                let goal_r = ctx.context.goal_positions.right;
+                let near = ((target.x - goal_l.x).powi(2) + (target.y - goal_l.y).powi(2)).sqrt() < 200.0
+                    || ((target.x - goal_r.x).powi(2) + (target.y - goal_r.y).powi(2)).sqrt() < 200.0;
+                let speed = player
+                    .skills
+                    .max_speed_with_condition(player.player_attributes.condition)
+                    .max(0.05);
+                let to = Vector3::new(target.x - player.position.x, target.y - player.position.y, 0.0);
+                let dist = to.magnitude();
+                if near && dist <= 400.0 {
+                    if dist < 1.0 {
+                        return Some(Vector3::zeros());
+                    }
+                    return Some(to / dist * speed.min(dist));
+                }
+            }
+        }
+        let b = &ctx.tick_context.positions.ball;
         let (target, ticks) = crate::r#match::engine::ball::Ball::predict_head_point_from(
             b.position, b.velocity,
         )?;

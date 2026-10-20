@@ -1175,6 +1175,77 @@ impl Ball {
         None
     }
 
+    /// Receiver version of [`Ball::predict_head_point_from`] (HDR_RECV,
+    /// 2026-10-20). The intended receiver must start running the moment
+    /// the ball leaves the passer's foot, so this works from ANY starting
+    /// height (the other version needs z >= 1.6, which loses the first
+    /// 0.3-0.5 s of every cross), and it also covers low crosses that
+    /// never rise above 2.3 m yet stay inside the header band
+    /// (1.6-2.4 m) for a while: the ball must reach 1.7 m at its peak,
+    /// and the target is where it comes down through 2.0 m (or 1.7 m for
+    /// a low cross). A ball already descending inside the band returns
+    /// its current position at tick 0.
+    pub fn predict_header_point_recv_from(
+        start_pos: Vector3<f32>,
+        start_vel: Vector3<f32>,
+    ) -> Option<(Vector3<f32>, u32)> {
+        const MAX_TICKS: u32 = 220;
+        const AIR_DRAG: f32 = 0.04;
+        const BALL_MASS: f32 = 0.43;
+        let g = crate::r#match::engine::physics::GRAVITY_PER_TICK;
+        let mut pos = start_pos;
+        let mut vel = start_vel;
+        let mut peak = pos.z;
+        let mut pk = pos;
+        // Peak height first (ballistic), so the target height is known.
+        {
+            let (mut p, mut v) = (pos, vel);
+            for _ in 0..MAX_TICKS {
+                let n = v.norm();
+                if n > 0.1 {
+                    let a = -AIR_DRAG * n / BALL_MASS * 0.016;
+                    v.x += v.x * a;
+                    v.y += v.y * a;
+                    v.z += v.z * a;
+                }
+                v.z -= g;
+                p += v;
+                if p.z > pk.z {
+                    pk = p;
+                }
+                if p.z < 0.2 && v.z < 0.0 {
+                    break;
+                }
+            }
+        }
+        peak = peak.max(pk.z);
+        if peak < 1.7 {
+            return None;
+        }
+        let z_star = if peak >= 2.3 { 2.0 } else { 1.7 };
+        if pos.z >= 1.6 && pos.z <= z_star && vel.z < 0.0 {
+            return Some((pos, 0));
+        }
+        for t in 1..=MAX_TICKS {
+            let n = vel.norm();
+            if n > 0.1 {
+                let a = -AIR_DRAG * n / BALL_MASS * 0.016;
+                vel.x += vel.x * a;
+                vel.y += vel.y * a;
+                vel.z += vel.z * a;
+            }
+            vel.z -= g;
+            pos += vel;
+            if pos.z < 0.2 && vel.z < 0.0 {
+                return None;
+            }
+            if vel.z < 0.0 && pos.z <= z_star {
+                return Some((pos, t));
+            }
+        }
+        None
+    }
+
     /// Check if the ball is aerial (in the air above player reach)
     pub fn is_aerial(&self) -> bool {
         const PLAYER_REACH_HEIGHT: f32 = 2.3;
