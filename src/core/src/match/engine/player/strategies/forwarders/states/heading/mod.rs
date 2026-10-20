@@ -57,7 +57,8 @@ impl StateProcessingHandler for ForwardHeadingState {
             let heading = ctx.player.skills.technical.heading / 20.0;
             let jumping = ctx.player.skills.physical.jumping / 20.0;
             let p = (0.62 + (heading + jumping) * 0.5 * 0.30).clamp(0.55, 0.95);
-            return if ctx.context.rng.unit_f32() < p {
+            let tgt = crate::r#match::engine::ball::contact::header_attempt(ctx.context.rng.unit_f32() < p, ctx.player().shooting_direction(), ctx.context.rng.unit_f32());
+            return if let Some(tgt) = tgt {
                 #[cfg(feature = "match-logs")]
                 {
                     use crate::r#match::player::strategies::players::ops::forward_shot_decision::mid_run_diag::FWD_HEADING_CORNER_BRANCH;
@@ -69,7 +70,7 @@ impl StateProcessingHandler for ForwardHeadingState {
                     Event::PlayerEvent(PlayerEvent::Shoot(
                         ShootingEventContext::new()
                             .with_player_id(ctx.player.id)
-                            .with_target(ctx.player().shooting_direction())
+                            .with_target(tgt)
                             .with_reason("FWD_HEADING_ON_GOAL")
                             .with_shot_type(ShotType::Header)
                             .build(ctx),
@@ -114,7 +115,7 @@ impl StateProcessingHandler for ForwardHeadingState {
         }
 
         // Attempt the header — combine duel win with skill execution.
-        if self.attempt_heading(ctx) {
+        if let Some(tgt) = crate::r#match::engine::ball::contact::header_attempt(self.attempt_heading(ctx), ctx.player().shooting_direction(), ctx.context.rng.unit_f32()) {
             // Success — shoot toward opponent goal, marked as a Header
             // for downstream xG.
             #[cfg(feature = "match-logs")]
@@ -128,7 +129,7 @@ impl StateProcessingHandler for ForwardHeadingState {
                 Event::PlayerEvent(PlayerEvent::Shoot(
                     ShootingEventContext::new()
                         .with_player_id(ctx.player.id)
-                        .with_target(ctx.player().shooting_direction())
+                        .with_target(tgt)
                         .with_reason("FWD_HEADING_ON_GOAL")
                         .with_shot_type(ShotType::Header)
                         .build(ctx),

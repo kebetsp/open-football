@@ -1500,7 +1500,7 @@ impl Ball {
         if !super::contact::hdr::on(super::contact::hdr::CLAIM) {
             return false;
         }
-        if p.tactical_position.current_position.is_goalkeeper() || !super::contact::can_header_in(p, self.position, players) {
+        if p.tactical_position.current_position.is_goalkeeper() {
             return false;
         }
         let mid_y = self.field_height * 0.5;
@@ -1509,6 +1509,23 @@ impl Ball {
             let dx = self.position.x - gx;
             (dx * dx + dy * dy).sqrt() <= 160.0
         });
+        // HDR_BOOK (2026-10-20): a ball still above header height
+        // (> CONTEST_MAX_Z) and right over this player near goal is about
+        // to come down into his header band. The early bookkeeping claim
+        // used to attach it to him there, before the header contest could
+        // start (measured: 67% of cross first touches were outside header
+        // reach). He waits for it instead; the claim returns once the
+        // ball is lower or he is not under it.
+        if super::contact::hdr::on(super::contact::hdr::BOOK) && near_goal && self.position.z > super::contact::CONTEST_MAX_Z {
+            let bdx = p.position.x - self.position.x;
+            let bdy = p.position.y - self.position.y;
+            if bdx * bdx + bdy * bdy <= 30.0 * 30.0 {
+                return true;
+            }
+        }
+        if !super::contact::can_header_in(p, self.position, players) {
+            return false;
+        }
         near_goal
             || players.iter().any(|o| {
                 o.team_id != p.team_id

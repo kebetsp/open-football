@@ -66,10 +66,11 @@ pub mod hdr {
     pub const FREE: usize = 7; // unchallenged attacker at the ball takes the header
     pub const CLUMSY: usize = 8; // opponent within ~5 m: a glanced header is a mishit, not a foot touch
     pub const GK: usize = 6; // the keeper runs onto a high ball in his own box
+    pub const BOOK: usize = 11; // an early bookkeeping claim of an airborne ball does not stop the aerial contest
     pub const QUALITY: usize = 10; // a poor contact is a weak off-target header, never a cancelled shot
     pub const RECV: usize = 9; // the intended receiver of a lofted ball always runs to the head-height point
     pub const DEF: usize = 5; // a defender in reach clears even when no attacker can reach
-    static FLAGS: OnceLock<[bool; 11]> = OnceLock::new();
+    static FLAGS: OnceLock<[bool; 12]> = OnceLock::new();
     pub fn on(i: usize) -> bool {
         FLAGS.get_or_init(|| {
             // Default on for the validated parts; "HDR_X=0" turns one off,
@@ -91,6 +92,7 @@ pub mod hdr {
                 e("HDR_CLUMSY", false),
                 e("HDR_RECV", true),
                 e("HDR_QUALITY", true),
+                e("HDR_BOOK", true),
             ]
         })[i]
     }
@@ -194,4 +196,22 @@ mod tests {
         assert!(MIN_REACH < MAX_REACH);
         assert!(MAX_REACH <= 24.0);
     }
+}
+
+/// HDR_QUALITY (2026-10-20): the target of a header attempt. A good
+/// contact keeps `dir`; a poor one is still a header on goal but aimed well
+/// off target (70-140u either side). With the switch off a poor contact
+/// returns `None` (no shot), the previous behaviour. `r` is a uniform
+/// random number in [0,1).
+pub fn header_attempt(good: bool, dir: Vector3<f32>, r: f32) -> Option<Vector3<f32>> {
+    if good {
+        return Some(dir);
+    }
+    if !hdr::on(hdr::QUALITY) {
+        return None;
+    }
+    let off = 70.0 + (r * 2.0).fract() * 70.0;
+    let mut t = dir;
+    t.y += if r < 0.5 { off } else { -off };
+    Some(t)
 }

@@ -73,7 +73,7 @@ impl StateProcessingHandler for DefenderAttackingCornerState {
                 use std::sync::atomic::Ordering;
                 crate::r#match::player::strategies::common::players::ops::forward_shot_decision::mid_run_diag::DEF_CORNER_HEAD_CHANCE.fetch_add(1, Ordering::Relaxed);
             }
-            if self.win_header(ctx) {
+            if let Some(tgt) = crate::r#match::engine::ball::contact::header_attempt(self.win_header(ctx), ctx.player().shooting_direction(), ctx.context.rng.unit_f32()) {
                 #[cfg(feature = "match-logs")]
                 {
                     use std::sync::atomic::Ordering;
@@ -84,7 +84,7 @@ impl StateProcessingHandler for DefenderAttackingCornerState {
                     Event::PlayerEvent(PlayerEvent::Shoot(
                         ShootingEventContext::new()
                             .with_player_id(ctx.player.id)
-                            .with_target(ctx.player().shooting_direction())
+                            .with_target(tgt)
                             .with_reason("DEF_CORNER_HEADER")
                             .with_shot_type(ShotType::Header)
                             .build(ctx),
