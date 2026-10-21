@@ -585,7 +585,8 @@ fn dist_point_segment(p: Vector3<f32>, a: Vector3<f32>, b: Vector3<f32>) -> f32 
 /// the wide lane ~1.1/match vs real 4.7). Size is a calibration to that real
 /// arrival rate (swept via `BYLINE_STICKY`, default `BYLINE_STICKY_DEFAULT`).
 /// 2026-10-07 re-sweep on the contest model (30 matches each): 0.8 -> ~7 arrivals/match (0.5: 5.7), crosses flat (8.2-8.7), crosses from <=5.5m 8% -> 13%; 1.2/1.6 not better (sweep is noisy).
-const BYLINE_STICKY_DEFAULT: f32 = 0.8;
+/// 2026-10-21 sweep after the kick-physics rewrite (60 matches per sample): 0.4 -> 3.8 arrivals/match, 0.8 -> 5.1-5.2, 1.2 -> 4.8, 2.0 -> 5.9-6.7, 3.0 -> 5.9; crosses from byline runs 1.2 -> 1.4-1.7; 3.0 goals 2.59 / shots 15.6 vs 2.0 goals 2.34 / shots 15.0 (within noise). Default raised to 3.0 on Pavel's call.
+const BYLINE_STICKY_DEFAULT: f32 = 3.0;
 fn byline_sticky() -> f32 {
     static K: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *K.get_or_init(|| {
