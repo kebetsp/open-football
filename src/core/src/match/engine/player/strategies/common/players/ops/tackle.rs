@@ -88,8 +88,17 @@ pub const LEG_CONTACT_RADIUS: f32 = 1.9;
 pub const BODY_CONTACT_RADIUS: f32 = 2.8;
 /// Search horizon: 0.6 s.
 pub const CONTACT_HORIZON_TICKS: u32 = 60;
-/// Hard cap on any deflected ball's speed (MAX_SHOT_VELOCITY).
-pub const MAX_DEFLECT_SPEED: f32 = 3.2;
+/// Deflected ball's speed ceiling: the same physical limit as any kick
+/// (`engine::kick`, derived from foot speed and the collision).
+pub const MAX_DEFLECT_SPEED: f32 = crate::r#match::engine::kick::KICK_SPEED_LIMIT_UTK;
+/// A leg contact cannot give the ball more than any kick can: scale a
+/// deflection so its TRUE speed (horizontal and vertical together) stays
+/// within the physical limit.
+fn within_kick_limit(v: Vector3<f32>) -> Vector3<f32> {
+    let t = crate::r#match::engine::kick::speed_mps(&v);
+    let limit = crate::r#match::engine::kick::KICK_SPEED_LIMIT_MPS;
+    if t > limit { v * (limit / t) } else { v }
+}
 /// Max deflection apex height (m) — a slide lifts, it doesn't lob.
 pub const MAX_DEFLECT_HEIGHT_M: f32 = 2.5;
 /// Ball must be this many ticks ahead of the body contact for a clean
@@ -298,7 +307,7 @@ pub fn resolve_contact(input: &ContactInput) -> ContactOutcome {
         ball_tick = Some(t);
         outcome.touched = true;
         outcome.ball_tick = ball_tick;
-        outcome.velocity = Vector3::new(v_out.x, v_out.y, vz);
+        outcome.velocity = within_kick_limit(Vector3::new(v_out.x, v_out.y, vz));
         outcome.control = control;
         outcome.leg_fraction = if tip_contact { 1.0 } else { frac };
         break;
@@ -492,7 +501,7 @@ pub fn block_contact(
     // Low contact lifts the ball a little (same lift model as a leg touch).
     let lift_angle = 0.17 + 0.45 * loft_roll;
     let vz = ((-vn / 8.0) * lift_angle.tan()).clamp(0.0, launch_vz(MAX_DEFLECT_HEIGHT_M));
-    Vector3::new(v_out.x, v_out.y, vz)
+    within_kick_limit(Vector3::new(v_out.x, v_out.y, vz))
 }
 
 /// Build the contact input for a tackle of `kind` against `opponent`

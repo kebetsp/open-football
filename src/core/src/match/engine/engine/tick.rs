@@ -558,8 +558,8 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // and the claim cooldown plus the absent `cached_shot_target`
             // keep the physics save & GK state machine out of it — the
             // outcome was already decided by the conversion model.
-            // Real strike from the spot at the shot-speed cap (3.2 u/tick,
-            // ~40 m/s); the ball is NOT moved. The decided goal is aimed
+            // Real strike from the spot (a placed ~32 m/s penalty through
+            // the kick model); the ball is NOT moved. The decided goal is aimed
             // inside the post, far from the keeper, and flagged so a
             // catch/parry event cannot undo it (`penalty_decided`).
             let corner_y = if context.rng.bernoulli(0.5) { 24.0 } else { -24.0 };
@@ -568,7 +568,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 let v = Vector3::new(aim.x - ball_pos.x, aim.y - ball_pos.y, 0.0);
                 v.normalize()
             };
-            field.ball.velocity = Vector3::new(dir.x * 3.2, dir.y * 3.2, 0.0);
+            field.ball.velocity = penalty_strike(field, taker_id, dir, context);
             field.ball.penalty_decided = Some((taker_id, true));
             // Mark the ball as a live shot. `check_goal` only credits a
             // crossing when the scorer has recent shot MEMORY (invisible
@@ -621,7 +621,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     let v = Vector3::new(aim.x - ball_pos.x, aim.y - ball_pos.y, 0.0);
                     v.normalize()
                 };
-                field.ball.velocity = Vector3::new(dir.x * 3.2, dir.y * 3.2, 0.0);
+                field.ball.velocity = penalty_strike(field, taker_id, dir, context);
                 field.ball.penalty_decided = Some((taker_id, false));
                 {
                     use crate::r#match::engine::ball::ball::ShotTarget;
@@ -2200,4 +2200,27 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             save_accounting_stats::ON_TARGET_PAIRED[1].fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// A penalty is a placed, deliberate strike (~32 m/s intended) through the
+/// kick model, so its speed carries the taker's own spread and ceiling like
+/// every other kick. The outcome itself was decided beforehand
+/// (`penalty_decided`); this only sets how the ball leaves the spot.
+fn penalty_strike(
+    field: &MatchField,
+    taker_id: u32,
+    dir: Vector3<f32>,
+    context: &MatchContext,
+) -> Vector3<f32> {
+    use crate::r#match::engine::kick::{StrikeKind, Striker};
+    use crate::r#match::player::strategies::players::ops::skill_composites as sc;
+    const PENALTY_INTENDED_UTK: f32 = 2.6; // 32.5 m/s
+    let minute = sc::minute_from_ms(context.total_match_time);
+    let striker = match field.players.iter().find(|p| p.id == taker_id) {
+        Some(p) => Striker::from_player(p, minute, StrikeKind::Kick),
+        None => Striker::new(0.5, 0.5, StrikeKind::Kick),
+    };
+    striker
+        .strike_vector(Vector3::new(dir.x * PENALTY_INTENDED_UTK, dir.y * PENALTY_INTENDED_UTK, 0.0), &context.rng)
+        .0
 }

@@ -2131,14 +2131,12 @@ impl PlayerEventDispatcher {
         let actual_pass_vector = actual_target - pass_origin;
         let actual_horizontal_distance = Self::calculate_horizontal_distance(&actual_pass_vector);
 
-        // Calculate pass force with power variation
-        // Bad players hit passes with inconsistent power
+        // Pass force: the intended weight of the pass. Execution noise
+        // (a normal spread that depends on technique and effort) is applied
+        // once, by the strike model in `engine::kick`, when the ball leaves
+        // the boot — not here as a second, uniform power roll.
         let power_consistency = 1.0 + (skills.technique * skills.stamina * 0.1);
-        let power_variation_range = (1.0 - overall_quality) * 0.35;
-        let power_variation = rng.random_range(
-            power_consistency - power_variation_range..power_consistency + power_variation_range,
-        );
-        let adjusted_force = event_model.pass_force * power_variation;
+        let adjusted_force = event_model.pass_force * power_consistency;
 
         // Calculate horizontal velocity to reach target
         let horizontal_velocity =
@@ -2262,12 +2260,12 @@ impl PlayerEventDispatcher {
             trajectory_type,
             TrajectoryType::HighArc | TrajectoryType::MediumArc
         ) {
-            const MAX_LOFTED_HORIZONTAL_SPEED: f32 = 3.2; // matches MAX_PASS_VELOCITY below
             let total_flight_ticks = (2.0 * final_z_velocity
                 / crate::r#match::engine::physics::GRAVITY_PER_TICK)
                 .max(1.0);
-            let required_speed =
-                (actual_horizontal_distance / total_flight_ticks).clamp(0.3, MAX_LOFTED_HORIZONTAL_SPEED);
+            // The speed this flight needs. Whether the striker can produce it
+            // is decided by the strike model below, not by a cap here.
+            let required_speed = (actual_horizontal_distance / total_flight_ticks).max(0.3);
             let dir = if horizontal_velocity.norm() > 0.01 {
                 horizontal_velocity.normalize()
             } else {
@@ -2284,17 +2282,6 @@ impl PlayerEventDispatcher {
             horizontal_velocity.y,
             final_z_velocity,
         );
-
-        // CRITICAL: Validate velocity to prevent cosmic-speed passes.
-        // Field is 840u = 105m (1u = 0.125m), simulation at 100 ticks/s.
-        // Old 7.0 u/tick = 87.5 m/s = 315 km/h — the same unit-conversion
-        // error family as everything else, assuming "1u ≈ 0.5m". Real
-        // football pass speeds: short ball 5-15 m/s, medium 15-25 m/s,
-        // elite driven/long pass tops out ~35 m/s. Cap at 3.2 u/tick
-        // (40 m/s) — elite piledriver territory, never broken by any
-        // outfield pass in real play. Matches the MAX_SHOT_VELOCITY
-        // calibration and restores the real shot/player speed ratio.
-        const MAX_PASS_VELOCITY: f32 = 3.2;
 
         // Check for NaN or infinity
         if final_velocity.x.is_nan()
@@ -2313,89 +2300,49 @@ impl PlayerEventDispatcher {
             );
         }
 
-        // Clamp velocity magnitude to maximum.
-        //
-        // 2026-07-16 realism pass: corner/FK HighArc deliveries clamp the
-        // HORIZONTAL component independently of z, instead of folding both
-        // into one combined-magnitude check. Diagnosed mechanism: a long
-        // corner (taker at the flag to a central box target is a genuine
-        // ~250-290u straight-line distance) needs a z-velocity near its own
-        // ceiling (`calculate_max_z_velocity`, already 8-15.6 for that
-        // distance bracket with the corner boost) just to clear the packed
-        // box — and that z component ALONE already exceeds the entire 3.2
-        // u/tick shared budget. Combining it with horizontal before the
-        // clamp scaled horizontal down to ~20-30% of what the distance
-        // requires, so the cross landed a fraction of the way to its aim
-        // and the rest of the "delivery" was a slow ground roll. z already
-        // has its own dedicated, distance-scaled ceiling — it doesn't need
-        // to also share a magnitude budget with horizontal. Every other
-        // pass type (open play, short/medium crosses) keeps the original
-        // combined clamp; this is scoped to the diagnosed mechanism only.
-        //
-        // 2026-07-16 GK-distribution extension: goalkeeper long kicks
-        // (goal kicks + open-play releases, both fire this event with
-        // `passer_is_goalkeeper` true) have their own even-higher raw z
-        // ceiling (`calculate_max_z_velocity`'s >250u bucket × the 1.5 GK
-        // boost = 12-18) and were NOT in this carve-out — so they fell
-        // through the combined clamp exactly like corners/FKs did before
-        // this fix, measured at reach_ratio 0.17-0.48 (mean 0.24) over 824
-        // sampled kicks, landing short of even the kicker's own penalty
-        // box in every one of a 324-kick sample.
-        //
-        // 2026-07-16 universal extension: the same mechanism is not
-        // GK-specific — ANY passer's ball is assigned a `HighArc`
-        // trajectory whenever `select_trajectory_type_contextual` (or one
-        // of the special-cased overrides above) decides the distance/
-        // obstacles call for it, and every such pass shares the identical
-        // distance-scaled z ceiling. Gating the carve-out on passer
-        // identity or delivery type was fixing the symptom in three
-        // places instead of the actual invariant. Measured: a plain
-        // outfield HighArc pass >60u (switches of play, counter-attack
-        // outlets, midfield long balls — reasons like
-        // `DEF_COUNTER_ATTACK`, `MID_RUNNING_SHOULD_PASS`,
-        // `FWD_PASSING_STATE`) had reach_ratio mean 0.47 / median 0.41
-        // over 1858 sampled kicks (15 matches) — the identical shortfall,
-        // just never carved out. `DEF_COUNTER_ATTACK` specifically was
-        // worse than the pre-fix GK number: mean 0.33 / median 0.30 over
-        // 271 samples — the exact "counter-attack ball doesn't reach the
-        // striker" case. The condition below now keys on the trajectory
-        // itself rather than accumulating more passer/reason special
-        // cases: whenever the ball is going to be struck as a genuine
-        // lofted ball, it needs the power to actually get there,
-        // regardless of who's kicking it. Reuses the same already-
-        // validated z cap (safer than inventing a new one for this much
-        // larger population) — real-world peak-height differences by
-        // pass type (a raking 50m diagonal vs. a near-post corner) remain
-        // an open, unsourced question, same caveat as the GK case above.
+        // Lofted-apex ceiling for deliveries (a trajectory choice, not a
+        // speed cap): a driven corner/cross peaks around 5 m.
         if matches!(trajectory_type, TrajectoryType::HighArc) {
-            // 2026-08 height-physics rewrite: `calculate_max_z_velocity`'s
-            // own ceiling already applies (its bucket table tops out at a
-            // real 8-12m for extreme/goal-kick distances, correctly
-            // converted). This SECOND cap exists specifically to bound
-            // corner/FK-cross/GK-long deliveries — a real driven corner
-            // or cross realistically peaks around 4-5m (sourced: a real
-            // measured corner trajectory example implies a ~6.3m full
-            // ballistic apex; practical header-contest height is 1.8-2.5m
-            // — Coaching American Soccer / peer-reviewed corner-kinematics
-            // writeup), so this stays a genuine, separate, tighter ceiling
-            // rather than relying on the (taller) general long-pass cap.
             let lofted_delivery_max_z = Self::z_launch_velocity_for_height(5.0);
             if final_velocity.z > lofted_delivery_max_z {
                 final_velocity.z = lofted_delivery_max_z;
             }
-            let horizontal_mag = (horizontal_velocity.x * horizontal_velocity.x
-                + horizontal_velocity.y * horizontal_velocity.y)
-                .sqrt();
-            if horizontal_mag > MAX_PASS_VELOCITY {
-                let scale = MAX_PASS_VELOCITY / horizontal_mag;
-                final_velocity.x = horizontal_velocity.x * scale;
-                final_velocity.y = horizontal_velocity.y * scale;
-            }
-        } else {
-            let velocity_magnitude = final_velocity.norm();
-            if velocity_magnitude > MAX_PASS_VELOCITY {
-                final_velocity = final_velocity * (MAX_PASS_VELOCITY / velocity_magnitude);
-            }
+        }
+
+        // The strike. How fast the ball really leaves is decided by the
+        // foot-ball collision (`engine::kick`): the wanted velocity is
+        // reached up to the striker's own ceiling, with a normal spread, and
+        // can never exceed what a human foot can do. A lob that its striker
+        // cannot hit hard enough is relaunched at the angle that still lands
+        // it (a real player would go higher, not weaker).
+        {
+            use crate::r#match::engine::kick::{StrikeKind, Striker, relaunch_lofted, speed_mps};
+            let kind = if field.ball.pass_origin_restart == PassOriginRestart::ThrowIn {
+                StrikeKind::Throw
+            } else {
+                StrikeKind::Kick
+            };
+            let striker = Striker::from_player(
+                field.get_player(event_model.from_player_id).unwrap(),
+                minute,
+                kind,
+            );
+            let intended_mps = speed_mps(&final_velocity);
+            let (struck, saturated) = striker.strike_vector(final_velocity, rng);
+            let lofted = matches!(
+                trajectory_type,
+                TrajectoryType::HighArc | TrajectoryType::MediumArc
+            );
+            final_velocity = if saturated && lofted {
+                relaunch_lofted(&final_velocity, speed_mps(&struck), actual_horizontal_distance)
+            } else {
+                struck
+            };
+            #[cfg(feature = "match-logs")]
+            crate::match_log_info!(
+                "KICKDIAG pass intended_mps={:.1} struck_mps={:.1} saturated={} traj={:?} dist_u={:.0}",
+                intended_mps, speed_mps(&struck), saturated, trajectory_type, actual_horizontal_distance
+            );
         }
 
         // Apply ball physics
@@ -3115,15 +3062,9 @@ impl PlayerEventDispatcher {
         const GOAL_WIDTH: f32 = 29.0; // Half-width of goal in game units (matches engine GOAL_WIDTH)
         #[allow(dead_code)]
         const GOAL_HEIGHT: f32 = 8.0; // Height of crossbar
-        // Shot velocity cap. Field is 840u = 105m, so 1u = 0.125m, and at
-        // 100-tick/s simulation a cap of 5.6 u/tick meant 70 m/s (~252 km/h)
-        // — about 2× the real-world top shot speed (~35 m/s = 2.8 u/tick).
-        // Keepers covering 1.16 u/tick laterally had only 9 ticks of shot
-        // flight from 50u out (~10u of coverage) against a 29u half-goal:
-        // any shot aimed outside the central 15u bypassed the save check.
-        // Calibrated to real-world peak shot speed — elite piledrivers now
-        // arrive in ~18 ticks instead of ~9, matching the ~3.75× shot/player
-        // speed ratio observed in real football (vs. the engine's prior ~10×).
+        // What the keeper-bias projection below ASSUMES a shot's speed is
+        // (a belief about typical shot pace, not a limit — the real limit
+        // comes from the strike model in `engine::kick`).
         const MAX_SHOT_VELOCITY: f32 = 3.2;
         field.ball.penalty_decided = None;
         const MIN_SHOT_DISTANCE: f32 = 1.0; // Minimum distance to prevent NaN from normalization
@@ -3902,10 +3843,10 @@ impl PlayerEventDispatcher {
         let horizontal_direction = Vector3::new(shot_vector.x, shot_vector.y, 0.0).normalize();
         let base_horizontal_velocity = shoot_event_model.force as f32 * power_multiplier * 1.6;
 
-        // Add power randomness (better players have more consistent power)
+        // Intended power. Execution spread (normal, shrinking with technique)
+        // is applied by the strike model when the ball leaves the boot.
         let power_consistency = 0.96 + (technique_skill * 0.08); // 0.96 to 1.04
-        let power_random = rng.random_range(power_consistency - 0.04..power_consistency + 0.04);
-        let horizontal_velocity = horizontal_direction * base_horizontal_velocity * power_random;
+        let horizontal_velocity = horizontal_direction * base_horizontal_velocity * power_consistency;
 
         // Calculate z-velocity based on shot style and player skills
         let shot_style: f32 = rng.random_range(0.0..1.0);
@@ -4080,24 +4021,26 @@ impl PlayerEventDispatcher {
             );
         }
 
-        // Clamp velocity magnitude to maximum realistic shot speed.
-        //
-        // 2026-08 realism-bug fix: this used to clamp the COMBINED (x,y,z)
-        // magnitude — the same "shared budget" bug already found and fixed
-        // for corner/FK-cross/GK-long passes on 2026-07-16 (a genuine z
-        // component, even a modest one, would scale horizontal speed DOWN
-        // too, since both shared one budget). For shots this was mostly
-        // inert historically because base z-velocity was small — but the
-        // new hang-time floor above deliberately raises z for long shots,
-        // and squashing horizontal to compensate would undo exactly the
-        // fix (a shot that arrives later AND slower). Clamp horizontal
-        // independently, same pattern already proven safe for passes.
-        let horizontal_magnitude =
-            (final_velocity.x * final_velocity.x + final_velocity.y * final_velocity.y).sqrt();
-        if horizontal_magnitude > MAX_SHOT_VELOCITY {
-            let scale = MAX_SHOT_VELOCITY / horizontal_magnitude;
-            final_velocity.x *= scale;
-            final_velocity.y *= scale;
+        // The strike. Shot speed is whatever the foot-ball collision gives
+        // (`engine::kick`): the intended velocity up to the shooter's own
+        // ceiling, normal spread, never beyond the physical limit. The old
+        // 3.2 u/tick horizontal clamp is gone.
+        {
+            use crate::r#match::engine::kick::{StrikeKind, Striker, speed_mps};
+            let striker = Striker::new(
+                power_skill,
+                technique_skill * 0.5 + execution_skill * 0.5,
+                StrikeKind::Kick,
+            );
+            #[cfg(feature = "match-logs")]
+            let intended_mps = speed_mps(&final_velocity);
+            let (struck, _saturated) = striker.strike_vector(final_velocity, rng);
+            #[cfg(feature = "match-logs")]
+            crate::match_log_info!(
+                "KICKDIAG shot intended_mps={:.1} struck_mps={:.1} saturated={}",
+                intended_mps, speed_mps(&struck), _saturated
+            );
+            final_velocity = struck;
         }
 
         // Record shot in player memory. A shot counts as "on target" only
@@ -5529,20 +5472,24 @@ impl PlayerEventDispatcher {
             field.ball.cached_shot_target = None;
         }
 
-        // Clearance cap. Needs more headroom than a pass because a
-        // clearance is typically lofted — horizontal AND vertical
-        // components are both meaningful, so the total magnitude
-        // (sqrt(hx² + hy² + vz²)) legitimately exceeds a flat pass.
-        // In-engine gravity is strong (balls fall fast), so a proper
-        // hoof needs ~5 u/tick each of horizontal and vertical to
-        // travel 30-40m before landing. 7.0 total covers that with a
-        // little slack. Still well below the global MAX_VELOCITY safety.
-        const MAX_CLEAR_VELOCITY: f32 = 3.2; // physical ceiling (was 7.0 = 87 m/s)
-        let speed = velocity.norm();
-        let mut capped_velocity = if speed > MAX_CLEAR_VELOCITY {
-            velocity * (MAX_CLEAR_VELOCITY / speed)
-        } else {
-            velocity
+        // The strike. A clearance is a hoof: the wanted velocity is reached
+        // up to the clearer's own ceiling (weak or tired players clear
+        // shorter), with a normal spread, never beyond the physical limit
+        // (`engine::kick`). The old 3.2 u/tick cap is gone. Without an
+        // owner (a keeper's punch of a shot) the touch is struck as an
+        // average player's.
+        let mut capped_velocity = {
+            use crate::r#match::engine::kick::{StrikeKind, Striker};
+            let minute = sc::minute_from_ms(context.total_match_time);
+            let striker = match field
+                .ball
+                .current_owner
+                .and_then(|id| field.get_player(id))
+            {
+                Some(p) => Striker::from_player(p, minute, StrikeKind::Kick),
+                None => Striker::new(0.5, 0.5, StrikeKind::Kick),
+            };
+            striker.strike_vector(velocity, &context.rng).0
         };
 
         // SAFETY: Prevent clearances from going toward own goal

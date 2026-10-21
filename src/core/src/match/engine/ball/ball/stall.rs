@@ -66,19 +66,33 @@ impl Ball {
             // escaped the 12-unit radius. Solution: kick harder AND
             // set `in_flight_state` so normal ownership checks are
             // suppressed long enough for the ball to actually leave.
-            let owner_side = self
+            let owner = self
                 .current_owner
-                .and_then(|id| players.iter().find(|p| p.id == id))
-                .and_then(|p| p.side);
+                .and_then(|id| players.iter().find(|p| p.id == id));
+            let owner_side = owner.and_then(|p| p.side);
+            // A hard, deliberate clearing kick: ~28 m/s if the kicker can
+            // produce it, otherwise his own top speed (no rng here, so no
+            // spread). Was a flat 7.0 u/tick (87 m/s) that the integrator
+            // silently clamped.
+            let wanted_mps = 28.0_f32;
+            let kick_mps = owner
+                .map(|p| {
+                    crate::r#match::engine::kick::Striker::from_player(
+                        p,
+                        45,
+                        crate::r#match::engine::kick::StrikeKind::Kick,
+                    )
+                    .top_ball_speed_mps()
+                })
+                .unwrap_or(wanted_mps)
+                .min(wanted_mps);
+            let push = kick_mps / crate::r#match::engine::kick::MPS_PER_UTK;
             let push_x: f32 = match owner_side {
-                Some(PlayerSide::Left) => 7.0,
-                Some(PlayerSide::Right) => -7.0,
-                _ => 7.0,
+                Some(PlayerSide::Left) => push,
+                Some(PlayerSide::Right) => -push,
+                _ => push,
             };
-            // 2026-08 height-physics rewrite: 0.8m is a real target apex
-            // for a hard, deliberate "clear the stall zone" kick — a low,
-            // driven push, not a lofted one. Shared conversion (engine
-            // audit #1, 2026-08-28) — see `match::engine::physics`.
+            // 0.8 m target apex: a low, driven push, not a lofted one.
             let stall_kick_z =
                 crate::r#match::engine::physics::z_launch_velocity_for_height(0.8);
             self.velocity = Vector3::new(push_x, 0.0, stall_kick_z);

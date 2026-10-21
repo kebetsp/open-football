@@ -18,12 +18,13 @@ impl Ball {
         // for 3-5 cycles before a defender could claim. 0.3 keeps the
         // second bounce low enough to reach on the return trip.
         const BOUNCE_COEFFICIENT: f32 = 0.3;
-        // Physical speed ceiling (2026-10-16 no-teleport/no-unphysical-
-        // motion rule): 3.2 u/tick = 40 m/s, the shot/pass cap and about
-        // the fastest real kick. Nothing — clearance, deflection, tackle
-        // contact — may exceed it. (Was 8.0 with clearances at 7.0 =
-        // 87 m/s.) 3.3 leaves float slack above the 3.2 action caps.
-        const MAX_VELOCITY: f32 = 3.3;
+        // Safety rail, not a mechanism (2026-10-20): every kick's speed is
+        // bounded by the strike model (`engine::kick`, derived from foot
+        // speed and the collision, ~37 m/s), and leg contacts are bounded by
+        // the same limit. This only catches a future source that forgets to
+        // be; the log below fires if it ever does. Measured in true m/s
+        // (the old check mixed u/tick with metres/tick).
+        const RAIL_MPS: f32 = crate::r#match::engine::kick::KICK_SPEED_LIMIT_MPS * 1.02;
 
         // Physics constants for realistic ball behavior
         // Air drag: affects aerial balls (proportional to v²)
@@ -48,14 +49,13 @@ impl Ball {
             return;
         }
 
-        let mut velocity_norm_sq = self.velocity.norm_squared();
-
-        // Clamp velocity if it exceeds maximum
-        if velocity_norm_sq > MAX_VELOCITY * MAX_VELOCITY {
-            let velocity_norm = velocity_norm_sq.sqrt();
-            self.velocity = self.velocity * (MAX_VELOCITY / velocity_norm);
-            velocity_norm_sq = MAX_VELOCITY * MAX_VELOCITY;
+        let true_mps = crate::r#match::engine::kick::speed_mps(&self.velocity);
+        if true_mps > RAIL_MPS {
+            #[cfg(feature = "match-logs")]
+            crate::match_log_info!("BALLRAIL fired speed_mps={:.1}", true_mps);
+            self.velocity = self.velocity * (RAIL_MPS / true_mps);
         }
+        let velocity_norm_sq = self.velocity.norm_squared();
 
         // engine audit #1 (2026-08-28): this used to branch into a
         // COMPLETELY DIFFERENT, made-up deceleration model ("multiply by
