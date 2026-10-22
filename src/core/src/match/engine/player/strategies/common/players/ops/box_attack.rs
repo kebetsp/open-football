@@ -906,16 +906,20 @@ pub fn decide_final_third(
     #[cfg(feature = "match-logs")]
     let mut pw = (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
     // (best pass value, p_c, tm lat m, tm depth m, chance_at, distance m)
+    let bias = super::directive_bias::on_ball(ctx);
     let mut best = Action::Hold;
-    let mut best_value = HOLD_VALUE;
+    let mut best_value = if bias.no_hold { 0.0 } else { HOLD_VALUE };
     let (mut d_shoot, mut d_deliver, mut d_pass, mut d_carry, mut d_take) =
         (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let (mut d_pf, mut d_pl, mut d_pb) = (0.0f32, 0.0f32, 0.0f32);
     let toward = (goal.x - from.x).signum();
 
     // Shoot.
-    if (goal - from).magnitude() <= SHOT_MAX_RANGE {
-        let v = shot_xg(from, goal, opponents);
+    if (goal - from).magnitude() <= SHOT_MAX_RANGE * bias.range_mul() {
+        let v = bias.shot(
+            shot_xg(from, goal, opponents),
+            nearest_opponent_dist(from, opponents) > 22.0,
+        );
         d_shoot = v;
         if v > best_value {
             best_value = v;
@@ -1046,6 +1050,14 @@ pub fn decide_final_third(
         if ctx.tick_context.ball.last_owner == Some(tm.id) {
             v *= BACK_TO_PASSER_MULT;
         }
+        v = bias.pass(v)
+            * super::directive_bias::receiver_mult(
+                ctx,
+                tm.id,
+                tm.position.y,
+                (tm.position - from).magnitude(),
+            )
+            * super::directive_bias::intercept_mult(ctx, from, tm.id, tm.position);
         d_pass = d_pass.max(v);
         #[cfg(feature = "match-logs")]
         if v > pw.0 {
@@ -1092,6 +1104,9 @@ pub fn decide_final_third(
     for i in 0..CARRY_HEADINGS {
         let t = i as f32 / (CARRY_HEADINGS - 1) as f32;
         let heading = rotate_xy(forward, -half + 2.0 * half * t);
+        if bias.stay_wide && -(from.y - goal.y).signum() * heading.y > 0.25 {
+            continue;
+        }
         let fair = carry_fair_scoring();
         let step_len = if fair { FAIR_CARRY_STEP } else { CARRY_STEP };
         let open = if fair && carry_contest_on() {
@@ -1222,7 +1237,8 @@ pub fn decide_final_third(
         };
         let v = disc * p_keep * press_keep * (end_value.unwrap_or_else(|| carry_chance_at(ctx, target, goal, opponents)) + RETAIN_BONUS)
             * carry_sticky_mult(ctx.player.velocity, heading)
-            * flank_mult;
+            * flank_mult
+            * bias.carry_mul;
         d_carry = d_carry.max(v);
         #[cfg(feature = "match-logs")]
         if flank_run && v > bl.0 {
@@ -1251,7 +1267,8 @@ pub fn decide_final_third(
             contest::carrier_skill_of(ctx, ctx.player.id),
             contest::defender_skill_of(ctx, blocker.id),
         );
-        let v = CARRY_DISCOUNT * p_beat * press_keep * (chance_at(beyond, goal, opponents) + RETAIN_BONUS);
+        let v = CARRY_DISCOUNT * p_beat * press_keep * (chance_at(beyond, goal, opponents) + RETAIN_BONUS)
+            * bias.carry_mul;
         d_take = v;
         if v > best_value {
             let lateral = Vector3::new(-forward.y, forward.x, 0.0);

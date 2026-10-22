@@ -338,6 +338,12 @@ struct Cand {
     position_group: PlayerFieldPositionGroup,
     start_position: Vector3<f32>,
     side: Option<PlayerSide>,
+    /// Manager `defensive_bias` levers (identical on every player of a
+    /// team; 1.0 / true = neutral). Compactness scales the lateral pull
+    /// toward the ball's side and tightens the midfield-to-back-line
+    /// gap; `show_outside` flips the presser's show-side.
+    compactness: f32,
+    show_outside: bool,
     /// This player's duty from the *previous* tick — read before this
     /// tick's reset, purely to bias continuity (Steps C/D/E). Never
     /// used as a source of new information, only as a tie-break toward
@@ -421,6 +427,8 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             position_group: p.tactical_position.current_position.position_group(),
             start_position: p.start_position,
             side: p.side,
+            compactness: p.defensive_compactness,
+            show_outside: p.defensive_show_outside,
             prev_duty: p.ai_defensive_duty,
             is_taking_ball: matches!(
                 p.state,
@@ -1175,7 +1183,14 @@ fn assign_team(
         let lateral = predicted.y - own_goal.y; // goal centre y == pitch centre y
         let wide = ((lateral.abs() - WIDE_START_UNITS) / WIDE_RAMP_UNITS).clamp(0.0, 1.0);
         if wide > 0.0 {
-            let inward = Vector3::new(0.0, -lateral.signum(), 0.0);
+            let show_outside = cands
+                .iter()
+                .find(|c| c.team_id == defending_team)
+                .map(|c| c.show_outside)
+                .unwrap_or(true);
+            // "Show them inside" flips the side the presser forces the carrier to.
+            let side_sign = if show_outside { -1.0 } else { 1.0 };
+            let inward = Vector3::new(0.0, side_sign * lateral.signum(), 0.0);
             let mixed = dir + inward * (SHOW_OUTSIDE_WEIGHT * wide);
             if mixed.magnitude() > 0.01 {
                 dir = mixed.normalize();
@@ -1210,7 +1225,14 @@ fn assign_team(
     // line reacting and the other sitting still.
     let back_line_depth = (predicted_ball_dist_to_goal * LINE_PUSH_FACTOR)
         .clamp(LINE_MIN_DEPTH_UNITS, LINE_MAX_DEPTH_UNITS);
-    let mid_line_depth = back_line_depth + MIDFIELD_LINE_GAP_UNITS;
+    let team_compactness = cands
+        .iter()
+        .find(|c| c.team_id == defending_team)
+        .map(|c| c.compactness)
+        .unwrap_or(1.0);
+    // Compactness 1.0 = the doctrine default; >1 tightens the midfield line
+    // toward the back line and pulls more strongly toward the ball's side.
+    let mid_line_depth = back_line_depth + MIDFIELD_LINE_GAP_UNITS / team_compactness.max(0.5);
 
     // Forwards excluded from ordinary hold-shape too (see the pool-
     // construction comment above) — they don't hold the back/mid line.
@@ -1226,8 +1248,8 @@ fn assign_team(
             _ => back_line_depth,
         };
         let target_x = own_goal.x + attack_dir * line_depth;
-        let target_y = c.start_position.y * (1.0 - WIDTH_PULL_FRACTION)
-            + predicted_carrier_pos.y * WIDTH_PULL_FRACTION;
+        let pull = (WIDTH_PULL_FRACTION * team_compactness).clamp(0.05, 0.9);
+        let target_y = c.start_position.y * (1.0 - pull) + predicted_carrier_pos.y * pull;
         let mut target = Vector3::new(target_x, target_y, 0.0);
         // Real spacing from the single nearest attacker (any opponent —
         // not just the carrier or the small set of top-ranked marked

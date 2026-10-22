@@ -235,9 +235,10 @@ pub enum Action {
 /// doc's "manager instructions always win" section.
 fn is_directed_or_restart_pending(ctx: &StateProcessingContext) -> bool {
     let player = ctx.player;
-    if player.behavioral_directive.is_some()
-        || player.link_target.is_some()
-        || player.supply_target.is_some()
+    // Only BylineAndCross still bypasses (see `directive_bias`); every
+    // other directive, link target and supply target tilts THIS domain's
+    // own values instead of removing the player from it.
+    if super::directive_bias::bypasses_new_systems(player)
         || player.kickoff_pass_pending > 0
         || player.throw_in_pass_pending > 0
         || player.free_kick_pass_pending > 0
@@ -820,12 +821,19 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
         return Some(super::box_attack::decide_final_third(ctx, from, attacking_goal, &opponents));
     }
 
+    let bias = super::directive_bias::on_ball(ctx);
+    let field_h = ctx.context.field_size.height as f32;
     let mut best_action = Action::Hold;
-    let mut best_value = HOLD_VALUE;
+    let mut best_value = if bias.no_hold { 0.0 } else { HOLD_VALUE };
 
     let dist_to_goal = (attacking_goal - from).magnitude();
-    if dist_to_goal <= SHOOT_EVAL_RADIUS {
-        let v = shoot_value(from, attacking_goal, &opponents);
+    if dist_to_goal <= SHOOT_EVAL_RADIUS * bias.range_mul() {
+        let raw = if dist_to_goal <= SHOOT_EVAL_RADIUS {
+            shoot_value(from, attacking_goal, &opponents)
+        } else {
+            0.0
+        };
+        let v = bias.shot(raw, nearest_opponent_dist(from, &opponents) > 22.0);
         if v > best_value {
             best_value = v;
             best_action = Action::Shoot;
@@ -837,7 +845,9 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
         if dist < 5.0 {
             continue;
         }
-        let v = pass_value(ctx, from, &tm, own_goal, attacking_goal, &opponents);
+        let v = bias.pass(pass_value(ctx, from, &tm, own_goal, attacking_goal, &opponents))
+            * super::directive_bias::receiver_mult(ctx, tm.id, tm.position.y, dist)
+            * super::directive_bias::intercept_mult(ctx, from, tm.id, tm.position);
         if v > best_value {
             best_value = v;
             best_action = Action::Pass(tm.id);
@@ -868,7 +878,11 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
         }
     }
 
-    let (cv, ctarget) = carry_value(from, forward, own_goal, attacking_goal, &opponents, group, ctx.player.velocity);
+    let (cv, mut ctarget) = carry_value(from, forward, own_goal, attacking_goal, &opponents, group, ctx.player.velocity);
+    let cv = cv * bias.carry_mul;
+    if bias.stay_wide {
+        ctarget = super::directive_bias::keep_wide(from, ctarget, field_h);
+    }
     if cv > best_value {
         best_value = cv;
         best_action = Action::Carry(ctarget);
@@ -877,6 +891,12 @@ pub fn decide_on_ball_action(ctx: &StateProcessingContext) -> Option<Action> {
     if let Some((dv, dtarget)) =
         dribble_value(ctx, from, forward, own_goal, attacking_goal, &opponents, group)
     {
+        let dv = dv * bias.carry_mul;
+        let dtarget = if bias.stay_wide {
+            super::directive_bias::keep_wide(from, dtarget, field_h)
+        } else {
+            dtarget
+        };
         if dv > best_value {
             best_value = dv;
             best_action = Action::Dribble(dtarget);

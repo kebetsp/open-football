@@ -7,6 +7,7 @@ pub mod defender_skill;
 pub mod defensive;
 pub mod defensive_duty;
 pub mod defensive_value;
+pub mod directive_bias;
 pub mod dribble_duel;
 pub mod effective_skill;
 pub mod first_touch;

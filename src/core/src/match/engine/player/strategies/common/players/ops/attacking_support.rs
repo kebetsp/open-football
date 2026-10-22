@@ -303,6 +303,10 @@ struct Cand {
     start_position: Vector3<f32>,
     side: Option<PlayerSide>,
     is_directed: bool,
+    /// Manager directive that shapes this player's off-ball duty (the
+    /// directive no longer removes him from the pool — see
+    /// `directive_bias`).
+    directive: Option<crate::club::player::traits::BehavioralDirective>,
 }
 
 struct Assignment {
@@ -464,9 +468,8 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
             position_group: p.tactical_position.current_position.position_group(),
             start_position: p.start_position,
             side: p.side,
-            is_directed: p.behavioral_directive.is_some()
-                || p.link_target.is_some()
-                || p.supply_target.is_some(),
+            is_directed: crate::r#match::player::strategies::common::players::ops::directive_bias::bypasses_new_systems(p),
+            directive: p.behavioral_directive,
         })
         .collect();
 
@@ -729,18 +732,49 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         }
     }
 
+    // --- Step B.5: manager directive "run in behind" (`RunChannelInBehind`,
+    // also what a teammate trigger switches on): a forced Penetrate run into
+    // his own channel just in front of the opponent's goal line.
+    let run_behind: Vec<Cand> = pool
+        .iter()
+        .filter(|c| {
+            c.directive == Some(crate::club::player::traits::BehavioralDirective::RunChannelInBehind)
+                && !assigned.contains(&c.id)
+        })
+        .copied()
+        .collect();
+    for c in run_behind.iter() {
+        let channel_y = c.start_position.y;
+        results.push(Assignment {
+            id: c.id,
+            duty: AttackDuty::Penetrate,
+            target: Vector3::new(opponent_goal.x - attack_dir * 70.0, channel_y, 0.0),
+            redirected: false,
+        });
+        assigned.push(c.id);
+    }
+
     // --- Step C: width -- any remaining wide-slotted player holds the
     // flank, at a depth keyed to role + current phase (`width_depth`).
     let target_x_from_depth = |depth: f32| own_goal.x + attack_dir * depth;
     let wide_cands: Vec<Cand> = pool
         .iter()
-        .filter(|c| !assigned.contains(&c.id) && is_wide(c.position_type, front_two_early))
+        .filter(|c| {
+            !assigned.contains(&c.id)
+                && (is_wide(c.position_type, front_two_early)
+                    || c.directive
+                        == Some(crate::club::player::traits::BehavioralDirective::StayWideNoCutInside))
+        })
         .copied()
         .collect();
     let field_height = context.field_size.height as f32;
     let mut flank_group_seen: Vec<(bool, PlayerFieldPositionGroup, i32)> = Vec::new();
     for c in wide_cands.iter() {
-        let is_left = is_left_flank(c.position_type);
+        let is_left = if is_wide(c.position_type, front_two_early) {
+            is_left_flank(c.position_type)
+        } else {
+            c.start_position.y < field_height / 2.0
+        };
         let stagger_index = match flank_group_seen
             .iter_mut()
             .find(|(l, g, _)| *l == is_left && *g == c.position_group)
@@ -804,6 +838,12 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         && (field.ball.position - opponent_goal).magnitude() <= box_crowd_gate;
     let box_central_band = box_half_width * BOX_CENTRAL_BAND_FRACTION;
     let box_pocket_offset = box_half_width * BOX_POCKET_Y_FRACTION;
+    let width_emph = field
+        .players
+        .iter()
+        .find(|p| p.id == reference_id)
+        .map(|p| p.spatial_width_emphasis)
+        .unwrap_or(1.0);
     let mut central_box_count = 0usize;
     let mut pocket_occupancy = [0i32, 0i32]; // [left, right]
 
@@ -817,7 +857,12 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         } else {
             c.start_position.y
         };
-        let y = anchor_y * (1.0 - ADVANCE_WIDTH_PULL) + field.ball.position.y * ADVANCE_WIDTH_PULL;
+        // Manager `spatial_bias.widthEmphasis` (1.0 = neutral): >1 keeps the
+        // advancing line in its own lanes and stretches it away from the
+        // pitch centre; <1 pulls it toward the ball and compacts it.
+        let anchor_y = field_height / 2.0 + (anchor_y - field_height / 2.0) * width_emph.clamp(0.5, 1.5);
+        let pull = (ADVANCE_WIDTH_PULL / width_emph.max(0.3)).clamp(0.0, 0.9);
+        let y = anchor_y * (1.0 - pull) + field.ball.position.y * pull;
 
         // A forward in the Progression phase holds the highest central
         // line (`advance_depth`) and runs in behind when there is genuine

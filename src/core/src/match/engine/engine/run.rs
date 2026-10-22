@@ -1127,11 +1127,15 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // Teammate triggers: on any owner change, actors with a
             // trigger switch their effective directive on (trigger
             // teammate on the ball) or revert to their base directive.
-            if any_teammate_triggers && raw_owner != last_trigger_owner {
-                last_trigger_owner = raw_owner;
+            // Reads the effective possessor (last controlled touch counts),
+            // not the single-tick raw owner: the trigger used to be on for
+            // ~one tick per touch (audit 2026-10-22).
+            let trig_owner = raw_owner.or_else(|| field.ball.possessing_touch());
+            if any_teammate_triggers && trig_owner != last_trigger_owner {
+                last_trigger_owner = trig_owner;
                 for p in field.players.iter_mut() {
                     if let Some((trigger_id, action)) = p.teammate_trigger {
-                        p.behavioral_directive = if raw_owner == Some(trigger_id) {
+                        p.behavioral_directive = if trig_owner == Some(trigger_id) {
                             Some(action)
                         } else {
                             p.directive_base
@@ -2457,6 +2461,12 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // to the captured base. Ball-lane triggers are side-corrected
             // so "left" is always the manager's left wing.
             if any_shape_rules {
+                // Effective possessor for shape-rule triggers (the raw
+                // single-tick owner left "in possession" rules active ~4% of
+                // the time — audit 2026-10-22).
+                let shape_poss_team = raw_owner
+                    .or_else(|| field.ball.possessing_touch())
+                    .and_then(|id| field.players.iter().find(|p| p.id == id).map(|p| p.team_id));
                 let w = context.field_size.width as f32;
                 let h = context.field_size.height as f32;
                 let third = h / 3.0;
@@ -2477,7 +2487,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         Some(s) => s,
                         None => continue,
                     };
-                    let in_possession = current_owner_team == Some(p.team_id);
+                    let in_possession = shape_poss_team == Some(p.team_id);
                     let raw_lane: i8 = if ball_y < third {
                         -1
                     } else if ball_y > h - third {
@@ -2543,7 +2553,8 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     let ball_owned = current_owner_team.is_some();
                     let mut target = base;
                     let mut rule_active = false;
-                    for rule in &p.shape_rules {
+                    let mut manager_active = false;
+                    for (rule_idx, rule) in p.shape_rules.iter().enumerate() {
                         if rule.is_active(
                             in_possession,
                             ball_owned,
@@ -2556,11 +2567,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         ) {
                             target = rule.target(base, side, w, h, team_tactical, ball_y);
                             rule_active = true;
+                            manager_active = rule_idx < p.manager_rule_count as usize;
                             break;
                         }
                     }
                     p.start_position = target;
                     p.shape_rule_active = rule_active;
+                    p.shape_manager_active = manager_active;
                 }
             }
 

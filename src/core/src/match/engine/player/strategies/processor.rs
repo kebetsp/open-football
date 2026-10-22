@@ -1324,6 +1324,39 @@ impl<'p> StateProcessor<'p> {
     /// position 8u off the target. In possession the marker plays normal.
     ///
     /// Never fires for goalkeepers or for a player currently on the ball.
+    /// True only while an explicit press/mark assignment is actually
+    /// driving this player (target is in possession, or a marker's team
+    /// lacks the ball). Every "explicit assignment wins" gate below keys
+    /// on this instead of on the mere presence of a target: a presser
+    /// whose target does not have the ball belongs to the normal
+    /// defensive/attacking systems (the audit measured a permanently
+    /// excluded presser ending FARTHER from his target, 134 -> 166u).
+    /// Reads `possessor`, not the single-tick `current_owner`.
+    fn assignment_active(ctx: &StateProcessingContext) -> bool {
+        let player = ctx.player;
+        if player.press_target.is_none() && player.mark_target.is_none() {
+            return false;
+        }
+        if player.tactical_position.current_position.is_goalkeeper() {
+            return false;
+        }
+        let possessor = ctx.tick_context.ball.possessor;
+        if possessor == Some(player.id) {
+            return false;
+        }
+        if let Some(t) = player.press_target {
+            if possessor == Some(t) && !ctx.ball().is_held_by_opponent_goalkeeper() {
+                return true;
+            }
+        }
+        if let Some(t) = player.mark_target {
+            if possessor == Some(t) || !ctx.team().is_control_ball() {
+                return true;
+            }
+        }
+        false
+    }
+
     fn assignment_override_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
         let player = ctx.player;
         if player.press_target.is_none() && player.mark_target.is_none() {
@@ -1351,7 +1384,7 @@ impl<'p> StateProcessor<'p> {
                 + ctx.player().separation_velocity() * 0.05
         };
 
-        let ball_owner = ctx.ball().owner_id();
+        let ball_owner = ctx.tick_context.ball.possessor;
 
         if let Some(target_id) = player.press_target {
             if ball_owner == Some(target_id) && !ctx.ball().is_held_by_opponent_goalkeeper() {
@@ -1943,7 +1976,7 @@ impl<'p> StateProcessor<'p> {
             return None; // kicker-mode baseline: gated off, see kicker_line_hold_velocity
         }
         let player = ctx.player;
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None; // an explicit assignment always wins
         }
         if matches!(ctx.player.state, Defender(DefenderState::Tackling)) {
@@ -2003,7 +2036,7 @@ impl<'p> StateProcessor<'p> {
             return None;
         }
         let player = ctx.player;
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None;
         }
         if matches!(
@@ -2077,7 +2110,7 @@ impl<'p> StateProcessor<'p> {
             return None;
         }
         let player = ctx.player;
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None;
         }
         if ctx.ball().owner_id() == Some(player.id) {
@@ -2474,7 +2507,7 @@ impl<'p> StateProcessor<'p> {
         if matches!(player.ai_attack_duty, AttackDuty::None) {
             return None;
         }
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None;
         }
         if ctx.ball().owner_id() == Some(player.id) {
@@ -2514,7 +2547,7 @@ impl<'p> StateProcessor<'p> {
         if matches!(player.ai_attack_duty, AttackDuty::None) {
             return None;
         }
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None;
         }
         if ctx.ball().owner_id() == Some(player.id) {
@@ -2587,7 +2620,7 @@ impl<'p> StateProcessor<'p> {
         if player.width_commitment_ticks == 0 {
             return None;
         }
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None; // an explicit assignment always wins
         }
         if matches!(ctx.player.state, Forward(ForwardState::Tackling)) {
@@ -2650,7 +2683,7 @@ impl<'p> StateProcessor<'p> {
             return None; // kicker-mode baseline: gated off, see kicker_line_hold_velocity
         }
         let player = ctx.player;
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None; // an explicit assignment always wins
         }
         if player.give_and_go_run_ticks == 0 {
@@ -2693,7 +2726,7 @@ impl<'p> StateProcessor<'p> {
             return None; // kicker-mode baseline: gated off, see kicker_line_hold_velocity
         }
         let player = ctx.player;
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None; // an explicit assignment always wins
         }
         if player.drop_and_spin_run_ticks == 0 {
@@ -2759,7 +2792,7 @@ impl<'p> StateProcessor<'p> {
             return None; // kicker-mode baseline: gated off (no shots dispatched anyway)
         }
         let player = ctx.player;
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None; // an explicit assignment always wins
         }
         // Yield outright to the from-null domain-1 system
@@ -2926,7 +2959,7 @@ impl<'p> StateProcessor<'p> {
             return None; // kicker-mode baseline: gated off (no shots dispatched anyway)
         }
         let player = ctx.player;
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None; // an explicit assignment always wins
         }
         if player.tactical_position.current_position.is_goalkeeper() {
@@ -2983,7 +3016,7 @@ impl<'p> StateProcessor<'p> {
             return None; // kicker-mode baseline: gated off (no shots dispatched anyway)
         }
         let player = ctx.player;
-        if player.press_target.is_some() || player.mark_target.is_some() {
+        if Self::assignment_active(ctx) {
             return None; // an explicit assignment always wins
         }
         let pos_type = player.tactical_position.current_position;

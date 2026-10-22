@@ -136,6 +136,12 @@ pub struct BallMetadata {
     /// block deflection). Read by the team shot gate to suspend the
     /// shot-spacing cooldown during box scrambles. 0 = none yet.
     pub last_rebound_tick: u64,
+
+    /// Who effectively has the ball: the raw single-tick owner, else the
+    /// last controlled touch (`Ball::possessing_touch`). `current_owner`
+    /// alone is true for ~4% of ticks; assignment triggers (press, mark,
+    /// teammate trigger) must read this instead.
+    pub possessor: Option<u32>,
 }
 
 impl BallMetadata {
@@ -183,6 +189,7 @@ impl BallMetadata {
         self.corner_box_hold = field.ball.corner_box_hold;
         self.throw_in_preferred_receiver = field.ball.throw_in_preferred_receiver;
         self.last_rebound_tick = field.ball.last_rebound_tick;
+        self.possessor = field.ball.current_owner.or_else(|| field.ball.possessing_touch());
     }
 }
 
@@ -209,6 +216,7 @@ impl From<&MatchField> for BallMetadata {
             corner_box_hold: [(0, 0.0, 0.0); 6],
             throw_in_preferred_receiver: None,
             last_rebound_tick: 0,
+            possessor: None,
         };
         meta.update(field);
         meta

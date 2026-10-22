@@ -146,6 +146,24 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // pattern and placement as the defensive-duty pass immediately
         // above.
         assign_attacking_support(field, context);
+        // Manager shape rules are OFFSETS on where the new systems already
+        // want the player (rule target minus his static `shape_base`), not
+        // absolute pins: an absolute pin dragged fullbacks 100u deeper than
+        // the dynamic lines and sent a "drop deeper" back four to its own
+        // goal line (audit re-test 2026-10-22).
+        for p in field.players.iter_mut() {
+            if !p.shape_manager_active || !p.shape_rule_active {
+                continue;
+            }
+            let Some(base) = p.shape_base else { continue };
+            let off = p.start_position - base;
+            if !matches!(p.ai_attack_duty, crate::r#match::player::AttackDuty::None) {
+                p.ai_attack_target += off;
+            }
+            if !matches!(p.ai_defensive_duty, crate::r#match::player::DefensiveDuty::None) {
+                p.ai_defensive_target += off;
+            }
+        }
         #[cfg(feature = "match-logs")]
         let owner_before_full = field.ball.current_owner;
         Self::play_players(field, context, tick_ctx, events);

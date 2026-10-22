@@ -78,6 +78,9 @@ pub enum ShapeAction {
     TuckInside,
     /// Drop ~12% of the pitch toward own goal, same lane.
     DropDeeper,
+    /// A short drop between the lines (~4% of the pitch, same lane) —
+    /// what the `drop_deep` instruction means for a forward/attacker.
+    DropShort,
     /// Principles-of-Play plan (2026-08-30): converge toward the team's
     /// shared back-line depth (`TeamTacticalState.defensive_line_x`,
     /// already computed and phase-aware, previously only read — softly
@@ -222,6 +225,11 @@ impl ShapeRule {
                     0.0,
                 )
             }
+            ShapeAction::DropShort => Vector3::new(
+                (base.x - dir * field_width * 0.04).clamp(20.0, field_width - 20.0),
+                base.y,
+                0.0,
+            ),
             ShapeAction::DropDeeper => Vector3::new(
                 (base.x - dir * field_width * 0.12).clamp(20.0, field_width - 20.0),
                 base.y,
@@ -807,6 +815,16 @@ pub struct MatchPlayer {
     /// right, 0 = centre. Pass-evaluator weight toward that lateral
     /// third ("build down the left").
     pub attack_bias: Option<i8>,
+    /// True when at least one of `shape_rules` was issued by the manager
+    /// (request `shapeRules`), as opposed to the engine's own default
+    /// rules. Manager rules are re-applied LAST in the velocity chain so the
+    /// new defensive/attacking systems cannot overwrite them.
+    pub manager_shape: bool,
+    /// Number of leading entries of `shape_rules` that are manager-issued
+    /// (they are pushed before the engine's defaults), and whether the rule
+    /// active this tick is one of them.
+    pub manager_rule_count: u8,
+    pub shape_manager_active: bool,
 
     /// Manager-set build-up-vs-direct dial, -2 (possession) .. +2
     /// (direct), 0 = neutral. Pass-evaluator weight on long-pass
@@ -1048,6 +1066,9 @@ impl MatchPlayer {
             shape_base: None,
             shape_rule_active: false,
             attack_bias: None,
+            manager_shape: false,
+            manager_rule_count: 0,
+            shape_manager_active: false,
             directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
@@ -1172,6 +1193,9 @@ impl MatchPlayer {
             shape_base: None,
             shape_rule_active: false,
             attack_bias: None,
+            manager_shape: false,
+            manager_rule_count: 0,
+            shape_manager_active: false,
             directness_bias: 0.0,
             is_force_match_selection,
             birth_date,
