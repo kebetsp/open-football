@@ -476,6 +476,7 @@ impl Ball {
                 self.restart_taker_lock = None; // new restart voids the old same-touch chain (§9.4.1)
                 self.restart_pending_taker = Some(taker_id);
                 self.corner_short_option = None; // §12.4 — set below iff staged
+                self.corner_box_hold = [(0, 0.0, 0.0); 6];
                 // Pick the corner routine via the SetPieceHistory-aware
                 // helper so repeated identical routines (with no chance
                 // produced) get blocked, varying the delivery flavour
@@ -638,6 +639,77 @@ impl Ball {
                     }
                 }
 
+                // Box filling (set-piece pass, 2026-10-22). Real corners
+                // (StatsBomb Bundesliga 2023/24, 360 freeze frames, n=245)
+                // have 5.7 attackers in the box besides the taker (p25-p75
+                // = 5-6); the engine staged ~3.7 because only the two CBs
+                // and the zone runners went in. Fill four more box slots
+                // from forwards first, then the remaining midfielders,
+                // best headers first. Fullbacks and holding players stay
+                // out (rest defence). Slots are >= 6m apart and mirror the
+                // staged CB pair / edge mids (no clustering, the 2026-09-12
+                // lesson).
+                {
+                    let mut taken: Vec<u32> = self
+                        .pending_restart_teleports
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(self.pending_corner_teleports.iter().map(|(id, _)| *id))
+                        .collect();
+                    taken.push(taker_id);
+                    let mut pool: Vec<(u32, f32, bool)> = players
+                        .iter()
+                        .filter(|p| {
+                            p.side == Some(attacking_side)
+                                && !taken.contains(&p.id)
+                                && (p.tactical_position.current_position.is_forward()
+                                    || p.tactical_position.current_position.is_midfielder())
+                        })
+                        .map(|p| {
+                            (
+                                p.id,
+                                p.skills.technical.heading,
+                                p.tactical_position.current_position.is_forward(),
+                            )
+                        })
+                        .collect();
+                    pool.sort_by(|a, b| {
+                        b.2.cmp(&a.2)
+                            .then(b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal))
+                    });
+                    let sgn: f32 = match side {
+                        GoalSide::Home => 1.0,
+                        GoalSide::Away => -1.0,
+                    };
+                    let goal_line_x = match side {
+                        GoalSide::Home => 0.0,
+                        GoalSide::Away => field_width,
+                    };
+                    // (depth from goal line, lateral offset from centre), in
+                    // priority order: penalty spot, six-yard centre, then the
+                    // two spot flanks and the box edge.
+                    let box_slots: [(f32, f32); 4] =
+                        [(88.0, 0.0), (48.0, 0.0), (84.0, -34.0), (84.0, 34.0)];
+                    let mut hold_n = 0usize;
+                    for ((id, _, _), (depth, lat)) in pool.iter().zip(box_slots.iter()) {
+                        let tx = goal_line_x + sgn * depth;
+                        let ty = center_y + lat;
+                        self.pending_restart_teleports
+                            .push((*id, Vector3::new(tx, ty, 0.0)));
+                        if hold_n < 6 {
+                            self.corner_box_hold[hold_n] = (*id, tx, ty);
+                            hold_n += 1;
+                        }
+                    }
+                    // The two staged centre-backs hold their post slots too.
+                    for (id, tgt) in self.pending_corner_teleports.clone().iter() {
+                        if hold_n < 6 {
+                            self.corner_box_hold[hold_n] = (*id, tgt.x, tgt.y);
+                            hold_n += 1;
+                        }
+                    }
+                }
+
                 // Defensive corner shape (wishlist #20 issue 4): the
                 // defending team previously ignored corners — measured
                 // 2/4 of the back line stranded 300-630u upfield while
@@ -657,13 +729,18 @@ impl Ball {
                     GoalSide::Away => -1.0_f32,
                 };
                 // (depth from goal line, lateral offset from centre).
-                let block_slots: [(f32, f32); 6] = [
+                // Real corners hold ~9 defenders in the box besides the
+                // keeper (StatsBomb 360, n=245); the engine held 6. Two more
+                // slots: six-yard centre and penalty-spot cover.
+                let block_slots: [(f32, f32); 8] = [
                     (10.0, -field_height * 0.10), // near post
                     (10.0, field_height * 0.10),  // far post
                     (30.0, -field_height * 0.05), // spot cover L
                     (30.0, field_height * 0.05),  // spot cover R
                     (58.0, -field_height * 0.09), // edge-of-box L (second ball)
                     (58.0, field_height * 0.09),  // edge-of-box R
+                    (44.0, 0.0),                  // six-yard centre
+                    (88.0, 0.0),                  // penalty-spot cover
                 ];
                 // Selecting by ROLE, not distance, is the whole point: the
                 // stranded players are the FULLBACKS pushed highest up, i.e.
@@ -677,7 +754,7 @@ impl Ball {
                     let dy = p.position.y - center_y;
                     (dx * dx + dy * dy).sqrt()
                 };
-                let mut block_ids: Vec<u32> = Vec::with_capacity(6);
+                let mut block_ids: Vec<u32> = Vec::with_capacity(8);
                 let mut back_line: Vec<(u32, f32)> = players
                     .iter()
                     .filter(|p| {
@@ -701,7 +778,7 @@ impl Ball {
                 block_ids.extend(back_line.iter().take(4).map(|&(id, _)| id));
                 block_ids.extend(
                     mids.iter()
-                        .take(6 - block_ids.len())
+                        .take(8 - block_ids.len())
                         .map(|&(id, _)| id),
                 );
                 for (slot, def_id) in block_ids.iter().enumerate() {
@@ -710,6 +787,36 @@ impl Ball {
                         *def_id,
                         Vector3::new(def_goal_x + into * depth, center_y + lateral, 0.0),
                     ));
+                }
+
+                // Law 17: every other defending outfielder inside 9.15m
+                // (73u) of the corner flag walks out to 9.15m+ during the
+                // dead-ball window. The processor's encroachment guard keeps
+                // them out until the kick; this makes the walk start at the
+                // award instead of after the freeze.
+                {
+                    const CORNER_CLEARANCE: f32 = 73.0;
+                    for p in players.iter() {
+                        if p.side != Some(defending_side)
+                            || p.tactical_position.current_position.is_goalkeeper()
+                            || block_ids.contains(&p.id)
+                        {
+                            continue;
+                        }
+                        let away = Vector3::new(p.position.x - corner_x, p.position.y - corner_y, 0.0);
+                        let d = (away.x * away.x + away.y * away.y).sqrt();
+                        if d >= CORNER_CLEARANCE {
+                            continue;
+                        }
+                        let dir = if d > 0.5 {
+                            away / d
+                        } else {
+                            Vector3::new(-into, if corner_y < center_y { 1.0 } else { -1.0 }, 0.0).normalize()
+                        };
+                        let tx = (corner_x + dir.x * (CORNER_CLEARANCE + 5.0)).clamp(2.0, field_width - 2.0);
+                        let ty = (corner_y + dir.y * (CORNER_CLEARANCE + 5.0)).clamp(2.0, field_height - 2.0);
+                        self.pending_restart_teleports.push((p.id, Vector3::new(tx, ty, 0.0)));
+                    }
                 }
 
                 // "GK up for late corners" (wishlist #16): teleport the

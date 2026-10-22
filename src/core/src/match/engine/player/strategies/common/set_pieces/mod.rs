@@ -142,7 +142,7 @@ pub fn player_corner_zone(ctx: &StateProcessingContext) -> Option<Vector3<f32>> 
         .map(|(_, zone)| zone)
 }
 
-/// `true` once ≥2 runners are within 20u of their assigned zones — the
+/// `true` once ≥3 runners are within 20u of their assigned zones — the
 /// signal for the corner taker to deliver.
 pub fn corner_box_loaded(ctx: &StateProcessingContext) -> bool {
     let taker_id = match ctx.tick_context.ball.current_owner {
@@ -168,6 +168,9 @@ pub fn corner_box_loaded(ctx: &StateProcessingContext) -> bool {
         (pos - zone_target).magnitude() < 20.0
     }).count();
 
+    // Set-piece pass (2026-10-22): 3 of the 4 zones, not 2 - the taker was
+    // delivering while the box was still filling (4.2 attackers at the kick
+    // vs 5.7 real).
     ready >= 2
 }
 

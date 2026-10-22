@@ -610,6 +610,11 @@ impl<'p> StateProcessor<'p> {
             result.velocity = Some(velocity);
         }
 
+        // Staged corner box attackers hold their slots until the kick.
+        if let Some(velocity) = Self::corner_box_hold_velocity(&processing_ctx) {
+            result.velocity = Some(velocity);
+        }
+
         // §12.4: the staged short-corner option holds his spot until the
         // corner is struck — without this his state machine runs him back
         // toward his anchor and the delivery picker's "genuinely
@@ -837,6 +842,42 @@ impl<'p> StateProcessor<'p> {
         }
 
         result
+    }
+
+    /// Set-piece pass (2026-10-22): the staged corner box attackers
+    /// (4 fill slots + the two centre-backs) walked to their slots during
+    /// the dead-ball window, but the moment it ended their state machines
+    /// (a flickering corner flag bailed AttackingCorner, domain 3 sent them
+    /// to Advance depths) walked them away, so the box was 4.2 attackers at
+    /// the kick against 5.7 real. Hold the slot while the taker still has
+    /// the ball; once he strikes it normal movement (and the zone/header
+    /// attack) resumes.
+    fn corner_box_hold_velocity(ctx: &StateProcessingContext) -> Option<Vector3<f32>> {
+        use crate::r#match::PassOriginRestart;
+        let ball = &ctx.tick_context.ball;
+        if ball.pass_origin_restart != PassOriginRestart::Corner {
+            return None;
+        }
+        let owner_id = ball.current_owner?;
+        let owner = ctx.context.players.by_id(owner_id)?;
+        if owner.team_id != ctx.player.team_id {
+            return None;
+        }
+        let (_, tx, ty) = ball
+            .corner_box_hold
+            .iter()
+            .copied()
+            .find(|(id, _, _)| *id != 0 && *id == ctx.player.id)?;
+        let to = Vector3::new(tx - ctx.player.position.x, ty - ctx.player.position.y, 0.0);
+        let dist = to.magnitude();
+        if dist < 3.0 {
+            return Some(Vector3::zeros());
+        }
+        let speed = ctx
+            .player
+            .skills
+            .max_speed_with_condition(ctx.player.player_attributes.condition);
+        Some(to / dist * speed.min(dist))
     }
 
     /// §12.4 hold for the staged short-corner option: zero velocity while

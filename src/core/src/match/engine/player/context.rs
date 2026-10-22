@@ -128,6 +128,7 @@ pub struct BallMetadata {
     /// if any. Read by the processor's hold override so he stays put
     /// (and genuinely stationary) until the kick.
     pub corner_short_option: Option<u32>,
+    pub corner_box_hold: [(u32, f32, f32); 6],
     /// Mirrors `Ball.throw_in_preferred_receiver` (realism-bug 2026-07-28).
     pub throw_in_preferred_receiver: Option<u32>,
 
@@ -179,6 +180,7 @@ impl BallMetadata {
         self.cached_shot_target = field.ball.cached_shot_target;
         self.pass_origin_restart = field.ball.pass_origin_restart;
         self.corner_short_option = field.ball.corner_short_option;
+        self.corner_box_hold = field.ball.corner_box_hold;
         self.throw_in_preferred_receiver = field.ball.throw_in_preferred_receiver;
         self.last_rebound_tick = field.ball.last_rebound_tick;
     }
@@ -204,6 +206,7 @@ impl From<&MatchField> for BallMetadata {
             cached_shot_target: None,
             pass_origin_restart: PassOriginRestart::OpenPlay,
             corner_short_option: None,
+            corner_box_hold: [(0, 0.0, 0.0); 6],
             throw_in_preferred_receiver: None,
             last_rebound_tick: 0,
         };

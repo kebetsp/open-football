@@ -5989,6 +5989,51 @@ impl PlayerEventDispatcher {
                         teleports.push((pid, Vector3::new(edge_x, y, 0.0)));
                     }
 
+                    // Set-piece pass (2026-10-22): real free kicks in range
+                    // have ~6 attackers in the box (StatsBomb 360, n=36:
+                    // 6.0 at shots, 6.4 at crosses, defenders 8.8-9.6); the
+                    // engine staged exactly 2. Four more from forwards first,
+                    // then midfielders (best headers first), on slots >= 6m
+                    // from the post pair and each other.
+                    let mut extra_slots: Vec<(f32, f32)> = Vec::new();
+                    {
+                        let mut taken_ids: Vec<u32> = box_ids.clone();
+                        taken_ids.extend(second_wave.iter().copied());
+                        let mut pool: Vec<(bool, f32, u32)> = field
+                            .players
+                            .iter()
+                            .filter(|p| {
+                                p.side == Some(victim_side)
+                                    && p.id != taker_id
+                                    && !p.is_sent_off
+                                    && !taken_ids.contains(&p.id)
+                                    && (p.tactical_position.current_position.is_forward()
+                                        || p.tactical_position.current_position.is_midfielder())
+                            })
+                            .map(|p| {
+                                (
+                                    p.tactical_position.current_position.is_forward(),
+                                    p.skills.technical.heading,
+                                    p.id,
+                                )
+                            })
+                            .collect();
+                        pool.sort_by(|a, b| {
+                            b.0.cmp(&a.0)
+                                .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                        });
+                        // (depth from goal line, lateral offset from centre)
+                        let slots: [(f32, f32); 4] =
+                            [(95.0, 0.0), (50.0, 0.0), (125.0, -30.0), (125.0, 30.0)];
+                        for ((_, _, pid), (depth, lat)) in pool.iter().zip(slots.iter()) {
+                            teleports.push((
+                                *pid,
+                                Vector3::new(goal_x + depth_dir * depth, mid_y + lat, 0.0),
+                            ));
+                            extra_slots.push((*depth, *lat));
+                        }
+                    }
+
                     // §12.3 — defensive mirror of the attacking shape.
                     // The two box attackers appear by teleport, so their
                     // markers must too (formation recovery walks and can
@@ -6003,11 +6048,16 @@ impl PlayerEventDispatcher {
                         (field_w * (95.0 / 840.0) - 14.0).min(dist_goal - 76.0).max(35.0);
                     let marker_x = goal_x + depth_dir * marker_depth;
                     let zone_x = goal_x + depth_dir * 55.0;
-                    let marker_spots = [
+                    let mut marker_spots = vec![
                         Vector3::new(marker_x, mid_y - field_h * 0.085, 0.0),
                         Vector3::new(marker_x, mid_y + field_h * 0.085, 0.0),
                         Vector3::new(zone_x, mid_y, 0.0),
                     ];
+                    // One goal-side marker per extra staged attacker.
+                    for (depth, lat) in extra_slots.iter() {
+                        let d = (depth - 14.0).min(dist_goal - 76.0).max(35.0);
+                        marker_spots.push(Vector3::new(goal_x + depth_dir * d, mid_y + lat, 0.0));
+                    }
                     let mut assigned: Vec<u32> =
                         teleports.iter().map(|(id, _)| *id).collect();
                     for spot in marker_spots {

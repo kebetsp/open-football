@@ -199,6 +199,58 @@ pub fn wall_size_for(band: FreeKickBand, is_wide_angle: bool) -> u8 {
     adj.max(2)
 }
 
+/// Probability that a direct free kick is SHOT rather than crossed or played
+/// short, from where it is taken (set-piece pass, 2026-10-22).
+///
+/// Sourced from StatsBomb open data (Bundesliga 2023/24 + Premier League
+/// 2015/16 first 120 matches; 3,762 free-kick events, 149 shots), share of
+/// free-kick events that are shots by distance to goal centre and lateral
+/// offset from the centre line (metres):
+///
+/// | dist m  | lat 0-6 | lat 6-12 | lat >12 |
+/// | 18-21   | 100%    | 89%      | 75% (n=4) |
+/// | 21-24   | 92%     | 85%      | 54%     |
+/// | 24-27   | 100%    | 87%      | 22%     |
+/// | 27-31   | 65%     | 43%      | 11%     |
+/// | 31-36   | 4%      | 11%      | 1%      |
+/// | 36+     | 0%      | 0%       | 0%      |
+///
+/// The old rule keyed on distance bands alone with a wide-angle cut-off at
+/// 60% of the distance, so a wide kick scored like a central one and the
+/// Close band (<18.75m) was only 10% shot against ~95% real. Bilinear
+/// interpolation over these knots; values are smoothed where n was small.
+pub fn direct_shot_probability(dist_m: f32, lateral_m: f32) -> f32 {
+    // distance knots (m)
+    const D: [f32; 7] = [15.0, 19.5, 22.5, 25.5, 29.0, 33.5, 38.0];
+    // columns: lateral knots 3, 9, 16 (m)
+    const P: [[f32; 3]; 7] = [
+        [0.95, 0.90, 0.70],
+        [0.97, 0.90, 0.68],
+        [0.95, 0.88, 0.54],
+        [0.96, 0.87, 0.24],
+        [0.65, 0.43, 0.11],
+        [0.04, 0.11, 0.01],
+        [0.0, 0.0, 0.0],
+    ];
+    const L: [f32; 3] = [3.0, 9.0, 16.0];
+    let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t.clamp(0.0, 1.0);
+    let d = dist_m.clamp(D[0], D[6]);
+    let mut i = 0;
+    while i + 2 < D.len() && d > D[i + 1] {
+        i += 1;
+    }
+    let td = (d - D[i]) / (D[i + 1] - D[i]);
+    let at = |row: usize| -> f32 {
+        let l = lateral_m.clamp(L[0], L[2]);
+        if l <= L[1] {
+            lerp(P[row][0], P[row][1], (l - L[0]) / (L[1] - L[0]))
+        } else {
+            lerp(P[row][1], P[row][2], (l - L[1]) / (L[2] - L[1]))
+        }
+    };
+    lerp(at(i), at(i + 1), td)
+}
+
 /// Probability that the wall blocks/deflects a direct free-kick shot.
 ///
 /// `wall_positioning*0.18 + bravery_avg*0.12 + taker_error*0.20
@@ -1332,6 +1384,24 @@ mod tests {
         // Home is blocked, away is unaffected.
         assert!(hist.should_block_corner_repeat(true, CornerRoutine::Short));
         assert!(!hist.should_block_corner_repeat(false, CornerRoutine::Short));
+    }
+
+    #[test]
+    fn direct_shot_probability_matches_real_table() {
+        // central and close: shot almost always (real 92-100%)
+        assert!(direct_shot_probability(22.0, 2.0) > 0.9);
+        assert!(direct_shot_probability(25.0, 4.0) > 0.9);
+        // wide at 25m: mostly crossed (real 22%)
+        let wide = direct_shot_probability(25.5, 16.0);
+        assert!((0.15..0.35).contains(&wide), "{wide}");
+        // far out: never shot
+        assert!(direct_shot_probability(36.0, 3.0) < 0.05);
+        assert_eq!(direct_shot_probability(45.0, 3.0), 0.0);
+        // monotone: wider is never more likely at the same distance
+        for d in [19.0, 23.0, 27.0, 30.0] {
+            assert!(direct_shot_probability(d, 3.0) >= direct_shot_probability(d, 9.0) - 1e-4);
+            assert!(direct_shot_probability(d, 9.0) >= direct_shot_probability(d, 16.0) - 1e-4);
+        }
     }
 
     #[test]

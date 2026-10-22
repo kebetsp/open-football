@@ -102,7 +102,12 @@ impl<'b> BallOperationsImpl<'b> {
     /// already-struck, in-flight free-kick pass.
     pub fn is_free_kick_encroaching(&self) -> bool {
         use crate::r#match::PassOriginRestart;
-        if self.ctx.tick_context.ball.pass_origin_restart != PassOriginRestart::DirectFreeKick {
+        // Law 17 (corner kick): opponents also stay at least 9.15m from the
+        // corner arc until the ball is in play (set-piece pass, 2026-10-22).
+        // Same window and same distance as the free kick, so every guard
+        // that reads this (tackle refusal, mandatory retreat) covers both.
+        let restart = self.ctx.tick_context.ball.pass_origin_restart;
+        if restart != PassOriginRestart::DirectFreeKick && restart != PassOriginRestart::Corner {
             return false;
         }
         let Some(owner_id) = self.ctx.tick_context.ball.current_owner else {
@@ -114,7 +119,10 @@ impl<'b> BallOperationsImpl<'b> {
         if owner.team_id == self.ctx.player.team_id {
             return false; // taker is a teammate — not the defending side
         }
-        self.distance() < 73.0
+        // Corner: 1m margin so a defender released by the retreat is not
+        // standing exactly on the 9.15m line.
+        let radius = if restart == PassOriginRestart::Corner { 81.0 } else { 73.0 };
+        self.distance() < radius
     }
 
     /// True while the opponent has a goal kick from their own goal area.

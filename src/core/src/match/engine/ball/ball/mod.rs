@@ -329,6 +329,9 @@ pub struct Ball {
     /// live and un-struck, so the delivery picker's "genuinely standing
     /// there, stationary" gate can actually be met.
     pub corner_short_option: Option<u32>,
+    /// Corner box slots (id, x, y); id 0 = unused. The staged box attackers
+    /// hold these until the kick (set-piece pass, 2026-10-22).
+    pub corner_box_hold: [(u32, f32, f32); 6],
     /// realism-bug (2026-07-28): the throw-in's staged close-support
     /// receiver — the specifically prepared, marker-evasion-adjusted
     /// option from `throw_in_shape_targets`. Read by the pass evaluator's
@@ -631,6 +634,7 @@ impl Ball {
             restart_pending_taker: None,
             free_kick_decided: false,
             corner_short_option: None,
+            corner_box_hold: [(0, 0.0, 0.0); 6],
             throw_in_preferred_receiver: None,
             last_touch_player_id: None,
             last_touch_team_id: None,

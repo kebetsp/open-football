@@ -866,7 +866,39 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         } else {
             1.0 + (1.0 - angle_ratio) * CENTRAL_SHOT_BONUS
         };
-        let shot_w = scores.direct_shot * angle_factor;
+        // Set-piece pass (2026-10-22): the shot share now comes from the
+        // real shoot-or-not table by distance AND lateral offset
+        // (`direct_shot_probability`, 3,762 real free kicks) instead of the
+        // old distance-band weight x a wide-angle cut-off at 60% of the
+        // distance. The other choices keep their relative weights and share
+        // whatever the shot leaves, so the total stays 1.
+        let _ = angle_factor;
+        let shot_w = if scores.direct_shot <= 0.0 {
+            0.0
+        } else {
+            let lateral_m = (ball_pos.y - mid_y).abs() / 8.0;
+            let mut p = crate::r#match::engine::set_pieces::direct_shot_probability(
+                dist_goal / 8.0,
+                lateral_m,
+            );
+            // Situational dampers the old score applied (protecting a lead,
+            // wind) as multipliers on the real rate.
+            if protecting_lead_late {
+                p *= 0.85;
+            }
+            if context.environment.weather == crate::r#match::engine::environment::Weather::Wind {
+                p *= 0.85;
+            }
+            p.clamp(0.0, 1.0)
+        };
+        let rest = scores.box_delivery + scores.short_routine + scores.recycle;
+        let rest_scale = if rest > 0.0 { (1.0 - shot_w) / rest } else { 0.0 };
+        let scores = crate::r#match::engine::set_pieces::FreeKickChoiceScores {
+            direct_shot: scores.direct_shot,
+            box_delivery: scores.box_delivery * rest_scale,
+            short_routine: scores.short_routine * rest_scale,
+            recycle: scores.recycle * rest_scale,
+        };
 
         field.ball.free_kick_decided = true;
         let total = shot_w + scores.box_delivery + scores.short_routine + scores.recycle;
