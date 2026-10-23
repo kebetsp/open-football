@@ -184,11 +184,19 @@ pub struct ShapeRule {
     /// Extra conditions that must ALL hold together with `trigger`
     /// ("in possession AND the ball on our left"). Rule 2.0.
     pub and: [Option<ShapeTrigger>; 2],
+    /// Rule 2.0 limit: the rule is skipped while this many or more
+    /// teammates (not himself) already stand within `ZONE_RADIUS` of its
+    /// target ("fill the half-space only if fewer than two are there").
+    pub max_in_zone: Option<u8>,
 }
+
+/// Radius around a rule's target that counts as "the zone" for
+/// `ShapeRule::max_in_zone` (100 u = 12.5 m).
+pub const ZONE_RADIUS: f32 = 100.0;
 
 impl ShapeRule {
     pub fn new(trigger: ShapeTrigger, action: ShapeAction) -> Self {
-        Self { trigger, action, and: [None, None] }
+        Self { trigger, action, and: [None, None], max_in_zone: None }
     }
 
     /// Whether this rule's trigger (and every extra condition) currently
@@ -980,6 +988,10 @@ pub struct MatchPlayer {
     /// Rule 2.0: the active manager rule's lateral part is an ABSOLUTE
     /// lane (replaces the duty target's y) rather than an offset on it.
     pub shape_abs_y: bool,
+    /// Rule 2.0: the ball lane (-1/0/1, manager's side) this player's
+    /// ball-lane triggers last saw, kept so the lane only changes after the
+    /// ball is clearly over the boundary (hysteresis against flicker).
+    pub shape_lane_prev: i8,
 
     /// Manager-set build-up-vs-direct dial, -2 (possession) .. +2
     /// (direct), 0 = neutral. Pass-evaluator weight on long-pass
@@ -1225,6 +1237,7 @@ impl MatchPlayer {
             manager_rule_count: 0,
             shape_manager_active: false,
             shape_abs_y: false,
+            shape_lane_prev: 0,
             directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
@@ -1353,6 +1366,7 @@ impl MatchPlayer {
             manager_rule_count: 0,
             shape_manager_active: false,
             shape_abs_y: false,
+            shape_lane_prev: 0,
             directness_bias: 0.0,
             is_force_match_selection,
             birth_date,
@@ -1845,6 +1859,12 @@ mod rule2_tests {
         assert!(active(true, -1));
         assert!(!active(true, 0), "ball not on the left");
         assert!(!active(false, -1), "not in possession");
+    }
+
+    #[test]
+    fn rule2_new_rule_has_no_limit_by_default() {
+        let r = ShapeRule::new(ShapeTrigger::InPossession, ShapeAction::HoldWidth);
+        assert_eq!(r.max_in_zone, None);
     }
 
     #[test]

@@ -2478,6 +2478,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 let shape_away_goals = context.score.away_team.get();
                 let minute_now =
                     (context.total_match_time * 90 / super::MATCH_TIME_MS) as u32;
+                // Teammate positions for `max_in_zone` limits (Rule 2.0).
+                let zone_snapshot: Vec<(u32, u32, f32, f32)> = field
+                    .players
+                    .iter()
+                    .filter(|q| !q.is_sent_off)
+                    .map(|q| (q.id, q.team_id, q.position.x, q.position.y))
+                    .collect();
                 for p in field.players.iter_mut() {
                     if p.shape_rules.is_empty() {
                         continue;
@@ -2488,17 +2495,36 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                         None => continue,
                     };
                     let in_possession = shape_poss_team == Some(p.team_id);
-                    let raw_lane: i8 = if ball_y < third {
-                        -1
-                    } else if ball_y > h - third {
-                        1
-                    } else {
-                        0
+                    // Hysteresis (Rule 2.0): a lane the player is already in
+                    // stays until the ball is `LANE_HYST` past its boundary, so
+                    // a ball hovering on a third's edge does not flip the rule
+                    // every few ticks (players were only moving ~half the
+                    // time they were asked to, measured 2026-10-23).
+                    const LANE_HYST: f32 = 0.06;
+                    let hyst = h * LANE_HYST;
+                    let prev_raw = match side {
+                        PlayerSide::Left => p.shape_lane_prev,
+                        PlayerSide::Right => -p.shape_lane_prev,
+                    };
+                    let raw_lane: i8 = match prev_raw {
+                        -1 if ball_y < third + hyst => -1,
+                        1 if ball_y > h - third - hyst => 1,
+                        0 if ball_y >= third - hyst && ball_y <= h - third + hyst => 0,
+                        _ => {
+                            if ball_y < third {
+                                -1
+                            } else if ball_y > h - third {
+                                1
+                            } else {
+                                0
+                            }
+                        }
                     };
                     let lane = match side {
                         PlayerSide::Left => raw_lane,
                         PlayerSide::Right => -raw_lane,
                     };
+                    p.shape_lane_prev = lane;
                     let (goals_for, goals_against) = if p.team_id == shape_home_id {
                         (shape_home_goals, shape_away_goals)
                     } else {
@@ -2571,7 +2597,22 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             team_tactical,
                             opponent_phase,
                         ) {
-                            target = rule.target(base, side, w, h, team_tactical, ball_y);
+                            let candidate = rule.target(base, side, w, h, team_tactical, ball_y);
+                            if let Some(max) = rule.max_in_zone {
+                                let near = zone_snapshot
+                                    .iter()
+                                    .filter(|(id, t, x, y)| {
+                                        *id != p.id
+                                            && *t == p.team_id
+                                            && ((x - candidate.x).powi(2) + (y - candidate.y).powi(2)).sqrt()
+                                                < crate::r#match::player::ZONE_RADIUS
+                                    })
+                                    .count();
+                                if near >= max as usize {
+                                    continue; // zone already full: this rule does not apply this tick
+                                }
+                            }
+                            target = candidate;
                             rule_active = true;
                             manager_active = rule_idx < p.manager_rule_count as usize;
                             abs_y = rule.action.lateral_is_absolute();
