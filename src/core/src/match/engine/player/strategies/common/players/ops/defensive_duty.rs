@@ -26,7 +26,7 @@
 //! different-minded coaches would compute the identical number). Zero
 //! pre-existing decision-function dependencies.
 
-use crate::PlayerFieldPositionGroup;
+use crate::{PlayerFieldPositionGroup, PlayerPositionType};
 use crate::r#match::player::strategies::common::players::ops::off_ball_support::{
     choose_defensive_spot, DefWorld, SupportPlayer,
 };
@@ -353,6 +353,12 @@ struct Cand {
     cp_extra: u8,
     /// Manager defensive line height (-1 deep .. +1 high), identical on a team.
     line_height: f32,
+    /// Manager press triggers (see `MatchPlayer::press_trigger_mask`) and the
+    /// inputs the triggers need.
+    press_mask: u8,
+    cp_active: bool,
+    pos_type: PlayerPositionType,
+    ball_origin: Option<Vector3<f32>>,
     /// This player's duty from the *previous* tick — read before this
     /// tick's reset, purely to bias continuity (Steps C/D/E). Never
     /// used as a source of new information, only as a tie-break toward
@@ -447,6 +453,12 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
                 0
             },
             line_height: p.defensive_line_height,
+            press_mask: p.press_trigger_mask,
+            cp_active: p.counterpress_ticks > 0
+                && context.tactical_for_team(p.team_id).ticks_since_turnover
+                    < p.counterpress_ticks as u32,
+            pos_type: p.tactical_position.current_position,
+            ball_origin: field.ball.pass_origin_position,
             prev_duty: p.ai_defensive_duty,
             is_taking_ball: matches!(
                 p.state,
@@ -983,7 +995,33 @@ fn assign_team(
     // (Step H) depends on whether Step E finds real cover, so the
     // final Assignment is pushed once that's known.
     let mut presser: Option<Cand> = None;
-    if let Some(carrier_id) = carrier_id {
+    // Manager press triggers (Rule 2.0): with any trigger set the team presses
+    // only while one holds (or inside the counter-press window); otherwise it
+    // holds shape and lets the ball carrier have it.
+    let press_allowed = {
+        let mask = pool.first().map(|c| c.press_mask).unwrap_or(0);
+        if mask == 0 || pool.first().map(|c| c.cp_active).unwrap_or(false) {
+            true
+        } else if let Some(carrier) = carrier_id.and_then(|id| cands.iter().find(|c| c.id == id)) {
+            use PlayerPositionType as P;
+            let pitch_len = (own_goal - opponent_goal).magnitude().max(1.0);
+            let attack_dir = (own_goal - opponent_goal) / pitch_len; // the carrier's team attacks toward our goal
+            let back_pass = pool
+                .first()
+                .and_then(|c| c.ball_origin)
+                .map(|o| (carrier.position - o).dot(&attack_dir) < -24.0)
+                .unwrap_or(false);
+            (mask & 1 != 0 && matches!(carrier.pos_type, P::DefenderLeft | P::DefenderRight | P::WingbackLeft | P::WingbackRight))
+                || (mask & 2 != 0 && matches!(carrier.pos_type, P::DefenderCenter | P::DefenderCenterLeft | P::DefenderCenterRight))
+                || (mask & 4 != 0 && carrier.position_group == PlayerFieldPositionGroup::Goalkeeper)
+                || (mask & 8 != 0 && back_pass)
+                || (mask & 16 != 0 && (focal_pos - opponent_goal).magnitude() <= pitch_len / 3.0)
+                || (mask & 32 != 0 && matches!(carrier.pos_type, P::MidfielderLeft | P::MidfielderRight | P::AttackingMidfielderLeft | P::AttackingMidfielderRight | P::ForwardLeft | P::ForwardRight))
+        } else {
+            true
+        }
+    };
+    if let Some(carrier_id) = carrier_id.filter(|_| press_allowed) {
         // Real defensive-zone doctrine: a defender is only eligible to
         // press when the carrier is genuinely in his zone (see
         // `PRESS_DEFENDER_ZONE_UNITS`'s own doc comment) — UNLESS no

@@ -998,6 +998,11 @@ pub struct MatchPlayer {
     /// passing options) close the ball down. 0 ticks = off.
     /// Manager defensive line height, -1 (deep) .. +1 (high); 0 = default.
     pub defensive_line_height: f32,
+    /// Manager press triggers (bitmask, identical on a team; 0 = press always):
+    /// 1 carrier is a full-back, 2 centre-back, 4 goalkeeper, 8 back pass,
+    /// 16 ball in their own third, 32 carrier is a winger. With a mask set the
+    /// team presses only while a trigger holds (or in the counter-press window).
+    pub press_trigger_mask: u8,
     pub counterpress_ticks: u16,
     pub counterpress_pressers: u8,
 
@@ -1247,6 +1252,7 @@ impl MatchPlayer {
             shape_abs_y: false,
             shape_lane_prev: 0,
             defensive_line_height: 0.0,
+            press_trigger_mask: 0,
             counterpress_ticks: 0,
             counterpress_pressers: 0,
             directness_bias: 0.0,
@@ -1379,6 +1385,7 @@ impl MatchPlayer {
             shape_abs_y: false,
             shape_lane_prev: 0,
             defensive_line_height: 0.0,
+            press_trigger_mask: 0,
             counterpress_ticks: 0,
             counterpress_pressers: 0,
             directness_bias: 0.0,
