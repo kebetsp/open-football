@@ -82,6 +82,41 @@ fn def_spots_on() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     !*OFF.get_or_init(|| std::env::var_os("DEF_SPOT_ABLATE").is_some())
 }
+/// Drag (2026-10-23, `docs/drag-and-pin-defender-following.md`, option B):
+/// defenders and midfielders follow an attacker who runs or drops, instead of
+/// handing him off the moment he leaves the threat zone. Two pieces, each with
+/// its own switch so the A/B runs on one binary:
+///  - run anticipation: a fast-moving attacker's danger is also judged at
+///    where he will be `DRAG_RUN_LEAD_TICKS` from now, so a run into the
+///    channel is picked up at its start, not at its end;
+///  - retention: an attacker one of our players already marks stays marked
+///    beyond the normal gate (up to `DRAG_FOLLOW_EXT` x the mark distance and
+///    with no danger floor) until the follower is `DRAG_LEASH_UNITS` from his
+///    own slot, then a teammate or nobody takes over (the hand-off).
+/// `DRAG_OFF` removes both; `DRAG_NO_RUN` / `DRAG_NO_RETAIN` remove one.
+/// All constants are category (d) estimates.
+const DRAG_RUN_SPEED_FRACTION: f32 = 0.60;
+const DRAG_RUN_LEAD_TICKS: f32 = 80.0;
+const DRAG_RUN_DISCOUNT: f32 = 0.9;
+const DRAG_FOLLOW_EXT: f32 = 1.5;
+const DRAG_LEASH_UNITS: f32 = 200.0; // 25 m from the follower's own slot
+const DRAG_MAX_RETAINED: usize = 2;
+fn drag_mask() -> u8 {
+    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        if std::env::var_os("DRAG_OFF").is_some() {
+            return 0;
+        }
+        let mut m = 3;
+        if std::env::var_os("DRAG_NO_RUN").is_some() {
+            m &= !2;
+        }
+        if std::env::var_os("DRAG_NO_RETAIN").is_some() {
+            m &= !1;
+        }
+        m
+    })
+}
 /// Forwards out of possession stand high, screening the opponent's build-up:
 /// 15m ahead of the midfield line, never deeper into the opponent's half than
 /// 58% of the pitch length.
@@ -1129,39 +1164,78 @@ fn assign_team(
     }
 
     // --- Step D: rank non-carrier opponents by danger, assign markers. ---
-    let mut threats: Vec<(Cand, f32)> = cands
+    let drag = drag_mask();
+    let prior_marked: Vec<u32> = pool
+        .iter()
+        .filter_map(|c| match c.prev_duty {
+            DefensiveDuty::Mark { opponent_id } => Some(opponent_id),
+            _ => None,
+        })
+        .collect();
+    let threat_danger = |p: Vector3<f32>| -> f32 {
+        (crate::r#match::player::strategies::common::players::ops::box_attack::threat_value_at(
+            p, own_goal,
+        ) / THREAT_FULL_VALUE)
+            .clamp(0.0, 1.0)
+    };
+    // (candidate, danger, retained-by-drag)
+    let mut threats: Vec<(Cand, f32, bool)> = cands
         .iter()
         .filter(|c| c.team_id == opponent_team && Some(c.id) != carrier_id)
         .filter(|c| (c.position - focal_pos).magnitude() <= THREAT_SCAN_RADIUS_UNITS)
-        // Distinct from the scan radius above (distance from the BALL —
-        // "could he plausibly receive a pass"): this is distance from
-        // OUR OWN GOAL — "is he actually a threat to it right now."
-        // See `MARK_MAX_DIST_UNITS`'s own doc comment.
-        .filter(|c| (c.position - own_goal).magnitude() <= MARK_MAX_DIST_UNITS)
-        .map(|c| {
+        .filter_map(|c| {
             // Threat is what the attacker can PRODUCE from where he
             // stands, in the attack's own xG currency (2026-10-03, wide
             // play plan): a corner-flag winger (cross EV ~0.03) no longer
             // outranks a central player at the box edge just because he
             // is close to our goal in a straight line.
-            let danger = (crate::r#match::player::strategies::common::players::ops::box_attack::threat_value_at(
-                c.position, own_goal,
-            ) / THREAT_FULL_VALUE)
-                .clamp(0.0, 1.0);
-            (*c, danger)
+            // Distance from OUR OWN GOAL — "is he actually a threat to it
+            // right now." See `MARK_MAX_DIST_UNITS`'s own doc comment.
+            let dist_goal = (c.position - own_goal).magnitude();
+            let mut danger = if dist_goal <= MARK_MAX_DIST_UNITS {
+                threat_danger(c.position)
+            } else {
+                0.0
+            };
+            if drag & 2 != 0
+                && c.max_speed > 0.0
+                && c.velocity.magnitude() >= DRAG_RUN_SPEED_FRACTION * c.max_speed
+            {
+                let proj = c.position + c.velocity * DRAG_RUN_LEAD_TICKS;
+                if (proj - own_goal).magnitude() <= MARK_MAX_DIST_UNITS {
+                    danger = danger.max(threat_danger(proj) * DRAG_RUN_DISCOUNT);
+                }
+            }
+            if danger >= DANGER_FLOOR {
+                return Some((*c, danger, false));
+            }
+            if drag & 1 != 0
+                && prior_marked.contains(&c.id)
+                && dist_goal <= MARK_MAX_DIST_UNITS * DRAG_FOLLOW_EXT
+            {
+                return Some((*c, danger, true));
+            }
+            None
         })
-        .filter(|(_, danger)| *danger >= DANGER_FLOOR)
         .collect();
     threats.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    for (opponent, danger) in threats {
+    let mut retained_used = 0usize;
+    for (opponent, danger, retained) in threats {
+        if retained && retained_used >= DRAG_MAX_RETAINED {
+            continue;
+        }
         // Forwards excluded from marker selection this pass (see the
         // pool-construction comment above) — individual marking isn't a
         // forward's off-ball job here.
         let marker = pool
             .iter()
             .filter(|c| {
-                !assigned.contains(&c.id) && c.position_group != PlayerFieldPositionGroup::Forward
+                !assigned.contains(&c.id)
+                    && c.position_group != PlayerFieldPositionGroup::Forward
+                    // Hand-off: a retained follow ends when the follower is
+                    // too far from his own slot.
+                    && (!retained || (c.position - c.start_position).magnitude() <= DRAG_LEASH_UNITS)
             })
             .min_by(|a, b| {
                 let sticky_a = matches!(
@@ -1180,8 +1254,14 @@ fn assign_team(
             })
             .copied();
         let Some(marker) = marker else {
+            if retained {
+                continue;
+            }
             break;
         };
+        if retained {
+            retained_used += 1;
+        }
         let mut tightness = MARK_LOOSE_UNITS - (MARK_LOOSE_UNITS - MARK_TIGHT_UNITS) * danger.min(1.0);
         // Inside our own box a marker keeps the real typical distance, not
         // touch-tight: StatsBomb 360 at a cross, attacker to nearest defender
