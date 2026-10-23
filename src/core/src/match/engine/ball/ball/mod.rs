@@ -297,6 +297,8 @@ pub struct Ball {
     /// (intercept, block, save, claim, throw-in) record_touch without
     /// having to thread the tick through every signature.
     pub current_tick_cached: u64,
+    /// Tick of the last manager-ordered tactical foul (cooldown against repeats).
+    pub tactical_foul_tick: u64,
 
     /// Origin of the most recent live pass — set when a PassTo event
     /// fires from a restart (goal kick, throw-in, corner, free kick).
@@ -641,6 +643,7 @@ impl Ball {
             last_touch_tick: 0,
             last_touch_was_controlled: false,
             current_tick_cached: 0,
+            tactical_foul_tick: 0,
             pass_origin_restart: PassOriginRestart::OpenPlay,
             offside_snapshot: None,
             pending_pass_origin: None,

@@ -1005,6 +1005,9 @@ pub struct MatchPlayer {
     pub press_trigger_mask: u8,
     pub counterpress_ticks: u16,
     pub counterpress_pressers: u8,
+    /// Counter-press that ends in a tactical foul: if the window is nearly over and the
+    /// carrier is breaking away toward our goal, the nearest player stops him with a foul.
+    pub counterpress_foul: bool,
 
     /// Manager-set build-up-vs-direct dial, -2 (possession) .. +2
     /// (direct), 0 = neutral. Pass-evaluator weight on long-pass
@@ -1255,6 +1258,7 @@ impl MatchPlayer {
             press_trigger_mask: 0,
             counterpress_ticks: 0,
             counterpress_pressers: 0,
+            counterpress_foul: false,
             directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
@@ -1388,6 +1392,7 @@ impl MatchPlayer {
             press_trigger_mask: 0,
             counterpress_ticks: 0,
             counterpress_pressers: 0,
+            counterpress_foul: false,
             directness_bias: 0.0,
             is_force_match_selection,
             birth_date,

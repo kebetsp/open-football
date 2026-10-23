@@ -244,6 +244,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 p.ai_defensive_target = t;
             }
         }
+        Self::resolve_tactical_foul(field, context, events);
         #[cfg(feature = "match-logs")]
         let owner_before_full = field.ball.current_owner;
         Self::play_players(field, context, tick_ctx, events);
@@ -265,6 +266,62 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         EventDispatcher::dispatch(events, field, context, match_data, true);
 
         handle_goal_reset(field, context);
+    }
+
+    /// Manager "foul and drop back" (Rule 2.0, G10): near the end of the counter-press
+    /// window, if the ball carrier is breaking away toward our goal and one of our
+    /// players is within contact range, that player stops him with a foul (the normal
+    /// foul/advantage/card pipeline decides the consequence); the free-kick restart
+    /// then forces everyone back 9.15 m. Once per turnover (6 s cooldown).
+    fn resolve_tactical_foul(
+        field: &mut MatchField,
+        context: &MatchContext,
+        events: &mut EventCollection,
+    ) {
+        use crate::r#match::player::events::players::FoulSeverity;
+        use crate::r#match::player::events::PlayerEvent;
+        let Some(owner_id) = field.ball.current_owner else { return };
+        let tick = context.current_tick();
+        if tick.saturating_sub(field.ball.tactical_foul_tick) < 600 && field.ball.tactical_foul_tick != 0 {
+            return;
+        }
+        let Some(carrier) = field.players.iter().find(|p| p.id == owner_id) else { return };
+        let carrier_team = carrier.team_id;
+        let carrier_pos = carrier.position;
+        let carrier_vel = carrier.velocity;
+        // The defending team is the one with the manager flag and not the carrier's.
+        let Some(def) = field
+            .players
+            .iter()
+            .find(|p| p.team_id != carrier_team && p.counterpress_foul && p.counterpress_ticks > 0)
+        else {
+            return;
+        };
+        let (def_team, window) = (def.team_id, def.counterpress_ticks as u32);
+        let since = context.tactical_for_team(def_team).ticks_since_turnover;
+        if since + 100 < window || since > window + 100 {
+            return; // only in the last second of the window
+        }
+        // Breaking away: moving, and toward the defending team's goal.
+        let Some(def_side) = field.players.iter().find(|p| p.team_id == def_team).and_then(|p| p.side) else { return };
+        let own_goal = match def_side {
+            PlayerSide::Left => context.goal_positions.left,
+            PlayerSide::Right => context.goal_positions.right,
+        };
+        let to_goal = own_goal - carrier_pos;
+        if carrier_vel.magnitude() < 0.25 || to_goal.magnitude() < 1.0 || carrier_vel.normalize().dot(&to_goal.normalize()) < 0.6 {
+            return;
+        }
+        let fouler = field
+            .players
+            .iter()
+            .filter(|p| p.team_id == def_team && !p.is_sent_off && p.tactical_position.current_position.position_group() != PlayerFieldPositionGroup::Goalkeeper)
+            .map(|p| (p.id, (p.position - carrier_pos).magnitude()))
+            .filter(|(_, d)| *d <= 14.0)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let Some((fouler_id, _)) = fouler else { return };
+        field.ball.tactical_foul_tick = tick.max(1);
+        events.add_player_event(PlayerEvent::CommitFoul(fouler_id, FoulSeverity::Normal));
     }
 
     /// Corner kicks and goal kicks rewrite ball ownership inside `ball.update`,
