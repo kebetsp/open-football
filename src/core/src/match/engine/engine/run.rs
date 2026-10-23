@@ -2550,10 +2550,16 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             p.position.y
                         );
                     }
-                    let ball_owned = current_owner_team.is_some();
+                    // Rule 2.0: "the ball is owned" for the out_of_possession trigger means
+                    // a team effectively has it (owner, recent controlled touch, pass in
+                    // flight), not the raw single-tick owner, which was true only ~4% of
+                    // ticks and made every `out_of_possession` rule almost never fire
+                    // (docs/rule-language-conflict-check.md, measured 2026-10-23).
+                    let ball_owned = shape_poss_team.is_some();
                     let mut target = base;
                     let mut rule_active = false;
                     let mut manager_active = false;
+                    let mut abs_y = false;
                     for (rule_idx, rule) in p.shape_rules.iter().enumerate() {
                         if rule.is_active(
                             in_possession,
@@ -2568,12 +2574,14 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             target = rule.target(base, side, w, h, team_tactical, ball_y);
                             rule_active = true;
                             manager_active = rule_idx < p.manager_rule_count as usize;
+                            abs_y = rule.action.lateral_is_absolute();
                             break;
                         }
                     }
                     p.start_position = target;
                     p.shape_rule_active = rule_active;
                     p.shape_manager_active = manager_active;
+                    p.shape_abs_y = manager_active && abs_y;
                 }
             }
 

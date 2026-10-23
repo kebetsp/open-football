@@ -461,10 +461,10 @@ fn setup_player_on_field(
                 // pushing it after HoldWidth doesn't change which one
                 // fires when.
                 if player.tactical_position.current_position.is_defender() {
-                    player.shape_rules.push(ShapeRule {
-                        trigger: ShapeTrigger::DefendingOwnThird,
-                        action: ShapeAction::CompactBackLine,
-                    });
+                    player.shape_rules.push(ShapeRule::new(
+                        ShapeTrigger::DefendingOwnThird,
+                        ShapeAction::CompactBackLine,
+                    ));
                 }
                 // docs/positional-attack-phase-design.md, Stage 5: real,
                 // sourced build-out doctrine — centre-backs split wide
@@ -486,10 +486,10 @@ fn setup_player_on_field(
                         | crate::PlayerPositionType::DefenderCenterLeft
                         | crate::PlayerPositionType::DefenderCenterRight
                 ) {
-                    player.shape_rules.push(ShapeRule {
-                        trigger: ShapeTrigger::UnderHighPress,
-                        action: ShapeAction::HoldWidth,
-                    });
+                    player.shape_rules.push(ShapeRule::new(
+                        ShapeTrigger::UnderHighPress,
+                        ShapeAction::HoldWidth,
+                    ));
                 }
                 players.push(player);
             }

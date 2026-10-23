@@ -95,19 +95,106 @@ pub enum ShapeAction {
     /// data isn't actually needed: the two team-level summaries already
     /// exist).
     CompactBackLine,
+    /// Rule 2.0: a parametrised move (lane + side + depth shift). The
+    /// five original lane/depth actions above are exactly expressible
+    /// as presets of this (`MoveSpec::preset`), checked by a unit test.
+    Move(MoveSpec),
+}
+
+impl ShapeAction {
+    /// Whether this action's LATERAL part is a pitch lane (absolute) rather
+    /// than a nudge on where the duty system already wants the player.
+    /// A lane is a fact about the pitch ("the half-space"); depth stays an
+    /// offset because the duty systems own it (a fixed absolute depth sent a
+    /// "drop deeper" back four to its own goal line, audit 2026-10-22).
+    pub fn lateral_is_absolute(&self) -> bool {
+        match self {
+            ShapeAction::Move(m) => !matches!(m.lane, LaneRef::Keep),
+            ShapeAction::StepIntoMidfield | ShapeAction::TuckInside | ShapeAction::HoldWidth => true,
+            _ => false,
+        }
+    }
+}
+
+/// Rule 2.0 (docs/rule-language-conflict-check.md): where a `Move`
+/// action puts the player ACROSS the pitch. Lanes follow the standard
+/// five-lane model (flank / half-space / centre / half-space / flank),
+/// each a fifth of the pitch width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneRef {
+    /// Keep the player's current lateral position (depth-only move).
+    Keep,
+    /// The touchline lane (same point `HoldWidth` uses).
+    Flank,
+    /// The half-space (centre of the second-from-touchline lane).
+    HalfSpace,
+    /// The central lane.
+    Centre,
+    /// Go this many thousandths of the way from the base lateral
+    /// position to the centre line (500 = halfway). Reproduces the
+    /// original `StepIntoMidfield`/`TuckInside` actions exactly. Ignores
+    /// `SideRef`.
+    ToCentre(i16),
+}
+
+/// Which side of the pitch a `Move` lane refers to. Left/Right are the
+/// MANAGER's left/right, corrected for the half-time side swap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideRef {
+    /// The side of the pitch the player's own base position is on.
+    Own,
+    /// The opposite side from the player's own.
+    Opposite,
+    Left,
+    Right,
+    /// The side the ball is on right now (own side when it is central).
+    BallSide,
+}
+
+/// A parametrised movement: lateral lane + side, plus a depth shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveSpec {
+    pub lane: LaneRef,
+    pub side: SideRef,
+    /// Depth shift along the attack direction in thousandths of the
+    /// pitch length; positive = toward the opponent goal.
+    pub depth_permille: i16,
+}
+
+impl MoveSpec {
+    /// The original fixed actions expressed as `Move` parameters. Checked
+    /// against `ShapeRule::target` by `rule2_presets_match_original_actions`.
+    pub fn preset(action: ShapeAction) -> Option<MoveSpec> {
+        let (lane, depth_permille) = match action {
+            ShapeAction::StepIntoMidfield => (LaneRef::ToCentre(500), 160),
+            ShapeAction::TuckInside => (LaneRef::ToCentre(550), 0),
+            ShapeAction::HoldWidth => (LaneRef::Flank, 50),
+            ShapeAction::DropDeeper => (LaneRef::Keep, -120),
+            ShapeAction::DropShort => (LaneRef::Keep, -40),
+            _ => return None,
+        };
+        Some(MoveSpec { lane, side: SideRef::Own, depth_permille })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShapeRule {
     pub trigger: ShapeTrigger,
     pub action: ShapeAction,
+    /// Extra conditions that must ALL hold together with `trigger`
+    /// ("in possession AND the ball on our left"). Rule 2.0.
+    pub and: [Option<ShapeTrigger>; 2],
 }
 
 impl ShapeRule {
-    /// Whether this rule's trigger currently holds. `team` is this
-    /// player's own team's already-computed tactical snapshot — cheap
-    /// to pass (plain `Copy` POD), avoids re-deriving ball-zone/
-    /// possession logic that already exists.
+    pub fn new(trigger: ShapeTrigger, action: ShapeAction) -> Self {
+        Self { trigger, action, and: [None, None] }
+    }
+
+    /// Whether this rule's trigger (and every extra condition) currently
+    /// holds. `team` is this player's own team's already-computed
+    /// tactical snapshot — cheap to pass (plain `Copy` POD), avoids
+    /// re-deriving ball-zone/possession logic that already exists.
     pub fn is_active(
         &self,
         in_possession: bool,
@@ -119,7 +206,35 @@ impl ShapeRule {
         team: TeamTacticalState,
         opponent_phase: GamePhase,
     ) -> bool {
-        match self.trigger {
+        let holds = |t: ShapeTrigger| {
+            Self::trigger_holds(
+                t,
+                in_possession,
+                ball_owned,
+                lane,
+                goals_for,
+                goals_against,
+                minute_now,
+                team,
+                opponent_phase,
+            )
+        };
+        holds(self.trigger) && self.and.iter().flatten().all(|t| holds(*t))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn trigger_holds(
+        trigger: ShapeTrigger,
+        in_possession: bool,
+        ball_owned: bool,
+        lane: i8,
+        goals_for: u8,
+        goals_against: u8,
+        minute_now: u32,
+        team: TeamTacticalState,
+        opponent_phase: GamePhase,
+    ) -> bool {
+        match trigger {
             ShapeTrigger::InPossession => in_possession,
             ShapeTrigger::OutOfPossession => !in_possession && ball_owned,
             ShapeTrigger::BallLeft => lane == -1,
@@ -222,6 +337,43 @@ impl ShapeRule {
                 Vector3::new(
                     team.defensive_line_x.clamp(20.0, field_width - 20.0),
                     (squeezed_y + ball_shift).clamp(20.0, field_height - 20.0),
+                    0.0,
+                )
+            }
+            ShapeAction::Move(spec) => {
+                // Manager's-left sign in raw field Y (Left-side teams
+                // attack +x and their left is the low-Y touchline).
+                let left_sign = match side {
+                    PlayerSide::Left => -1.0,
+                    PlayerSide::Right => 1.0,
+                };
+                let own_sign = if base.y < centre { -1.0 } else { 1.0 };
+                let sign = match spec.side {
+                    SideRef::Own => own_sign,
+                    SideRef::Opposite => -own_sign,
+                    SideRef::Left => left_sign,
+                    SideRef::Right => -left_sign,
+                    SideRef::BallSide => {
+                        if (ball_y - centre).abs() < field_height * 0.05 {
+                            own_sign
+                        } else if ball_y < centre {
+                            -1.0
+                        } else {
+                            1.0
+                        }
+                    }
+                };
+                let y = match spec.lane {
+                    LaneRef::Keep => base.y,
+                    LaneRef::Flank => centre + sign * (centre - 28.0),
+                    LaneRef::HalfSpace => centre + sign * field_height * 0.2,
+                    LaneRef::Centre => centre,
+                    LaneRef::ToCentre(p) => base.y + (centre - base.y) * (p as f32 / 1000.0),
+                };
+                Vector3::new(
+                    (base.x + dir * field_width * (spec.depth_permille as f32 / 1000.0))
+                        .clamp(20.0, field_width - 20.0),
+                    y.clamp(20.0, field_height - 20.0),
                     0.0,
                 )
             }
@@ -825,6 +977,9 @@ pub struct MatchPlayer {
     /// active this tick is one of them.
     pub manager_rule_count: u8,
     pub shape_manager_active: bool,
+    /// Rule 2.0: the active manager rule's lateral part is an ABSOLUTE
+    /// lane (replaces the duty target's y) rather than an offset on it.
+    pub shape_abs_y: bool,
 
     /// Manager-set build-up-vs-direct dial, -2 (possession) .. +2
     /// (direct), 0 = neutral. Pass-evaluator weight on long-pass
@@ -1069,6 +1224,7 @@ impl MatchPlayer {
             manager_shape: false,
             manager_rule_count: 0,
             shape_manager_active: false,
+            shape_abs_y: false,
             directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
@@ -1196,6 +1352,7 @@ impl MatchPlayer {
             manager_shape: false,
             manager_rule_count: 0,
             shape_manager_active: false,
+            shape_abs_y: false,
             directness_bias: 0.0,
             is_force_match_selection,
             birth_date,
@@ -1611,6 +1768,91 @@ impl From<&MatchPlayer> for MatchPlayerLite {
             position: player.position,
             tactical_positions: player.tactical_position.current_position,
         }
+    }
+}
+
+#[cfg(test)]
+mod rule2_tests {
+    use super::*;
+    use crate::r#match::{GamePhase, TeamTacticalState};
+
+    const W: f32 = 840.0;
+    const H: f32 = 545.0;
+
+    fn tgt(action: ShapeAction, base: Vector3<f32>, side: PlayerSide, ball_y: f32) -> Vector3<f32> {
+        ShapeRule::new(ShapeTrigger::InPossession, action).target(
+            base, side, W, H, TeamTacticalState::initial(), ball_y,
+        )
+    }
+
+    #[test]
+    fn rule2_presets_match_original_actions() {
+        let actions = [
+            ShapeAction::StepIntoMidfield,
+            ShapeAction::TuckInside,
+            ShapeAction::HoldWidth,
+            ShapeAction::DropDeeper,
+            ShapeAction::DropShort,
+        ];
+        for side in [PlayerSide::Left, PlayerSide::Right] {
+            for bx in [60.0, 180.0, 420.0, 700.0] {
+                for by in [40.0, 130.0, 272.5, 400.0, 500.0] {
+                    let base = Vector3::new(bx, by, 0.0);
+                    for a in actions {
+                        let preset = ShapeAction::Move(MoveSpec::preset(a).unwrap());
+                        let old = tgt(a, base, side, 272.5);
+                        let new = tgt(preset, base, side, 272.5);
+                        assert!((old - new).magnitude() < 0.01, "{:?} base=({},{}) {:?}: {:?} vs {:?}", a, bx, by, side, old, new);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rule2_lanes_and_sides() {
+        let base = Vector3::new(300.0, 300.0, 0.0);
+        // Left-side team: manager's left is the low-Y touchline.
+        let left_hs = ShapeAction::Move(MoveSpec { lane: LaneRef::HalfSpace, side: SideRef::Left, depth_permille: 0 });
+        let right_hs = ShapeAction::Move(MoveSpec { lane: LaneRef::HalfSpace, side: SideRef::Right, depth_permille: 0 });
+        assert!((tgt(left_hs, base, PlayerSide::Left, 272.5).y - (272.5 - 0.2 * H)).abs() < 0.01);
+        assert!((tgt(right_hs, base, PlayerSide::Left, 272.5).y - (272.5 + 0.2 * H)).abs() < 0.01);
+        // Right-side team attacks the other way: left flips to high Y.
+        assert!((tgt(left_hs, base, PlayerSide::Right, 272.5).y - (272.5 + 0.2 * H)).abs() < 0.01);
+        // Flank lane sits on the touchline inset, centre lane on the centre line.
+        let flank = ShapeAction::Move(MoveSpec { lane: LaneRef::Flank, side: SideRef::Own, depth_permille: 0 });
+        assert!((tgt(flank, base, PlayerSide::Left, 272.5).y - (H - 28.0)).abs() < 0.01);
+        let centre = ShapeAction::Move(MoveSpec { lane: LaneRef::Centre, side: SideRef::Own, depth_permille: 0 });
+        assert!((tgt(centre, base, PlayerSide::Left, 272.5).y - 272.5).abs() < 0.01);
+        // Ball side follows the ball.
+        let bs = ShapeAction::Move(MoveSpec { lane: LaneRef::Flank, side: SideRef::BallSide, depth_permille: 0 });
+        assert!(tgt(bs, base, PlayerSide::Left, 50.0).y < 100.0);
+        assert!(tgt(bs, base, PlayerSide::Left, 500.0).y > 440.0);
+        // Depth: positive = toward the opponent goal for each side.
+        let fwd = ShapeAction::Move(MoveSpec { lane: LaneRef::Keep, side: SideRef::Own, depth_permille: 100 });
+        assert!(tgt(fwd, base, PlayerSide::Left, 272.5).x > base.x);
+        assert!(tgt(fwd, base, PlayerSide::Right, 272.5).x < base.x);
+    }
+
+    #[test]
+    fn rule2_conjunctive_triggers() {
+        let team = TeamTacticalState::initial();
+        let mut rule = ShapeRule::new(ShapeTrigger::InPossession, ShapeAction::HoldWidth);
+        rule.and = [Some(ShapeTrigger::BallLeft), None];
+        let active = |in_poss: bool, lane: i8| {
+            rule.is_active(in_poss, true, lane, 0, 0, 10, team, GamePhase::MidBlock)
+        };
+        assert!(active(true, -1));
+        assert!(!active(true, 0), "ball not on the left");
+        assert!(!active(false, -1), "not in possession");
+    }
+
+    #[test]
+    fn rule2_out_of_possession_needs_a_team_to_own_the_ball() {
+        let team = TeamTacticalState::initial();
+        let rule = ShapeRule::new(ShapeTrigger::OutOfPossession, ShapeAction::DropDeeper);
+        assert!(rule.is_active(false, true, 0, 0, 0, 10, team, GamePhase::MidBlock));
+        assert!(!rule.is_active(false, false, 0, 0, 0, 10, team, GamePhase::MidBlock));
     }
 }
 

@@ -151,17 +151,97 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
         // absolute pins: an absolute pin dragged fullbacks 100u deeper than
         // the dynamic lines and sent a "drop deeper" back four to its own
         // goal line (audit re-test 2026-10-22).
+        // Rule 2.0 spacing guard (built in from the first commit: the
+        // 2026-09-12 rollback was a rule that drove players onto the same
+        // spot). A target a manager rule moves must not land within
+        // `RULE_MIN_GAP` of a teammate; it is pushed out to that distance.
+        // Teammate positions are current positions (a partial guard: the
+        // separation nudge handles the rest while moving).
+        const RULE_MIN_GAP: f32 = 28.0; // 3.5 m at 8 u/m
+        let rule_field_h = context.field_size.height as f32;
+        let rule_snapshot: Vec<(u32, u32, Vector3<f32>)> = field
+            .players
+            .iter()
+            .filter(|q| !q.is_sent_off)
+            .map(|q| (q.id, q.team_id, q.position))
+            .collect();
+        let spread = |target: &mut Vector3<f32>, me: u32, team: u32| {
+            for _ in 0..2 {
+                let near = rule_snapshot
+                    .iter()
+                    .filter(|(id, t, pos)| {
+                        *id != me
+                            && *t == team
+                            && ((pos.x - target.x).powi(2) + (pos.y - target.y).powi(2)).sqrt() < RULE_MIN_GAP
+                    })
+                    .min_by(|a, b| {
+                        let da = (a.2.x - target.x).powi(2) + (a.2.y - target.y).powi(2);
+                        let db = (b.2.x - target.x).powi(2) + (b.2.y - target.y).powi(2);
+                        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                let Some((_, _, pos)) = near else { break };
+                let dx = target.x - pos.x;
+                let dy = target.y - pos.y;
+                let len = (dx * dx + dy * dy).sqrt();
+                // Directly on top of him: step away sideways, toward the nearer touchline.
+                let (ux, uy) = if len < 0.5 {
+                    (0.0, if target.y < rule_field_h * 0.5 { -1.0 } else { 1.0 })
+                } else {
+                    (dx / len, dy / len)
+                };
+                target.x = pos.x + ux * RULE_MIN_GAP;
+                target.y = (pos.y + uy * RULE_MIN_GAP).clamp(20.0, rule_field_h - 20.0);
+            }
+        };
         for p in field.players.iter_mut() {
             if !p.shape_manager_active || !p.shape_rule_active {
                 continue;
             }
             let Some(base) = p.shape_base else { continue };
             let off = p.start_position - base;
-            if !matches!(p.ai_attack_duty, crate::r#match::player::AttackDuty::None) {
-                p.ai_attack_target += off;
+            // Rule 2.0 (docs/rule-language-conflict-check.md): depth is always an
+            // offset on where the duty system already wants the player; the
+            // lateral part is an absolute pitch lane when the rule names one
+            // (an offset added to a touchline target left a "step into
+            // midfield" fullback in the half-space-ish zone, measured
+            // 2026-10-23). Receivers and box/planned runners already have an
+            // exact target (the ball's destination, a box zone), which a
+            // manager rule must not move.
+            use crate::r#match::player::{AttackDuty, DefensiveDuty};
+            let abs_y = p.shape_abs_y;
+            let lane_y = p.start_position.y;
+            match p.ai_attack_duty {
+                AttackDuty::None | AttackDuty::Receive | AttackDuty::BoxRun | AttackDuty::Run => {}
+                _ => {
+                    p.ai_attack_target.x += off.x;
+                    if abs_y {
+                        p.ai_attack_target.y = lane_y;
+                    } else {
+                        p.ai_attack_target.y += off.y;
+                    }
+                }
             }
-            if !matches!(p.ai_defensive_duty, crate::r#match::player::DefensiveDuty::None) {
-                p.ai_defensive_target += off;
+            match p.ai_defensive_duty {
+                DefensiveDuty::None => {}
+                DefensiveDuty::HoldShape | DefensiveDuty::Cover => {
+                    p.ai_defensive_target.x += off.x;
+                    if abs_y {
+                        p.ai_defensive_target.y = lane_y;
+                    } else {
+                        p.ai_defensive_target.y += off.y;
+                    }
+                }
+                _ => p.ai_defensive_target += off,
+            }
+            if !matches!(p.ai_attack_duty, AttackDuty::None | AttackDuty::Receive | AttackDuty::BoxRun | AttackDuty::Run) {
+                let mut t = p.ai_attack_target;
+                spread(&mut t, p.id, p.team_id);
+                p.ai_attack_target = t;
+            }
+            if matches!(p.ai_defensive_duty, DefensiveDuty::HoldShape | DefensiveDuty::Cover) {
+                let mut t = p.ai_defensive_target;
+                spread(&mut t, p.id, p.team_id);
+                p.ai_defensive_target = t;
             }
         }
         #[cfg(feature = "match-logs")]
