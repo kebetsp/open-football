@@ -99,6 +99,11 @@ pub enum ShapeAction {
     /// five original lane/depth actions above are exactly expressible
     /// as presets of this (`MoveSpec::preset`), checked by a unit test.
     Move(MoveSpec),
+    /// Rule 2.0 role interchange: while the rule holds, this player and
+    /// `ShapeRule::swap_with` exchange position tags and anchors, so every
+    /// duty system treats each as the other's role. Returns to normal after
+    /// a minimum dwell once the rule stops holding.
+    SwapRole,
 }
 
 impl ShapeAction {
@@ -188,6 +193,8 @@ pub struct ShapeRule {
     /// teammates (not himself) already stand within `ZONE_RADIUS` of its
     /// target ("fill the half-space only if fewer than two are there").
     pub max_in_zone: Option<u8>,
+    /// For `SwapRole`: the id of the player whose role is taken.
+    pub swap_with: Option<u32>,
 }
 
 /// Radius around a rule's target that counts as "the zone" for
@@ -196,7 +203,7 @@ pub const ZONE_RADIUS: f32 = 100.0;
 
 impl ShapeRule {
     pub fn new(trigger: ShapeTrigger, action: ShapeAction) -> Self {
-        Self { trigger, action, and: [None, None], max_in_zone: None }
+        Self { trigger, action, and: [None, None], max_in_zone: None, swap_with: None }
     }
 
     /// Whether this rule's trigger (and every extra condition) currently
@@ -348,6 +355,7 @@ impl ShapeRule {
                     0.0,
                 )
             }
+            ShapeAction::SwapRole => base,
             ShapeAction::Move(spec) => {
                 // Manager's-left sign in raw field Y (Left-side teams
                 // attack +x and their left is the low-Y touchline).
@@ -1008,6 +1016,11 @@ pub struct MatchPlayer {
     /// Counter-press that ends in a tactical foul: if the window is nearly over and the
     /// carrier is breaking away toward our goal, the nearest player stops him with a foul.
     pub counterpress_foul: bool,
+    /// Role interchange state (see `ShapeAction::SwapRole`).
+    pub role_swap_wanted: Option<u32>,
+    pub role_swapped_with: Option<u32>,
+    pub role_swap_initiator: bool,
+    pub role_swap_tick: u64,
 
     /// Manager-set build-up-vs-direct dial, -2 (possession) .. +2
     /// (direct), 0 = neutral. Pass-evaluator weight on long-pass
@@ -1259,6 +1272,10 @@ impl MatchPlayer {
             counterpress_ticks: 0,
             counterpress_pressers: 0,
             counterpress_foul: false,
+            role_swap_wanted: None,
+            role_swapped_with: None,
+            role_swap_initiator: false,
+            role_swap_tick: 0,
             directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
@@ -1393,6 +1410,10 @@ impl MatchPlayer {
             counterpress_ticks: 0,
             counterpress_pressers: 0,
             counterpress_foul: false,
+            role_swap_wanted: None,
+            role_swapped_with: None,
+            role_swap_initiator: false,
+            role_swap_tick: 0,
             directness_bias: 0.0,
             is_force_match_selection,
             birth_date,

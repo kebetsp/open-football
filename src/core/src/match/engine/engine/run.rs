@@ -2586,6 +2586,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     let mut rule_active = false;
                     let mut manager_active = false;
                     let mut abs_y = false;
+                    p.role_swap_wanted = None;
                     for (rule_idx, rule) in p.shape_rules.iter().enumerate() {
                         if rule.is_active(
                             in_possession,
@@ -2597,6 +2598,12 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             team_tactical,
                             opponent_phase,
                         ) {
+                            if matches!(rule.action, crate::r#match::player::ShapeAction::SwapRole) {
+                                // Role interchange is resolved after this loop; it is
+                                // not a positional rule, so nothing is pinned here.
+                                p.role_swap_wanted = rule.swap_with;
+                                break;
+                            }
                             let candidate = rule.target(base, side, w, h, team_tactical, ball_y);
                             if let Some(max) = rule.max_in_zone {
                                 let near = zone_snapshot
@@ -2623,6 +2630,61 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     p.shape_rule_active = rule_active;
                     p.shape_manager_active = manager_active;
                     p.shape_abs_y = manager_active && abs_y;
+                }
+                // Role interchange (Rule 2.0): perform / undo swaps requested above.
+                {
+                    let tick = context.current_tick();
+                    let mut ops: Vec<(usize, usize, bool)> = Vec::new(); // (initiator, partner, swap?)
+                    for (ia, p) in field.players.iter().enumerate() {
+                        match (p.role_swap_wanted, p.role_swapped_with) {
+                            (Some(bid), None) => {
+                                if p.is_sent_off || p.tactical_position.current_position.position_group() == crate::PlayerFieldPositionGroup::Goalkeeper {
+                                    continue;
+                                }
+                                if let Some(ib) = field.players.iter().position(|q| q.id == bid) {
+                                    let q = &field.players[ib];
+                                    if ib != ia
+                                        && q.team_id == p.team_id
+                                        && !q.is_sent_off
+                                        && q.role_swapped_with.is_none()
+                                        && q.tactical_position.current_position.position_group() != crate::PlayerFieldPositionGroup::Goalkeeper
+                                    {
+                                        ops.push((ia, ib, true));
+                                    }
+                                }
+                            }
+                            (None, Some(bid)) if p.role_swap_initiator && tick.saturating_sub(p.role_swap_tick) >= 500 => {
+                                if let Some(ib) = field.players.iter().position(|q| q.id == bid) {
+                                    ops.push((ia, ib, false));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for (ia, ib, swap) in ops {
+                        let (lo, hi) = if ia < ib { (ia, ib) } else { (ib, ia) };
+                        let (left, right) = field.players.split_at_mut(hi);
+                        let (x, y) = (&mut left[lo], &mut right[0]);
+                        std::mem::swap(&mut x.tactical_position.current_position, &mut y.tactical_position.current_position);
+                        std::mem::swap(&mut x.start_position, &mut y.start_position);
+                        std::mem::swap(&mut x.shape_base, &mut y.shape_base);
+                        std::mem::swap(&mut x.start_anchor_x, &mut y.start_anchor_x);
+                        std::mem::swap(&mut x.start_anchor_y, &mut y.start_anchor_y);
+                        let (xid, yid) = (x.id, y.id);
+                        let (init, other) = if ia < ib { (x, y) } else { (y, x) };
+                        if swap {
+                            init.role_swapped_with = Some(other.id);
+                            init.role_swap_initiator = true;
+                            init.role_swap_tick = tick;
+                            other.role_swapped_with = Some(init.id);
+                            other.role_swap_initiator = false;
+                        } else {
+                            init.role_swapped_with = None;
+                            init.role_swap_initiator = false;
+                            other.role_swapped_with = None;
+                        }
+                        let _ = (xid, yid);
+                    }
                 }
             }
 
