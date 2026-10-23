@@ -146,6 +146,9 @@ const MARK_MAX_DIST_UNITS: f32 = 320.0; // 40.0m, matches the press zone
 /// several metres of breathing room in the middle third (enough to see
 /// the ball and cut the passing lane, not so close it matters yet).
 const MARK_TIGHT_UNITS: f32 = 8.0; // 1.0m
+/// Counter-press: passing options within this distance of the carrier are
+/// the ones worth shutting down (25 m).
+const COUNTERPRESS_OPTION_RADIUS_UNITS: f32 = 200.0;
 const MARK_LOOSE_UNITS: f32 = 40.0; // 5.0m
 
 /// Real cover stand-off distance — a covering defender sits this far
@@ -344,6 +347,10 @@ struct Cand {
     /// gap; `show_outside` flips the presser's show-side.
     compactness: f32,
     show_outside: bool,
+    /// Extra counter-press players active this tick for this player's team
+    /// (manager counter-press: pressers - 1 while inside the window after
+    /// the team lost the ball, else 0).
+    cp_extra: u8,
     /// This player's duty from the *previous* tick — read before this
     /// tick's reset, purely to bias continuity (Steps C/D/E). Never
     /// used as a source of new information, only as a tie-break toward
@@ -429,6 +436,14 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             side: p.side,
             compactness: p.defensive_compactness,
             show_outside: p.defensive_show_outside,
+            cp_extra: if p.counterpress_ticks > 0
+                && context.tactical_for_team(p.team_id).ticks_since_turnover
+                    < p.counterpress_ticks as u32
+            {
+                p.counterpress_pressers.saturating_sub(1)
+            } else {
+                0
+            },
             prev_duty: p.ai_defensive_duty,
             is_taking_ball: matches!(
                 p.state,
@@ -1019,6 +1034,55 @@ fn assign_team(
             if closing_ticks <= press_reach_ticks() {
                 presser = Some(candidate);
                 assigned.push(candidate.id);
+            }
+        }
+    }
+
+    // --- Step C2: manager counter-press (Rule 2.0, G10). While the window
+    // after losing the ball is open, up to `cp_extra` more players close
+    // the carrier's nearest passing options (tight marks), so the carrier
+    // is pressed AND his outlets are shut. Not extra pressers on the carrier
+    // himself: stacking everyone on one spot is the 2026-09-12 rollback. ---
+    let cp_extra = pool.first().map(|c| c.cp_extra).unwrap_or(0) as usize;
+    if cp_extra > 0 {
+        if let Some(carrier_id) = carrier_id {
+            let mut options: Vec<Cand> = cands
+                .iter()
+                .filter(|c| c.team_id == opponent_team && c.id != carrier_id)
+                .filter(|c| (c.position - focal_pos).magnitude() <= COUNTERPRESS_OPTION_RADIUS_UNITS)
+                .copied()
+                .collect();
+            options.sort_by(|a, b| {
+                (a.position - focal_pos)
+                    .magnitude()
+                    .partial_cmp(&(b.position - focal_pos).magnitude())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for opponent in options.into_iter().take(cp_extra) {
+                let closer = pool
+                    .iter()
+                    .filter(|c| !assigned.contains(&c.id))
+                    .min_by(|a, b| {
+                        (a.position - opponent.position)
+                            .magnitude()
+                            .partial_cmp(&(b.position - opponent.position).magnitude())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .copied();
+                let Some(closer) = closer else { break };
+                let to_goal = own_goal - opponent.position;
+                let dir = if to_goal.magnitude() > 1.0 {
+                    to_goal.normalize()
+                } else {
+                    Vector3::new(1.0, 0.0, 0.0)
+                };
+                results.push(Assignment {
+                    id: closer.id,
+                    duty: DefensiveDuty::Mark { opponent_id: opponent.id },
+                    target: opponent.position + dir * MARK_TIGHT_UNITS,
+                    engage: false,
+                });
+                assigned.push(closer.id);
             }
         }
     }

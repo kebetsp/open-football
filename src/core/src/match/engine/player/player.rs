@@ -992,6 +992,12 @@ pub struct MatchPlayer {
     /// ball-lane triggers last saw, kept so the lane only changes after the
     /// ball is clearly over the boundary (hysteresis against flicker).
     pub shape_lane_prev: i8,
+    /// Manager counter-press (identical on every player of a team):
+    /// for this many ticks after the team loses the ball, `counterpress_pressers`
+    /// players (the normal presser plus tight marks on the carrier's nearest
+    /// passing options) close the ball down. 0 ticks = off.
+    pub counterpress_ticks: u16,
+    pub counterpress_pressers: u8,
 
     /// Manager-set build-up-vs-direct dial, -2 (possession) .. +2
     /// (direct), 0 = neutral. Pass-evaluator weight on long-pass
@@ -1238,6 +1244,8 @@ impl MatchPlayer {
             shape_manager_active: false,
             shape_abs_y: false,
             shape_lane_prev: 0,
+            counterpress_ticks: 0,
+            counterpress_pressers: 0,
             directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
@@ -1367,6 +1375,8 @@ impl MatchPlayer {
             shape_manager_active: false,
             shape_abs_y: false,
             shape_lane_prev: 0,
+            counterpress_ticks: 0,
+            counterpress_pressers: 0,
             directness_bias: 0.0,
             is_force_match_selection,
             birth_date,
