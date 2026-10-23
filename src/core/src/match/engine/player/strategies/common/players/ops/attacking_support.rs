@@ -771,7 +771,15 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     let mut flank_group_seen: Vec<(bool, PlayerFieldPositionGroup, i32)> = Vec::new();
     for c in wide_cands.iter() {
         let is_left = if is_wide(c.position_type, front_two_early) {
-            is_left_flank(c.position_type)
+            // `is_left` here means the LOW-Y touchline. A "Left" tag is the
+            // manager's left, which is the low-Y touchline only for a team
+            // attacking +x (PlayerSide::Left); after the half-time swap the
+            // same tag's flank is the high-Y touchline. Without this every wide
+            // player ran to the wrong touchline in the second half (measured
+            // 2026-10-23: signed wide position +165 in the first half, about 0
+            // in the second).
+            let tag_left = is_left_flank(c.position_type);
+            if c.side == Some(PlayerSide::Right) { !tag_left } else { tag_left }
         } else {
             c.start_position.y < field_height / 2.0
         };
