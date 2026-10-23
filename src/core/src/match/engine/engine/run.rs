@@ -2479,11 +2479,11 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 let minute_now =
                     (context.total_match_time * 90 / super::MATCH_TIME_MS) as u32;
                 // Teammate positions for `max_in_zone` limits (Rule 2.0).
-                let zone_snapshot: Vec<(u32, u32, f32, f32)> = field
+                let zone_snapshot: Vec<(u32, u32, f32, f32, bool)> = field
                     .players
                     .iter()
                     .filter(|q| !q.is_sent_off)
-                    .map(|q| (q.id, q.team_id, q.position.x, q.position.y))
+                    .map(|q| (q.id, q.team_id, q.position.x, q.position.y, q.tactical_position.current_position.position_group() == crate::PlayerFieldPositionGroup::Goalkeeper))
                     .collect();
                 for p in field.players.iter_mut() {
                     if p.shape_rules.is_empty() {
@@ -2586,6 +2586,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     let mut rule_active = false;
                     let mut manager_active = false;
                     let mut abs_y = false;
+                    let mut abs_x = false;
                     p.role_swap_wanted = None;
                     for (rule_idx, rule) in p.shape_rules.iter().enumerate() {
                         if rule.is_active(
@@ -2604,11 +2605,38 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                                 p.role_swap_wanted = rule.swap_with;
                                 break;
                             }
-                            let candidate = rule.target(base, side, w, h, team_tactical, ball_y);
+                            // Live reference points for anchored moves (Rule 2.0).
+                            let refs = match rule.action {
+                                crate::r#match::player::ShapeAction::Move(m)
+                                    if !matches!(m.anchor, crate::r#match::player::Anchor::Base) =>
+                                {
+                                    let attack_pos = matches!(side, PlayerSide::Left);
+                                    let last_def_x = zone_snapshot
+                                        .iter()
+                                        .filter(|(_, t, _, _, gk)| *t != p.team_id && !*gk)
+                                        .map(|(_, _, x, _, _)| *x)
+                                        .fold(None, |acc: Option<f32>, x| {
+                                            Some(match acc {
+                                                None => x,
+                                                Some(a) => if attack_pos { a.max(x) } else { a.min(x) },
+                                            })
+                                        });
+                                    let opponent = match m.anchor {
+                                        crate::r#match::player::Anchor::Opponent(oid) => zone_snapshot
+                                            .iter()
+                                            .find(|(id, _, _, _, _)| *id == oid)
+                                            .map(|(_, _, x, y, _)| (*x, *y)),
+                                        _ => None,
+                                    };
+                                    crate::r#match::player::RuleRefs { last_def_x, ball_x: field.ball.position.x, opponent }
+                                }
+                                _ => crate::r#match::player::RuleRefs::default(),
+                            };
+                            let candidate = rule.target(base, side, w, h, team_tactical, ball_y, refs);
                             if let Some(max) = rule.max_in_zone {
                                 let near = zone_snapshot
                                     .iter()
-                                    .filter(|(id, t, x, y)| {
+                                    .filter(|(id, t, x, y, _)| {
                                         *id != p.id
                                             && *t == p.team_id
                                             && ((x - candidate.x).powi(2) + (y - candidate.y).powi(2)).sqrt()
@@ -2623,6 +2651,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             rule_active = true;
                             manager_active = rule_idx < p.manager_rule_count as usize;
                             abs_y = rule.action.lateral_is_absolute();
+                            abs_x = rule.action.depth_is_absolute();
                             break;
                         }
                     }
@@ -2630,6 +2659,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     p.shape_rule_active = rule_active;
                     p.shape_manager_active = manager_active;
                     p.shape_abs_y = manager_active && abs_y;
+                    p.shape_abs_x = manager_active && abs_x;
                 }
                 // Role interchange (Rule 2.0): perform / undo swaps requested above.
                 {

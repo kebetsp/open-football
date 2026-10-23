@@ -63,6 +63,11 @@ pub enum ShapeTrigger {
     /// coach-driven high press (`GamePhase::HighPress`), not merely
     /// pressing incidentally.
     UnderHighPress,
+    /// Rule 2.0: where the ball is, in the manager's attacking direction
+    /// (`TeamTacticalState::ball_zone` of this player's own team).
+    BallAttackingThird,
+    BallMiddleThird,
+    BallDefensiveThird,
 }
 
 /// Action half of a shape rule — computed relative to the player's
@@ -107,6 +112,12 @@ pub enum ShapeAction {
 }
 
 impl ShapeAction {
+    /// Whether this action's DEPTH is measured from a live reference (last defender,
+    /// ball, an opponent) and so is an absolute position rather than an offset.
+    pub fn depth_is_absolute(&self) -> bool {
+        matches!(self, ShapeAction::Move(m) if !matches!(m.anchor, Anchor::Base))
+    }
+
     /// Whether this action's LATERAL part is a pitch lane (absolute) rather
     /// than a nudge on where the duty system already wants the player.
     /// A lane is a fact about the pitch ("the half-space"); depth stays an
@@ -114,7 +125,7 @@ impl ShapeAction {
     /// "drop deeper" back four to its own goal line, audit 2026-10-22).
     pub fn lateral_is_absolute(&self) -> bool {
         match self {
-            ShapeAction::Move(m) => !matches!(m.lane, LaneRef::Keep),
+            ShapeAction::Move(m) => !matches!(m.lane, LaneRef::Keep) || matches!(m.anchor, Anchor::Opponent(_)),
             ShapeAction::StepIntoMidfield | ShapeAction::TuckInside | ShapeAction::HoldWidth => true,
             _ => false,
         }
@@ -156,6 +167,27 @@ pub enum SideRef {
     BallSide,
 }
 
+/// Reference point a `Move`'s depth (and, for an opponent, lateral position) is measured
+/// from. `Base` is the player's own formation base, as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Anchor {
+    Base,
+    /// The opponent's deepest outfield player (the offside line).
+    LastDefender,
+    /// The ball's current depth.
+    Ball,
+    /// A named opponent (player id): depth from him, and with `LaneRef::Keep` also his lateral position.
+    Opponent(u32),
+}
+
+/// Live reference positions a rule target may be measured from (computed each tick by the engine).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuleRefs {
+    pub last_def_x: Option<f32>,
+    pub ball_x: f32,
+    pub opponent: Option<(f32, f32)>,
+}
+
 /// A parametrised movement: lateral lane + side, plus a depth shift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoveSpec {
@@ -164,6 +196,7 @@ pub struct MoveSpec {
     /// Depth shift along the attack direction in thousandths of the
     /// pitch length; positive = toward the opponent goal.
     pub depth_permille: i16,
+    pub anchor: Anchor,
 }
 
 impl MoveSpec {
@@ -178,7 +211,7 @@ impl MoveSpec {
             ShapeAction::DropShort => (LaneRef::Keep, -40),
             _ => return None,
         };
-        Some(MoveSpec { lane, side: SideRef::Own, depth_permille })
+        Some(MoveSpec { lane, side: SideRef::Own, depth_permille, anchor: Anchor::Base })
     }
 }
 
@@ -266,6 +299,9 @@ impl ShapeRule {
             ShapeTrigger::DefendingOwnThird => {
                 !in_possession && matches!(team.ball_zone, BallZone::DefensiveThird)
             }
+            ShapeTrigger::BallAttackingThird => matches!(team.ball_zone, BallZone::AttackingThird),
+            ShapeTrigger::BallMiddleThird => matches!(team.ball_zone, BallZone::MiddleThird),
+            ShapeTrigger::BallDefensiveThird => matches!(team.ball_zone, BallZone::DefensiveThird),
             ShapeTrigger::UnderHighPress => {
                 in_possession && matches!(opponent_phase, GamePhase::HighPress)
             }
@@ -285,6 +321,7 @@ impl ShapeRule {
         field_height: f32,
         team: TeamTacticalState,
         ball_y: f32,
+        refs: RuleRefs,
     ) -> Vector3<f32> {
         let dir = match side {
             PlayerSide::Left => 1.0,
@@ -380,14 +417,23 @@ impl ShapeRule {
                     }
                 };
                 let y = match spec.lane {
-                    LaneRef::Keep => base.y,
+                    LaneRef::Keep => match (spec.anchor, refs.opponent) {
+                        (Anchor::Opponent(_), Some((_, oy))) => oy,
+                        _ => base.y,
+                    },
                     LaneRef::Flank => centre + sign * (centre - 28.0),
                     LaneRef::HalfSpace => centre + sign * field_height * 0.2,
                     LaneRef::Centre => centre,
                     LaneRef::ToCentre(p) => base.y + (centre - base.y) * (p as f32 / 1000.0),
                 };
+                let anchor_x = match spec.anchor {
+                    Anchor::Base => base.x,
+                    Anchor::LastDefender => refs.last_def_x.unwrap_or(base.x),
+                    Anchor::Ball => refs.ball_x,
+                    Anchor::Opponent(_) => refs.opponent.map(|o| o.0).unwrap_or(base.x),
+                };
                 Vector3::new(
-                    (base.x + dir * field_width * (spec.depth_permille as f32 / 1000.0))
+                    (anchor_x + dir * field_width * (spec.depth_permille as f32 / 1000.0))
                         .clamp(20.0, field_width - 20.0),
                     y.clamp(20.0, field_height - 20.0),
                     0.0,
@@ -996,6 +1042,8 @@ pub struct MatchPlayer {
     /// Rule 2.0: the active manager rule's lateral part is an ABSOLUTE
     /// lane (replaces the duty target's y) rather than an offset on it.
     pub shape_abs_y: bool,
+    /// Same for depth when the rule anchors to a live reference (last defender, ball, opponent).
+    pub shape_abs_x: bool,
     /// Rule 2.0: the ball lane (-1/0/1, manager's side) this player's
     /// ball-lane triggers last saw, kept so the lane only changes after the
     /// ball is clearly over the boundary (hysteresis against flicker).
@@ -1269,6 +1317,7 @@ impl MatchPlayer {
             manager_rule_count: 0,
             shape_manager_active: false,
             shape_abs_y: false,
+            shape_abs_x: false,
             shape_lane_prev: 0,
             defensive_line_height: 0.0,
             press_trigger_mask: 0,
@@ -1408,6 +1457,7 @@ impl MatchPlayer {
             manager_rule_count: 0,
             shape_manager_active: false,
             shape_abs_y: false,
+            shape_abs_x: false,
             shape_lane_prev: 0,
             defensive_line_height: 0.0,
             press_trigger_mask: 0,
@@ -1847,7 +1897,7 @@ mod rule2_tests {
 
     fn tgt(action: ShapeAction, base: Vector3<f32>, side: PlayerSide, ball_y: f32) -> Vector3<f32> {
         ShapeRule::new(ShapeTrigger::InPossession, action).target(
-            base, side, W, H, TeamTacticalState::initial(), ball_y,
+            base, side, W, H, TeamTacticalState::initial(), ball_y, RuleRefs::default(),
         )
     }
 
@@ -1879,23 +1929,23 @@ mod rule2_tests {
     fn rule2_lanes_and_sides() {
         let base = Vector3::new(300.0, 300.0, 0.0);
         // Left-side team: manager's left is the low-Y touchline.
-        let left_hs = ShapeAction::Move(MoveSpec { lane: LaneRef::HalfSpace, side: SideRef::Left, depth_permille: 0 });
-        let right_hs = ShapeAction::Move(MoveSpec { lane: LaneRef::HalfSpace, side: SideRef::Right, depth_permille: 0 });
+        let left_hs = ShapeAction::Move(MoveSpec { lane: LaneRef::HalfSpace, side: SideRef::Left, depth_permille: 0, anchor: Anchor::Base });
+        let right_hs = ShapeAction::Move(MoveSpec { lane: LaneRef::HalfSpace, side: SideRef::Right, depth_permille: 0, anchor: Anchor::Base });
         assert!((tgt(left_hs, base, PlayerSide::Left, 272.5).y - (272.5 - 0.2 * H)).abs() < 0.01);
         assert!((tgt(right_hs, base, PlayerSide::Left, 272.5).y - (272.5 + 0.2 * H)).abs() < 0.01);
         // Right-side team attacks the other way: left flips to high Y.
         assert!((tgt(left_hs, base, PlayerSide::Right, 272.5).y - (272.5 + 0.2 * H)).abs() < 0.01);
         // Flank lane sits on the touchline inset, centre lane on the centre line.
-        let flank = ShapeAction::Move(MoveSpec { lane: LaneRef::Flank, side: SideRef::Own, depth_permille: 0 });
+        let flank = ShapeAction::Move(MoveSpec { lane: LaneRef::Flank, side: SideRef::Own, depth_permille: 0, anchor: Anchor::Base });
         assert!((tgt(flank, base, PlayerSide::Left, 272.5).y - (H - 28.0)).abs() < 0.01);
-        let centre = ShapeAction::Move(MoveSpec { lane: LaneRef::Centre, side: SideRef::Own, depth_permille: 0 });
+        let centre = ShapeAction::Move(MoveSpec { lane: LaneRef::Centre, side: SideRef::Own, depth_permille: 0, anchor: Anchor::Base });
         assert!((tgt(centre, base, PlayerSide::Left, 272.5).y - 272.5).abs() < 0.01);
         // Ball side follows the ball.
-        let bs = ShapeAction::Move(MoveSpec { lane: LaneRef::Flank, side: SideRef::BallSide, depth_permille: 0 });
+        let bs = ShapeAction::Move(MoveSpec { lane: LaneRef::Flank, side: SideRef::BallSide, depth_permille: 0, anchor: Anchor::Base });
         assert!(tgt(bs, base, PlayerSide::Left, 50.0).y < 100.0);
         assert!(tgt(bs, base, PlayerSide::Left, 500.0).y > 440.0);
         // Depth: positive = toward the opponent goal for each side.
-        let fwd = ShapeAction::Move(MoveSpec { lane: LaneRef::Keep, side: SideRef::Own, depth_permille: 100 });
+        let fwd = ShapeAction::Move(MoveSpec { lane: LaneRef::Keep, side: SideRef::Own, depth_permille: 100, anchor: Anchor::Base });
         assert!(tgt(fwd, base, PlayerSide::Left, 272.5).x > base.x);
         assert!(tgt(fwd, base, PlayerSide::Right, 272.5).x < base.x);
     }

@@ -209,11 +209,13 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             // manager rule must not move.
             use crate::r#match::player::{AttackDuty, DefensiveDuty};
             let abs_y = p.shape_abs_y;
+            let abs_x = p.shape_abs_x;
+            let lane_x = p.start_position.x;
             let lane_y = p.start_position.y;
             match p.ai_attack_duty {
                 AttackDuty::None | AttackDuty::Receive | AttackDuty::BoxRun | AttackDuty::Run => {}
                 _ => {
-                    p.ai_attack_target.x += off.x;
+                    if abs_x { p.ai_attack_target.x = lane_x; } else { p.ai_attack_target.x += off.x; }
                     if abs_y {
                         p.ai_attack_target.y = lane_y;
                     } else {
@@ -224,7 +226,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             match p.ai_defensive_duty {
                 DefensiveDuty::None => {}
                 DefensiveDuty::HoldShape | DefensiveDuty::Cover => {
-                    p.ai_defensive_target.x += off.x;
+                    if abs_x { p.ai_defensive_target.x = lane_x; } else { p.ai_defensive_target.x += off.x; }
                     if abs_y {
                         p.ai_defensive_target.y = lane_y;
                     } else {
