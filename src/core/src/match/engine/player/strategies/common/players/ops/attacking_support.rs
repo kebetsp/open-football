@@ -307,6 +307,8 @@ struct Cand {
     /// directive no longer removes him from the pool — see
     /// `directive_bias`).
     directive: Option<crate::club::player::traits::BehavioralDirective>,
+    /// Manager opt-in to the run planner for this player.
+    runs_enabled: bool,
 }
 
 struct Assignment {
@@ -470,6 +472,7 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
             side: p.side,
             is_directed: crate::r#match::player::strategies::common::players::ops::directive_bias::bypasses_new_systems(p),
             directive: p.behavioral_directive,
+            runs_enabled: p.runs_enabled,
         })
         .collect();
 
@@ -677,7 +680,9 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     // AND `box_attack.rs`) never fires via the run-commitment path
     // either -- no separate change needed in either of those files. To
     // re-enable: delete the `false &&` below.
-    if false && matches!(phase, Phase::Progression | Phase::Final) {
+    // Manager opt-in only (Rule 2.0): the planner runs for players the manager named
+    // (`smart_runs`), nobody else, so it cannot disturb the default shape.
+    if matches!(phase, Phase::Progression | Phase::Final) && pool.iter().any(|c| c.runs_enabled) {
         let opponents_lite: Vec<MatchPlayerLite> = cands
             .iter()
             .filter(|c| c.team_id != carrier.team_id)
@@ -690,7 +695,7 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         let run_field_height = context.field_size.height as f32;
         let runner_inputs: Vec<RunnerInput> = pool
             .iter()
-            .filter(|c| !assigned.contains(&c.id) && is_runner_role(c.position_type))
+            .filter(|c| !assigned.contains(&c.id) && c.runs_enabled)
             .map(|c| {
                 let (commit_ticks, commit_target, commit_duty, stale_ticks) = field
                     .get_player(c.id)

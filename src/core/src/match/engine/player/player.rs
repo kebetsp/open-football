@@ -1021,6 +1021,9 @@ pub struct MatchPlayer {
     pub role_swapped_with: Option<u32>,
     pub role_swap_initiator: bool,
     pub role_swap_tick: u64,
+    /// Manager opt-in: this player's off-ball runs are planned by `off_ball_runs::plan_runs`
+    /// (valued in-behind / pocket / byline / check-short runs) instead of the flat duty tables.
+    pub runs_enabled: bool,
 
     /// Manager-set build-up-vs-direct dial, -2 (possession) .. +2
     /// (direct), 0 = neutral. Pass-evaluator weight on long-pass
@@ -1276,6 +1279,7 @@ impl MatchPlayer {
             role_swapped_with: None,
             role_swap_initiator: false,
             role_swap_tick: 0,
+            runs_enabled: false,
             directness_bias: 0.0,
             is_force_match_selection: player.is_force_match_selection,
             birth_date: player.birth_date,
@@ -1414,6 +1418,7 @@ impl MatchPlayer {
             role_swapped_with: None,
             role_swap_initiator: false,
             role_swap_tick: 0,
+            runs_enabled: false,
             directness_bias: 0.0,
             is_force_match_selection,
             birth_date,
