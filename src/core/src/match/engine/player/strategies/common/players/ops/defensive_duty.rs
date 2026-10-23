@@ -351,6 +351,8 @@ struct Cand {
     /// (manager counter-press: pressers - 1 while inside the window after
     /// the team lost the ball, else 0).
     cp_extra: u8,
+    /// Manager defensive line height (-1 deep .. +1 high), identical on a team.
+    line_height: f32,
     /// This player's duty from the *previous* tick — read before this
     /// tick's reset, purely to bias continuity (Steps C/D/E). Never
     /// used as a source of new information, only as a tie-break toward
@@ -444,6 +446,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             } else {
                 0
             },
+            line_height: p.defensive_line_height,
             prev_duty: p.ai_defensive_duty,
             is_taking_ball: matches!(
                 p.state,
@@ -1287,8 +1290,20 @@ fn assign_team(
     // `MIDFIELD_LINE_GAP_UNITS`'s own doc comment) — both driven by the
     // SAME ball-distance signal, so they move together rather than one
     // line reacting and the other sitting still.
-    let back_line_depth = (predicted_ball_dist_to_goal * LINE_PUSH_FACTOR)
-        .clamp(LINE_MIN_DEPTH_UNITS, LINE_MAX_DEPTH_UNITS);
+    // Manager line height (Rule 2.0): shifts the line by up to 90 u (11 m)
+    // and moves its bounds with it (+1 allows up to 360 u / 45 m from goal,
+    // -1 caps it at 160 u / 20 m).
+    let line_shift = cands
+        .iter()
+        .find(|c| c.team_id == defending_team)
+        .map(|c| c.line_height)
+        .unwrap_or(0.0)
+        .clamp(-1.0, 1.0);
+    let back_line_depth = (predicted_ball_dist_to_goal * LINE_PUSH_FACTOR + line_shift * 90.0)
+        .clamp(
+            LINE_MIN_DEPTH_UNITS + line_shift.min(0.0) * 16.0,
+            LINE_MAX_DEPTH_UNITS + line_shift * 100.0,
+        );
     let team_compactness = cands
         .iter()
         .find(|c| c.team_id == defending_team)

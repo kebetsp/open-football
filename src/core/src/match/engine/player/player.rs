@@ -996,6 +996,8 @@ pub struct MatchPlayer {
     /// for this many ticks after the team loses the ball, `counterpress_pressers`
     /// players (the normal presser plus tight marks on the carrier's nearest
     /// passing options) close the ball down. 0 ticks = off.
+    /// Manager defensive line height, -1 (deep) .. +1 (high); 0 = default.
+    pub defensive_line_height: f32,
     pub counterpress_ticks: u16,
     pub counterpress_pressers: u8,
 
@@ -1244,6 +1246,7 @@ impl MatchPlayer {
             shape_manager_active: false,
             shape_abs_y: false,
             shape_lane_prev: 0,
+            defensive_line_height: 0.0,
             counterpress_ticks: 0,
             counterpress_pressers: 0,
             directness_bias: 0.0,
@@ -1375,6 +1378,7 @@ impl MatchPlayer {
             shape_manager_active: false,
             shape_abs_y: false,
             shape_lane_prev: 0,
+            defensive_line_height: 0.0,
             counterpress_ticks: 0,
             counterpress_pressers: 0,
             directness_bias: 0.0,
