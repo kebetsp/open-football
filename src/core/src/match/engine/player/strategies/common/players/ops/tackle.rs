@@ -742,6 +742,8 @@ pub fn choose(
     let hold = jockey_benefit * (1.0 - g) - threat * g;
 
     let mut best = (hold, TackleChoice::Hold);
+    let mut dbg_ch = f32::NAN;
+    let mut dbg_sl = f32::NAN;
 
     if d <= LUNGE_REACH {
         let reach_quality = if d <= 12.0 {
@@ -756,6 +758,7 @@ pub fn choose(
         // Standing challenges carry NO penalty-box surcharge: a normal
         // tackle in the box is welcome (Pavel, 2026-09-29).
         let challenge = p_hit * v_win - p_foul * 0.15 - p_beaten * threat;
+        dbg_ch = challenge;
         if challenge > best.0 {
             best = (challenge, TackleChoice::Act(TackleKind::Challenge));
         }
@@ -766,6 +769,7 @@ pub fn choose(
         && threat > 0.25;
     if slide_candidate {
         let sv = slide_value(ctx, opponent, skills, threat);
+        dbg_sl = sv;
         if sv > best.0 {
             best = (sv, TackleChoice::Act(TackleKind::Slide));
         }
@@ -779,6 +783,12 @@ pub fn choose(
             if pv > best.0 {
                 best = (pv, TackleChoice::Act(TackleKind::PushOut));
             }
+        }
+    }
+    {
+        let od = (opponent.position - own_goal).magnitude();
+        if od > 132.0 && od < 240.0 {
+            crate::match_log_info!("EDGEDIAG car={} def={} cd={:.1} d={:.1} thr={:.2} pwin={:.2} marg={:.1} st={:.0} g={:.2} hold={:.3} ch={:.3} sl={:.3} pick={:?}", opponent.id, ctx.player.id, od / 8.0, d / 8.0, threat, p_win, margin, standoff_ticks, g, hold, dbg_ch, dbg_sl, best.1);
         }
     }
     best.1

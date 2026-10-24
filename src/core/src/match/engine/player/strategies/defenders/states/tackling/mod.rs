@@ -91,6 +91,8 @@ impl StateProcessingHandler for DefenderTacklingState {
             // Per-player tackle cooldown (a just-tackled player can't
             // lunge again for ~1 s).
             if !ctx.player.can_attempt_tackle() {
+            #[cfg(feature = "match-logs")]
+            { let od = (opponent.position - ctx.ball().direction_to_own_goal()).magnitude(); if od > 132.0 && od < 240.0 { crate::match_log_info!("EDGEGATE {} car={} def={}", "cooldown", opponent.id, ctx.player.id); } }
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::DEF_GATE_COOLDOWN.fetch_add(1, Ordering::Relaxed);
                 return Some(StateChangeResult::with_defender_state(
@@ -100,6 +102,8 @@ impl StateProcessingHandler for DefenderTacklingState {
 
             // Only the best-positioned teammate engages; the rest cover.
             if !ctx.team().is_best_player_to_chase_ball() {
+            #[cfg(feature = "match-logs")]
+            { let od = (opponent.position - ctx.ball().direction_to_own_goal()).magnitude(); if od > 132.0 && od < 240.0 { crate::match_log_info!("EDGEGATE {} car={} def={}", "notbest", opponent.id, ctx.player.id); } }
                 #[cfg(feature = "match-logs")]
                 crate::tackle_stats::DEF_GATE_NOT_BEST.fetch_add(1, Ordering::Relaxed);
                 return Some(StateChangeResult::with_defender_state(
@@ -111,11 +115,15 @@ impl StateProcessingHandler for DefenderTacklingState {
             // time accumulates), challenge, or slide.
             return match tackle::duel(ctx, &opponent, Self::duel_skills(ctx)) {
                 DuelAction::Hold => {
+            #[cfg(feature = "match-logs")]
+            { let od = (opponent.position - ctx.ball().direction_to_own_goal()).magnitude(); if od > 132.0 && od < 240.0 { crate::match_log_info!("EDGEGATE {} car={} def={}", "hold", opponent.id, ctx.player.id); } }
                     #[cfg(feature = "match-logs")]
                     crate::tackle_stats::DEF_GATE_CONTAIN_OR_CONCEDE.fetch_add(1, Ordering::Relaxed);
                     None
                 }
                 DuelAction::Act(events) => {
+            #[cfg(feature = "match-logs")]
+            { let od = (opponent.position - ctx.ball().direction_to_own_goal()).magnitude(); if od > 132.0 && od < 240.0 { crate::match_log_info!("EDGEGATE {} car={} def={}", "act", opponent.id, ctx.player.id); } }
                     #[cfg(feature = "match-logs")]
                     crate::tackle_stats::DEF_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                     let next = if events.is_empty() {
