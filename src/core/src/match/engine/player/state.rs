@@ -110,8 +110,8 @@ impl PlayerMatchState {
         let state_change_result =
             player_position_group.process(player.in_state_time, player, context, tick_context);
 
-        if state_change_result.start_tackle_cooldown {
-            player.start_tackle_cooldown();
+        if state_change_result.off_balance_ticks > 0 {
+            player.begin_off_balance(state_change_result.off_balance_ticks);
         }
 
         // Stash the shot reason on the player. The Shooting state will
@@ -188,6 +188,22 @@ impl PlayerMatchState {
             // remember to self-sanitize. Non-finite → zero this tick.
             let finite = velocity.x.is_finite() && velocity.y.is_finite() && velocity.z.is_finite();
             let velocity = if finite { velocity } else { Vector3::zeros() };
+
+            // Off balance after a tackle attempt (2026-10-24). This is the
+            // single point every state's, override's and directive's
+            // velocity passes through last, so nothing can run a
+            // stumbling player at full pace. While the spell lasts: top
+            // speed falls to 35% (recovering to 100% as balance returns)
+            // and the new velocity is only blended in slowly, so he
+            // cannot turn or accelerate - a dribbler who sidesteps
+            // really does get past.
+            let mut velocity = velocity;
+            if player.is_off_balance() {
+                let bal = player.balance_factor();
+                max_speed *= 0.35 + 0.65 * bal;
+                let k = 0.06 + 0.30 * bal;
+                velocity = player.velocity * (1.0 - k) + velocity * k;
+            }
 
             let velocity_sq = velocity.norm_squared();
             let max_speed_sq = max_speed * max_speed;

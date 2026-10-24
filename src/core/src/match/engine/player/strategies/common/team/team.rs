@@ -499,6 +499,12 @@ impl<'b> TeamOperationsImpl<'b> {
             }
         }
 
+        // A player who is off balance after a lunge cannot be the one who
+        // engages: the next-best teammate steps up.
+        if self.ctx.player.is_off_balance() {
+            return false;
+        }
+
         // Score for current player (use norm_squared to avoid sqrt)
         let player_dist_sq = (ball_position - self.ctx.player.position).norm_squared();
         let player_score = {
@@ -528,6 +534,10 @@ impl<'b> TeamOperationsImpl<'b> {
             let dist_sq = (ball_position - teammate.position).norm_squared();
             // Quick distance check
             if dist_sq > player_dist_sq {
+                return false;
+            }
+            // An off-balance teammate is not a competitor for the ball.
+            if self.ctx.tick_context.off_balance.contains(&teammate.id) {
                 return false;
             }
 

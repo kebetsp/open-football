@@ -693,7 +693,7 @@ impl<'p> StateProcessor<'p> {
             // the handler also changed state — a successful tackle
             // returns a state-change + cooldown, but a keep-current-state
             // (None) wouldn't hit the `if let Some(state)` branch below.
-            result.start_tackle_cooldown = state_results.start_tackle_cooldown;
+            result.off_balance_ticks = state_results.off_balance_ticks;
             // Propagate the shot reason the same way — tagged at the
             // transition point, consumed by the Shooting state when it
             // composes the Shoot event.
@@ -3559,8 +3559,8 @@ pub struct StateProcessingResult {
     pub velocity: Option<Vector3<f32>>,
     pub events: EventCollection,
     /// Propagated up from the per-state `StateChangeResult`. Consumed by
-    /// `state.rs` to bump `player.tackle_cooldown`.
-    pub start_tackle_cooldown: bool,
+    /// `state.rs` to start `player.off_balance_ticks`.
+    pub off_balance_ticks: u16,
     /// Tagged reason to attach to the next Shoot event fired by this
     /// player. Matches the pass-reason pattern. Written to
     /// `player.pending_shot_reason` by `state.rs` so the Shooting state
@@ -3580,7 +3580,7 @@ impl StateProcessingResult {
             state: None,
             velocity: None,
             events: EventCollection::new(),
-            start_tackle_cooldown: false,
+            off_balance_ticks: 0,
             shot_reason: None,
         }
     }
@@ -3592,13 +3592,13 @@ pub struct StateChangeResult {
 
     pub events: EventCollection,
 
-    /// Defender signalled "I just attempted a tackle" — the state.rs
-    /// update loop consumes this and bumps `player.tackle_cooldown` so
-    /// the next ~100 ticks of Tackling-state entries short-circuit
-    /// without rolling an attempt. Must live on the result (not be
+    /// Ticks the player is off balance after a tackle attempt (0 = none).
+    /// The state.rs update loop consumes this and starts
+    /// `player.off_balance_ticks`; until balance is restored he moves
+    /// slowly and cannot start another challenge. Must live on the result (not be
     /// applied directly in the state) because `ctx.player` is an
     /// immutable borrow inside the state processor.
-    pub start_tackle_cooldown: bool,
+    pub off_balance_ticks: u16,
     /// Tag the NEXT Shoot event fired by this player with this reason.
     /// Set by transitions to the Shooting state so the resulting
     /// Shoot event carries the decision-path context. Mirrors how
@@ -3619,7 +3619,7 @@ impl StateChangeResult {
             state: None,
             velocity: None,
             events: EventCollection::new(),
-            start_tackle_cooldown: false,
+            off_balance_ticks: 0,
             shot_reason: None,
         }
     }

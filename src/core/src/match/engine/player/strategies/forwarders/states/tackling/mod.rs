@@ -96,7 +96,7 @@ impl StateProcessingHandler for ForwardTacklingState {
             if opponent_distance <= DefensiveOperationsImpl::TACKLE_ENGAGEMENT_DISTANCE {
                 return match tackle::duel(ctx, &opponent, Self::duel_skills(ctx)) {
                     DuelAction::Hold => None,
-                    DuelAction::Act(events) => {
+                    DuelAction::Act(events, recovery) => {
                         #[cfg(feature = "match-logs")]
                         crate::tackle_stats::FWD_ATTEMPTS
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -107,7 +107,7 @@ impl StateProcessingHandler for ForwardTacklingState {
                         };
                         let mut result = StateChangeResult::with_forward_state(next);
                         result.events.add_range(events);
-                        result.start_tackle_cooldown = true;
+                        result.off_balance_ticks = recovery;
                         Some(result)
                     }
                 };

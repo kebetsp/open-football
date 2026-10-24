@@ -121,7 +121,7 @@ impl StateProcessingHandler for DefenderTacklingState {
                     crate::tackle_stats::DEF_GATE_CONTAIN_OR_CONCEDE.fetch_add(1, Ordering::Relaxed);
                     None
                 }
-                DuelAction::Act(events) => {
+                DuelAction::Act(events, recovery) => {
             #[cfg(feature = "match-logs")]
             { let od = (opponent.position - ctx.ball().direction_to_own_goal()).magnitude(); if od > 132.0 && od < 240.0 { crate::match_log_info!("EDGEGATE {} car={} def={}", "act", opponent.id, ctx.player.id); } }
                     #[cfg(feature = "match-logs")]
@@ -133,7 +133,7 @@ impl StateProcessingHandler for DefenderTacklingState {
                     };
                     let mut result = StateChangeResult::with_defender_state(next);
                     result.events.add_range(events);
-                    result.start_tackle_cooldown = true;
+                    result.off_balance_ticks = recovery;
                     Some(result)
                 }
             };

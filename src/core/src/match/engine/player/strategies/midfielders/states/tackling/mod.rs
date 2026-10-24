@@ -117,7 +117,7 @@ impl StateProcessingHandler for MidfielderTacklingState {
                         .fetch_add(1, Ordering::Relaxed);
                     None
                 }
-                DuelAction::Act(events) => {
+                DuelAction::Act(events, recovery) => {
                     #[cfg(feature = "match-logs")]
                     crate::tackle_stats::MID_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                     let next = if events.is_empty() {
@@ -127,7 +127,7 @@ impl StateProcessingHandler for MidfielderTacklingState {
                     };
                     let mut result = StateChangeResult::with_midfielder_state(next);
                     result.events.add_range(events);
-                    result.start_tackle_cooldown = true;
+                    result.off_balance_ticks = recovery;
                     Some(result)
                 }
             };

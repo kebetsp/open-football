@@ -382,8 +382,10 @@ pub enum DuelAction {
     /// Keep jockeying (stay in the Tackling state so standoff time
     /// accumulates).
     Hold,
-    /// A tackle was attempted; `events` may be empty (clean miss).
-    Act(Vec<Event>),
+    /// A tackle was attempted; `events` may be empty (clean miss). The
+    /// second value is how many ticks the tackler is off balance
+    /// afterwards (see `off_balance_ticks`).
+    Act(Vec<Event>, u16),
 }
 
 fn tri(rng_a: f32, rng_b: f32) -> f32 {
@@ -925,7 +927,28 @@ pub fn duel(
             if carrier_wins { None } else { Some(opponent.id) },
         )));
     }
-    DuelAction::Act(events)
+    let ticks = off_balance_ticks(
+        kind,
+        !carrier_wins && outcome.touched && !foul,
+        ctx.player.skills.physical.balance,
+    );
+    DuelAction::Act(events, ticks)
+}
+
+/// How long a tackler is off balance after an attempt, in ticks (100/s).
+/// Category-(d) estimates, no open dataset: a standing challenge costs
+/// about 0.6 s when it wins the ball cleanly and 1.0 s when it misses or
+/// fouls; a slide goes to ground, so 1.2 s and 1.8 s. A tackler with good
+/// balance recovers sooner (x0.7) and a poor one later (x1.3).
+fn off_balance_ticks(kind: TackleKind, clean_win: bool, balance_skill: f32) -> u16 {
+    let base = match (kind, clean_win) {
+        (TackleKind::Slide, true) => 120.0,
+        (TackleKind::Slide, false) => 180.0,
+        (_, true) => 60.0,
+        (_, false) => 100.0,
+    };
+    let b = ((balance_skill - 1.0) / 19.0).clamp(0.0, 1.0);
+    (base * (1.3 - 0.6 * b)).round() as u16
 }
 
 #[cfg(test)]

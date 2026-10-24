@@ -114,7 +114,7 @@ impl StateProcessingHandler for MidfielderPressingState {
             // realism-bug (2026-07-30): that fix alone reintroduced the
             // exact 1-tick thrash it was meant to remove, just gated on
             // cooldown instead of distance — a midfielder on
-            // `tackle_cooldown` still satisfies `opponent_distance < 8.0`
+            // `off_balance_ticks` still satisfies `opponent_distance < 8.0`
             // every tick, gets bounced back out of Tackling by its own
             // cooldown check, and immediately re-enters here next tick.
             // Raw traces showed this running every single 30ms sample for
@@ -168,7 +168,7 @@ impl StateProcessingHandler for MidfielderPressingState {
                     discipline: mid_profile.discipline,
                     condition: mid_profile.mid_condition_mult,
                 };
-                if let tackle::DuelAction::Act(events) = tackle::duel(ctx, &opponent, skills) {
+                if let tackle::DuelAction::Act(events, recovery) = tackle::duel(ctx, &opponent, skills) {
                     let next = if events.is_empty() {
                         MidfielderState::Pressing
                     } else {
@@ -176,7 +176,7 @@ impl StateProcessingHandler for MidfielderPressingState {
                     };
                     let mut result = StateChangeResult::with_midfielder_state(next);
                     result.events.add_range(events);
-                    result.start_tackle_cooldown = true;
+                    result.off_balance_ticks = recovery;
                     return Some(result);
                 }
             }

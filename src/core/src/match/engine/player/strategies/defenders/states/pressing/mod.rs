@@ -73,12 +73,12 @@ impl StateProcessingHandler for DefenderPressingState {
 
             // If close enough to tackle, transition to Tackling state.
             // Repeat-tackle prevention lives on the player via
-            // `tackle_cooldown` — a single-state cooldown here wouldn't
+            // `off_balance_ticks` — a single-state cooldown here wouldn't
             // cover the Standing/Running/Covering re-entry paths.
             //
             // realism-bug (2026-07-30): the cooldown check alone isn't
             // enough — it only lives INSIDE Tackling::process(), which
-            // bounces a cooldown player straight back to Pressing. With
+            // bounces an off-balance player straight back to Pressing. With
             // no cooldown awareness here, Pressing immediately routed
             // them right back into Tackling on the very next tick (still
             // within TACKLING_DISTANCE_THRESHOLD), producing a 1-tick
@@ -88,7 +88,7 @@ impl StateProcessingHandler for DefenderPressingState {
             // samples <0.6u/s) for up to 18-19 real seconds, both the
             // engaged defender AND an opposing presser oscillating in
             // lockstep the entire time. Gating entry here on
-            // `can_attempt_tackle()` lets a cooldown player fall through
+            // `can_attempt_tackle()` lets an off-balance player fall through
             // to the role-based coordination below (Cover/Marking/
             // HoldingLine) instead — a real defender who just missed a
             // tackle jockeys/covers, he doesn't keep re-lunging.
@@ -123,7 +123,7 @@ impl StateProcessingHandler for DefenderPressingState {
                     discipline: def_profile.discipline,
                     condition: def_profile.def_condition_mult,
                 };
-                if let tackle::DuelAction::Act(events) = tackle::duel(ctx, &opponent, skills) {
+                if let tackle::DuelAction::Act(events, recovery) = tackle::duel(ctx, &opponent, skills) {
                     let next = if events.is_empty() {
                         DefenderState::Pressing
                     } else {
@@ -131,7 +131,7 @@ impl StateProcessingHandler for DefenderPressingState {
                     };
                     let mut result = StateChangeResult::with_defender_state(next);
                     result.events.add_range(events);
-                    result.start_tackle_cooldown = true;
+                    result.off_balance_ticks = recovery;
                     return Some(result);
                 }
             }

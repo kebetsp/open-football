@@ -149,7 +149,9 @@ impl Ball {
             }
         }
         let pressure01 = (1.0 - nearest_opp_dist / 10.0).clamp(0.0, 1.0);
-        let difficulty = speed01 * 0.40 + pressure01 * 0.40 + aerial01 * 0.20;
+        // An off-balance receiver (just lunged) controls the ball worse.
+        let balance_penalty = 1.0 - receiver.balance_factor();
+        let difficulty = (speed01 * 0.40 + pressure01 * 0.40 + aerial01 * 0.20 + balance_penalty * 0.50).min(1.5);
 
         // Nervousness bump — high-pressure psych state spills more
         // first touches (the modifier is additive probability already).

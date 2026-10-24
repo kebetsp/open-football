@@ -30,6 +30,21 @@ pub struct GameTickContext {
     /// exactly this reason — this follows the same, already-established
     /// pattern rather than inventing a new one.
     pub run_commitments: HashMap<u32, (u16, Vector3<f32>)>,
+    /// Ids of players currently off balance after a tackle attempt.
+    /// Fresh every tick from `field.players` for the same reason as
+    /// `run_commitments` (`context.players` is a stale snapshot); read by
+    /// the best-chaser gate so a stumbling defender is not the one
+    /// everybody waits for.
+    pub off_balance: std::collections::HashSet<u32>,
+}
+
+fn collect_off_balance(field: &MatchField) -> std::collections::HashSet<u32> {
+    field
+        .players
+        .iter()
+        .filter(|p| p.is_off_balance())
+        .map(|p| p.id)
+        .collect()
 }
 
 fn collect_run_commitments(field: &MatchField) -> HashMap<u32, (u16, Vector3<f32>)> {
@@ -51,6 +66,7 @@ impl GameTickContext {
             grid,
             space: Space::from(field),
             run_commitments: collect_run_commitments(field),
+            off_balance: collect_off_balance(field),
         }
     }
 
@@ -61,6 +77,7 @@ impl GameTickContext {
         self.grid.update(field);
         self.space.update(field);
         self.run_commitments = collect_run_commitments(field);
+        self.off_balance = collect_off_balance(field);
     }
 
     /// Cheaper refresh used during shot-flight light ticks where only

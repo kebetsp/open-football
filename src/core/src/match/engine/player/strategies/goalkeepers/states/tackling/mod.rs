@@ -21,9 +21,8 @@ impl StateProcessingHandler for GoalkeeperTacklingState {
         #[cfg(feature = "match-logs")]
         crate::tackle_stats::GK_ENTRIES.fetch_add(1, Ordering::Relaxed);
 
-        // Shared tackle cooldown. Without it the keeper re-attempts every
-        // tick while the attacker is in range, generating fouls and/or
-        // compounding the inflated tackle count.
+        // A keeper who has just lunged is off balance until it passes
+        // (same mechanic as the outfield tackle recovery).
         if !ctx.player.can_attempt_tackle() {
             return Some(StateChangeResult::with_goalkeeper_state(
                 GoalkeeperState::Standing,
@@ -54,7 +53,7 @@ impl StateProcessingHandler for GoalkeeperTacklingState {
                 state_change
                     .events
                     .add(Event::PlayerEvent(PlayerEvent::TacklingBall(ctx.player.id)));
-                state_change.start_tackle_cooldown = true;
+                state_change.off_balance_ticks = 60;
                 Some(state_change)
             } else if committed_foul {
                 let mut state_change =
@@ -62,12 +61,12 @@ impl StateProcessingHandler for GoalkeeperTacklingState {
                 state_change
                     .events
                     .add_player_event(PlayerEvent::CommitFoul(ctx.player.id, foul_severity));
-                state_change.start_tackle_cooldown = true;
+                state_change.off_balance_ticks = 100;
                 return Some(state_change);
             } else {
                 let mut state_change =
                     StateChangeResult::with_goalkeeper_state(GoalkeeperState::Standing);
-                state_change.start_tackle_cooldown = true;
+                state_change.off_balance_ticks = 100;
                 return Some(state_change);
             }
         } else {

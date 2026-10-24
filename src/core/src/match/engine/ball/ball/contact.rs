@@ -26,7 +26,10 @@ pub const MIN_REACH: f32 = 10.0;
 pub fn contact_reach(p: &MatchPlayer) -> f32 {
     let ph = &p.skills.physical;
     let s = ((ph.agility + ph.acceleration + ph.balance) / 3.0 - 1.0) / 19.0;
-    MIN_REACH + (MAX_REACH - MIN_REACH) * s.clamp(0.0, 1.0)
+    let reach = MIN_REACH + (MAX_REACH - MIN_REACH) * s.clamp(0.0, 1.0);
+    // Off balance after a lunge: reaches 55% as far, recovering as balance
+    // returns.
+    reach * (0.55 + 0.45 * p.balance_factor())
 }
 
 /// Move the player onto the ball's ground position (x/y only).

@@ -576,13 +576,17 @@ pub struct MatchPlayer {
     pub fouls_committed: u8,
     /// Player has been sent off — skip state processing, treat as off field.
     pub is_sent_off: bool,
-    /// Ticks remaining before this player may attempt another tackle.
-    /// Decremented each tick in `update()`. Blocks Tackling-state entry
-    /// via `can_attempt_tackle()`. Prevents the Tackling-state machine
-    /// from re-firing attempts via Standing/Running/Covering/etc. paths
-    /// within the same second, which would otherwise produce 40+ fouls
-    /// per team in the first 5 minutes of every match.
-    pub tackle_cooldown: u16,
+    /// Ticks of physical off-balance left after a tackle attempt (any
+    /// outcome). While > 0 the player moves slowly and turns badly
+    /// (`PlayerMatchState::process`), cannot start another challenge
+    /// (`can_attempt_tackle`), reaches less far for the ball
+    /// (`contact_reach`) and controls it worse. It ends on its own when
+    /// balance is restored; there is no tackle cooldown. Replaces the old
+    /// flat 30 s `tackle_cooldown` lockout (2026-10-24).
+    pub off_balance_ticks: u16,
+    /// The length this spell started at, so the recovery can be graded
+    /// (fully off balance at the start, nearly recovered at the end).
+    pub off_balance_total: u16,
     /// Consecutive ticks this player's final velocity has been ~zero.
     /// Reset to 0 the instant real movement is detected. Root-cause-
     /// agnostic safety net (2026-08-04) — see `PlayerMatchState::process`
@@ -1248,7 +1252,8 @@ impl MatchPlayer {
             yellow_cards: 0,
             fouls_committed: 0,
             is_sent_off: false,
-            tackle_cooldown: 0,
+            off_balance_ticks: 0,
+            off_balance_total: 0,
             stuck_ticks: 0,
             pending_shot_reason: None,
             behavioral_directive: None,
@@ -1388,7 +1393,8 @@ impl MatchPlayer {
             yellow_cards: 0,
             fouls_committed: 0,
             is_sent_off: false,
-            tackle_cooldown: 0,
+            off_balance_ticks: 0,
+            off_balance_total: 0,
             stuck_ticks: 0,
             pending_shot_reason: None,
             behavioral_directive: None,
@@ -1610,35 +1616,49 @@ impl MatchPlayer {
         (position_default + tilt).clamp(0.02, 1.0)
     }
 
-    /// Consumes the tackle cooldown (ticks it down by 1). Called once per
+    /// Counts the off-balance spell down by one tick. Called once per
     /// simulation tick from `update()`.
     #[inline]
-    pub fn tick_tackle_cooldown(&mut self) {
-        self.tackle_cooldown = self.tackle_cooldown.saturating_sub(1);
+    pub fn tick_off_balance(&mut self) {
+        self.off_balance_ticks = self.off_balance_ticks.saturating_sub(1);
+        if self.off_balance_ticks == 0 {
+            self.off_balance_total = 0;
+        }
     }
 
-    /// Can this player currently attempt a sliding tackle? False while the
-    /// post-attempt cooldown is still counting down — regardless of which
-    /// state routed them into Tackling.
+    /// Can this player start a challenge right now? Only once balance is
+    /// restored, whichever state routed them toward Tackling.
     #[inline]
     pub fn can_attempt_tackle(&self) -> bool {
-        self.tackle_cooldown == 0
+        self.off_balance_ticks == 0
     }
 
-    /// Start the post-tackle cooldown. Called right after any attempt
-    /// resolves (success, miss, or foul).
     #[inline]
-    pub fn start_tackle_cooldown(&mut self) {
-        // 3000 ticks ≈ 30 seconds. Real football: a player contests 2-4
-        // tackles per 90 minutes — one every ~25 minutes. The previous
-        // 15-second cooldown still let attempts run at 205/team/match
-        // (5x real) because 10 outfield players × 15s allowed up to one
-        // attempt per second team-wide. 30s halves the team-wide ceiling
-        // and matches the realistic "commit, resolve, regroup,
-        // reposition" cadence — a defender who lunges and either wins,
-        // misses, or fouls is realistically out of the next play for
-        // half a minute, not 15 seconds.
-        self.tackle_cooldown = 3000;
+    pub fn is_off_balance(&self) -> bool {
+        self.off_balance_ticks > 0
+    }
+
+    /// Start (or extend) an off-balance spell after a tackle attempt.
+    /// A longer spell is never shortened by a shorter one.
+    #[inline]
+    pub fn begin_off_balance(&mut self, ticks: u16) {
+        if ticks > self.off_balance_ticks {
+            self.off_balance_ticks = ticks;
+            self.off_balance_total = ticks;
+        }
+    }
+
+    /// 1.0 = fully balanced, 0.0 = as unbalanced as a spell gets. Within a
+    /// spell it falls to its minimum straight after the lunge, holds there
+    /// for the first part, then recovers linearly to 1.0 as balance
+    /// returns.
+    pub fn balance_factor(&self) -> f32 {
+        if self.off_balance_ticks == 0 || self.off_balance_total == 0 {
+            return 1.0;
+        }
+        let remaining = self.off_balance_ticks as f32 / self.off_balance_total as f32;
+        // Worst for the first 40% of the spell, then a linear return.
+        (1.0 - (remaining / 0.6).min(1.0)).clamp(0.0, 1.0)
     }
 
     pub fn rebuild_waypoint_cache(&mut self) {
@@ -1658,7 +1678,7 @@ impl MatchPlayer {
         tick_context: &GameTickContext,
         events: &mut EventCollection,
     ) {
-        self.tick_tackle_cooldown();
+        self.tick_off_balance();
 
         let player_events = PlayerMatchState::process(self, context, tick_context);
 
