@@ -70,6 +70,35 @@ pub fn is_goal_side(
 /// rather than dominating the direct chase.
 pub const JOCKEY_SHOW_OUTSIDE_BIAS: f32 = 10.0;
 
+/// Box-edge exit from the jockey hold (2026-10-25). The hold-at-2.5 m
+/// delay (docs/defensive-delay-and-engagement-timing.md) is right in the
+/// middle third, but its exits (xG danger >= 0.15, touchline, heavy touch,
+/// cover ready) know nothing about the penalty area: a carrier 16.5-30 m
+/// out has far less than 0.15 xG-danger, so the presser kept holding until
+/// the carrier was already in the box. Measured 2026-10-25 (30 matches):
+/// presser trails at a median 3.7-4.1 m with ~0 closing speed, within
+/// lunge reach only 24-29% of the time. Once the carrier is this close to
+/// our goal (190u = 23.75 m, i.e. ~7 m outside the 132u box) the presser
+/// commits and meets him. Reasoned estimate (category d).
+/// OPT-IN (`BOXEDGE_COMMIT_ON=1`), off by default: measured 2026-10-25 over
+/// 60 matches per arm it made presser time in the Tackling state go from ~4%
+/// to ~25% at 16.5-24 m but did not change tackle contacts (11.9 vs 12.3 per
+/// match), fouls, or the median distance of dribbled shots (9.8 vs 10.3 m).
+/// Challenges from >=1.5 m have negative value in `tackle::choose`, so the
+/// extra Tackling entries just hold. Kept for tuning, not a fix.
+pub const BOX_EDGE_COMMIT_UNITS: f32 = 190.0;
+
+/// True when the carrier is close enough to our goal that a presser must
+/// stop delaying and engage (opt-in, see above).
+pub fn box_edge_commit(carrier_pos: Vector3<f32>, own_goal: Vector3<f32>) -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("BOXEDGE_COMMIT_ON").is_some()) {
+        return false;
+    }
+    (carrier_pos - own_goal).magnitude() <= BOX_EDGE_COMMIT_UNITS
+}
+
 /// Signed lateral (y-axis) direction a presser's own intercept target
 /// should lean to show the carrier outside: away from whichever
 /// touchline `carrier_y` already sits nearer to (the carrier's own

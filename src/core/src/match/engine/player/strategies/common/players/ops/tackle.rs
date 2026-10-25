@@ -346,6 +346,10 @@ pub const SLIDE_REACH: f32 = 34.0;
 pub const SLIDE_MIN_DISTANCE: f32 = 8.0;
 /// Where a holding defender stands off the carrier (~2m).
 pub const JOCKEY_STANDOFF: f32 = 16.0;
+/// At the box edge (see `defensive_value::box_edge_commit`) the hold is worth
+/// this share of its normal value and its cost clock runs this much faster.
+const BOX_EDGE_HOLD_SCALE: f32 = 0.5;
+const BOX_EDGE_CLOCK_SCALE: f32 = 0.5;
 
 /// Role-agnostic skill inputs, built by each tackling state from its
 /// own skill profile so the three roles share one implementation.
@@ -737,10 +741,21 @@ pub fn choose(
     // longer the standoff, the likelier the attacker gets a shot or
     // gets by — and that costs the threat at his position (T).
     // Near goal the clock runs faster.
-    let tau = 150.0 * (1.0 - 0.7 * threat);
-    let g = 1.0 - (-standoff_ticks / tau.max(30.0)).exp();
+    // Box-edge commit (2026-10-25): measured, 79% of decisions at 16.5-30 m
+    // were Hold (1.5-2.75 m from the carrier), because holding is cheap at
+    // first and a lunge from 2 m has a mediocre hit chance. Near the box the
+    // hold stops being cheap: it is worth half as much and its cost builds
+    // twice as fast. Reasoned estimates (category d).
+    let at_edge = dv::box_edge_commit(opponent.position, own_goal);
+    let (edge_tau, edge_benefit) = if at_edge {
+        (BOX_EDGE_CLOCK_SCALE, BOX_EDGE_HOLD_SCALE)
+    } else {
+        (1.0, 1.0)
+    };
+    let tau = 150.0 * (1.0 - 0.7 * threat) * edge_tau;
+    let g = 1.0 - (-standoff_ticks / tau.max(30.0 * edge_tau)).exp();
     let goal_side_factor = (margin / 20.0).clamp(0.0, 1.0);
-    let jockey_benefit = 0.2 * goal_side_factor * (0.6 + 0.4 * covered);
+    let jockey_benefit = 0.2 * goal_side_factor * (0.6 + 0.4 * covered) * edge_benefit;
     let hold = jockey_benefit * (1.0 - g) - threat * g;
 
     let mut best = (hold, TackleChoice::Hold);

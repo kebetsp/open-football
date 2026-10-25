@@ -44,6 +44,12 @@ use nalgebra::Vector3;
 /// pressure, not so close he can be turned or nutmegged" (arm's length
 /// plus a step). 8 units/metre, this project's established scale.
 const JOCKEY_DISTANCE_UNITS: f32 = 12.0;
+/// Box-edge commit (see `defensive_value::box_edge_commit`): the presser aims
+/// ~0.25 s ahead of the carrier and ~0.5 m goal-side instead of 0.6 s / 1.5 m,
+/// so he closes into engage range instead of waiting 4 m ahead.
+/// Reasoned estimates (category d).
+const BOX_EDGE_LEAD_TICKS: f32 = 25.0;
+const BOX_EDGE_STANDOFF_UNITS: f32 = 4.0;
 
 /// A press is only assigned if the best available closing time is
 /// under this many ticks (~2.2s at 100 ticks/s) — a real defender
@@ -69,6 +75,10 @@ fn press_reach_ticks() -> f32 {
     } else {
         PRESS_REACH_TICKS
     }
+}
+fn press_handover_on() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var_os("PRESS_HANDOVER_OFF").is_some())
 }
 /// `FWD_SCREEN_ABLATE` removes the forward screening job (forwards then get
 /// no duty out of possession unless pressing, as before).
@@ -410,6 +420,10 @@ struct Cand {
     support_spot: Option<Vector3<f32>>,
     support_anchor: Vector3<f32>,
     support_anchor_since_ms: u64,
+    /// Off balance after a tackle attempt (`MatchPlayer::is_off_balance`):
+    /// he cannot challenge and runs at a fraction of his pace, so he must not
+    /// stay the presser (presser handover, 2026-10-25).
+    off_balance: bool,
 }
 
 /// One player's resolved assignment for this tick.
@@ -504,6 +518,7 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             support_spot: p.support_spot,
             support_anchor: p.support_anchor,
             support_anchor_since_ms: p.support_anchor_since_ms,
+            off_balance: p.is_off_balance(),
         })
         .collect();
 
@@ -664,7 +679,15 @@ pub fn assign_defensive_duties(field: &mut MatchField, context: &MatchContext) {
             goal_for_side(defending_side),
             goal_for_side(opposite_side(defending_side)),
             defending_side,
-            false,
+            // A settled dribble (the last controlled touch, ball still at his
+            // feet, nothing in flight) is a tackleable carrier even though the
+            // raw owner field is empty on that tick.
+            field.ball.flags.in_flight_state == 0
+                && (focus_pos - field.ball.position).magnitude() <= 12.0
+                && crate::r#match::player::strategies::common::players::ops::defensive_value::box_edge_commit(
+                    focus_pos,
+                    goal_for_side(defending_side),
+                ),
         )
     } else {
         // Case 2b: a genuine loose ball — both teams organise around
@@ -1082,7 +1105,17 @@ fn assign_team(
             )
         });
         let mut best: Option<(Cand, f32, f32)> = None; // (cand, real closing_ticks, effective)
+        // Presser handover (2026-10-25): measured, after a failed challenge the
+        // beaten defender was still the assigned presser 69% of the time at
+        // +1 s (another defender took over only 4%), because the race ignores
+        // off-balance and gives the incumbent a 0.6x bonus. An off-balance
+        // player sits out the race while anyone else is ready.
+        // `PRESS_HANDOVER_OFF` restores the old race.
+        let handover = press_handover_on() && pool.iter().any(|c| !c.off_balance);
         for c in &pool {
+            if handover && c.off_balance {
+                continue;
+            }
             if c.position_group == PlayerFieldPositionGroup::Defender
                 && ball_dist_to_goal_for_zone > PRESS_DEFENDER_ZONE_UNITS
                 && any_midfielder_available
@@ -1352,13 +1385,28 @@ fn assign_team(
     // never `Some` for a loose ball. ---
     if let (Some(presser), Some(carrier_id)) = (presser, carrier_id) {
         let dist_to_carrier = (presser.position - focal_pos).magnitude();
+        // Box-edge commit (2026-10-25): measured 30 matches, the presser stood
+        // a median 3.7-4.1 m from a carrier 16.5-30 m out (target 0.6 s ahead
+        // + 1.5 m goal-side) with ~0 closing speed, and the 1.2 m / 2 m
+        // engage flag fired only if the carrier ran into him. At the box edge
+        // he now aims at the carrier and engages from the tackle model's own
+        // distance.
+        let at_edge = crate::r#match::player::strategies::common::players::ops::defensive_value::box_edge_commit(
+            focal_pos, own_goal,
+        );
         let engage = ball_owned
-            && ((cover_arrived && dist_to_carrier <= ENGAGE_WITH_COVER_UNITS)
-                || dist_to_carrier <= ENGAGE_WITHOUT_COVER_UNITS);
+            && if at_edge {
+                dist_to_carrier
+                    <= crate::r#match::player::strategies::common::players::ops::tackle::ENGAGE_DISTANCE
+            } else {
+                (cover_arrived && dist_to_carrier <= ENGAGE_WITH_COVER_UNITS)
+                    || dist_to_carrier <= ENGAGE_WITHOUT_COVER_UNITS
+            };
         // Stand at the carrier's anticipated position, goal-side AND (for a
         // wide carrier) on the inside, so the carrier is shown toward the
         // touchline instead of being allowed to cut in.
-        let predicted = focal_pos + focal_vel * PRESS_LEAD_TICKS;
+        let predicted =
+            focal_pos + focal_vel * if at_edge { BOX_EDGE_LEAD_TICKS } else { PRESS_LEAD_TICKS };
         let to_goal = own_goal - predicted;
         let mut dir = if to_goal.magnitude() > 1.0 {
             to_goal.normalize()
@@ -1381,7 +1429,8 @@ fn assign_team(
                 dir = mixed.normalize();
             }
         }
-        let target = predicted + dir * JOCKEY_DISTANCE_UNITS;
+        let target = predicted
+            + dir * if at_edge { BOX_EDGE_STANDOFF_UNITS } else { JOCKEY_DISTANCE_UNITS };
         results.push(Assignment {
             id: presser.id,
             duty: DefensiveDuty::Press {
