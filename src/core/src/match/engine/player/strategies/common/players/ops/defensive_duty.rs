@@ -1429,8 +1429,15 @@ fn assign_team(
                 dir = mixed.normalize();
             }
         }
-        let target = predicted
+        let mut target = predicted
             + dir * if at_edge { BOX_EDGE_STANDOFF_UNITS } else { JOCKEY_DISTANCE_UNITS };
+        if at_edge {
+            // Hold the entrance: no backpedalling into the box with a carrier
+            // who is still outside it.
+            target = crate::r#match::player::strategies::common::players::ops::defensive_value::clamp_to_entrance(
+                target, own_goal,
+            );
+        }
         results.push(Assignment {
             id: presser.id,
             duty: DefensiveDuty::Press {

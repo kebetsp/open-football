@@ -753,7 +753,9 @@ pub fn choose(
     // 0 at BOX_EDGE_COMMIT_UNITS (7 m outside the box), 1 at the box edge
     // (132u) and inside. Geometry, not a clock. `BOXEDGE_GEO_OFF` restores
     // the time-only cost (same-binary A/B).
-    let g = if box_geo_on() {
+    // Outside the box only: inside it the old time-based cost stays (a foul
+    // there is a penalty; Pavel 2026-10-25: "be careful inside").
+    let g = if box_geo_on() && !dv::carrier_in_box(opponent.position, own_goal) {
         let od = (opponent.position - own_goal).magnitude();
         let room = (dv::BOX_EDGE_COMMIT_UNITS - od) / (dv::BOX_EDGE_COMMIT_UNITS - BOX_EDGE_UNITS);
         g_time.max(room.clamp(0.0, 1.0))
@@ -822,7 +824,12 @@ pub fn choose(
 pub fn jockey_velocity(ctx: &StateProcessingContext, opponent: &MatchPlayerLite) -> Vector3<f32> {
     let own_goal = ctx.ball().direction_to_own_goal();
     let to_goal = norm_or(xy(own_goal - opponent.position), Vector3::new(-1.0, 0.0, 0.0));
-    let target = opponent.position + to_goal * JOCKEY_STANDOFF;
+    let mut target = opponent.position + to_goal * JOCKEY_STANDOFF;
+    // Hold the entrance: do not backpedal into the box with a carrier who is
+    // still outside it.
+    if dv::box_edge_commit(opponent.position, own_goal) {
+        target = dv::clamp_to_entrance(target, own_goal);
+    }
     SteeringBehavior::Pursuit {
         target,
         target_velocity: opponent.velocity(ctx),

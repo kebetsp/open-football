@@ -90,12 +90,42 @@ pub const JOCKEY_SHOW_OUTSIDE_BIAS: f32 = 10.0;
 /// pieces gave most of the effect.
 pub const BOX_EDGE_COMMIT_UNITS: f32 = 190.0;
 
-/// True when the carrier is close enough to our goal that a presser must
-/// stop delaying and engage.
+/// Canonical penalty area (16.5 m deep, 40.3 m wide at 8u/m) as the engine's
+/// own `penalty_area()` uses it.
+const BOX_DEPTH_UNITS: f32 = 132.0;
+const BOX_HALF_WIDTH_UNITS: f32 = 161.3;
+/// The first defender holds the entrance ~1 m inside the box edge, not deeper,
+/// while the carrier is still outside the box (2026-10-25: engine carries into
+/// the box were a median 25 m long from 37 m out, real 14 m from 21 m,
+/// because the presser backpedalled into the box with the carrier).
+pub const ENTRANCE_HOLD_UNITS: f32 = 140.0;
+
+/// Is this position inside the penalty area we defend?
+pub fn carrier_in_box(carrier_pos: Vector3<f32>, own_goal: Vector3<f32>) -> bool {
+    (carrier_pos.x - own_goal.x).abs() <= BOX_DEPTH_UNITS
+        && (carrier_pos.y - own_goal.y).abs() <= BOX_HALF_WIDTH_UNITS
+}
+
+/// Keep a presser's target from retreating deeper than the entrance line.
+pub fn clamp_to_entrance(target: Vector3<f32>, own_goal: Vector3<f32>) -> Vector3<f32> {
+    let dir = if target.x >= own_goal.x { 1.0 } else { -1.0 };
+    let depth = (target.x - own_goal.x).abs();
+    if depth >= ENTRANCE_HOLD_UNITS {
+        return target;
+    }
+    Vector3::new(own_goal.x + dir * ENTRANCE_HOLD_UNITS, target.y, target.z)
+}
+
+/// True when the carrier is OUTSIDE the box but close enough to our goal
+/// that a presser must stop delaying and engage. Inside the box the old
+/// (careful) behaviour is kept: a foul there is a penalty.
 pub fn box_edge_commit(carrier_pos: Vector3<f32>, own_goal: Vector3<f32>) -> bool {
     use std::sync::OnceLock;
     static OFF: OnceLock<bool> = OnceLock::new();
     if *OFF.get_or_init(|| std::env::var_os("BOXEDGE_COMMIT_OFF").is_some()) {
+        return false;
+    }
+    if carrier_in_box(carrier_pos, own_goal) {
         return false;
     }
     (carrier_pos - own_goal).magnitude() <= BOX_EDGE_COMMIT_UNITS
