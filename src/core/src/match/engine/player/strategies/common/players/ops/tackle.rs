@@ -346,10 +346,13 @@ pub const SLIDE_REACH: f32 = 34.0;
 pub const SLIDE_MIN_DISTANCE: f32 = 8.0;
 /// Where a holding defender stands off the carrier (~2m).
 pub const JOCKEY_STANDOFF: f32 = 16.0;
-/// At the box edge (see `defensive_value::box_edge_commit`) the hold is worth
-/// this share of its normal value and its cost clock runs this much faster.
-const BOX_EDGE_HOLD_SCALE: f32 = 0.5;
-const BOX_EDGE_CLOCK_SCALE: f32 = 0.5;
+/// Canonical penalty-area depth (16.5 m at 8u/m), the edge the hold cost
+/// reaches 1.0 at.
+const BOX_EDGE_UNITS: f32 = 132.0;
+fn box_geo_on() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !*OFF.get_or_init(|| std::env::var_os("BOXEDGE_GEO_OFF").is_some())
+}
 
 /// Role-agnostic skill inputs, built by each tackling state from its
 /// own skill profile so the three roles share one implementation.
@@ -741,21 +744,24 @@ pub fn choose(
     // longer the standoff, the likelier the attacker gets a shot or
     // gets by — and that costs the threat at his position (T).
     // Near goal the clock runs faster.
-    // Box-edge commit (2026-10-25): measured, 79% of decisions at 16.5-30 m
-    // were Hold (1.5-2.75 m from the carrier), because holding is cheap at
-    // first and a lunge from 2 m has a mediocre hit chance. Near the box the
-    // hold stops being cheap: it is worth half as much and its cost builds
-    // twice as fast. Reasoned estimates (category d).
-    let at_edge = dv::box_edge_commit(opponent.position, own_goal);
-    let (edge_tau, edge_benefit) = if at_edge {
-        (BOX_EDGE_CLOCK_SCALE, BOX_EDGE_HOLD_SCALE)
+    let tau = 150.0 * (1.0 - 0.7 * threat);
+    let g_time = 1.0 - (-standoff_ticks / tau.max(30.0)).exp();
+    // Box-edge hold cost (2026-10-25): the hold's cost used to depend only on
+    // elapsed time (a clock that resets), so 79% of decisions at 16.5-30 m
+    // were Hold and the box never entered the commit decision. Now the hold
+    // also costs the share of the room-to-the-box that is already used up:
+    // 0 at BOX_EDGE_COMMIT_UNITS (7 m outside the box), 1 at the box edge
+    // (132u) and inside. Geometry, not a clock. `BOXEDGE_GEO_OFF` restores
+    // the time-only cost (same-binary A/B).
+    let g = if box_geo_on() {
+        let od = (opponent.position - own_goal).magnitude();
+        let room = (dv::BOX_EDGE_COMMIT_UNITS - od) / (dv::BOX_EDGE_COMMIT_UNITS - BOX_EDGE_UNITS);
+        g_time.max(room.clamp(0.0, 1.0))
     } else {
-        (1.0, 1.0)
+        g_time
     };
-    let tau = 150.0 * (1.0 - 0.7 * threat) * edge_tau;
-    let g = 1.0 - (-standoff_ticks / tau.max(30.0 * edge_tau)).exp();
     let goal_side_factor = (margin / 20.0).clamp(0.0, 1.0);
-    let jockey_benefit = 0.2 * goal_side_factor * (0.6 + 0.4 * covered) * edge_benefit;
+    let jockey_benefit = 0.2 * goal_side_factor * (0.6 + 0.4 * covered);
     let hold = jockey_benefit * (1.0 - g) - threat * g;
 
     let mut best = (hold, TackleChoice::Hold);
