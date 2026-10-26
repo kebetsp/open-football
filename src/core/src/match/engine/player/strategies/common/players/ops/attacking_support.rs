@@ -412,6 +412,19 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
     // per tick with full `&mut MatchField` access, so no separate
     // `engine/run.rs` decay site is needed for this mechanism.
     for p in field.players.iter_mut() {
+        // Byline-pocket stall counter (see `box_attack::POCKET_STALL_TICKS`):
+        // counts ticks a carrier keeps the ball inside the pocket.
+        let owner_ish = field.ball.current_owner == Some(p.id)
+            || (field.ball.current_owner.is_none() && field.ball.possessing_touch() == Some(p.id));
+        let in_pocket = owner_ish
+            && p.side.is_some_and(|side| {
+                let attacked = match side {
+                    PlayerSide::Left => context.goal_positions.right,
+                    PlayerSide::Right => context.goal_positions.left,
+                };
+                super::box_attack::in_byline_pocket(p.position, attacked)
+            });
+        p.pocket_ticks = if in_pocket { p.pocket_ticks.saturating_add(1) } else { 0 };
         if field.ball.current_owner == Some(p.id) {
             p.run_commit_ticks = 0;
             p.run_stale_ticks = 0;
@@ -649,6 +662,60 @@ pub fn assign_attacking_support(field: &mut MatchField, context: &mut MatchConte
         }
     } else {
         context.box_plan[side_index] = Default::default();
+    }
+
+    // --- Short support for a carrier pinned in the byline pocket
+    // (2026-10-26, "winger stuck at the byline"): nobody came to help him.
+    // When the carrier has been in the pocket for ~0.4s with an opponent
+    // within 6m, the nearest free teammate comes to a safe passing spot
+    // 6-8m away -- back along the touchline, level infield, or diagonal
+    // back, whichever is farthest from every opponent -- so the carrier
+    // has a pass that is not into the presser.
+    if wide_play_on("pocketsupport")
+        && carrier.id == reference_id
+        && field.get_player(carrier.id).is_some_and(|c| c.pocket_ticks >= 40)
+        && nearest_opp_dist(carrier.position) <= 48.0
+    {
+        let fh = context.field_size.height as f32;
+        let fw = context.field_size.width as f32;
+        let side_y = if opponent_goal.y >= carrier.position.y { 1.0 } else { -1.0 };
+        let cp = carrier.position;
+        let mut best: Option<(f32, Vector3<f32>)> = None;
+        for off in [
+            Vector3::new(-attack_dir * 64.0, 0.0, 0.0),
+            Vector3::new(-attack_dir * 48.0, side_y * 48.0, 0.0),
+            Vector3::new(0.0, side_y * 56.0, 0.0),
+        ] {
+            let mut pt = cp + off;
+            pt.x = pt.x.clamp(30.0, fw - 30.0);
+            pt.y = pt.y.clamp(30.0, fh - 30.0);
+            let d = nearest_opp_dist(pt);
+            if best.map_or(true, |(bd, _)| d > bd) {
+                best = Some((d, pt));
+            }
+        }
+        if let Some((_, pt)) = best {
+            let supporter = pool
+                .iter()
+                .filter(|c| !assigned.contains(&c.id))
+                .filter(|c| (c.position - pt).magnitude() <= 260.0)
+                .min_by(|a, b| {
+                    (a.position - pt)
+                        .magnitude()
+                        .partial_cmp(&(b.position - pt).magnitude())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|c| c.id);
+            if let Some(id) = supporter {
+                results.push(Assignment {
+                    id,
+                    duty: AttackDuty::Support,
+                    target: pt,
+                    redirected: false,
+                });
+                assigned.push(id);
+            }
+        }
     }
 
     // --- Off-ball attacking runs, from null (`off_ball_runs.rs`,

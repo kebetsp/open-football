@@ -2590,6 +2590,11 @@ impl<'p> StateProcessor<'p> {
                 StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
             }
             (AttackDuty::Run, _) => StateChangeResult::with_forward_state(ForwardState::CreatingSpace),
+            (AttackDuty::Support, 0) => StateChangeResult::with_defender_state(DefenderState::PushingUp),
+            (AttackDuty::Support, 1) => {
+                StateChangeResult::with_midfielder_state(MidfielderState::AttackSupporting)
+            }
+            (AttackDuty::Support, _) => StateChangeResult::with_forward_state(ForwardState::CreatingSpace),
             (AttackDuty::None, _) => unreachable!("gated above"),
         })
     }

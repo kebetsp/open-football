@@ -538,6 +538,11 @@ pub enum AttackDuty {
     /// domain 4's own penalty-area zone assignment; this covers
     /// everything short of that.
     Run,
+    /// A short-support option for a carrier pinned in the byline pocket:
+    /// a nearby teammate comes to a safe passing position a few metres
+    /// infield of him (away from his marker), so the carrier can pass
+    /// instead of dithering. Assigned by `attacking_support.rs`.
+    Support,
 }
 
 #[derive(Debug, Clone)]
@@ -692,6 +697,12 @@ pub struct MatchPlayer {
     /// Cleared on ball release, genuine two-man pressure, or budget
     /// expiry (engine loop, same pattern as the three fields above).
     pub byline_commitment_ticks: u16,
+    /// Ticks this player has been the ball carrier inside the byline pocket
+    /// (within 12.5m of the goal line, wide). Drives the stall escalation in
+    /// `box_attack::decide_final_third` (a carrier pinned in the corner stops
+    /// carrying and delivers/passes) and the short-support duty. Updated once
+    /// per tick in `assign_attacking_support`.
+    pub pocket_ticks: u16,
     /// realism-bug (2026-09-12): a forward's off-ball width is governed
     /// by a per-tick blend (`ForwardRunningState`/`ForwardCreatingSpace
     /// State`) whose every input (ball position, start-position anchor,
@@ -1275,6 +1286,7 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            pocket_ticks: 0,
             width_commitment_ticks: 0,
             wide_run_track_target: None,
             wide_run_track_ticks: 0,
@@ -1416,6 +1428,7 @@ impl MatchPlayer {
             teammate_trigger: None,
             kickoff_pass_pending: 0,
             byline_commitment_ticks: 0,
+            pocket_ticks: 0,
             width_commitment_ticks: 0,
             wide_run_track_target: None,
             wide_run_track_ticks: 0,

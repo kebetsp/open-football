@@ -213,7 +213,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
             let lane_x = p.start_position.x;
             let lane_y = p.start_position.y;
             match p.ai_attack_duty {
-                AttackDuty::None | AttackDuty::Receive | AttackDuty::BoxRun | AttackDuty::Run => {}
+                AttackDuty::None | AttackDuty::Receive | AttackDuty::BoxRun | AttackDuty::Run | AttackDuty::Support => {}
                 _ => {
                     if abs_x { p.ai_attack_target.x = lane_x; } else { p.ai_attack_target.x += off.x; }
                     if abs_y {
@@ -235,7 +235,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                 }
                 _ => p.ai_defensive_target += off,
             }
-            if !matches!(p.ai_attack_duty, AttackDuty::None | AttackDuty::Receive | AttackDuty::BoxRun | AttackDuty::Run) {
+            if !matches!(p.ai_attack_duty, AttackDuty::None | AttackDuty::Receive | AttackDuty::BoxRun | AttackDuty::Run | AttackDuty::Support) {
                 let mut t = p.ai_attack_target;
                 spread(&mut t, p.id, p.team_id);
                 p.ai_attack_target = t;

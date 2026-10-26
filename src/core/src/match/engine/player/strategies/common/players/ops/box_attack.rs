@@ -861,6 +861,27 @@ fn in_crossing_area(point: Vector3<f32>, goal: Vector3<f32>) -> bool {
     (point.y - goal.y).abs() >= CROSS_MIN_LATERAL && (goal.x - point.x).abs() <= CROSS_MAX_DEPTH
 }
 
+/// The byline pocket: a wide point within `BYLINE_CTX_DEPTH` (12.5m) of the
+/// goal line. A carrier who stays here without crossing or passing is stuck
+/// (2026-10-26: 20s dithering episodes in the corner, ~0.1 per match).
+pub(crate) fn in_byline_pocket(point: Vector3<f32>, goal: Vector3<f32>) -> bool {
+    (point.y - goal.y).abs() >= CROSS_MIN_LATERAL && (goal.x - point.x).abs() <= BYLINE_CTX_DEPTH
+}
+
+/// Ticks a carrier may stay in the byline pocket before carries and
+/// take-ons are switched off and he must deliver, pass or recycle.
+pub(crate) const POCKET_STALL_TICKS: u16 = 150;
+
+/// The 4m minimum carry and the dead-end value cap are OFF by default: in a
+/// 40-match test each one alone cut cut-backs (2.2 -> 1.45 / 0.6 per match)
+/// and byline arrivals (5.4 -> 4.8 / 3.8). Opt in with `POCKET_EXTRA=1`.
+fn pocket_extra_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("POCKET_EXTRA").is_some())
+}
+/// A carry shorter than this inside the pocket is not a carry (4m).
+const POCKET_MIN_CARRY: f32 = 32.0;
+
 /// Value of possessing the ball at `point` for a player who will act on it:
 /// his own shot, a typical delivery if he is in a crossing position, or
 /// carrying the possession on (`continuation`) — the best of the three.
@@ -908,7 +929,9 @@ pub fn decide_final_third(
     // (best pass value, p_c, tm lat m, tm depth m, chance_at, distance m)
     let bias = super::directive_bias::on_ball(ctx);
     let mut best = Action::Hold;
-    let mut best_value = if bias.no_hold { 0.0 } else { HOLD_VALUE };
+    let pocket = in_byline_pocket(from, goal);
+    let stalled = pocket && wide_play_on("pocketesc") && ctx.player.pocket_ticks >= POCKET_STALL_TICKS;
+    let mut best_value = if bias.no_hold || stalled { 0.0 } else { HOLD_VALUE };
     let (mut d_shoot, mut d_deliver, mut d_pass, mut d_carry, mut d_take) =
         (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let (mut d_pf, mut d_pl, mut d_pb) = (0.0f32, 0.0f32, 0.0f32);
@@ -1102,6 +1125,9 @@ pub fn decide_final_third(
     let press_keep = 1.0 - CARRY_PRESSURE_LOSS * (1.0 - opp_m / CARRY_PRESSURE_RANGE_M).clamp(0.0, 1.0);
     let half = CARRY_FAN_HALF_DEG.to_radians();
     for i in 0..CARRY_HEADINGS {
+        if stalled {
+            break;
+        }
         let t = i as f32 / (CARRY_HEADINGS - 1) as f32;
         let heading = rotate_xy(forward, -half + 2.0 * half * t);
         if bias.stay_wide && -(from.y - goal.y).signum() * heading.y > 0.25 {
@@ -1126,7 +1152,8 @@ pub fn decide_final_third(
                 bl.7 += 1.0;
             }
         }
-        if travel < 15.0 {
+        let min_travel = if pocket && pocket_extra_on() { POCKET_MIN_CARRY } else { 15.0 };
+        if travel < min_travel {
             continue;
         }
         if fair && wide_play_on("mate") && teammate_in_lane(ctx, from, heading) {
@@ -1159,7 +1186,7 @@ pub fn decide_final_third(
                 }
             }
             travel = (target - from).magnitude();
-            if travel < 15.0 {
+            if travel < min_travel {
                 continue;
             }
         }
@@ -1235,7 +1262,14 @@ pub fn decide_final_third(
         } else {
             1.0
         };
-        let v = disc * p_keep * press_keep * (end_value.unwrap_or_else(|| carry_chance_at(ctx, target, goal, opponents)) + RETAIN_BONUS)
+        let mut endv = end_value.unwrap_or_else(|| carry_chance_at(ctx, target, goal, opponents));
+        if pocket && pocket_extra_on() && in_byline_pocket(target, goal) {
+            // A carry from the pocket to another point of the pocket adds
+            // nothing: at best he does there what he could do now (deliver
+            // or pass), so the end value cannot exceed that.
+            endv = endv.min((d_deliver.max(d_pass) - RETAIN_BONUS).max(0.0));
+        }
+        let v = disc * p_keep * press_keep * (endv + RETAIN_BONUS)
             * carry_sticky_mult(ctx.player.velocity, heading)
             * flank_mult
             * bias.carry_mul;
@@ -1260,7 +1294,7 @@ pub fn decide_final_third(
     }
 
     // Take-on.
-    if let Some(blocker) = nearest_blocker(from, forward, opponents) {
+    if let Some(blocker) = nearest_blocker(from, forward, opponents).filter(|_| !stalled) {
         let beyond = blocker.position + forward * 30.0;
         use crate::r#match::player::strategies::common::players::ops::tackle as contest;
         let p_beat = contest::carrier_keep_probability(
