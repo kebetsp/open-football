@@ -33,6 +33,17 @@ pub const TICK_SECONDS: f32 = 0.01;
 /// module doc above). `9.81 * 0.01² = 0.000981`.
 pub const GRAVITY_PER_TICK: f32 = GRAVITY * TICK_SECONDS * TICK_SECONDS;
 
+/// Aerial drag as the integrator applies it: dv/dt = -AIR_DRAG_C * v^2
+/// (u/tick^2 per (u/tick)^2), i.e. speed decays as v0 * exp(-c * distance).
+/// = 0.04 / 0.43 kg * 0.016 (see `Ball::update_velocity`).
+pub const AIR_DRAG_C: f32 = 0.04 / 0.43 * 0.016;
+
+/// Horizontal launch speed (u/tick) that covers `distance` units in
+/// `ticks` ticks of flight under `AIR_DRAG_C`: x(T) = ln(1 + c*v0*T)/c.
+pub fn air_launch_speed(distance: f32, ticks: f32) -> f32 {
+    ((AIR_DRAG_C * distance.max(0.0)).exp() - 1.0) / (AIR_DRAG_C * ticks.max(1.0))
+}
+
 /// The real vertical launch speed (metres/tick, i.e. already in the
 /// engine's own velocity storage units) needed for a ball launched from
 /// z=0 to reach `height_m` at the peak of its arc, under real ballistics
@@ -132,6 +143,20 @@ mod roll_tests {
         for &(d, va) in &[(40.0_f32, 0.1_f32), (100.0, 0.375), (200.0, 0.5)] {
             let v0 = roll_launch_speed(d, va);
             assert!((roll_distance(v0, va) - d).abs() < 0.01 * d);
+        }
+    }
+
+    #[test]
+    fn air_launch_speed_lands_at_target() {
+        // step the integrator's own drag law and check the distance covered
+        for &(d, t) in &[(100.0_f32, 60.0_f32), (300.0, 150.0), (400.0, 220.0)] {
+            let mut v = air_launch_speed(d, t);
+            let mut x = 0.0;
+            for _ in 0..t as u32 {
+                x += v;
+                v -= AIR_DRAG_C * v * v;
+            }
+            assert!((x - d).abs() / d < 0.03, "d={d} t={t}: covered {x}");
         }
     }
 

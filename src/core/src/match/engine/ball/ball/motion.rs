@@ -12,12 +12,16 @@ use nalgebra::Vector3;
 impl Ball {
     pub fn update_velocity(&mut self) {
         const BALL_MASS: f32 = 0.43;
-        // Football bounce retention on grass is ~25-35%. The previous
-        // 0.6 produced trampoline bounces where a lofted clearance
-        // bounced to 30m+ and stayed airborne (above PLAYER_JUMP_REACH)
-        // for 3-5 cycles before a defender could claim. 0.3 keeps the
-        // second bounce low enough to reach on the return trip.
-        const BOUNCE_COEFFICIENT: f32 = 0.3;
+        // Vertical restitution on natural grass ~0.5 (FIFA bounce test is
+        // ~0.84 on concrete; turf soaks up more), i.e. a ball dropped from
+        // 6 m comes back to ~1.5 m. The old 0.6 "trampoline" report came
+        // from the pre-2026-08-02 gravity bug (26 m apexes), and the old 0.3
+        // never actually applied because the bounce was unreachable (see
+        // is_on_ground below). Tangential retention below.
+        const BOUNCE_COEFFICIENT: f32 = 0.5;
+        // Sideways speed kept through a bounce: contact friction takes
+        // roughly a fifth to a quarter off a ball landing at pace.
+        const BOUNCE_TANGENTIAL: f32 = 0.78;
         // Safety rail, not a mechanism (2026-10-20): every kick's speed is
         // bounded by the strike model (`engine::kick`, derived from foot
         // speed and the collision, ~37 m/s), and leg contacts are bounded by
@@ -72,7 +76,14 @@ impl Ball {
         // real ball under constant proportional friction mathematically
         // never reaches exactly zero), not a second physics model.
         let velocity_norm = velocity_norm_sq.sqrt();
-        let is_on_ground = self.position.z <= 0.1;
+        // Rolling only if the ball is near the grass AND not moving
+        // vertically at any real speed. The old test was `z <= 0.1` alone:
+        // a falling ball passes through that band on its way down, was
+        // treated as rolling, had its downward velocity zeroed, and so the
+        // bounce below was unreachable (probe: 0 bounces on every lofted
+        // ball, which landed dead and rolled on at full horizontal speed).
+        const ROLL_MAX_VZ: f32 = 0.02; // m/tick = 2 m/s
+        let is_on_ground = self.position.z <= 0.1 && self.velocity.z.abs() < ROLL_MAX_VZ;
 
         if is_on_ground {
             // GROUND PHYSICS: constant rolling deceleration plus air drag
@@ -155,7 +166,10 @@ impl Ball {
         // Numerical cleanup only, not a second physics model (see comment
         // above): a real ball under constant proportional friction never
         // mathematically reaches exact zero, so once negligible, snap it.
-        if self.velocity.norm_squared() < 0.0001 {
+        // Only near the grass: a ball hanging in the air at the top of its
+        // arc (or dropped from rest, like the aerial-duel header drop) has
+        // near-zero speed too, and snapping it to z=0 teleported it down.
+        if self.velocity.norm_squared() < 0.0001 && self.position.z <= 0.1 {
             // 0.01^2
             self.velocity = Vector3::zeros();
             self.position.z = 0.0;
@@ -168,8 +182,8 @@ impl Ball {
             self.velocity.z = -self.velocity.z * BOUNCE_COEFFICIENT;
 
             // Apply some horizontal speed loss on bounce (realistic)
-            self.velocity.x *= 0.95;
-            self.velocity.y *= 0.95;
+            self.velocity.x *= BOUNCE_TANGENTIAL;
+            self.velocity.y *= BOUNCE_TANGENTIAL;
 
             // If bounce is too small, stop vertical movement. 2026-08
             // height-physics rewrite: 0.3 was calibrated for the OLD,
@@ -344,5 +358,69 @@ mod decay_regression_tests {
             assert!(ticks < 5000, "ball never came to rest");
         }
         assert!(ticks > 100, "expected many ticks before the ball stops");
+    }
+}
+
+#[cfg(test)]
+mod ball_physics_tests {
+    use super::*;
+
+    // returns (air_dist_m, air_s, total_dist_m, total_s, bounces, max_h)
+    fn run(vh_mps: f32, vz_mps: f32) -> (f32, f32, f32, f32, u32, f32) {
+        let mut b = Ball::with_coord(840.0, 545.0);
+        b.position = Vector3::new(100.0, 270.0, 0.0);
+        let k = 0.01_f32 / 8.0 * 8.0; // m/s -> u/tick : 1 m/s = 8 u/s = 0.08 u/tick
+        let _ = k;
+        b.velocity = Vector3::new(vh_mps * 0.08, 0.0, vz_mps * 0.01);
+        let (mut air_d, mut air_t, mut landed, mut bounces, mut maxh) = (0.0, 0.0, false, 0u32, 0.0_f32);
+        let mut prev_z = 0.0;
+        for t in 0..6000u32 {
+            b.update_velocity();
+            b.position += b.velocity;
+            maxh = maxh.max(b.position.z);
+            if b.position.z > 0.0 && prev_z <= 0.0 && t > 0 { }
+            if !landed && b.position.z <= 0.0 && t > 2 { landed = true; air_d = (b.position.x - 100.0) / 8.0; air_t = t as f32 / 100.0; }
+            if landed && b.position.z > 0.05 && prev_z <= 0.05 { bounces += 1; }
+            prev_z = b.position.z;
+            if b.velocity.norm() == 0.0 && t > 5 {
+                return (air_d, air_t, (b.position.x - 100.0) / 8.0, t as f32 / 100.0, bounces, maxh);
+            }
+        }
+        (air_d, air_t, (b.position.x - 100.0) / 8.0, 60.0, bounces, maxh)
+    }
+
+    /// Guard for the 2026-10-26 ground-contact fix: a falling ball must
+    /// reach the bounce code (it used to be treated as rolling the moment
+    /// it was within 0.1 m of the grass, so it landed dead and rolled on
+    /// at full horizontal speed).
+    #[test]
+    fn lofted_ball_bounces_and_loses_pace() {
+        let (_, _, total, _, bounces, maxh) = run(20.0, 12.0);
+        assert!(maxh > 5.0, "apex {maxh}");
+        assert!(bounces >= 2, "bounces {bounces}");
+        let (air_d, ..) = run(20.0, 12.0);
+        assert!(total - air_d < 30.0, "rolled {} m after landing", total - air_d);
+    }
+
+    #[test]
+    fn ground_roll_unchanged() {
+        let m = |v: f32| run(v, 0.0).2;
+        assert!((20.0..28.0).contains(&m(10.0)), "{}", m(10.0));
+        assert!((50.0..64.0).contains(&m(20.0)), "{}", m(20.0));
+    }
+
+    #[test]
+    fn dropped_ball_rebounds_about_a_quarter_of_the_height() {
+        let mut b = Ball::with_coord(840.0, 545.0);
+        b.position = Vector3::new(100.0, 270.0, 3.0);
+        b.velocity = Vector3::zeros();
+        let (mut hit, mut peak) = (false, 0.0_f32);
+        for _ in 0..400 {
+            b.update_velocity();
+            b.position += b.velocity;
+            if b.position.z <= 0.0 { hit = true; }
+            if hit { peak = peak.max(b.position.z); }
+        }
+        assert!((0.5..1.0).contains(&peak), "rebound apex {peak} m from 3 m");
     }
 }

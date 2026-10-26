@@ -2265,7 +2265,15 @@ impl PlayerEventDispatcher {
                 .max(1.0);
             // The speed this flight needs. Whether the striker can produce it
             // is decided by the strike model below, not by a cap here.
-            let required_speed = (actual_horizontal_distance / total_flight_ticks).max(0.3);
+            // Air drag slows the ball on the way (about a fifth of its speed
+            // over a 35 m flight), so the launch speed is solved with drag
+            // included. Without it lofted balls landed short and only the
+            // old dead-landing roll hid it.
+            let required_speed = crate::r#match::engine::physics::air_launch_speed(
+                actual_horizontal_distance,
+                total_flight_ticks,
+            )
+            .max(0.3);
             let dir = if horizontal_velocity.norm() > 0.01 {
                 horizontal_velocity.normalize()
             } else {
