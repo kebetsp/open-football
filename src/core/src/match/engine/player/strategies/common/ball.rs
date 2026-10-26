@@ -125,6 +125,25 @@ impl<'b> BallOperationsImpl<'b> {
         self.distance() < radius
     }
 
+    /// realism-bug (2026-10-26): true while an opponent is taking a (direct or
+    /// indirect) free kick and still holds the ball. The keeper must not rush
+    /// the taker during this dead-ball window: `ComingOut` and
+    /// `PreparingForSave` used to hand control to each other every ~60ms
+    /// (opponent holds ball within 2u -> PreparingForSave; slow ball within
+    /// 30u not heading at goal -> ComingOut), pinning him at the box edge
+    /// beside the ball for the whole stoppage. The window closes the moment
+    /// the kick is struck (owner changes), so a shot or live pass is untouched.
+    pub fn is_opponent_free_kick_setup(&self) -> bool {
+        use crate::r#match::PassOriginRestart;
+        let restart = self.ctx.tick_context.ball.pass_origin_restart;
+        if restart != PassOriginRestart::DirectFreeKick
+            && restart != PassOriginRestart::IndirectFreeKick
+        {
+            return false;
+        }
+        self.ctx.players().opponents().with_ball().next().is_some()
+    }
+
     /// True while the opponent has a goal kick from their own goal area.
     /// The ball is right at the goal we're attacking (distance < 80u).
     /// Forwards and midfielders should retreat rather than press the GK.

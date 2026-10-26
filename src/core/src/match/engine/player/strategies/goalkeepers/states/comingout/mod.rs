@@ -27,6 +27,14 @@ impl StateProcessingHandler for GoalkeeperComingOutState {
 
         let ball_distance = ctx.ball().distance();
 
+        // Opponent free-kick setup: do not rush the taker; go back to the
+        // line (see `is_opponent_free_kick_setup`).
+        if ctx.ball().is_opponent_free_kick_setup() {
+            return Some(StateChangeResult::with_goalkeeper_state(
+                GoalkeeperState::ReturningToGoal,
+            ));
+        }
+
         if self.should_dive(ctx) {
             return Some(StateChangeResult::with_goalkeeper_state(
                 GoalkeeperState::Diving,

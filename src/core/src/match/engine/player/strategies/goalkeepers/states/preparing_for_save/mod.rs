@@ -52,6 +52,14 @@ impl StateProcessingHandler for GoalkeeperPreparingForSaveState {
             ));
         }
 
+        // Opponent free-kick setup: nothing to save yet; stand and take the
+        // free-kick stance rather than bounce into ComingOut.
+        if ctx.ball().is_opponent_free_kick_setup() {
+            return Some(StateChangeResult::with_goalkeeper_state(
+                GoalkeeperState::Standing,
+            ));
+        }
+
         if ball_distance < CATCH_DISTANCE && distance_from_goal < MAX_DISTANCE_FROM_GOAL_TO_CATCH {
             return Some(StateChangeResult::with_goalkeeper_state(
                 GoalkeeperState::Catching,

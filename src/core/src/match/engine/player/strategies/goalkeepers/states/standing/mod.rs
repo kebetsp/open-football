@@ -56,6 +56,10 @@ impl StateProcessingHandler for GoalkeeperStandingState {
         let command_of_area = ctx.player.skills.goalkeeping.command_of_area / 20.0;
 
         // Check for immediate threats requiring urgent action
+        if ctx.ball().is_opponent_free_kick_setup() {
+            return None; // hold the free-kick stance until the kick is struck
+        }
+
         if let Some(opponent) = ctx.players().opponents().with_ball().next() {
             let opponent_distance = opponent.distance(ctx);
 
