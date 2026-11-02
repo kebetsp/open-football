@@ -405,6 +405,16 @@ pub struct Ball {
     /// ownership change.
     pub last_shot_xg: f32,
     pub last_shot_shooter_id: Option<u32>,
+    /// True while the most recent shot was on target (aimed inside the
+    /// posts, not over the bar) and nobody has CONTROLLED the ball since.
+    /// A defender's block/deflection does not end it, so a deflected
+    /// on-target shot that goes in is the shooter's goal, not an own goal
+    /// (real convention: an own goal needs the defender's touch to send in
+    /// a ball that was not already heading in on a shot). Cleared by any
+    /// controlled touch and by `clear_open_play_metadata`.
+    pub last_shot_on_target_live: bool,
+    /// Tick the most recent shot was struck (with `last_shot_on_target_live`).
+    pub last_shot_tick: u64,
     /// A penalty whose outcome the conversion model already decided:
     /// (taker id, is_goal). The ball is a real strike from the spot; this
     /// only tells the keeper-contact code that a decided GOAL cannot be
@@ -661,6 +671,8 @@ impl Ball {
             pressers_at_pass_count: 0,
             last_shot_xg: 0.0,
             last_shot_shooter_id: None,
+            last_shot_on_target_live: false,
+            last_shot_tick: 0,
             penalty_decided: None,
             first_touch_owed: None,
             last_shot_assister_id: None,
@@ -779,6 +791,9 @@ impl Ball {
         self.last_touch_team_id = Some(team_id);
         self.last_touch_tick = tick;
         self.last_touch_was_controlled = controlled;
+        if controlled {
+            self.last_shot_on_target_live = false;
+        }
     }
 
     /// How long after a controlled touch the toucher's team is still
@@ -833,6 +848,7 @@ impl Ball {
         self.pending_error_to_shot_player_id = None;
         self.last_shot_xg = 0.0;
         self.last_shot_shooter_id = None;
+        self.last_shot_on_target_live = false;
         self.last_shot_assister_id = None;
     }
 
@@ -1401,6 +1417,7 @@ impl Ball {
     pub fn clear_shot_metadata(&mut self) {
         self.last_shot_xg = 0.0;
         self.last_shot_shooter_id = None;
+        self.last_shot_on_target_live = false;
         self.last_shot_assister_id = None;
     }
 

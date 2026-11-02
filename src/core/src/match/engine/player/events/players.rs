@@ -4172,6 +4172,8 @@ impl PlayerEventDispatcher {
         // require the keeper to save anything.
         field.ball.last_shot_xg = prevented_xg;
         field.ball.last_shot_shooter_id = Some(shoot_event_model.from_player_id);
+        field.ball.last_shot_on_target_live = on_target;
+        field.ball.last_shot_tick = shoot_event_model.tick;
         // `last_shot_assister_id` was already stamped at the dispatch
         // site with the assist-window (~6 s) link — don't overwrite it
         // with the tighter key-pass-window value here.
