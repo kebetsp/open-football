@@ -20,7 +20,8 @@
 //! has no equivalent in the new domains.
 
 use crate::club::player::traits::BehavioralDirective as D;
-use crate::r#match::player::PlayerSide;
+use crate::r#match::player::{DirectivePhase, PlayerSide};
+use super::on_ball_decision::{FINAL_THIRD_BOUNDARY, OWN_THIRD_BOUNDARY};
 use crate::r#match::{MatchPlayer, StateProcessingContext};
 use nalgebra::Vector3;
 
@@ -29,6 +30,41 @@ const FIRST_TOUCH_TICKS: u32 = 45;
 /// A pass longer than this counts as a long ball for lay_off_on_long_ball
 /// and for the supply bias (matches `is_long_reception`'s directive gate).
 const LONG_BALL_UNITS: f32 = 140.0;
+
+/// Half the width of the fade between two phases, in units (~4.4 m each
+/// side of a boundary, ~9 m in all). Same boundaries as domain 2/3.
+const PHASE_FADE_HALF: f32 = 35.0;
+
+fn ramp(x: f32, from: f32, to: f32) -> f32 {
+    ((x - from) / (to - from)).clamp(0.0, 1.0)
+}
+
+/// How strongly an instruction limited to `phase` acts with the ball
+/// `dist_to_own_goal` units from our goal: 1 inside the phase, 0 outside,
+/// a linear fade across each boundary. `Any` is always 1.
+pub fn phase_weight(phase: DirectivePhase, dist_to_own_goal: f32) -> f32 {
+    let leave_own_third = ramp(
+        dist_to_own_goal,
+        OWN_THIRD_BOUNDARY - PHASE_FADE_HALF,
+        OWN_THIRD_BOUNDARY + PHASE_FADE_HALF,
+    );
+    let enter_final_third = ramp(
+        dist_to_own_goal,
+        FINAL_THIRD_BOUNDARY - PHASE_FADE_HALF,
+        FINAL_THIRD_BOUNDARY + PHASE_FADE_HALF,
+    );
+    match phase {
+        DirectivePhase::Any => 1.0,
+        DirectivePhase::BuildUp => 1.0 - leave_own_third,
+        DirectivePhase::Middle => leave_own_third * (1.0 - enter_final_third),
+        DirectivePhase::Attack => enter_final_third,
+    }
+}
+
+/// A multiplier faded toward neutral (1.0) by weight `w`.
+fn fade(m: f32, w: f32) -> f32 {
+    1.0 + (m - 1.0) * w
+}
 
 /// True when the player's behaviour is governed by the July state-machine
 /// implementation of a directive instead of the new domains.
@@ -111,6 +147,18 @@ pub fn on_ball(ctx: &StateProcessingContext) -> OnBallBias {
         Some(D::StayWideNoCutInside) => b.stay_wide = true,
         _ => {}
     }
+    if p.directive_phase != DirectivePhase::Any {
+        let w = phase_weight(p.directive_phase, ctx.ball().distance_to_own_goal());
+        b.carry_mul = fade(b.carry_mul, w);
+        b.pass_mul = fade(b.pass_mul, w);
+        b.pass_add *= w;
+        // Yes/no effects are on for the half of the fade nearest the phase.
+        if w < 0.5 {
+            b.shoot_on_sight = false;
+            b.no_hold = false;
+            b.stay_wide = false;
+        }
+    }
     b
 }
 
@@ -124,13 +172,20 @@ pub fn receiver_mult(
 ) -> f32 {
     let p = ctx.player;
     let mut m = 1.0;
+    // Distance of the ball from our goal, read once for the phase fades.
+    let own_dist = ctx.ball().distance_to_own_goal();
     if p.link_target == Some(receiver_id) {
-        m *= 1.2;
+        m *= fade(1.2, phase_weight(p.link_phase, own_dist));
     }
     if p.supply_target == Some(receiver_id) {
-        m *= if pass_dist > LONG_BALL_UNITS { 1.25 } else { 1.05 };
+        let base = if pass_dist > LONG_BALL_UNITS { 1.25 } else { 1.05 };
+        m *= fade(base, phase_weight(p.supply_phase, own_dist));
     }
-    if let Some(bias) = p.attack_bias {
+    for (bias, phase) in [
+        (p.attack_bias, p.attack_bias_phase),
+        (p.attack_bias_b, p.attack_bias_b_phase),
+    ] {
+        let Some(bias) = bias else { continue };
         let h = ctx.context.field_size.height as f32;
         let third = h / 3.0;
         let raw_lane: i8 = if receiver_y < third {
@@ -144,7 +199,7 @@ pub fn receiver_mult(
             PlayerSide::Left => raw_lane,
             PlayerSide::Right => -raw_lane,
         };
-        m *= if bias == 0 {
+        let base = if bias == 0 {
             if lane == 0 { 1.25 } else { 0.9 }
         } else if lane == bias {
             1.35
@@ -153,6 +208,7 @@ pub fn receiver_mult(
         } else {
             1.0
         };
+        m *= fade(base, phase_weight(phase, own_dist));
     }
     m
 }
@@ -199,5 +255,40 @@ pub fn keep_wide(from: Vector3<f32>, target: Vector3<f32>, field_height: f32) ->
         Vector3::new(target.x, from.y, target.z)
     } else {
         target
+    }
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::*;
+
+    #[test]
+    fn phase_weight_is_one_inside_zero_outside_and_fades_between() {
+        // Build-up: full in own third, gone in the middle, half at the boundary.
+        assert_eq!(phase_weight(DirectivePhase::BuildUp, 100.0), 1.0);
+        assert_eq!(phase_weight(DirectivePhase::BuildUp, 420.0), 0.0);
+        assert!((phase_weight(DirectivePhase::BuildUp, OWN_THIRD_BOUNDARY) - 0.5).abs() < 1e-4);
+        // Attack mirrors it at the final-third boundary.
+        assert_eq!(phase_weight(DirectivePhase::Attack, 700.0), 1.0);
+        assert_eq!(phase_weight(DirectivePhase::Attack, 420.0), 0.0);
+        assert!((phase_weight(DirectivePhase::Attack, FINAL_THIRD_BOUNDARY) - 0.5).abs() < 1e-4);
+        // Middle is full in the middle third and the three weights sum to 1
+        // everywhere (the instruction never fully disappears between phases).
+        assert_eq!(phase_weight(DirectivePhase::Middle, 420.0), 1.0);
+        for d in [0.0, 150.0, 270.0, 280.0, 300.0, 420.0, 540.0, 560.0, 580.0, 800.0] {
+            let sum = phase_weight(DirectivePhase::BuildUp, d)
+                + phase_weight(DirectivePhase::Middle, d)
+                + phase_weight(DirectivePhase::Attack, d);
+            assert!((sum - 1.0).abs() < 1e-4, "sum at {d} = {sum}");
+        }
+        // No phase word = always on.
+        assert_eq!(phase_weight(DirectivePhase::Any, 123.0), 1.0);
+    }
+
+    #[test]
+    fn fade_moves_a_multiplier_toward_neutral() {
+        assert_eq!(fade(1.35, 1.0), 1.35);
+        assert_eq!(fade(1.35, 0.0), 1.0);
+        assert!((fade(0.75, 0.5) - 0.875).abs() < 1e-6);
     }
 }

@@ -545,6 +545,32 @@ pub enum AttackDuty {
     Support,
 }
 
+/// The phase of play an instruction is limited to ("in the build-up",
+/// "in the attack"). Phases are the thirds of the pitch by the ball's
+/// distance from the team's own goal: build-up = own third, middle = middle
+/// third, attack = final third. `Any` = the whole match (no phase word).
+/// The fade between phases lives in `directive_bias::phase_weight`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum DirectivePhase {
+    #[default]
+    Any,
+    BuildUp,
+    Middle,
+    Attack,
+}
+
+impl DirectivePhase {
+    /// Wire name -> phase. Unknown names are None (caller logs and treats as Any).
+    pub fn parse(name: &str) -> Option<DirectivePhase> {
+        match name {
+            "build_up" => Some(DirectivePhase::BuildUp),
+            "middle" => Some(DirectivePhase::Middle),
+            "attack" => Some(DirectivePhase::Attack),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchPlayer {
     pub id: u32,
@@ -1044,6 +1070,15 @@ pub struct MatchPlayer {
     /// right, 0 = centre. Pass-evaluator weight toward that lateral
     /// third ("build down the left").
     pub attack_bias: Option<i8>,
+    /// Phase limits for the per-player instruction fields (see `DirectivePhase`).
+    pub attack_bias_phase: DirectivePhase,
+    /// Optional second flank preference for another phase ("left in the
+    /// build-up, right in the attack").
+    pub attack_bias_b: Option<i8>,
+    pub attack_bias_b_phase: DirectivePhase,
+    pub supply_phase: DirectivePhase,
+    pub link_phase: DirectivePhase,
+    pub directive_phase: DirectivePhase,
     /// True when at least one of `shape_rules` was issued by the manager
     /// (request `shapeRules`), as opposed to the engine's own default
     /// rules. Manager rules are re-applied LAST in the velocity chain so the
@@ -1330,6 +1365,12 @@ impl MatchPlayer {
             shape_base: None,
             shape_rule_active: false,
             attack_bias: None,
+            attack_bias_phase: DirectivePhase::Any,
+            attack_bias_b: None,
+            attack_bias_b_phase: DirectivePhase::Any,
+            supply_phase: DirectivePhase::Any,
+            link_phase: DirectivePhase::Any,
+            directive_phase: DirectivePhase::Any,
             manager_shape: false,
             manager_rule_count: 0,
             shape_manager_active: false,
@@ -1472,6 +1513,12 @@ impl MatchPlayer {
             shape_base: None,
             shape_rule_active: false,
             attack_bias: None,
+            attack_bias_phase: DirectivePhase::Any,
+            attack_bias_b: None,
+            attack_bias_b_phase: DirectivePhase::Any,
+            supply_phase: DirectivePhase::Any,
+            link_phase: DirectivePhase::Any,
+            directive_phase: DirectivePhase::Any,
             manager_shape: false,
             manager_rule_count: 0,
             shape_manager_active: false,
