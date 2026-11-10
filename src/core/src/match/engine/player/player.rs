@@ -228,6 +228,10 @@ pub struct ShapeRule {
     pub max_in_zone: Option<u8>,
     /// For `SwapRole`: the id of the player whose role is taken.
     pub swap_with: Option<u32>,
+    /// While the rule is active the player carries this position tag (the
+    /// line he has joined: "third centre-back"), so every role-based system
+    /// treats him as that role; the original tag returns when it stops.
+    pub adopt_role: Option<crate::PlayerPositionType>,
 }
 
 /// Radius around a rule's target that counts as "the zone" for
@@ -236,7 +240,7 @@ pub const ZONE_RADIUS: f32 = 100.0;
 
 impl ShapeRule {
     pub fn new(trigger: ShapeTrigger, action: ShapeAction) -> Self {
-        Self { trigger, action, and: [None, None], max_in_zone: None, swap_with: None }
+        Self { trigger, action, and: [None, None], max_in_zone: None, swap_with: None, adopt_role: None }
     }
 
     /// Whether this rule's trigger (and every extra condition) currently
@@ -1117,6 +1121,8 @@ pub struct MatchPlayer {
     /// Role interchange state (see `ShapeAction::SwapRole`).
     pub role_swap_wanted: Option<u32>,
     pub role_swapped_with: Option<u32>,
+    /// The tag the player had before a `ShapeRule::adopt_role` took effect.
+    pub role_adopted_from: Option<crate::PlayerPositionType>,
     pub role_swap_initiator: bool,
     pub role_swap_tick: u64,
     /// Manager opt-in: this player's off-ball runs are planned by `off_ball_runs::plan_runs`
@@ -1384,6 +1390,7 @@ impl MatchPlayer {
             counterpress_foul: false,
             role_swap_wanted: None,
             role_swapped_with: None,
+            role_adopted_from: None,
             role_swap_initiator: false,
             role_swap_tick: 0,
             runs_enabled: false,
@@ -1532,6 +1539,7 @@ impl MatchPlayer {
             counterpress_foul: false,
             role_swap_wanted: None,
             role_swapped_with: None,
+            role_adopted_from: None,
             role_swap_initiator: false,
             role_swap_tick: 0,
             runs_enabled: false,

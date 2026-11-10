@@ -2587,6 +2587,7 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                     let mut manager_active = false;
                     let mut abs_y = false;
                     let mut abs_x = false;
+                    let mut adopt: Option<crate::PlayerPositionType> = None;
                     p.role_swap_wanted = None;
                     for (rule_idx, rule) in p.shape_rules.iter().enumerate() {
                         if rule.is_active(
@@ -2652,8 +2653,19 @@ impl<const W: usize, const H: usize> FootballEngine<W, H> {
                             manager_active = rule_idx < p.manager_rule_count as usize;
                             abs_y = rule.action.lateral_is_absolute();
                             abs_x = rule.action.depth_is_absolute();
+                            adopt = rule.adopt_role;
                             break;
                         }
+                    }
+                    // Joined a line ("third centre-back"): carry that role's tag while the
+                    // rule holds, restore the original when it stops.
+                    if let Some(tag) = adopt {
+                        if p.role_adopted_from.is_none() {
+                            p.role_adopted_from = Some(p.tactical_position.current_position);
+                        }
+                        p.tactical_position.current_position = tag;
+                    } else if let Some(orig) = p.role_adopted_from.take() {
+                        p.tactical_position.current_position = orig;
                     }
                     p.start_position = target;
                     p.shape_rule_active = rule_active;

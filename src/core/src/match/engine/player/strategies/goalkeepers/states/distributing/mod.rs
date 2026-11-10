@@ -84,6 +84,9 @@ impl GoalkeeperDistributingState {
     ) -> Option<MatchPlayerLite> {
         const MIN_RECEIVE_DISTANCE: f32 = 30.0; // no back-passes / tap-outs
         const BLOCK_CORRIDOR: f32 = 8.0; // lane width for interception check
+        /// Targets whose completion chance (shared lane-contest model, 0.05-0.95)
+        /// is below this are not considered; the rest are weighted by its square.
+        const MIN_COMPLETION: f32 = 0.4;
         /// An opponent this close (3m at 8u/m) reaches a ball leaving the
         /// keeper's hand within a few ticks, wherever the lane points.
         const RELEASE_REACH: f32 = 24.0;
@@ -167,6 +170,21 @@ impl GoalkeeperDistributingState {
                 continue;
             }
 
+            // 2026-11-10: the corridor above is geometry only. Ask the same
+            // time-based question outfield players ask: can any opponent
+            // reach the lane or the receiver before the ball does? A pass
+            // with a low completion chance is dropped, and the rest are
+            // weighted by it, so a pressing attacker 1-3 m off the lane
+            // who can step across it now counts.
+            let completion = super::super::super::common::players::ops::on_ball_value::lane_completion_prob(
+                ctx,
+                ctx.player.position,
+                teammate.position,
+            );
+            if completion < MIN_COMPLETION {
+                continue;
+            }
+
             let recency_penalty = ctx.ball().passer_recency_penalty(teammate.id);
 
             // PRIMARY SIGNAL: how close to the halfway line is this
@@ -207,7 +225,8 @@ impl GoalkeeperDistributingState {
             let turnover = prof.turnover_risk(pass_difficulty, pressure, 0.0);
             let safety_factor = (1.0 - turnover * 0.6).max(0.2);
             let score =
-                halfway_score * space_bonus * position_bonus * recency_penalty * safety_factor;
+                halfway_score * space_bonus * position_bonus * recency_penalty * safety_factor
+                    * completion * completion;
 
             if score > 0.0 {
                 candidates.push((teammate, score));

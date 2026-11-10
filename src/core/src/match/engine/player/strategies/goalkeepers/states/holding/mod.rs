@@ -96,7 +96,7 @@ impl StateProcessingHandler for GoalkeeperHoldingState {
             // PRESSED_RADIUS AND no lane is currently clear; the moment a
             // lane opens (the standoff pushes the presser back, a teammate
             // moves) or the 6s budget is spent he releases as before.
-            const PRESSED_RADIUS: f32 = 40.0; // 5m at 8u/m
+            const PRESSED_RADIUS: f32 = 64.0; // 8m at 8u/m (wider than the 6m standoff)
             const MAX_HOLD_TICKS: u64 = 600; // IFAB Law 12: 6 seconds
             if ctx.in_state_time < MAX_HOLD_TICKS {
                 let pressed = ctx

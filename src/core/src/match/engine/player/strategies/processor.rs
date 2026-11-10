@@ -3254,7 +3254,7 @@ impl<'p> StateProcessor<'p> {
     /// median opponent stood 1.8m from the keeper at release and 8.4% of
     /// after-save distributions were claimed within 0.3s. Pressing high is
     /// still real doctrine (domain 1 wants it), so this is a standoff,
-    /// not a retreat: within `KEEPER_STANDOFF` (4m, matching the 3-5m
+    /// not a retreat: within `KEEPER_STANDOFF` (6m since 2026-11-10; was 4m, matching the 3-5m
     /// jockeying distance used elsewhere) the inward component of the
     /// proposed velocity is removed and a push outward added in
     /// proportion to how far inside the radius he is; lateral movement
@@ -3263,7 +3263,7 @@ impl<'p> StateProcessor<'p> {
         ctx: &StateProcessingContext,
         proposed: Option<Vector3<f32>>,
     ) -> Option<Vector3<f32>> {
-        const KEEPER_STANDOFF: f32 = 32.0; // 4m at 8u/m
+        const KEEPER_STANDOFF: f32 = 48.0; // 6m at 8u/m (was 4m until 2026-11-10)
         let player = ctx.player;
         if player.tactical_position.current_position.is_goalkeeper() {
             return None;

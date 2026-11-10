@@ -964,7 +964,7 @@ fn momentum_bonus(ctx: &StateProcessingContext, from: Vector3<f32>, candidate: V
 /// third-player evaluation) share one lane-contest computation instead
 /// of duplicating the opponent-margin loop — same "extract, don't
 /// duplicate" discipline `carry_shot_value` already uses for angle math.
-fn lane_completion_prob(
+pub(crate) fn lane_completion_prob(
     ctx: &StateProcessingContext,
     from_pos: Vector3<f32>,
     to_pos: Vector3<f32>,
